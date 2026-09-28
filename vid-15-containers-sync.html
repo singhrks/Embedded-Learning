@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Containers, timestamps and A/V sync | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Containers, timestamps and A/V sync</h1>
+<p class="lead">A codec produces a stream of compressed frames with no notion of time, language or what
+audio goes with them. The container supplies all of that — and the reason lip sync drifts, seeking misses,
+and files play in one player but not another is almost always here rather than in the codec.</p>
+
+<h2 id="containers">What a container does</h2>
+
+<pre class="diagram">   A CONTAINER (or "format", or "wrapper") provides:
+
+     MULTIPLEXING     interleave video, audio, subtitles so a
+                      player can read them in one pass without
+                      seeking
+     TIMING           a timestamp for every packet
+     INDEXING         "the keyframe nearest 3:42 is at byte
+                      offset N" - what makes seeking possible
+     METADATA         title, language, chapters, cover art
+     CODEC SETUP      the "extradata" a decoder needs before
+                      the first frame: SPS/PPS for H.264,
+                      sequence header for AV1
+
+   THE CODEC AND CONTAINER ARE INDEPENDENT. "MP4" says nothing
+   about the video codec inside it. A .mp4 can hold H.264,
+   HEVC, AV1 or MPEG-4 Part 2; an .mkv can hold anything at
+   all. "It is an MP4" is not a statement about
+   compatibility.
+
+   AND THE CONFUSION THAT FOLLOWS: a device that "supports
+   MP4" means it supports SOME codecs in MP4. Nearly every
+   playback failure reported as "this MP4 does not work" is a
+   codec, profile or level problem (chapter 14), not a
+   container problem.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Container</th><th>Strengths</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>MP4 / ISOBMFF</strong></td><td>Universal support, good indexing, fragmentable</td><td>The
+default for anything delivered. Also the base of DASH and CMAF</td></tr>
+<tr><td><strong>MKV / WebM</strong></td><td>Any codec, any number of tracks, extensible, robust to
+truncation</td><td>Archival, anything unusual. WebM is the restricted subset browsers accept</td></tr>
+<tr><td><strong>MPEG-TS</strong></td><td>188-byte packets, resynchronises after loss, no index
+needed</td><td>Broadcast, HLS segments, anything over a lossy link</td></tr>
+<tr><td><strong>fMP4 / CMAF</strong></td><td>Fragmented MP4 — a moov header then independent
+segments</td><td>Streaming. One format serving both HLS and DASH</td></tr>
+<tr><td><strong>MOV</strong></td><td>MP4's ancestor; richer professional metadata</td><td>Editing, ProRes</td></tr>
+<tr><td><strong>Annex B / raw ES</strong></td><td>No container at all — just NAL units with start
+codes</td><td>Debugging, and feeding a hardware decoder directly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="timestamps">Timestamps and timebases</h2>
+
+<pre><code>/* A timestamp is an INTEGER in a container-defined TIMEBASE.
+   It is not seconds.                                       */
+
+    time_in_seconds = timestamp * timebase
+
+  MP4        timebase = 1 / timescale, chosen per track.
+             90000 is traditional; 1000 (milliseconds) common.
+  MPEG-TS    always 1/90000. PCR at 27 MHz.
+  MKV        1/1000000000 by default (nanoseconds).
+
+/* WHY NOT JUST USE SECONDS: 30000/1001 fps (NTSC's 29.97)
+   cannot be represented exactly in any decimal. With a
+   timescale of 30000 each frame is exactly 1001 ticks, and
+   there is no accumulating rounding error. Floating point
+   here loses sync over a long file, slowly, in a way that is
+   very hard to debug.                                      */
+
+/* TWO TIMESTAMPS PER PACKET (chapter 10): */
+
+    PTS   when to PRESENT it
+    DTS   when to DECODE it
+
+  With B-frames, PTS != DTS and DTS may start negative:
+
+    packet:   I     P     B     B     P     B     B
+    DTS:     -2    -1     0     1     2     3     4
+    PTS:      0     3     1     2     6     4     5
+
+  DTS is always monotonically increasing. PTS is not.
+  A muxer that writes PTS where DTS belongs produces a file
+  that plays wrong or not at all.
+
+/* EDIT LISTS - MP4's way of saying "start playback at PTS
+   0.0666 even though the first sample has PTS 0". Used to
+   trim, to compensate for encoder delay, and for that
+   negative-DTS offset.
+
+   MANY TOOLS IGNORE THEM, which is why a file can be in sync
+   in one player and 66 ms out in another. If audio and video
+   are offset by exactly one or two frames, suspect an edit
+   list.                                                    */
+
+# Look at the real numbers:
+$ ffprobe -select_streams v -show_entries \
+    packet=pts,dts,pts_time,dts_time,duration -of csv input.mp4 | head -5
+packet,0,-1024,0.000000,-0.021333,512
+packet,3072,0,0.064000,0.000000,512
+packet,1024,512,0.021333,0.010667,512
+
+$ ffprobe -show_entries stream=time_base,start_time,duration \
+    -select_streams v input.mp4
+time_base=1/48000
+start_time=0.000000</code></pre>
+
+<div class="key">
+<b>Every sync bug is a timestamp bug</b>
+<p>Audio and video are decoded by independent decoders at independent rates. The <em>only</em> thing keeping
+them together is their timestamps and a common clock. If lip sync drifts, nothing is wrong with either
+codec — a timestamp is being generated, converted, or ignored incorrectly somewhere in the chain.</p>
+</div>
+
+<h2 id="sync">How playback actually stays in sync</h2>
+
+<pre class="diagram">   THREE POSSIBLE MASTER CLOCKS:
+
+   1. AUDIO MASTER   (what almost everyone uses)
+        The audio device consumes samples at a fixed, known
+        rate, so its playback position IS a clock. Video is
+        presented to match.
+        If video falls behind: DROP frames.
+        If video runs ahead:   REPEAT or wait.
+        WHY: humans notice an audio glitch instantly and a
+        dropped video frame barely at all. Audio must never
+        stutter, so audio wins.
+
+   2. EXTERNAL CLOCK
+        The system clock, or a PCR from a broadcast stream.
+        Used when both audio and video must follow a third
+        party - live broadcast, or synchronised playback
+        across devices.
+
+   3. VIDEO MASTER
+        Rare. Used when frame-accurate video matters more than
+        audio continuity - editing, frame-stepping.
+
+   THE DRIFT PROBLEM, and it is physical:
+     the sound card's crystal runs at 47,999.6 Hz while
+     claiming 48,000. That is 8 ppm - about 30 ms per hour.
+     Over a two-hour film, a minute of accumulated error if
+     nothing corrects it.
+
+     THE FIX: RESAMPLE the audio slightly - 48000 in,
+     47999.6 out - so it tracks the master clock. This is
+     what every serious player does, and it is inaudible.
+     The naive alternative (drop or duplicate a sample block)
+     is audible as a click.
+
+   ACCEPTABLE ERROR, from ITU-R BT.1359:
+     audio LEADING video:   -40 ms is detectable
+     audio LAGGING video:   +60 ms is detectable
+     Asymmetric because in the real world sound always
+     arrives after light, so we tolerate lag better.
+     Aim for +/-20 ms.</pre>
+
+<h2 id="streaming">Fragmented MP4 and streaming</h2>
+
+<pre><code>/* A normal MP4 has one 'moov' box holding the index for the
+   entire file. Two consequences:
+
+   1. If moov is at the END (which is where a muxer naturally
+      writes it, since it needs the whole file first), a
+      player must download the whole file before it can start.
+      -> +faststart moves it to the front. THIS IS THE MOST
+         COMMON MP4 MISTAKE.                                */
+
+$ ffmpeg -i in.mov -c copy -movflags +faststart out.mp4
+
+/*  2. It cannot be produced live, because you do not know
+       the index until you are finished.
+       -> FRAGMENTED MP4: a small moov with no sample table,
+          then a sequence of (moof + mdat) fragments, each
+          self-describing.                                  */
+
+    [ftyp][moov]  [moof][mdat] [moof][mdat] [moof][mdat] ...
+                  \___________/
+                   one fragment - independently decodable if
+                   it starts with a keyframe
+
+$ ffmpeg -i in.mp4 -c copy \
+    -movflags "frag_keyframe+empty_moov+default_base_moof" \
+    out_frag.mp4
+
+/* CMAF is fMP4 with a specific set of constraints, so that
+   ONE set of segments serves both HLS and DASH. Before CMAF
+   you encoded twice - MPEG-TS for HLS, fMP4 for DASH - and
+   stored both. Now you store one.
+
+   THE REQUIREMENTS for segmented streaming, all of which
+   must hold (chapters 10 and 13):
+     * closed GOP, keyframe at every segment boundary
+     * segment duration an exact multiple of the GOP
+     * identical timestamps across every rendition
+     * scene-cut keyframes DISABLED, or alignment breaks   */
+
+# Verify segments really do start with a keyframe:
+$ for s in seg_*.m4s; do
+    printf "%s " $s
+    ffprobe -v error -select_streams v -read_intervals "%+#1" \
+      -show_entries frame=key_frame -of csv=p=0 "$s"
+  done
+seg_001.m4s 1
+seg_002.m4s 1
+seg_003.m4s 1        # all 1 = correct. Any 0 = a broken
+                     # switch point.</code></pre>
+
+<div class="warn">
+<b>Variable frame rate breaks assumptions everywhere</b>
+<p>Screen recordings, phone cameras and browser capture routinely produce VFR: frames arrive when something
+changed, so durations vary. Tools that assume constant frame rate — many editors, naive muxers, anything
+computing <code>frame_number / fps</code> — will produce drifting sync. Convert to CFR at ingest with
+<code>-vsync cfr -r 30</code>, or carry the real timestamps end to end. Choosing halfway produces a file that
+is subtly wrong and very hard to diagnose.</p>
+</div>
+
+<h2 id="diagnose">Diagnosing sync</h2>
+
+<pre><code># 1. Are the streams offset at the start?
+$ ffprobe -show_entries stream=index,codec_type,start_time \
+    -of csv input.mp4
+stream,0,video,0.000000
+stream,1,audio,0.021333        # audio starts 21 ms later
+
+# A small offset is normal - encoder delay. A large one, or
+# one that GROWS, is the bug.
+
+# 2. Does the gap grow over time? This distinguishes a fixed
+#    offset from drift.
+$ ffprobe -select_streams v -show_entries packet=pts_time \
+    -of csv=p=0 input.mp4 | tail -1
+7200.033333
+$ ffprobe -select_streams a -show_entries packet=pts_time \
+    -of csv=p=0 input.mp4 | tail -1
+7203.115000          # 3 SECONDS out after 2 hours -> drift,
+                     # not an offset. Suspect a clock or a
+                     # wrong timebase.
+
+# 3. Fix a fixed offset:
+$ ffmpeg -i in.mp4 -itsoffset 0.15 -i in.mp4 \
+    -map 0:v -map 1:a -c copy fixed.mp4
+
+# 4. Check for VFR:
+$ ffprobe -select_streams v -show_entries frame=pkt_duration_time \
+    -of csv=p=0 in.mp4 | sort | uniq -c | sort -rn | head
+   4021 0.033333
+    118 0.041667        # mixed durations = VFR
+     37 0.025000
+
+# 5. The empirical test that beats all of the above: encode a
+#    clapperboard. A visible flash and a simultaneous click,
+#    then step through frame by frame and count.
+$ ffmpeg -f lavfi -i "testsrc=size=640x480:rate=30" \
+         -f lavfi -i "sine=frequency=1000:duration=10" \
+         -t 10 synctest.mp4</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Video must fully download before playing</td><td><code>moov</code> at the end — use
+<code>+faststart</code></td></tr>
+<tr><td>Sync drifts steadily over a long file</td><td>Clock drift with no resampling, or a wrong
+timebase</td></tr>
+<tr><td>Fixed offset, constant throughout</td><td>Encoder delay or a missing edit list</td></tr>
+<tr><td>In sync in one player, out in another</td><td>Edit list honoured by one and ignored by the
+other</td></tr>
+<tr><td>Sync fine at first, drifts in an editor</td><td>VFR source treated as CFR</td></tr>
+<tr><td>File will not play, "moov atom not found"</td><td>Truncated upload of a non-faststart MP4</td></tr>
+<tr><td>Seeking lands in the wrong place</td><td>Missing or wrong index; MPEG-TS has none, so players
+estimate</td></tr>
+<tr><td>ABR switch produces a glitch</td><td>Segments not starting on a keyframe, or timestamps not
+aligned</td></tr>
+<tr><td>Audio clicks periodically</td><td>Sample dropping instead of resampling to correct
+drift</td></tr>
+<tr><td>Remuxing broke playback</td><td>Extradata (SPS/PPS) not carried across</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name five things a container provides that a codec does not.</li>
+  <li>Explain why "it is an MP4" says nothing about compatibility.</li>
+  <li>Explain what a timebase is and why 30000/1001 motivates integer timestamps.</li>
+  <li>Distinguish PTS from DTS and say which is monotonic.</li>
+  <li>Explain what an edit list does and the sync symptom of ignoring one.</li>
+  <li>Name the three master-clock choices and say why audio usually wins.</li>
+  <li>Explain clock drift and the correct way to compensate.</li>
+  <li>Give the acceptable A/V sync window and why it is asymmetric.</li>
+  <li>Explain <code>+faststart</code> and what fragmented MP4 adds beyond it.</li>
+  <li>Distinguish a fixed offset from drift using timestamps.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

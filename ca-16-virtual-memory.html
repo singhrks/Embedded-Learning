@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual memory as an architectural idea | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Virtual memory as an architectural idea</h1>
+<p class="lead">Every address your program uses is a lie the hardware maintains. This chapter covers why that
+indirection exists and how it works in general; <a href="arm-12-mmu-overview.html">ARM chapter 12</a> and
+<a href="os-12-paging.html">OS chapter 12</a> cover the specific mechanics.</p>
+
+<h2 id="problem">The problem</h2>
+
+<p>Before virtual memory, a program's addresses were physical addresses. Four consequences, all bad:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Problem</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td><strong>No protection</strong></td><td>Any program can read or write any other program's memory, and the OS's. One bug takes down everything.</td></tr>
+<tr><td><strong>No relocation</strong></td><td>A program compiled to load at 0x10000 must load there. Two such programs cannot coexist.</td></tr>
+<tr><td><strong>Fragmentation</strong></td><td>Free memory exists but not contiguously, so a large allocation fails while plenty is free.</td></tr>
+<tr><td><strong>Hard capacity limit</strong></td><td>The working set must fit in physical RAM. No overcommit, no demand loading, no swap.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The idea</b>
+<p>Insert a hardware translation step between the address a program emits and the address that reaches
+memory. Software sees <strong>virtual addresses</strong>; the memory system sees <strong>physical
+addresses</strong>; a per-process mapping table, controlled by the OS and consulted by hardware, connects
+them. Every problem above dissolves at once.</p>
+</div>
+
+<pre class="diagram">                              (per process, OS-owned)
+                                  page tables
+                                       |
+   ┌──────┐   virtual addr   ┌─────────▼────────┐   physical addr   ┌──────┐
+   │ CPU  │ ───────────────► │       MMU        │ ────────────────► │ DRAM │
+   └──────┘                  └──────────────────┘                   └──────┘
+                                       │
+                                  translation
+                                     fault
+                                       ▼
+                                 OS exception handler
+                                 (map it, or kill it)
+
+The MMU sits inside the core, in the memory stage of the pipeline
+(chapter 11). Every load, store and instruction fetch goes through it.</pre>
+
+<h2 id="pages">Pages: the unit of mapping</h2>
+
+<p>Mapping every byte individually would need a table larger than memory. So the address space is divided
+into fixed-size <strong>pages</strong>, and only the page number is translated.</p>
+
+<pre class="diagram">   virtual address                     physical address
+  ┌────────────────┬──────────┐       ┌────────────────┬──────────┐
+  │  page number   │  offset  │       │  frame number  │  offset  │
+  └───────┬────────┴──────────┘       └───────▲────────┴─────▲────┘
+          │                                   │              │
+          └──── translated by the MMU ────────┘              │
+                                                             │
+                          offset passes through UNCHANGED ───┘
+
+Page size 4 KB  -> offset is 12 bits
+Page size 16 KB -> offset is 14 bits
+Page size 64 KB -> offset is 16 bits
+
+Because the offset is untranslated, the low bits of a virtual and a
+physical address are IDENTICAL. This single fact is what makes VIPT
+caches possible (chapter 14) - the cache can start its lookup before
+translation finishes.</pre>
+
+<h3>Choosing a page size</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Small pages (4 KB)</th><th>Large pages (2 MB, 1 GB)</th></tr></thead>
+<tbody>
+<tr><td>Internal fragmentation</td><td>Low — little waste per allocation</td><td>High — a 1-byte allocation can pin 2 MB</td></tr>
+<tr><td>Page table size</td><td>Large — many entries</td><td>Small</td></tr>
+<tr><td>TLB reach</td><td>Poor — 1024 entries cover 4 MB</td><td>Excellent — 1024 entries cover 2 GB</td></tr>
+<tr><td>Fault granularity</td><td>Fine — demand paging works well</td><td>Coarse — one fault pulls in 2 MB</td></tr>
+<tr><td>Typical use</td><td>General purpose</td><td>Databases, VMs, the kernel's own linear map, ML workloads</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Most systems support several sizes simultaneously — Linux calls the large ones <em>huge pages</em>, ARM
+calls the intermediate levels <em>blocks</em>. The trade-off is always fragmentation against TLB reach.</p>
+
+<h2 id="tables">Page tables</h2>
+
+<p>A flat array indexed by page number is the obvious design and is immediately impossible:</p>
+
+<pre class="diagram">  48-bit address space, 4 KB pages
+      2^48 / 2^12 = 2^36 pages = 68,719,476,736 entries
+      x 8 bytes each = 512 GB of page table.  Per process.
+
+The fix: exploit sparseness. Almost all of that space is unmapped, so
+use a MULTI-LEVEL tree and simply omit the empty subtrees.
+
+  VA[47:39] -> L0 entry -> points to an L1 table  (or is INVALID)
+  VA[38:30] -> L1 entry -> points to an L2 table
+  VA[29:21] -> L2 entry -> points to an L3 table
+  VA[20:12] -> L3 entry -> the physical frame + permissions
+  VA[11:0]  -> offset within the frame
+
+A process using 8 MB needs only a handful of tables, not 512 GB.
+An INVALID entry at any level prunes an entire subtree in one step.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Structure</th><th>How it works</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>Multi-level (radix) tree</strong></td><td>Fixed fan-out per level, indexed by address bits</td><td>The universal choice: x86-64, ARM, RISC-V. Cost is one memory access per level on a miss.</td></tr>
+<tr><td><strong>Inverted page table</strong></td><td>One entry per <em>physical</em> frame, hashed by VA</td><td>Size proportional to RAM, not address space. Awkward for shared memory. Used historically on PowerPC.</td></tr>
+<tr><td><strong>Hashed page table</strong></td><td>Hash the VA into a bucket chain</td><td>Compact but variable-latency lookups</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>What an entry carries besides an address</h3>
+
+<p>A translation entry is not just a pointer. The permission and attribute bits are where most of the
+architecture's power lives:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Field</th><th>Purpose</th><th>What it enables</th></tr></thead>
+<tbody>
+<tr><td><strong>Valid</strong></td><td>Is this mapping present?</td><td>Demand paging, swap, lazy allocation</td></tr>
+<tr><td><strong>Read / Write</strong></td><td>Access permission</td><td>Read-only data, copy-on-write</td></tr>
+<tr><td><strong>Execute-never</strong></td><td>May instructions be fetched here?</td><td>W^X — the single most effective anti-exploit measure</td></tr>
+<tr><td><strong>Privilege</strong></td><td>User-accessible, or kernel only?</td><td>The user/kernel boundary itself</td></tr>
+<tr><td><strong>Accessed / Dirty</strong></td><td>Has it been read? written?</td><td>Page replacement policy; knowing what must be written back</td></tr>
+<tr><td><strong>Memory attributes</strong></td><td>Cacheable? Device? Shareable?</td><td>MMIO correctness, DMA buffers (<a href="arm-11-memory-types.html">ARM ch. 11</a>)</td></tr>
+<tr><td><strong>Global / ASID</strong></td><td>Shared across processes, or tagged</td><td>Avoiding a full TLB flush on context switch</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>The insight worth carrying forward</b>
+<p>Protection and translation are the <em>same mechanism</em>. The hardware must consult the table on every
+access to find the physical address, so checking permissions at the same time is free. That is why virtual
+memory is the foundation of process isolation rather than a separate feature — and why a system without an
+MMU (a Cortex-M) needs an entirely different protection scheme, the MPU.</p>
+</div>
+
+<h2 id="tlb">The TLB</h2>
+
+<p>A four-level walk costs four memory accesses. Doing that on every load would make every access five times
+slower. So translations are cached in the <strong>Translation Lookaside Buffer</strong>.</p>
+
+<pre class="diagram">  Typical structure
+
+    L1 TLB    32-64 entries, fully associative, ~1 cycle
+              often split: separate iTLB and dTLB
+    L2 TLB    1024-2048 entries, set-associative, ~10 cycles
+    miss      -> hardware page table walker -> up to 4 memory accesses
+                 (each of which may itself hit or miss in the caches)
+
+  TLB reach = entries x page size
+    1024 entries x 4 KB  =   4 MB   <- easily exceeded
+    1024 entries x 2 MB  =   2 GB   <- why huge pages help so much
+
+  A TLB miss on a workload with a large random working set can cost
+  more than the cache miss that follows it.</pre>
+
+<h3>Context switches and tagging</h3>
+
+<p>Each process has its own mapping, so naively a context switch invalidates every TLB entry — and the new
+process then takes hundreds of misses warming it back up. Two mechanisms avoid this:</p>
+
+<ul>
+  <li><strong>Address space identifiers.</strong> Tag each entry with the owning process (ARM calls it
+  <em>ASID</em>, x86 calls it <em>PCID</em>). Entries from several processes coexist; a switch just changes
+  the current tag.</li>
+  <li><strong>Global entries.</strong> Kernel mappings are identical in every process, so they are marked
+  global and match regardless of tag — no reload after a system call.</li>
+</ul>
+
+<div class="warn">
+<b>Software must invalidate; hardware will not notice</b>
+<p>The TLB is a cache with <em>no coherence protocol</em>. If you modify a page table entry, the stale
+translation lives on until you explicitly invalidate it. On a multi-core system you must invalidate on
+<em>every</em> core that might hold it — a "TLB shootdown", which on ARM is a broadcast
+<code>TLBI</code> and on x86 requires an inter-processor interrupt. Forgetting this produces the classic
+"works on one core, fails on four" bug, and shootdown cost is a real scalability limit for
+<code>munmap</code>-heavy workloads.</p>
+</div>
+
+<h2 id="faults">Page faults: the useful exception</h2>
+
+<p>A translation failure traps to the OS, which decides what it means. Most faults are not errors — they are
+how features get implemented.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Fault</th><th>OS response</th><th>Feature it implements</th></tr></thead>
+<tbody>
+<tr><td>Valid bit clear, page is on disk</td><td>Read it in, update the entry, retry</td><td>Demand paging and swap</td></tr>
+<tr><td>Valid bit clear, never touched</td><td>Allocate a zero page now</td><td>Lazy allocation — why <code>malloc</code> of 1 GB is instant</td></tr>
+<tr><td>Write to a read-only shared page</td><td>Copy it, make the copy writable, retry</td><td>Copy-on-write — why <code>fork()</code> is cheap</td></tr>
+<tr><td>Access flag clear</td><td>Set it and retry</td><td>Tracking which pages are in use, for replacement</td></tr>
+<tr><td>Write to a clean page</td><td>Set dirty, retry</td><td>Knowing which pages need writing back</td></tr>
+<tr><td>Genuinely unmapped, or permission violation</td><td>SIGSEGV / bug check</td><td>Protection — catching the actual bug</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">The demand-paging round trip
+
+  1. Instruction issues a load             VA -> MMU
+  2. TLB miss -> page table walk
+  3. Entry invalid -> PAGE FAULT exception, precise
+  4. Hardware saves the faulting address and cause, enters the OS
+  5. OS looks up its own record of what SHOULD be at that address
+  6. Allocates a frame, reads from disk if needed, writes the entry
+  7. Invalidates the stale TLB entry
+  8. Returns from the exception
+  9. The SAME instruction re-executes, and now succeeds
+
+Step 9 is why the exception must be PRECISE (chapter 11). The core
+must be able to restart the faulting instruction as though nothing
+had happened - which constrains the whole out-of-order design.</pre>
+
+<h2 id="uses">What the indirection buys, beyond protection</h2>
+
+<p>Protection is the reason virtual memory was invented, but it turned out to enable a series of other things that would otherwise be impossible or expensive. Each row below is a feature you have almost certainly used without realising it was the MMU doing the work.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Capability</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><td>Shared libraries</td><td>One physical copy of libc mapped into every process at whatever address suits it</td></tr>
+<tr><td>Memory-mapped files</td><td>File pages mapped directly; reads become faults, writes become dirty pages</td></tr>
+<tr><td>Guard pages</td><td>An unmapped page below each stack turns overflow into a clean fault instead of silent corruption</td></tr>
+<tr><td>ASLR</td><td>Randomised mapping addresses make exploit gadget locations unpredictable</td></tr>
+<tr><td>Contiguity from fragments</td><td>Physically scattered frames appear as one contiguous buffer</td></tr>
+<tr><td>Overcommit</td><td>Promise more address space than you have RAM, back it only on use</td></tr>
+<tr><td>Virtualisation</td><td>A second translation stage under the first (<a href="arm-16-two-stage.html">ARM ch. 16</a>)</td></tr>
+<tr><td>Device isolation</td><td>The same idea applied to DMA — the IOMMU (<a href="sec-02-dma-problem.html">security ch. 02</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="costs">And what it costs</h2>
+
+<ul>
+  <li><strong>Latency</strong> on every access, hidden by the TLB but never zero.</li>
+  <li><strong>Memory</strong> for the tables themselves, plus the walker's own cache pressure.</li>
+  <li><strong>Determinism.</strong> A page fault can take microseconds to milliseconds. This is why hard
+  real-time systems lock pages (<code>mlockall</code>) or avoid an MMU entirely — see
+  <a href="os-19-rtos.html">OS chapter 19</a>.</li>
+  <li><strong>Shootdown cost</strong> on many-core systems.</li>
+  <li><strong>A side channel.</strong> Timing differences between mapped and unmapped pages leak layout
+  information, which is what defeats naive ASLR.</li>
+</ul>
+
+<h2 id="inspect">Seeing it on a real system</h2>
+
+<p>Virtual memory is easy to treat as an abstraction you never see. In fact the mapping is fully visible from user space, and looking at a real process's memory map makes the mechanism concrete in a way no diagram does.</p>
+
+<pre><code># the virtual layout of a running process
+cat /proc/self/maps
+#   aaaab7c40000-aaaab7c48000 r-xp 00000000 fe:01 1234  /usr/bin/cat
+#   aaaab7c57000-aaaab7c58000 r--p 00007000 fe:01 1234  /usr/bin/cat
+#   ffff9c7f0000-ffff9c811000 r-xp 00000000 fe:01 5678  /lib/ld-linux.so
+#   ffffe3d21000-ffffe3d42000 rw-p 00000000 00:00 0     [stack]
+#              ^ permissions: r/w/x and p=private or s=shared
+
+# per-page physical detail
+cat /proc/self/smaps            # Rss, Pss, dirty pages, huge pages per mapping
+
+# fault counts: minor = no disk, major = disk read required
+/usr/bin/time -v ./program 2&gt;&amp;1 | grep -i fault
+ps -o min_flt,maj_flt -p $$
+
+# TLB pressure
+perf stat -e dTLB-load-misses,iTLB-load-misses,dtlb_walk,itlb_walk ./program</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>malloc</code> of a huge block succeeds instantly, then crashes on write</td><td>Lazy allocation plus overcommit; memory was never really reserved</td></tr>
+<tr><td>First touch of each page is slow, later touches fast</td><td>Demand paging — one minor fault per page</td></tr>
+<tr><td>Huge pages give a large speedup on a big-working-set program</td><td>TLB reach, not cache behaviour</td></tr>
+<tr><td>A latency spike of milliseconds in an otherwise fast loop</td><td>A major fault: the OS went to disk</td></tr>
+<tr><td>Page table change works on one core, fails on four</td><td>Missing TLB shootdown</td></tr>
+<tr><td>A driver reads garbage from a peripheral</td><td>Mapped with the wrong memory attributes, not the wrong address</td></tr>
+<tr><td>Stack overflow gives a clean crash rather than corruption</td><td>The guard page did its job</td></tr>
+<tr><td>Real-time task misses a deadline occasionally</td><td>An unlocked page faulted; use <code>mlockall()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the four problems virtual memory solves, and say which one is about security.</li>
+  <li>Explain why the page offset is not translated, and one thing that fact makes possible.</li>
+  <li>Compute the size of a flat page table for a 48-bit space, and explain how a multi-level tree avoids it.</li>
+  <li>List six fields in a page table entry besides the frame number, and what each enables.</li>
+  <li>Define TLB reach and explain why huge pages help large working sets.</li>
+  <li>Explain why the TLB needs explicit invalidation and what a shootdown is.</li>
+  <li>Name four features implemented by <em>deliberately</em> taking a page fault.</li>
+  <li>Explain why virtual memory complicates hard real-time systems.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage, filesystems and data integrity | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Storage, filesystems and data integrity</h1>
+<p class="lead">Flash does not behave like memory: it wears out, it must be erased in large blocks before it
+can be written, and a power cut during a write leaves a block in an indeterminate state. Every storage design
+decision follows from those three facts.</p>
+
+<h2 id="flash">What flash actually does</h2>
+
+<pre class="diagram">   THREE PROPERTIES that shape everything above them.
+
+   1. ERASE BEFORE WRITE, AND ERASE IS BLOCK-SIZED
+        A write can only turn 1 bits into 0 bits. To turn
+        a 0 back into a 1 you must ERASE, and erase works
+        on a whole block - 4 kB, 64 kB, sometimes 256 kB.
+        So "change one byte" means: read the block, erase
+        it, write it back modified. That is slow and it
+        costs a full erase cycle.
+
+   2. FINITE ERASE CYCLES
+        NOR flash    ~10,000 - 100,000 per block
+        SLC NAND     ~60,000 - 100,000
+        MLC NAND     ~3,000 - 10,000
+        TLC NAND     ~500 - 3,000
+        eMMC/SD      varies wildly; consumer cards are the
+                     worst and lie about it
+
+        A log that rewrites the same block once a minute
+        exhausts a 10,000-cycle block in SEVEN DAYS.
+
+   3. ERASE AND WRITE TAKE A LONG TIME AND CAN BE
+      INTERRUPTED
+        Erase: 10s to 100s of milliseconds. During it the
+        bank may be unreadable - which is why a flash
+        routine cannot execute from the bank it is
+        erasing. A power cut mid-erase leaves the block
+        indeterminate: it may read as anything, and it may
+        read DIFFERENTLY on successive reads.
+
+   PLUS, ON NAND SPECIFICALLY:
+     - blocks arrive from the factory already bad, and
+       more go bad in service. You need bad-block
+       management.
+     - bit errors are EXPECTED, not exceptional. NAND
+       requires ECC to be usable at all.
+     - read disturb: reading a page repeatedly can flip
+       bits in neighbouring pages.</pre>
+
+<h2 id="choose">Choosing the medium</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Medium</th><th>Size</th><th>Good for</th><th>Watch for</th></tr></thead>
+<tbody>
+<tr><td>Internal MCU flash</td><td>16 kB – 2 MB</td><td>Code, config, small logs</td><td>Erase blocks are large
+relative to the total; no wear levelling unless you write it</td></tr>
+<tr><td>External NOR (QSPI)</td><td>1–128 MB</td><td>Code XIP, assets, firmware images</td><td>Slower than
+internal; cannot execute from it while erasing it</td></tr>
+<tr><td>External NAND</td><td>128 MB – 8 GB</td><td>Filesystems, bulk data</td><td>Needs ECC and bad-block
+management — use UBI/UBIFS, not a raw filesystem</td></tr>
+<tr><td>eMMC</td><td>4–256 GB</td><td>Linux root filesystems</td><td>Has its own controller doing wear
+levelling; quality varies enormously by grade</td></tr>
+<tr><td>SD card</td><td>Any</td><td>Development, removable data</td><td><strong>Not for production.</strong>
+Undocumented controllers, silent failures, counterfeit parts</td></tr>
+<tr><td>FRAM / MRAM</td><td>4 kB – 1 MB</td><td>Frequently-written state</td><td>Expensive per byte, and
+worth every penny for a counter written every second</td></tr>
+<tr><td>EEPROM</td><td>128 B – 512 kB</td><td>Calibration, serial numbers</td><td>Byte-writable, ~1M cycles,
+slow</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>FRAM is the answer to a specific, common problem</b>
+<p>If your design needs to write a small amount of state <em>frequently</em> — an energy meter's running
+total, a run-hours counter, a position that must survive power loss — flash is the wrong medium at any price,
+because you will exhaust it. FRAM is byte-writable, needs no erase, writes at bus speed, and survives
+10¹²–10¹⁴ cycles. It costs more per byte than flash and you only need a few hundred bytes. Reaching for it
+unprompted when the question involves a frequently-updated counter is a strong signal.</p>
+</div>
+
+<h2 id="filesystems">Filesystems</h2>
+
+<pre><code>ON AN MCU - usually no filesystem at all. A fixed layout in
+flash with a small record manager is simpler, smaller and
+easier to make power-fail safe. If you do want one:
+
+  LittleFS   designed for MCUs: power-fail safe by design,
+             wear levelling built in, bounded RAM. The
+             default choice.
+  SPIFFS     older, no true directories, slower as it
+             fills. Being superseded.
+  FatFS      when the media must be readable by a PC. NOT
+             power-fail safe: FAT has no journal, and an
+             interrupted write can corrupt the allocation
+             table and lose unrelated files.
+
+ON LINUX:
+
+  ext4       the default. Journals METADATA by default,
+             not your file's contents - so a power cut can
+             leave a file that exists, is the right size,
+             and contains garbage.
+  F2FS       flash-friendly, log-structured. Good on eMMC.
+  UBIFS      for RAW NAND. Sits on UBI, which does the
+             wear levelling and bad-block management. This
+             is the correct stack for bare NAND; putting
+             ext4 on raw NAND is a mistake.
+  SquashFS   read-only, compressed. Excellent for a root
+             filesystem you never write - which is what
+             you want (chapter 14).
+  overlayfs  read-only lower + tmpfs upper. Writes go to
+             RAM and vanish at reboot, so the flash is
+             never written and cannot be corrupted.
+
+THE ARCHITECTURE THAT AVOIDS MOST PROBLEMS:
+  read-only root (SquashFS or ext4 ro)
+  + tmpfs for /tmp, /var/log, /run
+  + a small separate rw partition for state, mounted sync
+  Nothing writes to the main filesystem in normal
+  operation, so a power cut cannot corrupt it.</code></pre>
+
+<h2 id="atomic">Making a write survive a power cut</h2>
+
+<pre><code>THE PATTERN, and it is the same at every scale:
+
+  NEVER UPDATE IN PLACE. Write the new version somewhere
+  else, then switch to it in one atomic step.
+
+--- ON LINUX ---------------------------------------------
+    fd = open("state.tmp", O_WRONLY|O_CREAT|O_TRUNC);
+    write(fd, data, len);
+    fsync(fd);                 /* data actually on media  */
+    close(fd);
+    rename("state.tmp", "state.json");   /* ATOMIC        */
+    /* and fsync the DIRECTORY too, or the rename itself
+       may not be durable:                                */
+    dirfd = open(".", O_RDONLY); fsync(dirfd); close(dirfd);
+
+  The fsync calls are the part people omit. Without them
+  the rename can be durable while the data is not, leaving
+  you with a correctly-named empty file.
+
+--- ON AN MCU, NO FILESYSTEM -----------------------------
+  Two slots plus a sequence number and a CRC:
+
+    struct record {
+        uint32_t seq;        /* increments each write     */
+        uint8_t  payload[N];
+        uint32_t crc;        /* over seq + payload        */
+    };
+    /* slot A and slot B in different erase blocks */
+
+  WRITE:  erase the OLDER slot, write the new record with
+          seq = newer_seq + 1.
+  READ:   read both, validate CRCs, take the valid one
+          with the higher sequence number.
+
+  A power cut while writing a slot leaves that slot
+  invalid (bad CRC) and the OTHER slot intact and valid.
+  There is no window where both are bad. Handle sequence
+  wraparound, or use a 64-bit counter.
+
+  This is roughly forty lines and it is the single most
+  useful piece of embedded storage code there is.</code></pre>
+
+<div class="qbank">
+<div class="qbank-head"><h3 id="q">Questions</h3><span class="qbank-count"></span></div>
+
+<details class="qa">
+<summary>A device logs one line per second to internal flash. What is wrong with that?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Wear, if it is implemented naively. Flash erases in blocks, so appending a line to the same block means
+read-modify-erase-write of the whole block. At one write per second against a 10,000-cycle endurance you
+exhaust that block in under three hours if every write erases; even at one erase per minute it is about seven
+days.</p>
+<p>The fixes, in order: <strong>buffer in RAM and write a full page at a time</strong>, which cuts erase count
+by the number of records per page; <strong>append sequentially through the region</strong> so each block is
+erased once per pass rather than per record (a log-structured layout); <strong>wear-level</strong> across all
+available blocks; and <strong>use a filesystem that does this for you</strong> — LittleFS on an MCU, F2FS or
+UBIFS on Linux.</p>
+<p>Then question the requirement: does the log need to be persistent, or is it diagnostic? If diagnostic,
+write it to RAM and only persist on a fault — that is the tmpfs pattern, and it eliminates the problem
+entirely.</p>
+<div class="qa-listen"><b>Listening for</b>The erase-block arithmetic, and challenging whether persistence
+is needed at all.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you make a configuration write survive a power cut at any instant?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Never update in place. On an MCU: two slots in different erase blocks, each holding a sequence number, the
+payload and a CRC. To write, erase the older slot and write a record with sequence+1. To read, validate both
+CRCs and take the valid record with the higher sequence. A power cut during a write leaves that slot invalid
+and the other intact — there is no window where both are bad.</p>
+<p>On Linux: write to a temporary file, <code>fsync</code> it, close, <code>rename</code> over the target —
+which is atomic on ext4 — and then <code>fsync</code> the containing directory so the rename itself is
+durable. Omitting the fsyncs is the common bug and leaves you with a correctly-named empty file.</p>
+<p>Then verify by testing: automated power cuts under load, a hundred times, is the only way to know. Products
+that survive this were designed for it.</p>
+<div class="qa-listen"><b>Listening for</b>The two-slot scheme with sequence and CRC, and the directory
+fsync on Linux.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Why is an SD card a bad idea in a shipped product?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Because you are trusting an undocumented controller you cannot qualify. Consumer cards do wear levelling
+and bad-block management internally with proprietary firmware whose behaviour on power loss is unspecified —
+and several are known to corrupt data outside the block being written, or to brick entirely. Endurance varies
+by an order of magnitude between cards sold under the same part number, manufacturers change the internals
+without changing the marking, and counterfeits are common.</p>
+<p>They are also mechanically unreliable — a socket is a connection that vibrates loose and oxidises — and
+removable, which is a security and support problem.</p>
+<p>Use eMMC instead: soldered down, industrial grades available with specified endurance and power-loss
+behaviour, and a supply chain you can qualify. If cost forces raw NAND, use UBI/UBIFS which handles ECC and
+bad blocks explicitly. Keep SD cards for development, where reimaging in ninety seconds is exactly what you
+want.</p>
+<div class="qa-listen"><b>Listening for</b>The undocumented-controller argument specifically, not just "they
+wear out".</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What does ext4's journal actually protect?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Metadata, by default — the filesystem structure: inodes, directory entries, the allocation bitmaps. That
+means after a power cut the filesystem is consistent and mountable, and you will not have cross-linked files
+or a corrupt directory tree.</p>
+<p>It does <em>not</em> protect your file's contents. The default <code>data=ordered</code> mode guarantees
+that data blocks are written before the metadata that references them — so you will not see stale data from a
+deleted file — but a file being rewritten when power was lost can legitimately end up existing, being the right
+size, and containing a mixture of old and new bytes or zeros.</p>
+<p><code>data=journal</code> journals contents too, at a substantial write-amplification cost, which on flash
+is also a wear cost. Usually the better answer is not to rely on the filesystem at all: use atomic
+rename for anything that matters, and keep the root filesystem read-only so the question rarely arises.</p>
+<div class="qa-listen"><b>Listening for</b>The metadata/data distinction — this is the misunderstanding that
+causes people to trust a journal too much.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>You need to store a counter updated every second, forever. What do you use?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>FRAM or MRAM. Flash is the wrong medium at any price: one write per second is 31 million writes a year, and
+even with perfect wear levelling across a large region you are burning through endurance for no reason. FRAM
+is byte-writable with no erase step, writes at bus speed, and survives 10¹²–10¹⁴ cycles — effectively
+unlimited at this rate. You need a few bytes, so the cost is small in absolute terms.</p>
+<p>If FRAM is not available: keep the counter in RAM and persist it rarely — on a threshold change, on
+shutdown, or on a brown-out interrupt using the energy stored in the bulk capacitor. Combine with a
+conservative estimate on recovery (assume the maximum possible progress since the last save), so the counter
+never goes backwards.</p>
+<p>Alternatively, spread the writes: a ring of N slots in flash, each written in turn, multiplies endurance by
+N — which is what a wear-levelling layer does, and is worth implementing explicitly if the pattern is this
+simple.</p>
+<div class="qa-listen"><b>Listening for</b>Naming FRAM, and the brown-out-triggered save as the fallback.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How much flash do you budget for a device that must support firmware updates?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Roughly double the application, plus the bootloader and a small metadata region — because A/B updating means
+holding a complete second copy. This is the term most often forgotten in a memory budget and it frequently
+moves you to the next part size up.</p>
+<p>The alternatives when flash is tight: a <strong>single-bank update with a recovery bootloader</strong> —
+smaller, but there is a window during which the device has no valid application and must be able to re-download,
+which requires the bootloader to contain enough of a communication stack to do so; or
+<strong>external flash</strong> for the staging area, which costs a part and pins but keeps the internal flash
+for code; or <strong>compressed images</strong>, which reduces the download and the staging area but not the
+final size.</p>
+<p>Also budget the erase time: writing a 512 kB image to flash takes seconds and during that period the device
+must remain responsive enough not to trip its own watchdog.</p>
+<div class="qa-listen"><b>Listening for</b>The doubling, and awareness of the recovery-bootloader trade.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What is write amplification and why should you care?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>The ratio of physical bytes written to the medium against logical bytes your application wrote. If you
+append 100 bytes to a file and the layer beneath must read, erase and rewrite a 128 kB block, the amplification
+is over a thousand — and your endurance budget is consumed a thousand times faster than the naive
+calculation.</p>
+<p>Sources: erase-block granularity, filesystem metadata updates (each write may also update an inode and a
+bitmap), journaling (which writes the data twice), and the FTL inside an eMMC doing garbage collection and
+block relocation.</p>
+<p>Why it matters: it is the difference between an endurance calculation that says ten years and reality that
+says ten months. To reduce it — batch writes so each erase block is filled before it is closed; align writes
+to the erase block size; use a log-structured filesystem which is designed for exactly this; avoid
+<code>sync</code> mounts for high-rate data; and disable <code>atime</code>, since otherwise every
+<em>read</em> becomes a metadata write.</p>
+<div class="qa-listen"><b>Listening for</b><code>atime</code> as a hidden write source — it is a small
+detail that indicates real experience.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>A field unit's filesystem is corrupt. Walk me through your response.<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Immediate: does the device still boot? A read-only root plus a separate data partition means corruption of
+the data partition is survivable — the device boots, reports the fault, and continues with defaults. If the
+root is corrupt and there is no recovery image, the unit is dead and that is a design failure, not an
+operational one.</p>
+<p>Diagnosis: what was writing at the time? Check the power history first — an under-voltage record or a
+brown-out counter usually explains it, and the fix is electrical rather than software. Then check whether the
+write path was atomic, whether the filesystem was mounted with the options you think, and whether the medium
+is at end of life (SMART data on eMMC, or your own erase-cycle counter).</p>
+<p>Design response: make the root read-only; make every persistent write atomic; set the brown-out threshold
+above the voltage where flash writes become unreliable; keep a recovery image or A/B rootfs so a corrupt bank
+is not fatal; and add a boot-time integrity check that can fall back rather than fail.</p>
+<p>And the honest note: if this is happening across a fleet, it is a systemic design issue and fixing the
+individual units is not the response.</p>
+<div class="qa-listen"><b>Listening for</b>Checking power history before blaming software, and treating a
+fleet-wide pattern as a design failure.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Do you need a filesystem at all on a microcontroller?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Usually not, and not having one is simpler and safer. A fixed layout — a config region using the two-slot
+atomic scheme, a log region written sequentially, and a firmware staging region — covers most needs in a few
+hundred lines, is easy to reason about, and has no failure modes you did not design.</p>
+<p>You want a filesystem when: the data is genuinely file-shaped and variable (several independent records
+whose sizes are not known in advance), when a PC must read the medium (which forces FAT and its power-fail
+weakness), or when a third-party component expects one.</p>
+<p>If you do want one on an MCU, LittleFS is the default: designed for this environment, power-fail safe by
+construction, with wear levelling and bounded RAM usage. What to avoid is FAT for internal state — no journal,
+and an interrupted write can corrupt the allocation table and take unrelated files with it.</p>
+<div class="qa-listen"><b>Listening for</b>Defaulting to "no filesystem" and justifying when one is
+warranted, rather than assuming one is needed.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you detect that flash is wearing out before it fails?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Instrument it. Count erase cycles per block (or per region) in your own metadata and expose the maximum as
+telemetry — you know the rated endurance, so you can report a percentage consumed and predict end of life.
+That is the only reliable approach on raw flash, because the medium will not tell you.</p>
+<p>On eMMC, the device reports it: the health status registers give estimated lifetime consumed in 10%
+increments for SLC and MLC regions, plus a pre-EOL indicator. Read them periodically and report.</p>
+<p>Behavioural indicators worth monitoring regardless: write or erase operations that take longer than usual,
+rising ECC correction counts on NAND, verify-after-write failures, and blocks being retired by the bad-block
+manager. Any of those trending upward is an early warning.</p>
+<p>And the design response to the prediction: if a fleet is going to hit end of life at three years and the
+product is warranted for five, that is a design change now — reduce write rate, increase the region, or change
+medium — not a support problem later.</p>
+<div class="qa-listen"><b>Listening for</b>Counting cycles yourself on raw flash, and treating the prediction
+as an input to design rather than to support.</div>
+</div>
+</details>
+
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Storage fails after weeks in the field</td><td>Erase-cycle exhaustion from a naive log or
+counter</td></tr>
+<tr><td>Endurance calculation off by 1000×</td><td>Write amplification not accounted for</td></tr>
+<tr><td>File exists, right size, contains garbage</td><td>Relied on ext4's journal, which protects
+metadata</td></tr>
+<tr><td>Corruption after every power cut</td><td>Update in place instead of atomic rename or two-slot</td></tr>
+<tr><td>Correctly-named empty file after a crash</td><td>Missing <code>fsync</code> before rename, or on the
+directory</td></tr>
+<tr><td>Random corruption across a fleet</td><td>SD cards in production</td></tr>
+<tr><td>Reads consume write endurance</td><td><code>atime</code> updates not disabled</td></tr>
+<tr><td>Device cannot recover from a bad update</td><td>Single-bank update with no recovery path</td></tr>
+<tr><td>Core hangs during flash erase</td><td>Erase routine executing from the bank being erased</td></tr>
+<tr><td>End of life arrives before the warranty ends</td><td>Erase cycles never counted or reported</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the three properties of flash that shape every storage decision.</li>
+  <li>Give typical erase-cycle endurance for NOR, SLC, MLC and TLC.</li>
+  <li>Compute how quickly a once-per-minute rewrite exhausts a 10,000-cycle block.</li>
+  <li>Explain why raw NAND needs UBI rather than a filesystem directly.</li>
+  <li>Give the two-slot atomic write scheme and say why there is no unsafe window.</li>
+  <li>Give the Linux atomic write sequence including both <code>fsync</code> calls.</li>
+  <li>Say what ext4's journal protects and what it does not.</li>
+  <li>Explain when FRAM is the right answer.</li>
+  <li>Define write amplification and name four sources.</li>
+  <li>Describe the read-only root architecture and what it eliminates.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/qa.js"></script>
+</body>
+</html>

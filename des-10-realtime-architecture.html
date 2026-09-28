@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real-time architecture and task decomposition | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Real-time architecture and task decomposition</h1>
+<p class="lead">"Real-time" means predictable, not fast. A slow system with a proven bound is real-time; a fast
+one without is not. This chapter is how to decompose a design into tasks, assign priorities defensibly, and
+produce the arithmetic that shows the deadlines are met.</p>
+
+<h2 id="classify">Classify every deadline first</h2>
+
+<pre class="diagram">   BEFORE any decomposition, list what has a deadline and
+   what happens when it is missed. This one table drives
+   the entire architecture.
+
+   HARD   a miss is a system failure, possibly unsafe.
+          Motor commutation, airbag deployment, fuel
+          injection, an over-current trip.
+          -&gt; hardware, or a small analysed core. NOT Linux.
+
+   FIRM   a late result is worthless but the system
+          tolerates occasional misses. A video frame past
+          its display slot; a control sample too late to
+          use.
+          -&gt; RTOS with margin, or Linux with care.
+
+   SOFT   a late result is still useful, just less.
+          A UI redraw, a log upload, a display update.
+          -&gt; anywhere.
+
+   THE TABLE FOR A REAL DESIGN:
+
+   function          deadline   class  consequence of miss
+   ----------------- --------- ------ --------------------
+   over-current trip     5 us   HARD   bridge destroyed
+   commutation          50 us   HARD   motor stalls
+   current control       1 ms   HARD   torque ripple
+   position loop        10 ms   FIRM   degraded accuracy
+   CAN comms            50 ms   FIRM   stale status
+   display update      100 ms   SOFT   feels laggy
+   log to flash          1 s    SOFT   nothing
+
+   THE 5 us ROW IS NOT SOFTWARE. Nothing in this track
+   makes a CPU respond in 5 us reliably - that is a
+   comparator and a hardware break input. Recognising which
+   rows are not software problems is the first and most
+   important act of partitioning.</pre>
+
+<h2 id="decompose">Decomposing into tasks</h2>
+
+<pre><code>THE PRINCIPLE: one task per independent RATE or blocking
+source, not one task per feature.
+
+  A GOOD DECOMPOSITION
+    control       1 ms period, never blocks
+    sensor        10 ms period, blocks on I2C
+    comms         event-driven, blocks on a queue
+    housekeeping  1 s period, low priority
+
+  A BAD ONE, and this is the common mistake
+    "temperature task", "humidity task", "pressure task"
+    - three tasks with the SAME period doing the SAME kind
+    of work, each costing a stack and a TCB, and all
+    contending for the same I2C bus. Merge them into one
+    sensor task with a list.
+
+FEWER TASKS IS BETTER. Each one costs:
+    a stack (the dominant RAM cost)
+    a TCB
+    a synchronisation surface with every other task
+    a scheduling decision
+
+  If two tasks always run together, or one always waits for
+  the other, they are one task.
+
+WHEN A SEPARATE TASK IS JUSTIFIED
+  - a genuinely different period
+  - it blocks on something the others must not wait for
+  - a different criticality that you want isolated
+  - it can be preempted and the others cannot
+
+THE ISR/TASK SPLIT
+  ISRs: capture the event, put it somewhere, signal, return.
+        Tens of microseconds.
+  Tasks: everything else.
+
+  An ISR that parses a protocol, walks a list or takes a
+  lock is a design error - it delays every other interrupt
+  in the system and its duration enters everyone's jitter
+  budget.</code></pre>
+
+<h2 id="priorities">Assigning priorities, and proving it works</h2>
+
+<pre><code>RATE-MONOTONIC: shorter period gets higher priority. Not
+"more important" - more FREQUENT. Liu and Layland proved
+this optimal among fixed-priority schemes: if any
+fixed-priority assignment meets all deadlines, this one
+does.
+
+SCHEDULABILITY, the simple sufficient test:
+
+    U = SUM(Ci / Ti)   over tasks
+      + SUM(Ei / Pi)   over INTERRUPTS
+
+    schedulable if U &lt;= n(2^(1/n) - 1)
+
+      n=1  100%      n=4  75.7%
+      n=2  82.8%     n=5  74.3%
+      n=3  78.0%     n-&gt;inf 69.3%
+
+WORKED:
+    control     T=1ms    C=180us  -&gt; 0.180
+    sensor      T=10ms   C=400us  -&gt; 0.040
+    comms       T=100ms  C=2ms    -&gt; 0.020
+    logging     T=1000ms C=5ms    -&gt; 0.005
+    CAN ISR     P=1ms    E=15us   -&gt; 0.015
+    timer ISR   P=100us  E=3us    -&gt; 0.030
+                                     -----
+                                U =  0.290
+
+    n=4 tasks -&gt; bound 0.757. 0.290 &lt;= 0.757: SCHEDULABLE
+    with large margin.
+
+TWO THINGS CANDIDATES OMIT, AND BOTH MATTER:
+
+  1. INTERRUPT TIME IS PART OF U. A 20 us ISR at 10 kHz is
+     20% utilisation before any task runs. A system that
+     analyses as 65% and misses deadlines at 85% has
+     forgotten this.
+
+  2. C IS THE MEASURED WORST CASE, not the average. The
+     worst case is often 5-10x typical because of a cache
+     miss, a flash wait state, or an error path. Measure it
+     with a cycle counter and record the MAXIMUM.
+
+ABOVE THE BOUND the system may still be schedulable - the
+test is sufficient, not necessary - but you must then do
+exact response-time analysis rather than the simple test.
+And 70% is why a fixed-priority real-time system is not
+planned at 95% CPU.</code></pre>
+
+<div class="key">
+<b>The number that makes a real-time answer credible</b>
+<p>Producing a task table with periods, measured worst-case compute times, priorities and a utilisation sum is
+the single most convincing thing you can do in a real-time design round. It takes four minutes on a whiteboard,
+it demonstrates that you know deadlines are proven rather than hoped for, and it naturally exposes the
+follow-up conversations — what happens at 90% load, what the blocking terms are, where the jitter comes from.
+Most candidates describe an architecture; very few show that it meets its deadlines.</p>
+</div>
+
+<h2 id="jitter">Where the time actually goes</h2>
+
+<pre class="diagram">   A TASK'S RESPONSE TIME IS NOT ITS COMPUTE TIME. The
+   sources of delay, all of which must be bounded:
+
+   1. INTERRUPT LATENCY        12 cycles architecturally on
+                               Cortex-M, plus flash wait
+                               states and any higher-
+                               priority handler running
+
+   2. INTERRUPTS DISABLED      every critical section in
+                               every driver. The LONGEST one
+                               anywhere delays everything.
+
+   3. HIGHER-PRIORITY TASKS    preemption, by design
+
+   4. BLOCKING ON A SHARED     bounded by priority
+      RESOURCE                 inheritance; UNBOUNDED
+                               without it (chapter 11)
+
+   5. THE KERNEL ITSELF        context switch cost, tick
+                               processing, timer list walks
+
+   6. NON-DETERMINISM          cache misses, flash wait
+                               states, DMA contending for
+                               the bus, a page fault on
+                               Linux
+
+   MEASURE, DO NOT ASSUME:
+     - a GPIO toggled at the start and end of an ISR, on a
+       scope, gives you duration AND jitter directly
+     - a cycle counter recording the MAXIMUM, not the mean
+     - cyclictest on Linux, where the Max column is the
+       only one that matters
+
+   THE RULE: every one of the six must have a bound, or
+   your deadline analysis is fiction. This list is also a
+   good answer to "why is my system occasionally late?" -
+   it is almost always item 2 or item 4.</pre>
+
+<div class="qbank">
+<div class="qbank-head"><h3 id="q">Questions</h3><span class="qbank-count"></span></div>
+
+<details class="qa">
+<summary>Define real-time. Is a 3 GHz processor real-time?<span class="qa-lvl j">Junior</span></summary>
+<div class="qa-body">
+<p>Real-time means the system has a <em>bounded, provable</em> response time — the correctness of a result
+depends on when it is produced, not only on its value. It says nothing about speed.</p>
+<p>So a 3 GHz processor running Linux is not real-time by default: it is fast, and its worst case is
+unbounded — a page fault, a scheduler decision, an SMI or a thermal event can cost milliseconds, and nothing
+guarantees otherwise. Meanwhile a 16 MHz Cortex-M0 with an analysed interrupt path and no cache <em>is</em>
+real-time, because you can state and prove the bound.</p>
+<p>The corollary worth adding: making a system real-time usually means giving up average performance. Caches,
+branch predictors, out-of-order execution and demand paging all improve the average by adding variance —
+which is exactly what a deadline cannot tolerate.</p>
+<div class="qa-listen"><b>Listening for</b>"Predictable, not fast", and the observation that the two are
+often in tension.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Produce a task decomposition for a motor controller with a 1 ms current loop and CAN reporting.<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>First separate what is not software: over-current protection at microsecond scale is a comparator driving
+the timer's break input, and commutation dead-time is generated by the timer hardware. Neither is a task.</p>
+<p>Then the tasks, one per independent rate or blocking source:</p>
+<ul>
+<li><strong>Current control</strong> — 1 ms period, highest priority, never blocks. Triggered by the timer, not
+by a delay. Reads ADC (already sampled by DMA), computes, writes PWM compare registers.</li>
+<li><strong>Position/speed loop</strong> — 10 ms, medium priority, consumes the current loop's state.</li>
+<li><strong>CAN handling</strong> — event-driven from a queue fed by the CAN ISR, lower priority.</li>
+<li><strong>Housekeeping</strong> — 1 s: temperature, diagnostics, logging. Lowest.</li>
+</ul>
+<p>Priorities by rate-monotonic, so exactly the order above. Then the utilisation sum including the ADC and
+CAN ISRs, checked against the bound for four tasks (0.757).</p>
+<p>The detail that scores: the current loop must not block on anything — no mutex shared with a lower-priority
+task, no logging call, no dynamic allocation. State shared with the position loop is passed through a
+double-buffer or an atomic snapshot rather than a lock.</p>
+<div class="qa-listen"><b>Listening for</b>Pulling the microsecond-scale protection out of software first,
+and the "highest-priority task never blocks" discipline.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Your utilisation is 45% but you are missing deadlines. What is going on?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Utilisation is necessary but not sufficient — a low number tells you the CPU is not saturated, not that
+deadlines are met. The usual causes, in order:</p>
+<p><strong>Interrupt time not counted.</strong> A 20 µs ISR at 10 kHz is 20% that never appeared in your task
+table. Add all ISRs to the sum.</p>
+<p><strong>Priority inversion.</strong> A high-priority task blocked on a mutex held by a low-priority one,
+with a medium-priority task preventing the holder from running. The delay is unbounded and invisible in a
+utilisation calculation. Check that mutexes (not semaphores) are used for mutual exclusion and that inheritance
+is enabled.</p>
+<p><strong>Long interrupts-disabled regions.</strong> A driver's critical section, a flash write that stalls
+the bus for milliseconds, or a library that disables interrupts. The longest such region anywhere delays
+everything.</p>
+<p><strong>Worst case measured as average.</strong> If C is the typical compute time, the analysis is wrong by
+whatever the tail is.</p>
+<p><strong>Priority assignment not rate-monotonic</strong>, so a frequent task waits behind an infrequent
+one.</p>
+<p>How to find it: <code>irqsoff</code> tracing or a GPIO toggle showing interrupts-disabled duration, and an
+RTOS trace showing which task was running when the deadline was missed.</p>
+<div class="qa-listen"><b>Listening for</b>Knowing that utilisation is a sufficient test only, and naming
+blocking terms as the usual culprit.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How many tasks should a system have?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>As few as possible — one per independent rate or independent blocking source, not one per feature. Each
+task costs a stack (which usually dominates RAM), a control block, a scheduling decision, and a
+synchronisation surface with every other task. Ten tasks means forty-five potential interaction pairs.</p>
+<p>The test: if two tasks always run together, or one always waits for the other, they should be one task. If
+three tasks have the same period and do the same kind of work — a "temperature task", a "humidity task" and a
+"pressure task" all polling I2C every 100 ms — merge them into one sensor task iterating a list.</p>
+<p>What genuinely justifies a separate task: a different period; blocking on something the others must not
+wait for; a different criticality you want isolated (so a bug in the comms task cannot delay the control
+loop); or a different preemptability requirement.</p>
+<p>A typical well-factored embedded system has three to eight tasks. Twenty is a smell.</p>
+<div class="qa-listen"><b>Listening for</b>The cost per task and the merge test, rather than a number.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What belongs in an ISR and what does not?<span class="qa-lvl j">Junior</span></summary>
+<div class="qa-body">
+<p>In: acknowledge the hardware, clear the status flag, capture the minimum data (read the byte, snapshot the
+timer value), put it somewhere, signal a task, return. Tens of microseconds at most.</p>
+<p>Out: anything that blocks, anything unbounded, anything that allocates, protocol parsing, list walking,
+floating point on a part where the FP context is not saved, printf, and any RTOS call that is not the ISR-safe
+variant.</p>
+<p>The reason is not style: an ISR delays every lower-priority interrupt and every task in the system, so its
+duration enters everyone's jitter budget. A 2 ms ISR makes a 1 ms deadline impossible for everything below
+it.</p>
+<p>The pattern that follows is deferred processing — the ISR is a producer into a ring buffer or a queue, and
+a task is the consumer. On Linux the same split is a top half and a workqueue or threaded IRQ.</p>
+<div class="qa-listen"><b>Listening for</b>The jitter-budget reasoning, and naming deferred processing as the
+resulting pattern.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>The customer wants to add a feature to a system running at 68% utilisation. What do you say?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>That we are at the edge of the safe region and the answer requires measurement, not intuition. The
+rate-monotonic bound for a handful of tasks is around 74–76%, so 68% leaves very little margin — and the
+bound assumes measured worst-case compute times, which people often do not have.</p>
+<p>What I would do: first re-measure the existing worst cases rather than trusting the old numbers, because
+they drift; then size the new feature's compute and period and recompute U; then check where in the priority
+order it lands, since a short-period addition raises the priority of the new work and delays everything below
+it.</p>
+<p>If it does not fit, the options in order: reduce the new feature's rate (often it does not need the period
+requested); move it off the critical path entirely — a lower-priority task, or a second processor; optimise the
+existing worst cases, which is usually where the easy wins are; or raise the clock, accepting the power
+cost.</p>
+<p>And the thing worth saying explicitly: above the bound the system may still work, but it is no longer
+<em>proven</em> to, and for anything with a safety or contractual deadline that distinction matters more than
+whether it happens to pass a test.</p>
+<div class="qa-listen"><b>Listening for</b>Re-measuring rather than trusting old numbers, and the
+proven-versus-observed distinction.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Name every source of delay between an event and the code that handles it.<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Six, and each must be bounded or the analysis is fiction:</p>
+<p><strong>1. Interrupt latency</strong> — 12 cycles architecturally on Cortex-M, plus flash wait states, plus
+any higher-priority handler already running. <strong>2. Interrupts disabled</strong> — the longest critical
+section anywhere in the system, including vendor drivers and libraries. <strong>3. Higher-priority
+preemption</strong> — by design, and bounded by the priority assignment. <strong>4. Blocking on a shared
+resource</strong> — bounded by priority inheritance, unbounded without it. <strong>5. Kernel
+overhead</strong> — context switch cost, tick processing, timer list traversal. <strong>6.
+Non-determinism</strong> — cache misses, flash wait states, DMA contending for the bus, and on Linux page
+faults and scheduler decisions.</p>
+<p>How to bound each: measure ISR duration with a GPIO and a scope; instrument the longest interrupts-off
+region with <code>irqsoff</code> tracing or a DWT-based measurement; keep critical sections to a few
+instructions; use priority inheritance; and for item 6, either eliminate the source (lock memory, pre-fault
+stacks, disable caches for the critical path) or measure the tail and include it.</p>
+<div class="qa-listen"><b>Listening for</b>Item 2 and item 4 specifically — they are the ones that cause real
+failures and the ones candidates most often omit.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you measure worst-case execution time?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Instrument and record the maximum, never the average. On Cortex-M the DWT cycle counter is free and exact:
+read it at entry and exit, subtract with wrap-safe arithmetic, and keep a running maximum in a variable you can
+inspect or report.</p>
+<p>The important part is <em>what you run while measuring</em>: peak load, every error path deliberately
+provoked, caches in their worst state, and the longest input the code can receive. A worst case measured on the
+happy path is not a worst case — and the tail is often 5–10× the typical because of a cache miss, a flash wait
+state, or a rarely-taken branch.</p>
+<p>For anything genuinely safety-relevant, measurement alone is not sufficient because you cannot prove you hit
+the worst path. Static WCET analysis tools compute a bound from the code and the processor model — conservative,
+expensive, and required in some certification contexts.</p>
+<p>The practical compromise most projects use: measure the maximum over a long soak with deliberate fault
+injection, then add substantial margin and monitor it in the field, so a regression shows up as a rising
+maximum rather than a missed deadline.</p>
+<div class="qa-listen"><b>Listening for</b>Recording the maximum, exercising error paths, and knowing that
+measurement is not proof.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Can you meet a 1 ms deadline on Linux?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Usually yes on average and not reliably at the tail, which is the only part that matters. A stock kernel
+gives you tens to hundreds of microseconds typically, with occasional excursions into milliseconds. With
+<code>PREEMPT_RT</code>, careful tuning — an isolated CPU, <code>SCHED_FIFO</code>, <code>mlockall</code>,
+pre-faulted stacks, no page faults, no dynamic allocation in the loop, IRQ affinity set — you can get maximum
+latencies into the tens of microseconds on good hardware, and 1 ms becomes achievable with margin.</p>
+<p>But it must be <em>measured</em>, not assumed: <code>cyclictest</code>, running for hours under the real
+system load, and the Max column is the number. And it must be re-measured after any change to the kernel,
+drivers or workload, because a single badly-written driver holding a lock or disabling interrupts destroys the
+guarantee.</p>
+<p>My recommendation for a hard deadline would still be to put it on a microcontroller — not because Linux
+cannot be tuned to meet it, but because the argument that it <em>will</em> meet it is fragile and has to be
+re-made on every update. That is precisely why the AP-plus-MCU architecture is so common.</p>
+<div class="qa-listen"><b>Listening for</b>A qualified yes with the tuning list, and the judgement that
+fragility of the guarantee is itself a reason to partition.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What is jitter and when does it matter more than latency?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Latency is how long after the event the response happens; jitter is how much that varies. For many control
+systems jitter is the more damaging: a control loop that runs every 1.000 ms is well-behaved, and one that runs
+every 0.8–1.2 ms has an effectively varying gain, which degrades stability and shows up as audible or
+mechanical noise.</p>
+<p>Where jitter dominates: closed-loop control (the sample interval is part of the maths), signal generation
+and sampling (a jittery ADC trigger adds noise directly to your signal), motor commutation, and anything
+producing a waveform another device decodes.</p>
+<p>Where latency dominates: reacting to a fault, responding to a user, meeting a protocol timeout.</p>
+<p>The fix for jitter is to remove software from the timing path — trigger the ADC from a timer rather than
+from code, generate PWM from a comparator, use DMA so the transfer time does not depend on when a task ran. A
+consistently late but <em>evenly spaced</em> loop is far better than an occasionally-early one.</p>
+<div class="qa-listen"><b>Listening for</b>The control-theory reason jitter matters, and hardware triggering
+as the remedy.</div>
+</div>
+</details>
+
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Deadlines missed at 45% utilisation</td><td>Interrupt time or blocking terms not in the sum</td></tr>
+<tr><td>Occasional lateness under load</td><td>A long interrupts-disabled region somewhere</td></tr>
+<tr><td>High-priority task delayed by a low one</td><td>Priority inversion — semaphore used as a lock</td></tr>
+<tr><td>Twenty tasks, most of them idle</td><td>Decomposed by feature instead of by rate</td></tr>
+<tr><td>Control loop jitters when comms are busy</td><td>ISR too long, or shared lock on the critical
+path</td></tr>
+<tr><td>Analysis says schedulable, reality disagrees</td><td>C measured as average, not worst case</td></tr>
+<tr><td>Adding a feature broke unrelated timing</td><td>Already at the bound with no margin</td></tr>
+<tr><td>Audible noise from a motor</td><td>Jitter in the commutation or current loop</td></tr>
+<tr><td>Works on the bench, late in the product</td><td>Worst case never exercised in test</td></tr>
+<tr><td>Linux meets the deadline in test, not in the field</td><td>Tail latency; measure Max with
+<code>cyclictest</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define real-time without using the word fast.</li>
+  <li>Classify hard, firm and soft with an example and a consequence for each.</li>
+  <li>Say how to recognise a requirement that is not a software problem at all.</li>
+  <li>Give the decomposition principle and the test for whether two tasks should be one.</li>
+  <li>State the rate-monotonic rule and the utilisation bound for four tasks.</li>
+  <li>Show how interrupt time enters the utilisation sum.</li>
+  <li>Explain why C must be the worst case and how much larger it typically is.</li>
+  <li>List the six sources of delay between event and handler.</li>
+  <li>Explain how to measure WCET and why measurement is not proof.</li>
+  <li>Distinguish jitter from latency and say when each dominates.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/qa.js"></script>
+</body>
+</html>

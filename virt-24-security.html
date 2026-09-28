@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hypervisor attack surface and VM escape | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Hypervisor attack surface and VM escape</h1>
+<p class="lead">A hypervisor's entire value is a boundary, and a boundary is only as good as the code that
+sits on it. Almost every published escape has come from the same small number of places — and knowing which
+places they are turns "is this design secure?" into a question you can actually answer.</p>
+
+<h2 id="surface">Where the attack surface actually is</h2>
+
+<p>The instinct is that a hypervisor is small and therefore safe. The hypervisor often is small; the surface a
+guest can reach is usually much larger, and it is almost never where people first look.</p>
+
+<pre class="diagram">   EVERYTHING A MALICIOUS GUEST CAN REACH:
+
+   1. THE EXIT HANDLERS                        (chapters 04, 06)
+        Every trap reason is an entry point taking
+        attacker-controlled input. The guest chooses which
+        one to invoke and with what register state.
+
+   2. EMULATED DEVICE MODELS                   (chapter 14)
+        BY FAR THE LARGEST SURFACE. Thousands of lines of C
+        parsing attacker-controlled register writes, in the
+        VMM, usually at host privilege. Historically the
+        source of most escapes.
+
+   3. THE VIRTIO RINGS                         (chapter 15)
+        Shared memory the guest writes and the host reads.
+        Every index, length and descriptor is attacker
+        controlled and can CHANGE between your check and
+        your use.
+
+   4. HYPERCALLS                               (chapter 04)
+        A deliberate syscall-like interface, with the same
+        obligations as any syscall boundary.
+
+   5. STAGE-2 MANAGEMENT                       (chapter 05)
+        Where you decide which physical pages a guest may
+        reach. A bug here is an immediate escape.
+
+   6. SHARED MICROARCHITECTURE                 (chapter 19)
+        Caches, branch predictors, memory bandwidth. Not
+        reachable by writing to a register - reachable by
+        measuring.
+
+   ---------------------------------------------------------
+
+   NOTE THE SHAPE: items 1, 4 and 5 live in a small, audited
+   hypervisor. Item 2 lives in a large user-space program
+   nobody thinks of as security-critical. THAT ASYMMETRY IS
+   THE WHOLE POINT OF THIS CHAPTER.</pre>
+
+<h2 id="classes">The classes of escape, with the mistake that causes each</h2>
+
+<p>Published escapes cluster into a handful of patterns. They are all familiar from ordinary systems
+programming, which is reassuring — the boundary is exotic, the bugs are not.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>The mistake</th><th>Where it lives</th></tr></thead>
+<tbody>
+<tr><td><strong>Device-model memory safety</strong></td><td>A length or index from the guest used without
+bounds checking</td><td>Emulated NIC, disk, graphics, audio — anything with a buffer</td></tr>
+<tr><td><strong>Time-of-check to time-of-use</strong></td><td>Validating a value in shared memory, then
+reading it again</td><td>virtio rings, any shared descriptor</td></tr>
+<tr><td><strong>Confused deputy</strong></td><td>The host performs an operation on the guest's behalf with
+host privilege</td><td>Device models, hypercall handlers</td></tr>
+<tr><td><strong>Address translation errors</strong></td><td>A guest physical address translated without
+checking it belongs to that guest</td><td>Stage-2 code, DMA setup</td></tr>
+<tr><td><strong>Missing IOMMU discipline</strong></td><td>An assigned device programmed to DMA outside the
+guest's memory</td><td>Passthrough (<a href="virt-16-passthrough.html">chapter 17</a>)</td></tr>
+<tr><td><strong>Instruction emulation bugs</strong></td><td>A decoder mis-parsing a crafted
+instruction</td><td>Mostly x86 (<a href="virt-22-x86-comparison.html">chapter 10</a>)</td></tr>
+<tr><td><strong>Side channels</strong></td><td>Shared microarchitectural state leaking across the
+boundary</td><td>Caches, predictors, SMT siblings</td></tr>
+<tr><td><strong>Nested confusion</strong></td><td>A guest hypervisor's state trusted by the host
+hypervisor</td><td>Nested virtualisation (<a href="virt-20-nested.html">chapter 22</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>The double-fetch is the one worth internalising</b>
+<p>Shared memory is not a snapshot. When a guest hands you a descriptor containing a length, and you validate
+that length and then read it a second time to use it, a second vCPU can rewrite it in between — and your
+validated value and your used value are different. This is not a race you can win by being fast, and it is
+exactly the same bug as re-reading a user pointer in a syscall, or re-reading a shared buffer in a TEE
+(<a href="tee-20-ta-security.html">OP-TEE chapter 20</a>). The rule is identical in all three places:
+<strong>copy out of shared memory once, into memory only you can write, then validate the copy, then use only
+the copy.</strong> Any code that reads the same shared field twice is a bug regardless of what it does in
+between.</p>
+</div>
+
+<pre><code>/* THE BUG, in the shape it actually appears */
+struct vring_desc *d = &amp;vq-&gt;desc[idx];    /* GUEST memory */
+
+if (d-&gt;len &gt; MAX_LEN)                     /* fetch 1: check */
+        return -EINVAL;
+
+buf = map_guest(d-&gt;addr, d-&gt;len);         /* fetch 2: USE  */
+/*                       ^^^^^^ a second vCPU changed it
+                                between the two reads.    */
+
+/* THE FIX: one fetch, into local storage. */
+struct vring_desc d = vq-&gt;desc[idx];      /* COPY, once    */
+
+if (d.len &gt; MAX_LEN)                      /* check the copy */
+        return -EINVAL;
+if (!guest_owns(d.addr, d.len))           /* and the address */
+        return -EINVAL;
+
+buf = map_guest(d.addr, d.len);           /* use the copy   */
+
+/* AND NOTE THE SECOND CHECK. A length that is in range says
+   nothing about whether the ADDRESS belongs to this guest.
+   Both must be validated, on the copy, before either is
+   used.                                                  */</code></pre>
+
+<h2 id="reduce">Reducing the surface, in order of effect</h2>
+
+<p>These are architectural rather than defensive-coding measures, and they are ordered by how much they
+actually remove rather than by how much they are discussed.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Measure</th><th>What it removes</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><strong>Delete device models you do not need</strong></td><td>The largest surface, entirely. A VMM
+with four devices instead of forty</td><td>None — this is the cheapest real win available</td></tr>
+<tr><td><strong>Sandbox the VMM</strong></td><td>Turns a device-model escape into access to a confined
+process rather than to the host — seccomp, namespaces, a dedicated user</td><td>Some engineering; standard
+practice</td></tr>
+<tr><td><strong>Move devices out of the monolith</strong></td><td>One compromised device model cannot reach
+the others (vhost-user, per-device processes)</td><td>Complexity, and more IPC</td></tr>
+<tr><td><strong>Write device models in a memory-safe language</strong></td><td>The entire memory-safety class
+(<a href="rs-01-why-rust.html">Rust chapter 01</a>)</td><td>Rewriting; increasingly common in new
+VMMs</td></tr>
+<tr><td><strong>Use an IOMMU for every DMA-capable device</strong></td><td>Device-initiated escapes</td><td>
+Setup, and pinned memory</td></tr>
+<tr><td><strong>Shrink the trusted hypervisor</strong></td><td>Surface in the most privileged code — the
+pKVM and Jailhouse argument</td><td>Functionality; a design decision, not a patch</td></tr>
+<tr><td><strong>Static partitioning</strong></td><td>Nearly all runtime surface, by not sharing
+(<a href="virt-18-partitioning.html">chapter 19</a>)</td><td>Efficiency — you gave up sharing</td></tr>
+<tr><td><strong>Disable SMT for sensitive workloads</strong></td><td>A large family of side
+channels</td><td>Up to half your throughput</td></tr>
+<tr><td><strong>Fuzz the guest-facing interfaces</strong></td><td>Bugs, before someone else finds
+them</td><td>Cheap; badly under-used</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The first row deserves emphasis because it is so often skipped. A general-purpose VMM emulates a large
+collection of legacy devices that a purpose-built guest will never touch, and every one of them is reachable
+code. Removing them costs nothing and is frequently the single biggest reduction available — which is the
+argument behind the minimal VMMs in <a href="virt-17-kvm-internals.html">chapter 18</a>.</p>
+
+<h2 id="review">Reviewing a guest-facing handler</h2>
+
+<p>Whether the code is an exit handler, a hypercall or a device model, the questions are the same. This is the
+checklist worth applying to every one of them.</p>
+
+<pre class="diagram">   □ IS EVERY INPUT TREATED AS HOSTILE?
+     Register values, lengths, indices, addresses,
+     descriptors. The guest chose all of them.
+
+   □ IS SHARED MEMORY READ EXACTLY ONCE?
+     Copy first, then validate the copy, then use the copy.
+     Any second read of the same field is a bug.
+
+   □ IS EVERY GUEST ADDRESS CHECKED FOR OWNERSHIP?
+     In range is not the same as belongs to this guest.
+
+   □ ARE LENGTHS CHECKED AGAINST THE DESTINATION, not just
+     against a constant?
+
+   □ CAN AN ARITHMETIC OPERATION ON GUEST INPUT OVERFLOW,
+     and would the result then pass the bounds check?
+
+   □ IS THE LOOP BOUNDED?
+     A guest-supplied count that drives iteration is a
+     denial of service at best.
+
+   □ WHAT HAPPENS ON THE ERROR PATH?
+     Partially applied state, a freed pointer still
+     installed, a lock not dropped.
+
+   □ DOES THIS RUN AT HOST PRIVILEGE, and does it need to?
+
+   □ IS THE OPERATION AUTHORISED for THIS guest, or only
+     valid in general?
+
+   ---------------------------------------------------------
+
+   IF YOU HAVE READ THE DRIVER TRACKS, THIS LIST IS FAMILIAR.
+   It is the IOCTL review checklist (Windows chapter 16),
+   the syscall checklist (Linux chapter 33), and the TA
+   parameter checklist (OP-TEE chapter 20), with the nouns
+   changed. THE BOUNDARY IS NEW; THE DISCIPLINE IS NOT.</pre>
+
+<h2 id="honest">What a hypervisor boundary is worth</h2>
+
+<p>It is worth being honest about the strength of this boundary relative to the others on this site, because
+it is frequently oversold in both directions.</p>
+
+<pre class="diagram">   STRONGER THAN a process boundary: far less shared state,
+   a much narrower interface, and hardware enforcement of
+   the memory separation.
+
+   WEAKER THAN it is usually presented: the VMM is a large
+   user-space program at host privilege, and it is part of
+   the boundary whether or not your threat model says so.
+
+   AND THE HONEST SUMMARY:
+
+     A VM IS A GOOD BOUNDARY AGAINST A COMPROMISED WORKLOAD.
+     IT IS A WEAKER BOUNDARY AGAINST A DETERMINED ATTACKER
+     WHO ALREADY HAS CODE EXECUTION IN THE GUEST AND TIME TO
+     SPEND ON YOUR DEVICE MODELS.
+
+   IF THE SECOND IS YOUR THREAT MODEL, the answer is not a
+   better device model. It is to remove the hypervisor from
+   the trusted set entirely - which is what confidential
+   computing (chapter 21) does - or to stop sharing the
+   machine at all (chapter 19).
+
+   CHOOSING BETWEEN THOSE IS AN ARCHITECTURE DECISION, and
+   it should be made before the code is written rather than
+   after the first advisory.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Host crash triggered reliably from inside a guest</td><td>An unvalidated input in an exit handler or
+device model — assume it is exploitable, not merely a crash</td></tr>
+<tr><td>Corruption in another guest's memory</td><td>An address used without an ownership check, or DMA without
+an IOMMU</td></tr>
+<tr><td>Works under test, fails with two vCPUs</td><td>A double fetch — the second vCPU is the
+attacker</td></tr>
+<tr><td>A guest can reach host files</td><td>A device model with a path it did not sanitise, running
+unsandboxed</td></tr>
+<tr><td>An assigned device wrote outside the guest</td><td>IOMMU not configured, or the wrong group
+assigned</td></tr>
+<tr><td>Guest can measure another guest's activity</td><td>Shared cache or SMT sibling; not fixable in
+software alone</td></tr>
+<tr><td>Advisory affects a device you do not use</td><td>It was compiled in and reachable — delete
+it</td></tr>
+<tr><td>Fuzzer finds a crash in an hour</td><td>The interface was never fuzzed; expect more</td></tr>
+<tr><td>Nested guest affects the host</td><td>Guest-hypervisor state trusted without
+revalidation</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the six places a malicious guest can reach, and which is largest.</li>
+  <li>Explain the asymmetry between where the surface is and where the audit usually is.</li>
+  <li>Describe a double fetch and say why being fast does not fix it.</li>
+  <li>Give the three-step rule for handling shared memory.</li>
+  <li>Say why an in-range length is not sufficient validation for an address.</li>
+  <li>Give the cheapest surface reduction available, and why it is so often skipped.</li>
+  <li>Explain what sandboxing the VMM changes about an escape's consequences.</li>
+  <li>Name three other boundaries on this site whose review checklist is the same.</li>
+  <li>State honestly what a VM boundary is and is not good against.</li>
+  <li>Say what to do instead if your threat model exceeds it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

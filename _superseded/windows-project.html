@@ -1,0 +1,894 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: Windows KMDF driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 13</p>
+<h1>Project — a complete Windows KMDF driver</h1>
+<p class="lead">The same ring buffer as the Linux project, built the Windows way: a KMDF software driver
+with read, write and IOCTL support, a manual queue for blocking reads, a timer, and a Win32 client
+application. Deliberately parallel to chapter 10, so you can compare the two ecosystems line by line.</p>
+
+<div class="tip">
+<b>What you need</b>
+<ul>
+<li>Visual Studio 2022 with "Desktop development with C++"</li>
+<li>Windows SDK and the matching WDK (SDK first, then WDK)</li>
+<li>A <strong>disposable VM</strong> with <code>bcdedit /set testsigning on</code> and a snapshot taken</li>
+<li>WinDbg on the host, kernel debugging attached (see <a href="windows-kernel.html#setup">chapter 11</a>)</li>
+</ul>
+</div>
+
+<h2 id="spec">Specification</h2>
+
+<p>A software-only device — no hardware needed — installed as <code>Root\KRingBuf</code> and reachable from
+user mode as <code>\\.\KRingBuf</code>:</p>
+
+<ul>
+  <li><code>WriteFile</code> appends bytes to a kernel ring buffer.</li>
+  <li><code>ReadFile</code> consumes bytes; if empty, the request is <em>parked</em> and completed when data
+  arrives — the Windows equivalent of a blocking read.</li>
+  <li><code>DeviceIoControl</code> exposes reset, statistics, and a watermark setting.</li>
+  <li>A periodic timer injects a heartbeat byte, so you can watch a parked read complete asynchronously
+  and exercise the DPC path without hardware.</li>
+  <li>Multiple concurrent readers and writers are safe.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Structure of the KMDF ring buffer driver with default queue, manual queue and timer">
+  <rect class="svg-box-a" x="20" y="16" width="200" height="52" rx="7"/>
+  <text class="svg-tb" x="34" y="38">krbtest.exe</text><text class="svg-tm" x="34" y="56">CreateFile / ReadFile / IOCTL</text>
+  <rect class="svg-box-g" x="20" y="86" width="200" height="40" rx="7"/>
+  <text class="svg-tm" x="34" y="111">I/O manager builds an IRP</text>
+
+  <rect class="svg-box-w" x="270" y="16" width="220" height="110" rx="7"/>
+  <text class="svg-tb" x="284" y="38">Default queue (Sequential)</text>
+  <text class="svg-tm" x="284" y="60">EvtIoRead</text>
+  <text class="svg-tm" x="284" y="78">EvtIoWrite</text>
+  <text class="svg-tm" x="284" y="96">EvtIoDeviceControl</text>
+  <text class="svg-tm" x="284" y="116">one request at a time</text>
+
+  <rect class="svg-box-d" x="540" y="16" width="200" height="110" rx="7"/>
+  <text class="svg-tb" x="554" y="38">Manual queue</text>
+  <text class="svg-tm" x="554" y="60">reads with no data yet</text>
+  <text class="svg-tm" x="554" y="78">park here, uncompleted</text>
+  <text class="svg-tm" x="554" y="100">WDF handles cancellation</text>
+
+  <rect class="svg-box" x="270" y="150" width="220" height="60" rx="7"/>
+  <text class="svg-tb" x="284" y="172">Ring buffer + WDFSPINLOCK</text>
+  <text class="svg-tm" x="284" y="194">NonPagedPoolNx, tag 'BRK'</text>
+
+  <rect class="svg-box-g" x="540" y="150" width="200" height="60" rx="7"/>
+  <text class="svg-tb" x="554" y="172">WDFTIMER (1 s)</text>
+  <text class="svg-tm" x="554" y="194">runs at DISPATCH_LEVEL,</text>
+  <text class="svg-tm" x="554" y="208">injects a byte, drains queue</text>
+
+  <rect class="svg-box" x="20" y="240" width="720" height="44" rx="7"/>
+  <text class="svg-tb" x="34" y="262">Completion: WdfRequestCompleteWithInformation() — from the queue handler OR from the timer</text>
+  <text class="svg-tm" x="34" y="278">this is the whole point of the manual queue: the completing code is not the code that received the request</text>
+
+  <path class="svg-line" d="M220 42 L270 42 M120 68 L120 86 M400 126 L400 150 M490 60 L540 60 M640 126 L640 150 M640 210 L500 200"/>
+</svg>
+<figcaption>Driver structure. Compare with the Linux project's diagram — same problem, different mechanisms.</figcaption>
+</figure>
+
+<h2 id="setup">Step 1 — create the project</h2>
+
+<ol class="steps">
+  <li>Visual Studio &rarr; <em>Create a new project</em> &rarr; search "Kernel Mode Driver, Empty (KMDF)".</li>
+  <li>Name it <code>KRingBuf</code>.</li>
+  <li>Right-click the project &rarr; <em>Add</em> &rarr; <em>New Item</em> and create the four files below.</li>
+  <li>Project properties &rarr; <em>Driver Signing</em> &rarr; Sign Mode = <strong>Test Sign</strong>,
+  and pick or create a test certificate.</li>
+  <li>Set the configuration to <strong>Debug / x64</strong> (or ARM64 if your VM is ARM).</li>
+</ol>
+
+<h2 id="public">Step 2 — the shared interface header</h2>
+
+<div class="codewrap"><div class="code-title">public.h — included by both the driver and the application</div>
+<pre><code>#pragma once
+
+// Device interface GUID. Generate your own with guidgen.exe — never reuse one.
+// {C8F2E1A0-4B3D-4E7F-9A21-6D5E8B0C1234}
+DEFINE_GUID(GUID_DEVINTERFACE_KRINGBUF,
+        0xc8f2e1a0, 0x4b3d, 0x4e7f, 0x9a, 0x21, 0x6d, 0x5e, 0x8b, 0x0c, 0x12, 0x34);
+
+#define KRB_DEVICE_TYPE  0x8123u     // 0x8000+ is the third-party range
+
+typedef struct _KRB_STATS {
+    ULONG   Capacity;
+    ULONG   Count;
+    ULONG64 TotalWritten;
+    ULONG64 TotalRead;
+    ULONG   Overruns;
+    ULONG   Watermark;
+    ULONG   PendingReads;
+} KRB_STATS, *PKRB_STATS;
+
+#define IOCTL_KRB_RESET \
+    CTL_CODE(KRB_DEVICE_TYPE, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+#define IOCTL_KRB_GET_STATS \
+    CTL_CODE(KRB_DEVICE_TYPE, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+#define IOCTL_KRB_SET_WATERMARK \
+    CTL_CODE(KRB_DEVICE_TYPE, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+#define IOCTL_KRB_GET_CAPACITY \
+    CTL_CODE(KRB_DEVICE_TYPE, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS)</code></pre></div>
+
+<h2 id="driverh">Step 3 — the driver header</h2>
+
+<div class="codewrap"><div class="code-title">driver.h</div>
+<pre><code>#pragma once
+
+#include &lt;ntddk.h&gt;
+#include &lt;wdf.h&gt;
+#include "public.h"
+
+#define KRB_POOL_TAG      'fBRK'      // "KRBf" reversed - shows in !poolused
+#define KRB_CAPACITY      4096
+#define KRB_TIMER_PERIOD  1000        // ms
+
+typedef struct _DEVICE_CONTEXT {
+    PUCHAR        Buffer;             // the ring
+    ULONG         Capacity;
+    ULONG         Head;               // next write position
+    ULONG         Tail;               // next read position
+    ULONG         Count;              // bytes stored
+
+    ULONG64       TotalWritten;
+    ULONG64       TotalRead;
+    ULONG         Overruns;
+    ULONG         Watermark;
+
+    WDFSPINLOCK   Lock;               // guards everything above
+    WDFQUEUE      ManualQueue;        // reads waiting for data
+    WDFTIMER      Timer;              // heartbeat producer
+    ULONG         TimerTicks;
+} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
+
+DRIVER_INITIALIZE                 DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD         KrbEvtDeviceAdd;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP    KrbEvtDeviceContextCleanup;
+EVT_WDF_IO_QUEUE_IO_READ          KrbEvtIoRead;
+EVT_WDF_IO_QUEUE_IO_WRITE         KrbEvtIoWrite;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL KrbEvtIoDeviceControl;
+EVT_WDF_TIMER                     KrbEvtTimer;</code></pre></div>
+
+<h2 id="driverc">Step 4 — the driver</h2>
+
+<div class="codewrap"><div class="code-title">driver.c — part 1: entry, device creation, ring helpers</div>
+<pre><code>#include "driver.h"
+
+//
+// DriverEntry: called once when the driver is loaded.
+// Its only real job is to register EvtDeviceAdd.
+//
+NTSTATUS
+DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
+{
+    WDF_DRIVER_CONFIG config;
+    NTSTATUS status;
+
+    WDF_DRIVER_CONFIG_INIT(&amp;config, KrbEvtDeviceAdd);
+
+    status = WdfDriverCreate(DriverObject, RegistryPath,
+                             WDF_NO_OBJECT_ATTRIBUTES, &amp;config, WDF_NO_HANDLE);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("KRingBuf: WdfDriverCreate failed 0x%08X\n", status));
+        return status;
+    }
+
+    KdPrint(("KRingBuf: loaded\n"));
+    return STATUS_SUCCESS;
+}
+
+//
+// Called once per device instance. Create every framework object here.
+// NOTE: no hardware access - resources are not assigned yet.
+//
+NTSTATUS
+KrbEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+    NTSTATUS               status;
+    WDFDEVICE              device;
+    WDF_OBJECT_ATTRIBUTES  attrs;
+    WDF_IO_QUEUE_CONFIG    queueConfig;
+    WDF_TIMER_CONFIG       timerConfig;
+    PDEVICE_CONTEXT        ctx;
+    WDFQUEUE               defaultQueue;
+
+    UNREFERENCED_PARAMETER(Driver);
+
+    // ---- 1. the device object, with our context attached ----
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attrs, DEVICE_CONTEXT);
+    attrs.EvtCleanupCallback = KrbEvtDeviceContextCleanup;
+
+    status = WdfDeviceCreate(&amp;DeviceInit, &amp;attrs, &amp;device);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    ctx = DeviceGetContext(device);
+    RtlZeroMemory(ctx, sizeof(*ctx));
+    ctx-&gt;Capacity  = KRB_CAPACITY;
+    ctx-&gt;Watermark = 1;
+
+    // ---- 2. the ring buffer itself. NonPagedPoolNx: the timer DPC
+    //         touches it at DISPATCH_LEVEL, where paging is illegal. ----
+    ctx-&gt;Buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                          ctx-&gt;Capacity, KRB_POOL_TAG);
+    if (ctx-&gt;Buffer == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    // ---- 3. the lock ----
+    WDF_OBJECT_ATTRIBUTES_INIT(&amp;attrs);
+    attrs.ParentObject = device;
+    status = WdfSpinLockCreate(&amp;attrs, &amp;ctx-&gt;Lock);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // ---- 4. the default queue: sequential, so only one request is
+    //         in flight at a time and our handlers need no extra locking
+    //         against each other. ----
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                                           WdfIoQueueDispatchSequential);
+    queueConfig.EvtIoRead          = KrbEvtIoRead;
+    queueConfig.EvtIoWrite         = KrbEvtIoWrite;
+    queueConfig.EvtIoDeviceControl = KrbEvtIoDeviceControl;
+
+    status = WdfIoQueueCreate(device, &amp;queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES, &amp;defaultQueue);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // ---- 5. the manual queue: reads park here when there is no data.
+    //         WDF gives us cancellation handling for free. ----
+    WDF_IO_QUEUE_CONFIG_INIT(&amp;queueConfig, WdfIoQueueDispatchManual);
+    status = WdfIoQueueCreate(device, &amp;queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES, &amp;ctx-&gt;ManualQueue);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // ---- 6. the heartbeat timer (stands in for hardware interrupts) ----
+    WDF_TIMER_CONFIG_INIT_PERIODIC(&amp;timerConfig, KrbEvtTimer, KRB_TIMER_PERIOD);
+    WDF_OBJECT_ATTRIBUTES_INIT(&amp;attrs);
+    attrs.ParentObject = device;
+    status = WdfTimerCreate(&amp;timerConfig, &amp;attrs, &amp;ctx-&gt;Timer);
+    if (!NT_SUCCESS(status))
+        return status;
+    WdfTimerStart(ctx-&gt;Timer, WDF_REL_TIMEOUT_IN_MS(KRB_TIMER_PERIOD));
+
+    // ---- 7. publish a device interface so user mode can find us ----
+    status = WdfDeviceCreateDeviceInterface(device,
+                                            &amp;GUID_DEVINTERFACE_KRINGBUF, NULL);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // ---- 8. and a symbolic link, so \\.\KRingBuf works too ----
+    DECLARE_CONST_UNICODE_STRING(link, L"\\DosDevices\\KRingBuf");
+    status = WdfDeviceCreateSymbolicLink(device, &amp;link);
+
+    KdPrint(("KRingBuf: device added, capacity %u\n", ctx-&gt;Capacity));
+    return status;
+}
+
+VOID
+KrbEvtDeviceContextCleanup(_In_ WDFOBJECT Object)
+{
+    PDEVICE_CONTEXT ctx = DeviceGetContext((WDFDEVICE)Object);
+
+    if (ctx-&gt;Timer)
+        WdfTimerStop(ctx-&gt;Timer, TRUE);       // TRUE = wait for it to finish
+
+    if (ctx-&gt;Buffer) {
+        ExFreePoolWithTag(ctx-&gt;Buffer, KRB_POOL_TAG);
+        ctx-&gt;Buffer = NULL;
+    }
+    KdPrint(("KRingBuf: cleaned up\n"));
+}
+
+// ---- ring helpers. The caller must hold ctx-&gt;Lock. ----
+
+static ULONG KrbSpace(_In_ PDEVICE_CONTEXT ctx)
+{
+    return ctx-&gt;Capacity - ctx-&gt;Count;
+}
+
+static VOID KrbPut(_In_ PDEVICE_CONTEXT ctx, _In_reads_bytes_(Len) PUCHAR Src,
+                   _In_ ULONG Len)
+{
+    ULONG first = min(Len, ctx-&gt;Capacity - ctx-&gt;Head);
+
+    RtlCopyMemory(ctx-&gt;Buffer + ctx-&gt;Head, Src, first);
+    if (Len &gt; first)
+        RtlCopyMemory(ctx-&gt;Buffer, Src + first, Len - first);
+
+    ctx-&gt;Head = (ctx-&gt;Head + Len) % ctx-&gt;Capacity;
+    ctx-&gt;Count += Len;
+    ctx-&gt;TotalWritten += Len;
+}
+
+static VOID KrbGet(_In_ PDEVICE_CONTEXT ctx, _Out_writes_bytes_(Len) PUCHAR Dst,
+                   _In_ ULONG Len)
+{
+    ULONG first = min(Len, ctx-&gt;Capacity - ctx-&gt;Tail);
+
+    RtlCopyMemory(Dst, ctx-&gt;Buffer + ctx-&gt;Tail, first);
+    if (Len &gt; first)
+        RtlCopyMemory(Dst + first, ctx-&gt;Buffer, Len - first);
+
+    ctx-&gt;Tail = (ctx-&gt;Tail + Len) % ctx-&gt;Capacity;
+    ctx-&gt;Count -= Len;
+    ctx-&gt;TotalRead += Len;
+}</code></pre></div>
+
+<div class="codewrap"><div class="code-title">driver.c — part 2: read, write, the drain helper and the timer</div>
+<pre><code>//
+// Try to satisfy one parked read. Caller must NOT hold the lock.
+// Returns TRUE if a request was completed.
+//
+static BOOLEAN KrbTryCompleteOnePendingRead(_In_ PDEVICE_CONTEXT ctx)
+{
+    WDFREQUEST request;
+    NTSTATUS   status;
+    PVOID      buffer;
+    size_t     bufLen;
+    ULONG      toCopy;
+
+    status = WdfIoQueueRetrieveNextRequest(ctx-&gt;ManualQueue, &amp;request);
+    if (!NT_SUCCESS(status))
+        return FALSE;                         // nothing parked
+
+    status = WdfRequestRetrieveOutputBuffer(request, 1, &amp;buffer, &amp;bufLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(request, status);
+        return TRUE;
+    }
+
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    if (ctx-&gt;Count == 0) {
+        // Raced with another reader. Put it back and give up.
+        WdfSpinLockRelease(ctx-&gt;Lock);
+        WdfRequestRequeue(request);
+        return FALSE;
+    }
+    toCopy = min((ULONG)bufLen, ctx-&gt;Count);
+    KrbGet(ctx, (PUCHAR)buffer, toCopy);
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, toCopy);
+    return TRUE;
+}
+
+//
+// EvtIoRead. If data is available, complete immediately.
+// Otherwise park the request in the manual queue and return WITHOUT
+// completing it - the timer or a writer will finish it later.
+//
+VOID
+KrbEvtIoRead(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request, _In_ size_t Length)
+{
+    WDFDEVICE       device = WdfIoQueueGetDevice(Queue);
+    PDEVICE_CONTEXT ctx    = DeviceGetContext(device);
+    NTSTATUS        status;
+    PVOID           buffer;
+    size_t          bufLen;
+    ULONG           toCopy = 0;
+
+    if (Length == 0) {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
+        return;
+    }
+
+    status = WdfRequestRetrieveOutputBuffer(Request, 1, &amp;buffer, &amp;bufLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    if (ctx-&gt;Count &gt; 0) {
+        toCopy = min((ULONG)bufLen, ctx-&gt;Count);
+        KrbGet(ctx, (PUCHAR)buffer, toCopy);
+    }
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    if (toCopy &gt; 0) {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, toCopy);
+        return;
+    }
+
+    // No data. Park it. This is the Windows equivalent of a blocking read.
+    status = WdfRequestForwardToIoQueue(Request, ctx-&gt;ManualQueue);
+    if (!NT_SUCCESS(status))
+        WdfRequestComplete(Request, status);
+    // NOTE: on success we return without completing. That is correct.
+}
+
+VOID
+KrbEvtIoWrite(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request, _In_ size_t Length)
+{
+    WDFDEVICE       device = WdfIoQueueGetDevice(Queue);
+    PDEVICE_CONTEXT ctx    = DeviceGetContext(device);
+    NTSTATUS        status;
+    PVOID           buffer;
+    size_t          bufLen;
+    ULONG           toCopy;
+
+    if (Length == 0) {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
+        return;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, 1, &amp;buffer, &amp;bufLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    toCopy = min((ULONG)bufLen, KrbSpace(ctx));
+    if (toCopy == 0)
+        ctx-&gt;Overruns++;
+    else
+        KrbPut(ctx, (PUCHAR)buffer, toCopy);
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    if (toCopy == 0) {
+        // Full. A real driver might park the write too; we fail fast.
+        WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+        return;
+    }
+
+    // New data may satisfy a parked reader.
+    while (KrbTryCompleteOnePendingRead(ctx))
+        ;
+
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, toCopy);
+}
+
+//
+// Periodic timer. Runs at DISPATCH_LEVEL - no paging, no waiting.
+// Stands in for a hardware interrupt DPC.
+//
+VOID
+KrbEvtTimer(_In_ WDFTIMER Timer)
+{
+    WDFDEVICE       device = (WDFDEVICE)WdfTimerGetParentObject(Timer);
+    PDEVICE_CONTEXT ctx    = DeviceGetContext(device);
+    UCHAR           beat;
+
+    ctx-&gt;TimerTicks++;
+    beat = (UCHAR)('0' + (ctx-&gt;TimerTicks % 10));
+
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    if (KrbSpace(ctx) &gt; 0)
+        KrbPut(ctx, &amp;beat, 1);
+    else
+        ctx-&gt;Overruns++;
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    while (KrbTryCompleteOnePendingRead(ctx))
+        ;
+}</code></pre></div>
+
+<div class="codewrap"><div class="code-title">driver.c — part 3: the IOCTL handler</div>
+<pre><code>VOID
+KrbEvtIoDeviceControl(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+                      _In_ size_t OutputBufferLength,
+                      _In_ size_t InputBufferLength,
+                      _In_ ULONG  IoControlCode)
+{
+    WDFDEVICE       device = WdfIoQueueGetDevice(Queue);
+    PDEVICE_CONTEXT ctx    = DeviceGetContext(device);
+    NTSTATUS        status = STATUS_INVALID_DEVICE_REQUEST;
+    ULONG_PTR       info   = 0;
+    PVOID           buffer;
+    size_t          bufLen;
+
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    switch (IoControlCode) {
+
+    case IOCTL_KRB_RESET:
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        ctx-&gt;Head = ctx-&gt;Tail = ctx-&gt;Count = 0;
+        ctx-&gt;Overruns = 0;
+        WdfSpinLockRelease(ctx-&gt;Lock);
+        status = STATUS_SUCCESS;
+        break;
+
+    case IOCTL_KRB_GET_STATS: {
+        PKRB_STATS st;
+
+        // The minimum-size argument makes WDF reject a short buffer for us.
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(KRB_STATS),
+                                                &amp;buffer, &amp;bufLen);
+        if (!NT_SUCCESS(status))
+            break;
+
+        st = (PKRB_STATS)buffer;
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        st-&gt;Capacity     = ctx-&gt;Capacity;
+        st-&gt;Count        = ctx-&gt;Count;
+        st-&gt;TotalWritten = ctx-&gt;TotalWritten;
+        st-&gt;TotalRead    = ctx-&gt;TotalRead;
+        st-&gt;Overruns     = ctx-&gt;Overruns;
+        st-&gt;Watermark    = ctx-&gt;Watermark;
+        WdfSpinLockRelease(ctx-&gt;Lock);
+        st-&gt;PendingReads = 0;
+
+        info   = sizeof(KRB_STATS);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_KRB_SET_WATERMARK: {
+        ULONG value;
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(ULONG),
+                                               &amp;buffer, &amp;bufLen);
+        if (!NT_SUCCESS(status))
+            break;
+
+        value = *(PULONG)buffer;
+        if (value &gt; ctx-&gt;Capacity) {      // VALIDATE every user input
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        ctx-&gt;Watermark = value;
+        WdfSpinLockRelease(ctx-&gt;Lock);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_KRB_GET_CAPACITY:
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(ULONG),
+                                                &amp;buffer, &amp;bufLen);
+        if (!NT_SUCCESS(status))
+            break;
+        *(PULONG)buffer = ctx-&gt;Capacity;
+        info   = sizeof(ULONG);
+        status = STATUS_SUCCESS;
+        break;
+
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+
+    WdfRequestCompleteWithInformation(Request, status, info);
+}</code></pre></div>
+
+<div class="warn">
+<b>Read the read path twice</b>
+<p><code>KrbEvtIoRead</code> either completes the request or forwards it — and on the forward path it
+returns having completed nothing. If you ever add a code path that does neither, the calling application
+hangs forever with no error. "Exactly one of: complete, forward, or fail" is the invariant to check on
+every branch of every WDF handler.</p>
+</div>
+
+<h2 id="inf">Step 5 — the INF</h2>
+
+<div class="codewrap"><div class="code-title">KRingBuf.inf</div>
+<pre><code>[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = KRingBuf.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+[SourceDisksFiles]
+KRingBuf.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceDesc% = KRingBuf_Install, Root\KRingBuf
+
+[KRingBuf_Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+KRingBuf.sys
+
+[KRingBuf_Install.NT.Services]
+AddService = KRingBuf,%SPSVCINST_ASSOCSERVICE%,KRingBuf_Service
+
+[KRingBuf_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\KRingBuf.sys
+
+[KRingBuf_Install.NT.Wdf]
+KmdfService = KRingBuf, KRingBuf_wdfsect
+[KRingBuf_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "Embedded Learning Hub"
+DiskName         = "KRingBuf Installation Disk"
+DeviceDesc       = "Kernel Ring Buffer Device"
+ServiceName      = "KRingBuf Service"</code></pre></div>
+
+<h2 id="app">Step 6 — the user-mode application</h2>
+
+<div class="codewrap"><div class="code-title">krbtest.c — build as a separate console project</div>
+<pre><code>#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;initguid.h&gt;
+#include "public.h"
+
+#define DEV_PATH L"\\\\.\\KRingBuf"
+
+static void ShowStats(HANDLE h, const char *when)
+{
+    KRB_STATS st;
+    DWORD     ret;
+
+    if (!DeviceIoControl(h, IOCTL_KRB_GET_STATS, NULL, 0,
+                         &amp;st, sizeof(st), &amp;ret, NULL)) {
+        printf("  GET_STATS failed: %lu\n", GetLastError());
+        return;
+    }
+    printf("[%s] cap=%lu count=%lu written=%llu read=%llu overruns=%lu\n",
+           when, st.Capacity, st.Count, st.TotalWritten, st.TotalRead,
+           st.Overruns);
+}
+
+int main(void)
+{
+    HANDLE h;
+    DWORD  ret, cap, wm;
+    char   out[128], in[128];
+
+    h = CreateFileW(DEV_PATH, GENERIC_READ | GENERIC_WRITE,
+                    0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("CreateFile failed: %lu "
+               "(is the driver installed and started?)\n", GetLastError());
+        return 1;
+    }
+    printf("opened %ws\n", DEV_PATH);
+
+    /* --- capacity --- */
+    if (DeviceIoControl(h, IOCTL_KRB_GET_CAPACITY, NULL, 0,
+                        &amp;cap, sizeof(cap), &amp;ret, NULL))
+        printf("capacity: %lu bytes\n", cap);
+
+    /* --- start clean --- */
+    DeviceIoControl(h, IOCTL_KRB_RESET, NULL, 0, NULL, 0, &amp;ret, NULL);
+    ShowStats(h, "after reset");
+
+    /* --- write then read --- */
+    strcpy_s(out, sizeof(out), "hello from user mode");
+    if (!WriteFile(h, out, (DWORD)strlen(out), &amp;ret, NULL))
+        printf("WriteFile failed: %lu\n", GetLastError());
+    else
+        printf("wrote %lu bytes\n", ret);
+    ShowStats(h, "after write");
+
+    ZeroMemory(in, sizeof(in));
+    if (ReadFile(h, in, sizeof(in) - 1, &amp;ret, NULL))
+        printf("read  %lu bytes: \"%s\"\n", ret, in);
+    ShowStats(h, "after read");
+
+    /* --- the interesting one: this read finds the buffer empty, so the
+           driver parks it. It returns when the 1-second timer fires. --- */
+    printf("\nblocking read (the timer should complete it within ~1 s)...\n");
+    DWORD t0 = GetTickCount();
+    ZeroMemory(in, sizeof(in));
+    if (ReadFile(h, in, sizeof(in) - 1, &amp;ret, NULL))
+        printf("  returned %lu bytes (\"%s\") after %lu ms\n",
+               ret, in, GetTickCount() - t0);
+    else
+        printf("  failed: %lu\n", GetLastError());
+
+    /* --- invalid watermark must be rejected --- */
+    wm = cap + 1;
+    if (!DeviceIoControl(h, IOCTL_KRB_SET_WATERMARK, &amp;wm, sizeof(wm),
+                         NULL, 0, &amp;ret, NULL))
+        printf("\noversized watermark rejected: %lu "
+               "(expect 87 = ERROR_INVALID_PARAMETER)\n", GetLastError());
+
+    /* --- unknown IOCTL must be rejected --- */
+    if (!DeviceIoControl(h, CTL_CODE(KRB_DEVICE_TYPE, 0x8FF,
+                                     METHOD_BUFFERED, FILE_ANY_ACCESS),
+                         NULL, 0, NULL, 0, &amp;ret, NULL))
+        printf("unknown ioctl rejected: %lu\n", GetLastError());
+
+    /* --- watch the heartbeat accumulate --- */
+    printf("\nwatching the heartbeat for 5 seconds:\n");
+    for (int i = 0; i &lt; 5; i++) {
+        Sleep(1000);
+        ShowStats(h, "tick");
+    }
+
+    CloseHandle(h);
+    return 0;
+}</code></pre></div>
+
+<h2 id="install">Step 7 — build, install, run</h2>
+
+<div class="codewrap"><div class="code-title">on the TEST VM, elevated command prompt</div>
+<pre><code>:: copy KRingBuf.sys, KRingBuf.inf, KRingBuf.cat and krbtest.exe over first
+
+:: 1. trust the test certificate (extract it from the .sys once)
+certmgr /add KRingBuf.cer /s /r localMachine root
+certmgr /add KRingBuf.cer /s /r localMachine trustedpublisher
+
+:: 2. create the root-enumerated device and install the driver
+devcon install KRingBuf.inf Root\KRingBuf
+
+:: 3. confirm it started
+devcon status Root\KRingBuf
+sc query KRingBuf
+::   STATE : 4 RUNNING
+
+:: 4. run the test
+krbtest.exe
+
+:: 5. when you are done
+devcon remove Root\KRingBuf</code></pre></div>
+
+<pre><code>:: expected output
+opened \\.\KRingBuf
+capacity: 4096 bytes
+[after reset] cap=4096 count=0 written=0 read=0 overruns=0
+wrote 20 bytes
+[after write] cap=4096 count=20 written=20 read=0 overruns=0
+read  20 bytes: "hello from user mode"
+[after read] cap=4096 count=0 written=20 read=20 overruns=0
+
+blocking read (the timer should complete it within ~1 s)...
+  returned 1 bytes ("7") after 638 ms
+
+oversized watermark rejected: 87 (expect 87 = ERROR_INVALID_PARAMETER)
+unknown ioctl rejected: 1  (ERROR_INVALID_FUNCTION)
+
+watching the heartbeat for 5 seconds:
+[tick] cap=4096 count=1 written=22 read=21 overruns=0
+[tick] cap=4096 count=2 written=23 read=21 overruns=0
+...</code></pre>
+
+<div class="tip">
+<b>That 638 ms is the whole lesson</b>
+<p>The read arrived, found nothing, and was parked in the manual queue with no thread blocked in your
+driver. The timer DPC — running at DISPATCH_LEVEL on some arbitrary CPU, in some arbitrary thread context —
+retrieved and completed it. That decoupling of "who received the request" from "who completes it" is the
+core of the Windows I/O model, and it is what makes asynchronous I/O natural on Windows.</p>
+</div>
+
+<h2 id="debugging">Step 8 — debug it</h2>
+
+<pre><code>:: On the HOST, with WinDbg attached to the VM
+.sympath+ C:\path\to\KRingBuf\x64\Debug
+.reload /f
+
+:: break in your handlers
+bu KRingBuf!KrbEvtIoRead
+bu KRingBuf!KrbEvtTimer
+g
+
+:: when it breaks
+k                                    :: stack
+!irql                                :: which IRQL are we at? (timer -&gt; 2)
+dt KRingBuf!_DEVICE_CONTEXT @rcx     :: dump your context struct
+
+:: WDF-specific
+.load wdfkd.dll
+!wdfkd.wdfdriverinfo KRingBuf
+!wdfkd.wdfdevicequeues &lt;WDFDEVICE&gt;   :: see the parked read sitting in the manual queue
+!wdfkd.wdflogdump KRingBuf           :: the framework's own trace log
+
+:: pool usage - find leaks by tag
+!poolused 2
+:: look for the KRBf tag; it should be exactly one 4096-byte allocation</code></pre>
+
+<h3>Turn on Driver Verifier before you trust anything</h3>
+<pre><code>verifier /standard /driver KRingBuf.sys
+shutdown /r /t 0
+:: rerun krbtest.exe. Verifier will bug-check immediately on
+:: pool corruption, an IRQL violation, or a leak on unload.</code></pre>
+
+<h2 id="break">Step 9 — break it deliberately</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Change</th><th>Result</th><th>Lesson</th></tr></thead>
+<tbody>
+<tr><td>Change <code>POOL_FLAG_NON_PAGED</code> to <code>POOL_FLAG_PAGED</code></td><td>Bug check 0xA <code>IRQL_NOT_LESS_OR_EQUAL</code> when the timer fires</td><td>DISPATCH_LEVEL code cannot touch pageable memory</td></tr>
+<tr><td>Remove the <code>WdfRequestForwardToIoQueue</code> and just return</td><td><code>krbtest.exe</code> hangs forever on the blocking read; Ctrl+C does not help</td><td>Every request must be completed or forwarded</td></tr>
+<tr><td>Complete the request <em>and</em> forward it</td><td>Bug check 0x44 <code>MULTIPLE_IRP_COMPLETE_REQUESTS</code></td><td>Exactly one completion, ever</td></tr>
+<tr><td>Delete the <code>value &gt; ctx-&gt;Capacity</code> check</td><td>User mode can set an arbitrary watermark — a user-triggered driver state corruption</td><td>Validate every input crossing the boundary</td></tr>
+<tr><td>Pass <code>0</code> instead of <code>sizeof(KRB_STATS)</code> to <code>WdfRequestRetrieveOutputBuffer</code></td><td>A caller passing a 4-byte buffer causes a kernel buffer overflow — a security bug</td><td>Always state the minimum size</td></tr>
+<tr><td>Call <code>KeWaitForSingleObject</code> in <code>KrbEvtTimer</code></td><td>Bug check — waiting at DISPATCH_LEVEL</td><td>The IRQL contract is real</td></tr>
+<tr><td>Remove <code>WdfTimerStop(..., TRUE)</code> from cleanup</td><td>Use-after-free when the timer fires during unload; Verifier catches it</td><td>Quiesce every asynchronous source before freeing what it touches</td></tr>
+<tr><td>Take the spin lock and then call <code>KrbTryCompleteOnePendingRead</code></td><td>Deadlock: the helper takes the same lock</td><td>Know your lock's scope; never complete a request while holding a lock</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="compare">Linux vs Windows, side by side</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Concern</th><th>Linux (chapter 10)</th><th>Windows (this chapter)</th></tr></thead>
+<tbody>
+<tr><td>Entry point</td><td><code>module_init</code> &rarr; <code>krb_init</code></td><td><code>DriverEntry</code> &rarr; <code>KrbEvtDeviceAdd</code></td></tr>
+<tr><td>Per-device state</td><td>Your struct, in <code>file-&gt;private_data</code></td><td>WDF context, via <code>DeviceGetContext()</code></td></tr>
+<tr><td>Blocking read</td><td>Thread sleeps on a wait queue</td><td>Request is parked in a manual queue; <em>no thread blocks in the driver</em></td></tr>
+<tr><td>Waking</td><td><code>wake_up_interruptible()</code></td><td><code>WdfIoQueueRetrieveNextRequest()</code> + complete</td></tr>
+<tr><td>User buffer</td><td><code>copy_to_user()</code> explicitly</td><td>The I/O manager already copied it (METHOD_BUFFERED)</td></tr>
+<tr><td>Lock</td><td><code>mutex</code> (sleeping) or <code>spinlock</code></td><td><code>WDFWAITLOCK</code> (sleeping) or <code>WDFSPINLOCK</code></td></tr>
+<tr><td>Custom commands</td><td><code>ioctl</code> with <code>_IOR</code>/<code>_IOW</code> macros</td><td><code>DeviceIoControl</code> with <code>CTL_CODE</code></td></tr>
+<tr><td>Node in the namespace</td><td><code>class_create</code> + <code>device_create</code> &rarr; udev</td><td>Device interface GUID + symbolic link</td></tr>
+<tr><td>Install</td><td><code>insmod</code></td><td>INF + signature + PnP enumeration</td></tr>
+<tr><td>Cancellation</td><td>Signals interrupt the sleep, <code>-ERESTARTSYS</code></td><td>WDF cancels the queued request automatically</td></tr>
+<tr><td>Runtime checking</td><td>KASAN, lockdep, <code>DEBUG_ATOMIC_SLEEP</code></td><td>Driver Verifier, SDV, Code Analysis</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The design difference worth internalising</b>
+<p>Linux drivers block a thread. Windows drivers park a request. The Linux model is simpler to write; the
+Windows model scales better because no kernel thread is tied up waiting, and it makes cancellation a
+framework concern rather than a driver concern. Neither is wrong — but knowing <em>why</em> each ecosystem
+chose its model is what makes you fluent in both.</p>
+</div>
+
+<h2 id="extend">Extensions to try</h2>
+<ol class="steps">
+  <li><strong>Honour the watermark.</strong> Only complete a parked read once <code>Count &gt;= Watermark</code>.</li>
+  <li><strong>Park writes too</strong> when the buffer is full, in a second manual queue, and complete them
+  when a read makes room.</li>
+  <li><strong>Switch the default queue to parallel dispatch</strong> and find out what breaks. Then fix it.
+  This teaches the WDF synchronisation scopes better than any document.</li>
+  <li><strong>Add <code>EvtIoStop</code></strong> and test suspend/resume — a request parked across a power
+  transition must be handled correctly, and this is a real-world bug source.</li>
+  <li><strong>Add WPP tracing</strong> and capture a trace with <code>tracelog</code>.</li>
+  <li><strong>Port it to UMDF</strong>. The logic is nearly identical, but a bug takes down a service rather
+  than the machine — which shows exactly why UMDF is the recommended default.</li>
+</ol>
+
+<h2 id="checklist">Project checklist</h2>
+<ul class="checklist">
+  <li>The driver installs, starts, and shows RUNNING in <code>sc query</code>.</li>
+  <li><code>krbtest.exe</code> completes every step, including the parked read that returns after ~1 second.</li>
+  <li>Install/uninstall repeated ten times leaves no leaked pool (<code>!poolused 2</code>, tag KRBf).</li>
+  <li>Driver Verifier standard settings run clean through a full test pass.</li>
+  <li>Static Driver Verifier reports no violations.</li>
+  <li>Code Analysis is clean at <code>/analyze</code> level.</li>
+  <li>You have caused at least three of the deliberate bugs and recognised each bug check.</li>
+  <li>You can find the parked request in <code>!wdfdevicequeues</code> while the read is outstanding.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

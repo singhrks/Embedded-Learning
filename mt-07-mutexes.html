@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mutexes in practice | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Mutexes in practice</h1>
+<p class="lead">The primitive is simple; using it well is a set of habits. What a lock protects, how long you
+hold it, whether you can take two, and never — under any circumstances — releasing it by hand on an error
+path.</p>
+
+<h2 id="invariant">A lock protects an invariant, not a variable</h2>
+
+<p>A lock does not protect a variable; it protects an invariant. Thinking in terms of invariants rather than data is what tells you where the critical section actually begins and ends.</p>
+
+<pre class="diagram">   THE QUESTION THAT PREVENTS MOST LOCK BUGS
+
+     "What is true when this lock is not held?"
+
+   If you cannot answer in one sentence, the lock is
+   decoration.
+
+   BAD: "m protects `count`."
+        Then what protects the relationship between `count`
+        and the buffer it counts? Two locks, two invariants,
+        and a window between them.
+
+   GOOD: "m protects the queue: `head`, `tail`, `count` and
+          the elements between head and tail are mutually
+          consistent whenever m is not held."
+
+   Now every rule follows from the sentence:
+     - you may not read `count` without m, because the
+       invariant only holds while m is unheld and you are
+       observing it mid-update otherwise
+     - you must restore ALL of it before unlocking
+     - a function that returns a pointer INTO the queue has
+       leaked the invariant past the lock, and is wrong
+
+   WRITE THE SENTENCE IN A COMMENT NEXT TO THE LOCK. It is the
+   single highest-value comment in concurrent code, and the
+   one people never write.</pre>
+
+<pre><code>/* What that looks like in a header. */
+
+struct queue {
+        /* @lock protects every field below it: head, tail and
+         * count are mutually consistent, and elements
+         * [head, tail) are initialised, whenever @lock is not
+         * held. Callers must not retain pointers to elements
+         * after releasing @lock.
+         */
+        pthread_mutex_t lock;
+        struct item    *head, *tail;
+        size_t          count;
+};
+
+/* The kernel writes this as a lockdep-checkable annotation;
+   C++ has an analyser attribute for it:                    */
+
+class Queue {
+    std::mutex m_;
+    size_t     count_ GUARDED_BY(m_);      /* clang thread
+                                              safety analysis */
+public:
+    size_t size() { std::lock_guard&lt;std::mutex&gt; g(m_);
+                    return count_; }
+};
+/* -Wthread-safety turns "read count_ without m_" into a
+   COMPILE ERROR. It is underused and nearly free.          */</code></pre>
+
+<h2 id="raii">Never unlock by hand</h2>
+
+<p>Unlocking on every exit path — including exceptions and early returns — is exactly the problem scope-bound resource management solves. In practice this removes the majority of lock-leak bugs structurally.</p>
+
+<pre><code>/* THE BUG, in every codebase that uses manual unlock. */
+
+int process(struct queue *q, int x)
+{
+        pthread_mutex_lock(&amp;q-&gt;lock);
+
+        if (x &lt; 0)
+                return -EINVAL;              /* LOCK LEAKED   */
+
+        if (q-&gt;count == 0) {
+                pthread_mutex_unlock(&amp;q-&gt;lock);
+                return -EAGAIN;              /* fine, for now */
+        }
+
+        do_work(q);                          /* if this throws
+                                                or longjmps:
+                                                LOCK LEAKED   */
+        pthread_mutex_unlock(&amp;q-&gt;lock);
+        return 0;
+}
+/* Someone adds a fourth early return in six months, and the
+   process deadlocks the next time that path is taken.      */
+
+/* C++: RAII. The destructor cannot be forgotten and runs on
+   exceptions too. */
+int process(Queue &amp;q, int x)
+{
+        std::lock_guard&lt;std::mutex&gt; g(q.m);   /* one line     */
+        if (x &lt; 0)      return -EINVAL;       /* unlocked      */
+        if (q.empty())  return -EAGAIN;       /* unlocked      */
+        do_work(q);                           /* throws? still
+                                                 unlocked      */
+        return 0;
+}
+/* std::scoped_lock (C++17) is the same and takes N mutexes
+   deadlock-free. Prefer it: std::lock_guard has no advantage. */
+
+/* Rust: the data is INSIDE the mutex, so there is no way to
+   touch it without locking, and the guard unlocks on drop. */
+let q = Mutex::new(Queue::new());
+{
+    let mut g = q.lock().unwrap();
+    g.push(item);
+}   // unlocked here, always
+
+/* C, with GCC/Clang: */
+static inline void unlock_p(pthread_mutex_t **m) {
+        pthread_mutex_unlock(*m);
+}
+#define LOCKED(mtx) \
+        pthread_mutex_t *__l __attribute__((cleanup(unlock_p))) \
+                = &amp;(mtx); pthread_mutex_lock(__l)
+
+int process(struct queue *q, int x)
+{
+        LOCKED(q-&gt;lock);
+        if (x &lt; 0) return -EINVAL;      /* unlocked correctly */
+        ...
+}</code></pre>
+
+<div class="key">
+<b>Rust's real contribution</b>
+<p>Other languages give you a lock and a separate piece of data and trust you to pair them. Rust makes
+<code>Mutex&lt;T&gt;</code> <em>own</em> the <code>T</code>, so accessing the data without holding the lock is
+not a bug you might make — it is code that does not compile. That single design choice removes the entire
+"forgot to take the lock" category, which is most of this chapter.</p>
+</div>
+
+<h2 id="kinds">Which mutex</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Kind</th><th>What it adds</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><strong>Normal / fast</strong></td><td>Nothing. Undefined behaviour if you relock or unlock someone
+else's</td><td>Cheapest. The default</td></tr>
+<tr><td><strong>Error-checking</strong></td><td>Returns <code>EDEADLK</code> on self-relock, <code>EPERM</code>
+on foreign unlock</td><td>A branch. Use in debug builds</td></tr>
+<tr><td><strong>Recursive</strong></td><td>The owner may lock it again; counts</td><td>An owner field and a
+counter — and see the warning below</td></tr>
+<tr><td><strong>Timed</strong></td><td><code>pthread_mutex_timedlock</code>,
+<code>try_lock_for</code></td><td>Nothing extra when uncontended</td></tr>
+<tr><td><strong>Robust</strong></td><td>If the owner dies, the next locker gets
+<code>EOWNERDEAD</code> and may recover</td><td>Only for shared-memory IPC mutexes</td></tr>
+<tr><td><strong>Priority-inheriting</strong></td><td>Boosts the holder to the highest waiter's
+priority</td><td>Essential for real-time (<a href="mt-15-priority-inversion.html">chapter 15</a>)</td></tr>
+<tr><td><strong>Adaptive</strong></td><td>Spins briefly before sleeping</td><td>Great for short critical
+sections, wasteful for long ones</td></tr>
+<tr><td><strong>Shared / process-shared</strong></td><td>Lives in shared memory across
+processes</td><td>Must be robust, or a crash wedges everyone</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Recursive mutexes are a design smell</b>
+<p>They exist so that a function holding a lock can call another function that takes the same lock. That
+situation means you do not know your own locking structure. The real cost is that the invariant is only
+guaranteed at the <em>outermost</em> unlock — so the inner function sees the data mid-update and cannot tell.
+The fix is to split each public function into a locking wrapper and an unlocked <code>_locked</code> worker,
+which also documents which is which.</p>
+</div>
+
+<pre><code>/* The pattern that removes the need for recursion. */
+
+static void queue_push_locked(struct queue *q, struct item *i)
+{
+        /* caller MUST hold q->lock. Name says so. */
+        ...
+}
+
+void queue_push(struct queue *q, struct item *i)
+{
+        LOCKED(q-&gt;lock);
+        queue_push_locked(q, i);
+}
+
+void queue_push_many(struct queue *q, struct item **v, size_t n)
+{
+        LOCKED(q-&gt;lock);                    /* taken ONCE     */
+        for (size_t k = 0; k &lt; n; k++)
+                queue_push_locked(q, v[k]);
+}</code></pre>
+
+<h2 id="granularity">How much to protect, and for how long</h2>
+
+<p>One big lock is simple and serialises everything; many small locks are concurrent and risk deadlock. The choice is a genuine engineering trade-off, and the right answer is usually less fine-grained than people expect.</p>
+
+<pre><code>/* TOO COARSE: one lock for everything.
+   Correct, simple, and it serialises your whole program. */
+
+/* TOO FINE: a lock per element.
+   More memory than the data, more time in locking than in
+   work, and now you can deadlock by taking two. */
+
+/* HOLD TIME is usually the bigger lever than granularity: */
+
+/* BAD - I/O inside the critical section. */
+{
+        std::lock_guard&lt;std::mutex&gt; g(m);
+        auto v = cache[k];
+        write_to_disk(v);            /* 10 ms, holding the lock,
+                                        blocking every other
+                                        thread                 */
+}
+
+/* GOOD - copy out, then work. */
+Value v;
+{
+        std::lock_guard&lt;std::mutex&gt; g(m);
+        v = cache[k];                /* microseconds          */
+}
+write_to_disk(v);                    /* nobody is blocked     */
+
+/* THE RULES
+
+   1. Never call into unknown code while holding a lock. A
+      callback, a virtual function, an allocator or a logger
+      may take another lock and deadlock you (chapter 14).
+   2. Never do I/O or sleep while holding a lock.
+   3. Never allocate while holding a hot lock if you can
+      avoid it - malloc has its own locks.
+   4. Copy small things out and release; do not hold a lock
+      across expensive work.
+   5. If the critical section is one atomic-sized update, use
+      an atomic instead (chapter 11).                        */</code></pre>
+
+<h2 id="measure">Measuring contention</h2>
+
+<p>Lock contention is invisible in source code and very visible in performance. These are the ways to find out which lock is actually the bottleneck rather than guessing and optimising the wrong one.</p>
+
+<pre><code># Is the lock actually contended, or are you guessing?
+
+$ perf lock record ./app &amp;&amp; perf lock report
+ Name   acquired  contended  avg wait    max wait   total wait
+ &amp;q-&gt;lock  184291      41082   1.42 us   9.81 ms     58.3 ms
+
+$ perf stat -e 'syscalls:sys_enter_futex' -p $(pidof app)
+# a large futex count means real contention: the fast path is
+# not being taken
+
+# In the kernel:
+$ echo 1 > /proc/sys/kernel/lock_stat
+$ cat /proc/lock_stat
+
+# The number that matters is CONTENDED / ACQUIRED. Below a few
+# percent, leave it alone. Above ten percent, either shrink
+# the critical section or split the lock - and measure again,
+# because splitting a lock often just moves the queue.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Deadlock on an uncommon error path</td><td>Manual unlock missed on an early return</td></tr>
+<tr><td>Deadlock after an exception</td><td>Manual unlock skipped by the unwind — use RAII</td></tr>
+<tr><td>Data corruption despite "everything is locked"</td><td>Two locks, two invariants, and a gap between
+them</td></tr>
+<tr><td>A getter returns a torn value</td><td>Read without the lock because "it is just one field"</td></tr>
+<tr><td>Crash using a pointer obtained under a lock</td><td>The invariant escaped the critical
+section</td></tr>
+<tr><td>Throughput collapses under load</td><td>Long hold times — usually I/O or allocation inside the
+lock</td></tr>
+<tr><td>Deadlock when a callback fires</td><td>Unknown code called while holding a lock</td></tr>
+<tr><td>Works, then deadlocks after a refactor adds a call</td><td>A recursive-mutex design that was hiding the
+structure</td></tr>
+<tr><td><code>EDEADLK</code> from <code>pthread_mutex_lock</code></td><td>Self-relock on an error-checking
+mutex — a real bug it just caught for you</td></tr>
+<tr><td>Everything hangs after a process crashes</td><td>Process-shared mutex that was not robust</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the sentence that should be written next to every lock, and write one for a real structure.</li>
+  <li>Show the manual-unlock bug and give the fix in C, C++ and Rust.</li>
+  <li>Explain what Rust's <code>Mutex&lt;T&gt;</code> makes impossible that other languages
+  permit.</li>
+  <li>Name six kinds of mutex and what each adds.</li>
+  <li>Explain why recursive mutexes are a design smell and give the refactor that removes them.</li>
+  <li>Give five rules about what must never happen inside a critical section.</li>
+  <li>Explain why hold time usually matters more than lock granularity.</li>
+  <li>Measure lock contention and say what ratio would make you act.</li>
+  <li>Explain why splitting a contended lock sometimes changes nothing.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

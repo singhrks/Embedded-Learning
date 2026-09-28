@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DX12: resources, heaps and descriptors | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DX12: resources, heaps and descriptors</h1>
+<p class="lead">DX11 had "create a texture". DX12 splits that into three separate decisions — where the
+memory lives, what the resource is, and how a shader finds it — and makes you take all three. Understanding
+the split is most of what makes DX12 feel large.</p>
+
+<h2 id="three">Memory, resource, descriptor</h2>
+
+<pre class="diagram">   1. A HEAP is memory. It has a TYPE that decides who can
+      see it and how fast.
+
+        DEFAULT   GPU-local VRAM. Fast for the GPU, the CPU
+                  cannot touch it. Where everything you draw
+                  from lives.
+        UPLOAD    CPU-writable, GPU-readable. Write-combined:
+                  writing is fast, READING IS CATASTROPHIC
+                  (uncached, ~1 byte at a time). Staging
+                  buffers and per-frame constants.
+        READBACK  GPU-writable, CPU-readable. For getting
+                  results back - screenshots, queries.
+        CUSTOM    you specify the pool and CPU page property.
+
+   2. A RESOURCE is a typed view of some of that memory: a
+      buffer, a 2D texture, a texture array. It has a format,
+      dimensions, and a STATE (chapter 16).
+
+   3. A DESCRIPTOR is a small opaque struct - 32 to 64 bytes,
+      device-dependent - that tells a shader HOW to read a
+      resource. It lives in a DESCRIPTOR HEAP.
+
+   THE SAME MEMORY CAN HAVE MANY DESCRIPTORS:
+        one texture, viewed as
+          SRV  R8G8B8A8_UNORM_SRGB   for sampling
+          UAV  R8G8B8A8_UNORM        for compute writes
+          RTV  R8G8B8A8_UNORM        as a render target
+        Three descriptors, one resource, one allocation.</pre>
+
+<pre><code>/* COMMITTED - a resource with its own implicit heap. Simple,
+   and what you use until you have a reason not to. */
+
+D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+D3D12_RESOURCE_DESC rd = {};
+rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+rd.Width            = 1024;
+rd.Height           = 1024;
+rd.DepthOrArraySize = 1;
+rd.MipLevels        = 0;              /* 0 = full chain       */
+rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+rd.SampleDesc.Count = 1;
+rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+ComPtr&lt;ID3D12Resource&gt; tex;
+device-&gt;CreateCommittedResource(
+    &amp;hp, D3D12_HEAP_FLAG_NONE, &amp;rd,
+    D3D12_RESOURCE_STATE_COPY_DEST,   /* initial state        */
+    nullptr, IID_PPV_ARGS(&amp;tex));
+
+/* PLACED - you allocate one big heap and sub-allocate. This
+   is what a real engine does: allocation is expensive
+   (milliseconds, and it can fail), so you make a few large
+   heaps at startup and manage offsets yourself. */
+
+ComPtr&lt;ID3D12Heap&gt; heap;
+D3D12_HEAP_DESC hd = {};
+hd.SizeInBytes = 256ull * 1024 * 1024;
+hd.Properties  = { D3D12_HEAP_TYPE_DEFAULT };
+hd.Alignment   = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+hd.Flags       = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+device-&gt;CreateHeap(&amp;hd, IID_PPV_ARGS(&amp;heap));
+
+device-&gt;CreatePlacedResource(heap.Get(), offset, &amp;rd,
+                             D3D12_RESOURCE_STATE_COPY_DEST,
+                             nullptr, IID_PPV_ARGS(&amp;tex));
+/* Offsets must respect GetResourceAllocationInfo()'s
+   alignment - 64 KB usually, 4 MB for MSAA targets. */
+
+/* Unless you enjoy writing allocators, use D3D12MemoryAllocator
+   (D3D12MA) - the same library as Vulkan's VMA, and it handles
+   placed resources, pools and defragmentation properly. */</code></pre>
+
+<div class="danger">
+<b>Never read from an UPLOAD heap</b>
+<p>Upload memory is write-combined: writes are buffered and flushed efficiently, but reads bypass the cache
+entirely and go across PCIe one access at a time. A single innocent-looking <code>+=</code> on a mapped upload
+buffer can cost <em>hundreds of times</em> what you expect. Build your data in ordinary memory and
+<code>memcpy</code> it in one pass, and never use a mapped pointer as scratch space.</p>
+</div>
+
+<h2 id="upload">Getting data onto the GPU</h2>
+
+<pre><code>/* DEFAULT heap memory is not CPU-visible, so everything goes
+   via an UPLOAD staging buffer and a copy. */
+
+void UploadBuffer(ID3D12Device *dev, ID3D12GraphicsCommandList *cmd,
+                  ID3D12Resource *dst, const void *src, size_t n,
+                  ComPtr&lt;ID3D12Resource&gt; &amp;keepAlive)
+{
+    /* 1. staging buffer in UPLOAD */
+    D3D12_HEAP_PROPERTIES up = { D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = n;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.Format           = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    dev-&gt;CreateCommittedResource(&amp;up, D3D12_HEAP_FLAG_NONE, &amp;bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&amp;keepAlive));
+    /* keepAlive matters: the staging buffer must OUTLIVE the
+       GPU's execution of the copy. Releasing it at the end of
+       this function is a use-after-free the GPU discovers
+       later (chapter 13). */
+
+    /* 2. write it - one memcpy, no reads */
+    void *p = nullptr;
+    D3D12_RANGE none = { 0, 0 };        /* we read nothing */
+    keepAlive-&gt;Map(0, &amp;none, &amp;p);
+    memcpy(p, src, n);
+    keepAlive-&gt;Unmap(0, nullptr);
+    /* Map/Unmap are cheap and may be left mapped permanently
+       for per-frame buffers - "persistent mapping". */
+
+    /* 3. copy on the GPU */
+    cmd-&gt;CopyBufferRegion(dst, 0, keepAlive.Get(), 0, n);
+
+    /* 4. transition to its use state (chapter 16) */
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  =
+        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd-&gt;ResourceBarrier(1, &amp;b);
+}
+
+/* TEXTURES are harder: the GPU wants a swizzled, tiled layout
+   with per-row alignment, so you cannot memcpy an image
+   directly. Use the helper: */
+    D3D12_SUBRESOURCE_DATA sub = { pixels, rowPitch, slicePitch };
+    UpdateSubresources(cmd, dstTex, staging, 0, 0, 1, &amp;sub);
+/* It queries the required footprint - rows padded to 256 bytes
+   - copies row by row into the staging buffer, and issues
+   CopyTextureRegion. Doing this by hand is possible and
+   almost never worth it. */</code></pre>
+
+<h2 id="descriptors">Descriptors and heaps</h2>
+
+<pre class="diagram">   FOUR HEAP TYPES, and only two are shader-visible.
+
+     CBV_SRV_UAV   constant buffers, textures, UAVs.
+                   SHADER-VISIBLE. Usually one big heap.
+     SAMPLER       SHADER-VISIBLE, separate heap, max 2048.
+     RTV           render target views. CPU-only.
+     DSV           depth stencil views. CPU-only.
+
+   YOU MAY ONLY HAVE ONE SHADER-VISIBLE HEAP OF EACH TYPE
+   BOUND AT A TIME. That is the constraint that shapes every
+   DX12 binding design: you cannot bind a small heap per
+   object. You make ONE large heap and put everything in it.
+
+   SetDescriptorHeaps is also EXPENSIVE - it can flush the
+   GPU on some hardware. Call it once per command list, not
+   per draw.
+
+   THE TWO HANDLE TYPES, and confusing them is a classic bug:
+
+     D3D12_CPU_DESCRIPTOR_HANDLE   for CREATING descriptors
+                                   (CreateShaderResourceView)
+     D3D12_GPU_DESCRIPTOR_HANDLE   for BINDING them
+                                   (SetGraphicsRootDescriptorTable)
+
+   A CPU-only heap has no GPU handles at all. A shader-visible
+   heap has both, and you index them in parallel.
+
+   AND THE INCREMENT SIZE IS DEVICE-DEPENDENT:
+     UINT n = device->GetDescriptorHandleIncrementSize(type);
+     handle.ptr += index * n;
+   Hardcoding it works on your GPU and corrupts on another.</pre>
+
+<pre><code>/* A minimal descriptor allocator - a bump pointer over one
+   big heap. This is close to what real engines do for static
+   descriptors. */
+
+class DescriptorHeap {
+public:
+    void Init(ID3D12Device *dev, D3D12_DESCRIPTOR_HEAP_TYPE type,
+              UINT count, bool shaderVisible)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC d = {};
+        d.Type           = type;
+        d.NumDescriptors = count;
+        d.Flags = shaderVisible
+                ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        dev-&gt;CreateDescriptorHeap(&amp;d, IID_PPV_ARGS(&amp;heap_));
+
+        size_    = dev-&gt;GetDescriptorHandleIncrementSize(type);
+        cpuStart_ = heap_-&gt;GetCPUDescriptorHandleForHeapStart();
+        if (shaderVisible)
+            gpuStart_ = heap_-&gt;GetGPUDescriptorHandleForHeapStart();
+        capacity_ = count;
+    }
+
+    UINT Allocate() {
+        if (used_ &gt;= capacity_) throw std::runtime_error("heap full");
+        return used_++;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE Cpu(UINT i) const
+    { return { cpuStart_.ptr + SIZE_T(i) * size_ }; }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE Gpu(UINT i) const
+    { return { gpuStart_.ptr + UINT64(i) * size_ }; }
+
+    ID3D12DescriptorHeap *Get() const { return heap_.Get(); }
+
+private:
+    ComPtr&lt;ID3D12DescriptorHeap&gt; heap_;
+    D3D12_CPU_DESCRIPTOR_HANDLE  cpuStart_{};
+    D3D12_GPU_DESCRIPTOR_HANDLE  gpuStart_{};
+    UINT size_ = 0, used_ = 0, capacity_ = 0;
+};
+
+/* Creating a descriptor writes into the heap slot: */
+UINT slot = srvHeap.Allocate();
+D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+srv.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+srv.Texture2D.MipLevels     = -1;        /* all of them        */
+device-&gt;CreateShaderResourceView(tex.Get(), &amp;srv,
+                                 srvHeap.Cpu(slot));
+
+/* Binding points the shader at a slot: */
+cmd-&gt;SetGraphicsRootDescriptorTable(1, srvHeap.Gpu(slot));</code></pre>
+
+<div class="key">
+<b>Bindless is where this is going</b>
+<p>With Resource Binding Tier 2 or 3 you can put every texture in the scene in one heap, pass an
+<em>integer index</em> to the shader, and index the heap directly:
+<code>ResourceDescriptorHeap[materialIndex]</code> in Shader Model 6.6. No per-draw descriptor tables, no
+rebinding, and the GPU can drive its own draws. It removes most of the binding code in this chapter, and it
+is what modern renderers do — worth designing toward even if you start with tables.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A CPU loop over mapped memory takes milliseconds</td><td>Reading from an UPLOAD heap</td></tr>
+<tr><td>Corruption or page fault after an upload</td><td>Staging buffer released before the GPU executed the
+copy</td></tr>
+<tr><td>Texture uploads as garbage or skewed</td><td>Row pitch not padded to 256 bytes — use
+<code>UpdateSubresources</code></td></tr>
+<tr><td>Works on your GPU, corrupts elsewhere</td><td>Hardcoded descriptor increment size</td></tr>
+<tr><td>Shader reads the wrong texture</td><td>CPU handle used where a GPU handle was needed, or the wrong
+slot index</td></tr>
+<tr><td>Frame time collapses with many draws</td><td><code>SetDescriptorHeaps</code> called per
+draw</td></tr>
+<tr><td>Debug layer: heap not shader-visible</td><td>Binding a descriptor from an RTV/DSV or non-visible
+heap</td></tr>
+<tr><td>Random blank textures</td><td>Descriptor slot overwritten by another allocation — no ownership
+tracking</td></tr>
+<tr><td>Resource creation takes milliseconds</td><td>Committed resources per object; use placed resources from
+a pre-made heap</td></tr>
+<tr><td>Out of memory with plenty of VRAM free</td><td>Heap fragmentation, or heap flags too restrictive for
+the resource type</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the split between heap, resource and descriptor, and why DX12 separates them.</li>
+  <li>Name the four heap types and say who can access each.</li>
+  <li>Explain why reading from an UPLOAD heap is catastrophic.</li>
+  <li>Describe the four steps of uploading a buffer, and the lifetime rule for the staging
+  resource.</li>
+  <li>Say why textures cannot be uploaded with a plain <code>memcpy</code>.</li>
+  <li>Name the four descriptor heap types and which are shader-visible.</li>
+  <li>State the one-heap-bound-at-a-time constraint and what it implies for your design.</li>
+  <li>Distinguish CPU and GPU descriptor handles and give a bug from confusing them.</li>
+  <li>Explain why descriptor increment size must be queried.</li>
+  <li>Say what bindless changes, and which tier and shader model it needs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

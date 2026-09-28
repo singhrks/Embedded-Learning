@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMMU / IOMMU concepts | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 05</p>
+<h1>SMMU / IOMMU concepts</h1>
+<p class="lead">The MMU protects memory from the CPU. The SMMU protects memory from everything else.
+This chapter explains why DMA breaks every guarantee the MMU gives you, how the SMMU restores them, and
+how to debug it when a device faults.</p>
+
+<h2 id="problem">The problem: DMA bypasses the MMU</h2>
+
+<p>Recall from <a href="arm-architecture.html">chapter 03</a> that the MMU sits between a CPU core and the
+interconnect. Every address the CPU emits is translated and permission-checked.</p>
+
+<p>Now consider a network controller doing DMA. You give it a buffer address, it writes packets there
+directly, with no CPU involvement. Its transactions go straight onto the interconnect. The CPU's MMU is
+nowhere in that path.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison showing CPU access going through the MMU while a DMA device bypasses it entirely">
+  <text class="svg-tb" x="30" y="20">Without an SMMU</text>
+
+  <rect class="svg-box-a" x="30" y="36" width="130" height="46" rx="7"/>
+  <text class="svg-tb" x="60" y="64">CPU</text>
+  <rect class="svg-box-g" x="30" y="102" width="130" height="46" rx="7"/>
+  <text class="svg-tb" x="62" y="130">MMU</text>
+  <text class="svg-tm" x="38" y="168">translated,</text>
+  <text class="svg-tm" x="38" y="184">permission checked</text>
+
+  <rect class="svg-box-d" x="260" y="36" width="170" height="46" rx="7"/>
+  <text class="svg-tb" x="274" y="64">NIC / GPU / DMA</text>
+  <text class="svg-tm" x="274" y="118">raw physical addresses,</text>
+  <text class="svg-tm" x="274" y="136">no checks at all</text>
+
+  <rect class="svg-box" x="30" y="212" width="400" height="52" rx="7"/>
+  <text class="svg-tb" x="150" y="234">Interconnect -&gt; DRAM</text>
+  <text class="svg-tm" x="44" y="254">a buggy or hostile device can write ANY physical address</text>
+
+  <path class="svg-line" d="M95 82 L95 102 M95 148 L95 212"/>
+  <path class="svg-line-a" d="M345 82 L345 212" stroke-dasharray="5 4" marker-end="url(#a5)"/>
+  <defs><marker id="a5" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+
+  <text class="svg-tb" x="510" y="20">With an SMMU</text>
+  <rect class="svg-box-d" x="510" y="36" width="220" height="46" rx="7"/>
+  <text class="svg-tb" x="524" y="64">NIC / GPU / DMA</text>
+  <rect class="svg-box-g" x="510" y="102" width="220" height="60" rx="7"/>
+  <text class="svg-tb" x="524" y="124">SMMU</text>
+  <text class="svg-tm" x="524" y="146">StreamID -&gt; tables -&gt; translate + check</text>
+  <rect class="svg-box" x="510" y="212" width="220" height="52" rx="7"/>
+  <text class="svg-tb" x="560" y="242">Interconnect -&gt; DRAM</text>
+  <path class="svg-line" d="M620 82 L620 102 M620 162 L620 212"/>
+</svg>
+<figcaption>Left: DMA is a hole straight through every memory protection you built. Right: the SMMU closes it.</figcaption>
+</figure>
+
+<h3>What goes wrong without one</h3>
+<ul>
+  <li><strong>No isolation.</strong> A firmware bug in the NIC — or a malicious peripheral on a hot-pluggable
+  bus like Thunderbolt/PCIe — can read your disk encryption keys out of kernel memory. This is the classic
+  <em>DMA attack</em>.</li>
+  <li><strong>No virtualisation.</strong> You cannot pass a physical device through to a VM. The guest would
+  program the device with guest-physical addresses (IPAs), and the device would use them as real physical
+  addresses, scribbling over the host or another guest.</li>
+  <li><strong>No scatter-gather.</strong> Devices needing a large contiguous buffer force the OS to find
+  contiguous physical memory, which fragments and eventually fails. With translation, physically scattered
+  pages can look contiguous to the device.</li>
+  <li><strong>32-bit devices on 64-bit systems.</strong> A legacy device that can only address 4 GB cannot
+  reach a buffer above that line, forcing slow "bounce buffer" copies.</li>
+</ul>
+
+<div class="key">
+<b>One-sentence definition</b>
+<p>An SMMU (Arm's name) / IOMMU (the generic name; Intel VT-d, AMD-Vi are others) is an MMU placed in front
+of non-CPU bus masters, giving each device its own address space and permission set.</p>
+</div>
+
+<h2 id="streamid">StreamID: how the SMMU knows who is asking</h2>
+
+<p>The CPU's MMU serves one core and uses <code>TTBR</code> plus the ASID to pick a translation context.
+The SMMU serves <em>many different devices</em> through one block, so it needs the transaction to identify
+its origin. That identifier is the <strong>StreamID</strong>.</p>
+
+<ul>
+  <li>The StreamID is derived from interconnect sideband signals — for PCIe it is typically built from the
+  Requester ID (bus:device:function); for on-chip masters the SoC integrator hard-wires it.</li>
+  <li>An optional <strong>SubstreamID</strong> (SSID, called PASID on PCIe) subdivides one device into multiple
+  contexts — this is what lets a GPU give each user process its own address space.</li>
+  <li>StreamID assignment is a SoC integration decision, documented in the SoC TRM, and surfaced to software
+  through the device tree (<code>iommus = &lt;&amp;smmu 0x800&gt;</code>) or ACPI IORT tables.</li>
+</ul>
+
+<div class="note">
+<b>Why this is the crux of SMMU debugging</b>
+<p>The most common SMMU bring-up failure is a StreamID mismatch: the device tree says StreamID 0x800, the
+hardware actually emits 0x801, so the SMMU finds no valid stream table entry and aborts every transaction.
+The fault register will tell you the StreamID it saw — compare it against what you configured.</p>
+</div>
+
+<h2 id="stages">Two stages, two owners</h2>
+
+<p>The SMMU reuses the CPU's translation architecture exactly, including the descriptor format. That is
+deliberate: the same page tables can be shared.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Stage 1</th><th>Stage 2</th></tr></thead>
+<tbody>
+<tr><td>Translates</td><td>Device VA (IOVA) &rarr; IPA</td><td>IPA &rarr; PA</td></tr>
+<tr><td>Owned by</td><td>The OS or the device's own driver/guest</td><td>The hypervisor</td></tr>
+<tr><td>Table root</td><td>Context descriptor's TTB fields</td><td>Stream table entry's <code>S2TTB</code></td></tr>
+<tr><td>Purpose</td><td>Scatter-gather, per-process isolation, restricting a device to its buffers</td><td>Confining a whole device to one VM's memory</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Bare-metal OS with an SMMU (stage 1 only)
+
+   device --> IOVA --[ stage 1, OS tables ]--> PA
+
+Device passed through to a virtual machine (both stages)
+
+   device --> IOVA --[ stage 1, guest tables ]--> IPA --[ stage 2, hypervisor ]--> PA
+                       guest programs the                the guest cannot change
+                       device with its own                this, so it cannot escape
+                       addresses                          its own memory</pre>
+
+<h2 id="tables">SMMUv3 data structures</h2>
+
+<p>SMMUv3 is entirely table-driven: software builds structures in memory and tells the SMMU where they are.
+There is no per-device register bank to program (unlike SMMUv2's "context banks").</p>
+
+<figure>
+<svg viewBox="0 0 780 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SMMUv3 lookup chain from StreamID through stream table and context descriptor to page tables">
+  <rect class="svg-box-d" x="20" y="20" width="180" height="56" rx="7"/>
+  <text class="svg-tb" x="34" y="42">Incoming transaction</text>
+  <text class="svg-tm" x="34" y="62">StreamID · SSID · addr · R/W · NS</text>
+
+  <rect class="svg-box-a" x="250" y="20" width="230" height="90" rx="7"/>
+  <text class="svg-tb" x="264" y="42">Stream Table</text>
+  <text class="svg-tm" x="264" y="62">base = SMMU_STRTAB_BASE</text>
+  <text class="svg-tm" x="264" y="80">indexed by StreamID</text>
+  <text class="svg-tm" x="264" y="98">entry = STE (64 bytes)</text>
+
+  <rect class="svg-box-g" x="530" y="20" width="230" height="130" rx="7"/>
+  <text class="svg-tb" x="544" y="42">Stream Table Entry</text>
+  <text class="svg-tm" x="544" y="62">V         valid</text>
+  <text class="svg-tm" x="544" y="80">Config    bypass / S1 / S2 / both</text>
+  <text class="svg-tm" x="544" y="98">S1ContextPtr  -&gt; CD table</text>
+  <text class="svg-tm" x="544" y="116">S2TTB     stage-2 table root</text>
+  <text class="svg-tm" x="544" y="134">VMID, S2 attributes</text>
+
+  <rect class="svg-box-a" x="250" y="170" width="230" height="96" rx="7"/>
+  <text class="svg-tb" x="264" y="192">Context Descriptor</text>
+  <text class="svg-tm" x="264" y="212">indexed by SubstreamID</text>
+  <text class="svg-tm" x="264" y="230">TTB0/TTB1  stage-1 roots</text>
+  <text class="svg-tm" x="264" y="248">TCR, MAIR, ASID</text>
+  <text class="svg-tm" x="264" y="262">— same fields as the CPU's</text>
+
+  <rect class="svg-box" x="530" y="170" width="230" height="96" rx="7"/>
+  <text class="svg-tb" x="544" y="192">Translation tables</text>
+  <text class="svg-tm" x="544" y="212">identical descriptor format</text>
+  <text class="svg-tm" x="544" y="230">to the CPU MMU — so the OS</text>
+  <text class="svg-tm" x="544" y="248">can literally share the same</text>
+  <text class="svg-tm" x="544" y="264">tables with a device (SVA)</text>
+
+  <rect class="svg-box-w" x="20" y="300" width="360" height="60" rx="7"/>
+  <text class="svg-tb" x="34" y="322">Command queue (CMDQ)</text>
+  <text class="svg-tm" x="34" y="342">software writes: CFGI_STE, TLBI_NH_VA, SYNC ...</text>
+
+  <rect class="svg-box-w" x="400" y="300" width="360" height="60" rx="7"/>
+  <text class="svg-tb" x="414" y="322">Event queue (EVTQ) + PRI queue</text>
+  <text class="svg-tm" x="414" y="342">SMMU writes faults here: StreamID, addr, reason</text>
+
+  <path class="svg-line-a" d="M200 48 L250 48 M480 60 L530 60 M600 150 L480 170 M480 214 L530 214" marker-end="url(#a6)"/>
+  <defs><marker id="a6" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+</svg>
+<figcaption>SMMUv3 lookup chain. Compare with the CPU: StreamID plays the role of "which core", the context descriptor plays the role of TTBR + TCR + MAIR.</figcaption>
+</figure>
+
+<h3>The lookup, step by step</h3>
+<ol class="steps">
+  <li>A transaction arrives carrying StreamID, optional SubstreamID, address, access type and NS state.</li>
+  <li>The SMMU indexes the <strong>Stream Table</strong> with the StreamID. (Large StreamID spaces use a
+  two-level stream table so you do not have to allocate an entry for every possible ID.)</li>
+  <li>The <strong>STE</strong> says what to do: <em>abort</em> everything, <em>bypass</em> translation entirely,
+  apply stage 1, apply stage 2, or apply both. A missing or invalid STE means abort.</li>
+  <li>If stage 1 is enabled, the STE points to a <strong>Context Descriptor table</strong>, indexed by
+  SubstreamID. The CD holds <code>TTB0</code>, <code>TCR</code>, <code>MAIR</code> and the ASID — exactly the
+  CPU's translation context.</li>
+  <li>The SMMU walks the stage-1 tables to produce an IPA, then (if enabled) walks the stage-2 tables from
+  <code>S2TTB</code> to produce a PA.</li>
+  <li>Permissions are checked at both stages. The result is cached in the SMMU's own TLBs.</li>
+  <li>On failure the SMMU writes an event record to the <strong>Event Queue</strong> and either aborts the
+  transaction or stalls it, depending on configuration.</li>
+</ol>
+
+<h3>Programming interface</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Structure</th><th>Direction</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><strong>Command Queue</strong></td><td>software &rarr; SMMU</td><td>Invalidate a cached STE/CD, invalidate TLB entries, synchronise. Circular buffer with producer/consumer indices.</td></tr>
+<tr><td><strong>Event Queue</strong></td><td>SMMU &rarr; software</td><td>Fault reports: translation fault, permission fault, bad StreamID, external abort.</td></tr>
+<tr><td><strong>PRI Queue</strong></td><td>SMMU &rarr; software</td><td>Page Request Interface — a device asking the OS to page memory in. Requires device support.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Key commands you will see in a driver: <code>CMD_CFGI_STE</code> (invalidate a cached stream table entry
+after you modify one), <code>CMD_CFGI_CD</code>, <code>CMD_TLBI_NH_VA</code> (invalidate a stage-1 TLB entry),
+<code>CMD_TLBI_S2_IPA</code>, and <code>CMD_SYNC</code> (wait for everything before it to complete —
+the SMMU's equivalent of <code>DSB</code>).</p>
+
+<div class="warn">
+<b>The invalidation rule</b>
+<p>Anything you change in memory — an STE, a CD, a page table entry — is invisible to the SMMU until you
+issue the matching invalidate command and a <code>CMD_SYNC</code>. This mirrors the CPU's
+write &rarr; DSB &rarr; TLBI &rarr; DSB &rarr; ISB rule, and forgetting it produces exactly the same class of
+"works sometimes" bug.</p>
+</div>
+
+<h2 id="linux-view">How this looks from Linux</h2>
+
+<p>Almost no driver author programs an SMMU directly. You use the <strong>DMA API</strong>, and the IOMMU
+layer sits underneath it transparently.</p>
+
+<pre class="diagram">   your driver
+        |  dma_map_single(dev, cpu_addr, size, DMA_TO_DEVICE)
+        v
+   DMA API  (kernel/dma/mapping.c)
+        |  is there an IOMMU for this device?
+        +---- no  --> dma_direct: dma_addr == phys_addr (+ offset)
+        |             plus cache maintenance if non-coherent
+        |
+        +---- yes --> dma-iommu layer
+                        allocate a free IOVA range from this device's
+                        iova_domain (an allocator, like a mini malloc)
+                        |
+                        v
+                      iommu_map(domain, iova, phys, size, prot)
+                        |
+                        v
+                      arm-smmu-v3 driver
+                        write page table entries
+                        queue CMD_TLBI + CMD_SYNC
+                        |
+                        v
+                      returns dma_addr_t = the IOVA
+        |
+        v
+   you program the device with that dma_addr_t
+   (NEVER with a virtual address, NEVER with a raw physical address)</pre>
+
+<div class="codewrap"><div class="code-title">the correct DMA idiom in a Linux driver</div>
+<pre><code>/* ---- streaming mapping: a buffer used for one transfer ---- */
+dma_addr_t dma;
+void *buf = kmalloc(SZ_4K, GFP_KERNEL);
+
+dma = dma_map_single(dev, buf, SZ_4K, DMA_TO_DEVICE);
+if (dma_mapping_error(dev, dma))
+        return -ENOMEM;
+
+writel(lower_32_bits(dma), regs + DMA_ADDR_LO);
+writel(upper_32_bits(dma), regs + DMA_ADDR_HI);
+writel(SZ_4K,              regs + DMA_LEN);
+writel(START,              regs + DMA_CTRL);
+/* ... wait for the completion interrupt ... */
+dma_unmap_single(dev, dma, SZ_4K, DMA_TO_DEVICE);
+
+/* ---- coherent mapping: a long-lived descriptor ring ---- */
+struct desc *ring = dma_alloc_coherent(dev, RING_BYTES, &amp;ring_dma, GFP_KERNEL);
+/* no cache maintenance needed on this one - the API guarantees coherency */
+dma_free_coherent(dev, RING_BYTES, ring, ring_dma);
+
+/* ---- tell the core what your device can address ---- */
+dma_set_mask_and_coherent(dev, DMA_BIT_MASK(48));</code></pre></div>
+
+<div class="danger">
+<b>Three rules that will save you weeks</b>
+<ol>
+<li><strong>Never give a device a pointer from <code>kmalloc</code> directly.</strong> It is a virtual address.
+The device needs the <code>dma_addr_t</code> the API returned.</li>
+<li><strong>Never DMA to or from stack memory</strong>, and never to memory from <code>vmalloc</code>.
+Stack buffers may not be cache-line aligned, so a cache invalidate can destroy neighbouring stack data;
+<code>vmalloc</code> memory is not physically contiguous.</li>
+<li><strong>Respect ownership.</strong> Between <code>dma_map</code> and <code>dma_unmap</code>, the buffer
+belongs to the device. Touching it from the CPU without <code>dma_sync_single_for_cpu()</code> gives you
+stale or corrupted data on non-coherent systems.</li>
+</ol>
+</div>
+
+<h3>Where the SMMU shows up in device tree</h3>
+<pre><code>smmu: iommu@2b400000 {
+        compatible = "arm,smmu-v3";
+        reg = &lt;0x0 0x2b400000 0x0 0x100000&gt;;
+        interrupts = &lt;GIC_SPI 74 IRQ_TYPE_EDGE_RISING&gt;,   /* eventq  */
+                     &lt;GIC_SPI 75 IRQ_TYPE_EDGE_RISING&gt;,   /* gerror  */
+                     &lt;GIC_SPI 77 IRQ_TYPE_EDGE_RISING&gt;;   /* cmdq-sync */
+        interrupt-names = "eventq", "gerror", "cmdq-sync";
+        #iommu-cells = &lt;1&gt;;                  /* one cell: the StreamID */
+};
+
+dma_engine@2c000000 {
+        compatible = "vendor,dma-engine";
+        reg = &lt;0x0 0x2c000000 0x0 0x1000&gt;;
+        iommus = &lt;&amp;smmu 0x42&gt;;               /* this device's StreamID is 0x42 */
+        dma-coherent;                        /* it participates in coherency  */
+};</code></pre>
+
+<h2 id="advanced">Advanced features</h2>
+
+<h3>SVA — Shared Virtual Addressing</h3>
+<p>Because the SMMU uses the same descriptor format as the CPU MMU, the OS can point a device's Context
+Descriptor at a <em>user process's own page tables</em> and give the device the same ASID. The device can then
+dereference exactly the pointers the application uses — no mapping, no copying, no <code>dma_map</code>.
+This is how modern GPU and accelerator programming models avoid buffer marshalling. It requires the device
+to support ATS and PRI, so it can request that swapped-out pages be brought in.</p>
+
+<h3>ATS — Address Translation Services</h3>
+<p>A PCIe device can ask the SMMU to translate an address ahead of time and cache the result in its own
+<strong>ATC</strong> (Address Translation Cache), then issue pre-translated transactions. This removes the
+SMMU from the fast path. The cost is a new correctness obligation: when the OS unmaps a page it must send an
+<em>ATC invalidate</em> to the device and wait for the response, otherwise the device keeps using a stale
+translation. This is also a security consideration — you are trusting the device to honour invalidations.</p>
+
+<h3>PRI — Page Request Interface</h3>
+<p>Lets a device take the equivalent of a page fault: instead of aborting on an unmapped address, it sends a
+page request, the OS pages memory in, and the device retries. Enables demand paging for devices, but needs
+the SMMU configured to <em>stall</em> rather than terminate faulting transactions.</p>
+
+<h3>Secure vs Non-secure streams</h3>
+<p>SMMUv3 has separate secure and non-secure programming interfaces and separate stream tables. Secure
+firmware owns the secure side, so a Non-secure OS cannot configure translations for a device operating in
+the secure world. See <a href="trustzone.html">chapter 06</a>.</p>
+
+<h2 id="debug">Debugging SMMU faults</h2>
+
+<p>A typical Linux fault looks like this:</p>
+<pre><code>arm-smmu-v3 2b400000.iommu: event 0x10 received:
+arm-smmu-v3 2b400000.iommu: 0x0000004200000010
+arm-smmu-v3 2b400000.iommu: 0x0000000000000000
+arm-smmu-v3 2b400000.iommu: 0x00000000fffff000
+arm-smmu-v3 2b400000.iommu: 0x0000000000000000</code></pre>
+
+<p>Decode it: event type <code>0x10</code> is <code>C_BAD_STREAMID</code>, and the StreamID field reads
+<code>0x42</code>. The device is emitting StreamID 0x42 and there is no valid stream table entry for it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Event</th><th>Name</th><th>Means</th><th>Check</th></tr></thead>
+<tbody>
+<tr><td><code>0x02</code></td><td>C_BAD_STE</td><td>Stream table entry is malformed</td><td>Driver bug, or memory holding the STE is not coherent/uncached as required</td></tr>
+<tr><td><code>0x04</code></td><td>C_BAD_CD</td><td>Context descriptor is malformed</td><td>TCR/MAIR values, table alignment</td></tr>
+<tr><td><code>0x10</code></td><td>C_BAD_STREAMID</td><td>No STE for this StreamID</td><td><strong>Device tree / IORT StreamID does not match the hardware.</strong> The most common cause.</td></tr>
+<tr><td><code>0x10</code>–<code>0x11</code></td><td>F_TRANSLATION</td><td>Address is not mapped</td><td>Device programmed with a physical or virtual address instead of the <code>dma_addr_t</code>; or the buffer was unmapped while DMA was still in flight</td></tr>
+<tr><td><code>0x12</code></td><td>F_ADDR_SIZE</td><td>Address exceeds the configured output size</td><td><code>dma_set_mask()</code> value vs actual device capability</td></tr>
+<tr><td><code>0x13</code></td><td>F_ACCESS</td><td>Access flag not set</td><td>Page table AF bit</td></tr>
+<tr><td><code>0x14</code></td><td>F_PERMISSION</td><td>Mapped, but wrong permission</td><td>You mapped <code>DMA_TO_DEVICE</code> and the device is writing — direction mismatch</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Triage flow</h3>
+<pre class="diagram">  Device faults on a DMA transfer
+        |
+        v
+  Is the fault reported at all?
+     no  -> SMMU may be in bypass. Check: is CONFIG_ARM_SMMU_V3 built in?
+            Did the firmware leave it disabled? Is `iommu.passthrough=1` on
+            the kernel command line? A silently working device with no SMMU
+            configured is a security bug, not a success.
+     yes |
+         v
+  What is the StreamID in the event record?
+     does not match the device tree  -> integration/DT bug. Check the SoC TRM.
+     matches |
+             v
+  What address faulted?
+     looks like a physical address    -> driver passed phys instead of dma_addr_t
+     looks like a kernel VA           -> driver passed a virtual address
+     is a valid IOVA but unmapped     -> unmapped too early, or DMA outlived the
+                                         mapping (missing dma_unmap ordering, or
+                                         the device was not quiesced on remove)
+     mapped but permission fault      -> DMA direction mismatch
+             |
+             v
+  Still stuck? Enable tracing:
+     echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+     cat /sys/kernel/debug/tracing/trace_pipe
+   and dump the group / domain state under /sys/kernel/iommu_groups/</pre>
+
+<h3>Useful commands</h3>
+<pre><code># which IOMMU groups exist and what is in them
+ls -l /sys/kernel/iommu_groups/*/devices/
+
+# is a given device behind an IOMMU?
+ls /sys/bus/pci/devices/0000:01:00.0/iommu_group
+
+# trace map/unmap calls
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# kernel command line options worth knowing
+#   iommu.passthrough=1   put devices in bypass (debug only!)
+#   iommu.strict=0        deferred TLB invalidation - faster, less safe
+#   arm-smmu-v3.disable_bypass=1  abort unmatched streams instead of allowing them</code></pre>
+
+<div class="tip">
+<b>Bisecting an SMMU problem</b>
+<p>Boot once with <code>iommu.passthrough=1</code>. If the problem disappears, it is a mapping or StreamID
+issue. If it persists, the bug is in the device programming itself and the SMMU was just the messenger.
+This one experiment splits the search space in half.</p>
+</div>
+
+<h2 id="compare">SMMU vs MMU: side by side</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>CPU MMU</th><th>SMMU</th></tr></thead>
+<tbody>
+<tr><td>Serves</td><td>One core</td><td>Many devices through one block</td></tr>
+<tr><td>"Who is asking"</td><td>Implicit — it is this core</td><td>Explicit — the StreamID on the transaction</td></tr>
+<tr><td>Context selection</td><td><code>TTBR0/1_EL1</code> + ASID</td><td>Stream Table Entry &rarr; Context Descriptor + ASID</td></tr>
+<tr><td>Configured via</td><td>System registers (<code>MSR</code>/<code>MRS</code>)</td><td>Memory-based tables + a command queue</td></tr>
+<tr><td>Invalidation</td><td><code>TLBI</code> instruction + <code>DSB</code></td><td><code>CMD_TLBI_*</code> in the command queue + <code>CMD_SYNC</code></td></tr>
+<tr><td>Fault reporting</td><td>Synchronous exception, <code>ESR</code>/<code>FAR</code></td><td>Asynchronous event record in the Event Queue + an interrupt</td></tr>
+<tr><td>Descriptor format</td><td colspan="2" style="text-align:center"><strong>Identical</strong> — which is what makes SVA possible</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="checklist">Chapter checklist</h2>
+<ul class="checklist">
+  <li>You can explain in one sentence why an MMU is not enough.</li>
+  <li>You can describe what a StreamID is and where it comes from.</li>
+  <li>You can say who owns stage 1 and who owns stage 2, and why that split enables device passthrough.</li>
+  <li>You can name the three SMMUv3 queues and what flows through each.</li>
+  <li>You can write the correct Linux DMA mapping sequence and explain what <code>dma_addr_t</code> really is.</li>
+  <li>Given an SMMU fault log, you can name three plausible causes and the order in which to check them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

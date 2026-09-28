@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustZone: the NS bit | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TrustZone: the NS bit</h1>
+<p class="lead">Everything about TrustZone follows from one design decision: add a single extra bit to every
+bus transaction saying which world it came from, then teach every block in the SoC to respect it. One wire,
+system-wide.</p>
+
+<h2 id="idea">The whole idea</h2>
+
+<div class="key">
+<b>The rule</b>
+<p>A <strong>Non-secure master cannot access Secure resources.</strong> A <strong>Secure master can access
+both.</strong></p>
+<p>This is enforced in hardware — at the memory controller, at each peripheral, at the interrupt controller,
+at the SMMU and on the interconnect itself. Not by software checks that a compromised kernel could skip.</p>
+</div>
+
+<pre class="diagram">The bit is AxPROT[1] on AXI (ARM chapter 25), universally called
+the NS bit:
+
+   NS = 0   this access is SECURE
+   NS = 1   this access is NON-SECURE
+
+   CPU core                       peripheral / memory
+      |                                  ^
+      |  ADDR                            |
+      |  DATA                            |
+      |  AxPROT[1] = NS  ----------------+  checked HERE
+      |  AxID = master id
+      |  AxCACHE = attributes
+
+  Where NS comes from, for a CPU access:
+     · at EL3, from SCR_EL3.NS
+     · at EL0/EL1/EL2, from the current SECURITY STATE, which
+       EL3 set via SCR_EL3.NS before dropping down
+     · plus the page descriptor's NS bit, for Secure software
+       creating a mapping that issues Non-secure accesses
+       (ARM chapter 14)
+
+  Where it comes from for a DEVICE access:
+     · hard-wired per master, or
+     · from the SMMU's STE/CD NSCFG fields (chapter 04), or
+     · assigned dynamically by a TZPC (chapter 10)</pre>
+
+<h2 id="difference">Why this differs from a hypervisor</h2>
+
+<p>TrustZone is often described as a second processor or a special mode. It is neither: it is one extra bit carried with every transaction, and nearly everything else follows mechanically from that.</p>
+
+<pre class="diagram">   HYPERVISOR ISOLATION            TRUSTZONE ISOLATION
+   --------------------            -------------------
+   software isolating software     SILICON isolating silicon
+   the hypervisor is code that     the NS bit is a WIRE; the
+     can have bugs                   memory controller physically
+   a guest escape gives you the      refuses the transaction
+     hypervisor's privilege        a compromised EL1 with
+   stage-2 tables are configured     arbitrary code execution
+     by that software                still cannot read Secure DRAM
+                                     — the data never comes back
+
+  Both are useful, and they compose: a system can run a
+  hypervisor in the Normal world AND have a Secure world beneath
+  both. They defend against different things.
+
+  The practical distinction: a hypervisor protects guests from
+  each other, assuming the hypervisor is correct. TrustZone
+  protects secrets from the ENTIRE normal-world software stack,
+  assuming only that EL3 firmware and the hardware are correct.</pre>
+
+<h2 id="states">Security state versus exception level</h2>
+
+<p>The security state is a property of execution, not of a core, and it changes at defined moments. Knowing exactly when it changes is what makes the world switch comprehensible.</p>
+
+<pre><code>/* These are ORTHOGONAL. A context is identified by BOTH. */
+
+                   Non-secure          Secure
+   EL0             applications        trusted applications
+   EL1             Linux, Windows      trusted OS (OP-TEE)
+   EL2             hypervisor          secure partition mgr (v8.4+)
+   EL3             ------- the monitor, in BOTH -------
+
+/* Which security state am I in? There is no register that says
+   so directly at EL1 — by design. Secure software knows because
+   it was loaded into the secure world; Non-secure software
+   cannot tell and should not need to.
+
+   At EL3: */
+        mrs     x0, scr_el3
+        tst     x0, #1                  /* SCR_EL3.NS */
+        /* NS=0: the world below is Secure
+           NS=1: the world below is Non-secure */
+
+/* SCR_EL3.NS is the ONE bit that selects which world exists
+   below EL3. Changing it and executing ERET is the world
+   switch (chapter 11).                                    */</code></pre>
+
+<h2 id="banked">Banked state</h2>
+
+<p>Many system registers exist twice — once per security state — so that the two worlds cannot observe or disturb each other's configuration. Which registers are banked is worth knowing before you debug across the boundary.</p>
+
+<pre class="diagram">Because the two worlds must not see each other's configuration,
+much of the EL1 system register file is BANKED by security
+state:
+
+   SCTLR_EL1        one for Secure, one for Non-secure
+   TTBR0_EL1        ditto — the two worlds have entirely
+   TTBR1_EL1        separate page tables
+   TCR_EL1
+   MAIR_EL1
+   VBAR_EL1         separate vector tables
+   ESR_EL1, FAR_EL1, ELR_EL1, SPSR_EL1
+   TPIDR_EL0/EL1
+   ...
+
+  SCR_EL3.NS selects which bank EL3 sees. So when the monitor
+  switches worlds it does NOT have to save and restore these —
+  the hardware provides two copies.
+
+  What it DOES have to save and restore: the general-purpose
+  registers X0-X30, the FP/SIMD state, and any registers that
+  are NOT banked. That is the bulk of the world-switch cost
+  (chapter 11).
+
+  NOT banked: the caches and TLBs, which instead TAG their
+  entries with the security state so entries from the two
+  worlds coexist without leaking (chapter 10).</pre>
+
+<h2 id="descriptors">The NS bit in page tables</h2>
+
+<p>The NS bit appears in page-table descriptors too, which is how the secure world decides whether a mapping it creates reaches secure or non-secure memory. This is the page-table half of the mechanism.</p>
+
+<pre><code>/* Secure software can create a mapping that issues NON-SECURE
+   accesses. That is how a trusted OS reads a buffer shared with
+   the normal world.                                          */
+
+   descriptor bit 5   NS
+        0   accesses through this mapping are SECURE
+        1   accesses through this mapping are NON-SECURE
+
+/* Only meaningful in the SECURE translation regime. Non-secure
+   software's accesses are always NS=1 regardless of what its
+   descriptors say — enforced by hardware, not by the tables. */
+
+/* And in TABLE descriptors there is a separate NSTable bit
+   (bit 63): it forces every entry BELOW it to be Non-secure,
+   whatever those entries claim. A way to delegate an entire
+   subtree safely — useful when secure software builds a
+   mapping region for shared buffers.                       */
+
+/* The practical rule for secure software:
+     · map your own memory NS=0
+     · map shared buffers NS=1
+     · NEVER map normal-world memory NS=0, or a normal-world
+       pointer becomes a secure access                       */</code></pre>
+
+<h2 id="memory">Partitioning memory</h2>
+
+<p>Physical memory is partitioned by the same bit, enforced by hardware outside the processor. That is why secure memory is not merely protected from the normal world but genuinely invisible to it.</p>
+
+<pre class="diagram">Physical memory as a TZASC (chapter 10) is typically configured
+at boot:
+
+  0x8000_0000  +--------------------------------+
+               | Non-secure DRAM                |  NS=1 permitted
+               |   Linux kernel + userspace     |  NS=0 also permitted
+               |   ~1.9 GB                      |  (Secure can read it)
+  0xFC00_0000  +--------------------------------+
+               | SHARED buffer region           |  both worlds
+               |   TEE message passing          |
+  0xFE00_0000  +--------------------------------+
+               | Secure DRAM                    |  NS=1 -> REFUSED
+               |   OP-TEE OS + TA heap          |  invisible to Linux
+  0xFF00_0000  +--------------------------------+
+               | EL3 firmware (BL31)            |  Secure only, and
+               |                                |  often LOCKED so even
+  0xFF10_0000  +--------------------------------+  S-EL1 cannot write it
+
+  What "refused" means concretely: the memory controller returns
+  an error response, which becomes an external abort at the CPU
+  (ARM chapter 29, DFSC 0b010000) — or, on some configurations,
+  returns zeros silently. The latter is far harder to debug and
+  is why chapter 20 exists.
+
+  Note the LOCKED EL3 region: even the secure world's own OS
+  cannot modify the monitor. Privilege inside a world is still
+  layered.</pre>
+
+<h2 id="everywhere">Everything checks it</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Block</th><th>Uses the NS bit to</th></tr></thead>
+<tbody>
+<tr><td><strong>CPU core</strong></td><td>Emit it on every fetch and data access, from the current security state</td></tr>
+<tr><td><strong>MMU</strong></td><td>Separate translation regimes per state; the descriptor <code>NS</code> bit</td></tr>
+<tr><td><strong>Caches</strong></td><td>Tag lines with the security state, so a Non-secure lookup cannot hit a Secure line</td></tr>
+<tr><td><strong>TLBs</strong></td><td>Same — entries are tagged</td></tr>
+<tr><td><strong>TZASC</strong></td><td>Per-region DRAM permission by NS state</td></tr>
+<tr><td><strong>TZPC</strong></td><td>Mark whole peripherals Secure or Non-secure</td></tr>
+<tr><td><strong>GIC</strong></td><td>Interrupt groups: Group 0 Secure (FIQ), Group 1 per state</td></tr>
+<tr><td><strong>SMMU</strong></td><td>Separate secure and non-secure programming interfaces and stream tables</td></tr>
+<tr><td><strong>eFuses / OTP</strong></td><td>Key material readable only by Secure masters</td></tr>
+<tr><td><strong>Debug</strong></td><td><code>SPIDEN</code>/<code>SPNIDEN</code> gate whether JTAG may see the secure world</td></tr>
+<tr><td><strong>Interconnect / XPU</strong></td><td>Final per-master, per-region check including NS state</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The consequence worth internalising</b>
+<p>A single bit is cheap to add to a bus, so it could be added <em>everywhere</em>. That is why TrustZone is a
+system-wide property rather than a CPU feature, and why an SoC that implements it partially — a peripheral
+that ignores the NS bit, a bus segment that drops it — has a complete bypass. Verifying that every block
+honours it is a real part of SoC security review.</p>
+</div>
+
+<h2 id="symptom">The symptom this produces</h2>
+
+<div class="warn">
+<b>"The peripheral reads back all zeros"</b>
+<p>If a peripheral is marked Secure in the TZPC, a Linux driver that <code>ioremap()</code>s its registers
+gets an error or zeros — because the access carries NS=1 and the peripheral refuses it. The address is right,
+the clock is on, the driver is correct, and nothing works.</p>
+<p>This is the single most confusing TrustZone symptom for driver authors, because nothing in the normal-world
+software stack knows the secure world exists. When a peripheral behaves as though it is not there on
+production hardware but works on a development board, suspect the security configuration before suspecting
+your driver.</p>
+</div>
+
+<pre><code>/* What you see from Linux: */
+        val = readl(base + REG_ID);
+        /* val == 0, or 0xFFFFFFFF, or an external abort */
+
+/* dmesg, if it aborts: */
+//   Unhandled fault: synchronous external abort (0x96000010)
+//                                                      ^^ DFSC
+//                                                      external abort
+
+/* How to confirm it is a security issue rather than a clock or
+   address problem:
+     1. check the clock and power domain first — same symptom
+     2. read the SoC TRM for the peripheral's default TZPC
+        assignment
+     3. if firmware exposes it, query via an SMC
+     4. compare against a development board, where the fuses
+        and firmware configuration usually differ            */</code></pre>
+
+<h2 id="notprotect">What one bit does not give you</h2>
+
+<p>One bit provides a strong boundary and a surprisingly narrow one. These are the things it does not give you, each of which has been mistaken for a guarantee it never made.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Not protected against</th><th>Why</th><th>What does help</th></tr></thead>
+<tbody>
+<tr><td>Physical bus probing</td><td>The NS bit is a wire; an attacker with a probe reads the data lines</td><td>Memory encryption, on-die placement</td></tr>
+<tr><td>Cold-boot DRAM extraction</td><td>DRAM contents survive briefly after power loss</td><td>Memory encryption, key scrubbing</td></tr>
+<tr><td>Side channels</td><td>The two worlds share caches, branch predictors and DRAM</td><td>Constant-time code, cache partitioning, flushing on switch</td></tr>
+<tr><td>Speculation across the boundary</td><td>Spectre-class leaks predate the check</td><td><code>CSDB</code>, <code>SB</code>, index masking</td></tr>
+<tr><td>Bugs in secure software</td><td>The NS bit does not validate anything</td><td>A small, audited TCB (<a href="sec-16-tee-attacks.html">ch. 16</a>)</td></tr>
+<tr><td>A block that ignores NS</td><td>Enforcement is only as complete as the implementation</td><td>SoC security review</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check-hw">Confirming the hardware honours it</h2>
+
+<p>Whether a given platform actually implements the enforcement blocks behind TrustZone varies, and a system with the architectural feature but without the enforcement hardware offers much weaker guarantees than it appears to.</p>
+
+<pre><code>/* During SoC bring-up or security review, test the NEGATIVE
+   cases explicitly. A policy never exercised is a policy you do
+   not know works.                                           */
+
+/* From the Normal world, attempt to read Secure DRAM: */
+        void __iomem *p = ioremap(SECURE_DRAM_BASE, 4);
+        u32 v = readl(p);
+        /* EXPECTED: an external abort, or a latched fault in the
+           TZASC. If it returns real data, the region is not
+           actually protected.                                */
+
+/* From the Normal world, attempt to program a Secure device: */
+        writel(1, secure_dev_base + CTRL);
+        /* EXPECTED: refused. Verify by reading back, and by
+           checking the peripheral did not act.               */
+
+/* And from the Secure world, verify you CAN reach both: */
+        secure read of Non-secure DRAM   -> should succeed
+        secure read of Secure DRAM       -> should succeed
+
+/* Write these as a boot-time self-test on development
+   firmware. Chapter 19 covers building the full matrix.  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Peripheral reads all zeros or aborts on production hardware</td><td>Assigned to the secure world by the TZPC</td></tr>
+<tr><td>External abort with DFSC <code>0b010000</code></td><td>The bus refused the access — often a security check</td></tr>
+<tr><td>Works on the dev board, fails on shipping units</td><td>Different fuse or firmware security configuration</td></tr>
+<tr><td>Linux cannot see a memory region present in the TRM</td><td>Carved out as Secure DRAM by the TZASC</td></tr>
+<tr><td>A secure driver can read normal-world memory</td><td>Correct — Secure masters may access both</td></tr>
+<tr><td>Normal-world code reads secure memory successfully</td><td><strong>A security bug.</strong> The region is not protected.</td></tr>
+<tr><td>Secure interrupt cannot be masked by Linux</td><td>Group 0, delivered as FIQ to EL3 — by design</td></tr>
+<tr><td>JTAG cannot see secure state</td><td>Secure debug fused off</td></tr>
+<tr><td>A shared buffer works from Linux, faults from the TEE</td><td>Secure mapping created with NS=0 instead of NS=1</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the TrustZone rule in one sentence and name the signal that carries it.</li>
+  <li>Explain why silicon-level isolation differs from hypervisor isolation, and what each assumes.</li>
+  <li>Explain how security state and exception level are orthogonal.</li>
+  <li>Say which EL1 registers are banked by security state and why.</li>
+  <li>Explain the descriptor <code>NS</code> bit and the <code>NSTable</code> bit.</li>
+  <li>Name six blocks that check the NS bit and what each does with it.</li>
+  <li>Explain the "peripheral reads all zeros" symptom and the order in which to rule out causes.</li>
+  <li>Give four things the NS bit does not protect against.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

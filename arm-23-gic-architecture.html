@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The GIC: architecture | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The GIC: architecture</h1>
+<p class="lead">A separate hardware block that collects interrupt signals from every peripheral, prioritises
+them, decides which core should handle each, and enforces the secure/non-secure split. Understanding its
+structure is what makes interrupt routing, affinity and virtualisation comprehensible.</p>
+
+<h2 id="why">Why a dedicated block</h2>
+
+<p>With many cores and hundreds of interrupt sources, deciding which core handles what — and in which order — is too complex to leave to the cores themselves. The GIC is the dedicated block that does it.</p>
+
+<pre class="diagram">A CPU core has ONE interrupt input (two, counting FIQ). A SoC has
+hundreds of interrupt sources and several cores. Something must:
+
+   · multiplex hundreds of sources onto a few core inputs
+   · PRIORITISE — a timer tick must not delay a critical fault
+   · ROUTE — decide which core handles which interrupt
+   · MASK selectively, per source and per priority
+   · handle EDGE versus LEVEL signalling per source
+   · enforce SECURITY — keep secure interrupts away from the
+     normal world (security track)
+   · support VIRTUALISATION — inject interrupts into a guest
+     without a hypervisor trap on every one
+
+That block is the Generic Interrupt Controller. It is architected
+by Arm, so the programming model is the same across every SoC —
+which is why one Linux driver serves them all.</pre>
+
+<h2 id="versions">Versions</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Version</th><th>Brought</th><th>CPU interface</th></tr></thead>
+<tbody>
+<tr><td><strong>GICv2</strong></td><td>Up to 8 cores, basic virtualisation</td><td>MMIO (<code>GICC_*</code>)</td></tr>
+<tr><td><strong>GICv3</strong></td><td>Affinity routing, LPIs and the ITS, large core counts, four security groups</td><td><strong>System registers</strong> (<code>ICC_*_EL1</code>)</td></tr>
+<tr><td><strong>GICv4</strong></td><td>Direct injection of virtual LPIs — a guest receives an MSI with no hypervisor exit</td><td>System registers</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The move from MMIO to system registers in GICv3 matters: acknowledging an interrupt becomes an
+<code>MRS</code> rather than a device read, which is dramatically faster and removes the barriers that MMIO
+access requires (<a href="arm-11-memory-types.html">chapter 11</a>).</p>
+
+<h2 id="components">The components</h2>
+
+<p>The GIC is not one unit but several, split by what they are responsible for and where they physically sit. Knowing which piece owns which registers is most of what you need to program it.</p>
+
+<pre class="diagram">   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │ UART irq │ │Timer irq │ │ DMA irq  │ │ PCIe MSI │
+   └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+        │            │            │            │
+   ┌────▼────────────▼────────────▼──────┐ ┌───▼──────────┐
+   │  DISTRIBUTOR          GICD_*         │ │  ITS         │
+   │  · one, global, MMIO                 │ │  GITS_*      │
+   │  · enable/disable per interrupt      │ │  translates  │
+   │  · priority, group, edge/level       │ │  MSIs → LPIs │
+   │  · TARGET ROUTING (which core)       │ │  and routes  │
+   │  · handles SPIs (shared peripherals) │ │  by DeviceID │
+   └────┬─────────────────────────┬───────┘ └───┬──────────┘
+        │                         │             │
+   ┌────▼──────────┐        ┌─────▼─────────────▼──────┐
+   │ REDISTRIBUTOR │        │ REDISTRIBUTOR             │
+   │ GICR_* core 0 │        │ GICR_* core 1             │
+   │ · SGIs, PPIs  │        │ · per-core private ints   │
+   │ · LPI tables  │        │ · pending/config tables   │
+   └────┬──────────┘        └─────┬─────────────────────┘
+        │                         │
+   ┌────▼──────────┐        ┌─────▼─────────┐
+   │ CPU INTERFACE │        │ CPU INTERFACE │
+   │ ICC_*_EL1     │        │ ICC_*_EL1     │
+   │ · acknowledge │        │               │
+   │ · EOI         │        │               │
+   │ · priority    │        │               │
+   │   masking     │        │               │
+   └────┬──────────┘        └─────┬─────────┘
+        │ IRQ / FIQ               │
+     ┌──▼───┐                  ┌──▼───┐
+     │ Core │                  │ Core │
+     └──────┘                  └──────┘</pre>
+
+<h2 id="intids">Interrupt ID ranges</h2>
+
+<p>The GIC partitions its interrupt ID space by <em>scope</em> — who the interrupt belongs to — and that
+partition is baked into the number itself, so you can tell a great deal about an interrupt just from its ID
+without looking anything else up. SGIs and PPIs are per-core: each core has its own instance of IDs 0–31, so
+"IPI number 3" or "the timer PPI" means something different, privately, on every core simultaneously. SPIs and
+LPIs are global: there is exactly one interrupt 45 in the whole system, shared across all cores, which is why
+an SPI needs the routing and affinity mechanism the rest of this chapter describes — something has to decide
+which core actually takes it. LPIs exist because SPIs are a scarce, statically-configured resource, and a
+modern SoC with hundreds of MSI-capable PCIe and platform devices needed an ID space that scales past the
+low-thousands limit of the SPI range.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Range</th><th>Type</th><th>Scope</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><strong>0–15</strong></td><td><strong>SGI</strong> — Software Generated</td><td>Per core</td><td>Core-to-core IPIs: TLB shootdown, rescheduling, function calls, stop-CPU</td></tr>
+<tr><td><strong>16–31</strong></td><td><strong>PPI</strong> — Private Peripheral</td><td>Per core</td><td>Per-core devices: the generic timer, the PMU, the virtual maintenance interrupt</td></tr>
+<tr><td><strong>32–1019</strong></td><td><strong>SPI</strong> — Shared Peripheral</td><td>Global</td><td>Ordinary devices: UART, DMA, Ethernet</td></tr>
+<tr><td>1020–1023</td><td>Special</td><td>—</td><td>1023 = spurious, returned when there is nothing to handle</td></tr>
+<tr><td><strong>8192+</strong></td><td><strong>LPI</strong> — Locality-specific Peripheral</td><td>Global</td><td>Message-signalled interrupts (MSI/MSI-X). Effectively unlimited.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># see the mapping on a live system
+cat /proc/interrupts
+#            CPU0    CPU1    CPU2    CPU3
+#   3:      102394   98211  101002   99887   GICv3  30 Level  arch_timer
+#                                                   ^^ PPI 30 — per core,
+#                                                      hence counts on all
+#  24:       15221       0       0       0   GICv3  56 Level  uart-pl011
+#                                                   ^^ SPI — routed to CPU0
+#  IPI0:      8842    9021    8877    8990   Rescheduling interrupts
+#  IPI1:       221     198     205     211   Function call interrupts
+#                                            ^^^^ these are SGIs</code></pre>
+
+<h2 id="affinity">Affinity routing</h2>
+
+<p>Routing an interrupt to a specific core in a large system needs a way to name that core. The hierarchical scheme used here also appears in other parts of the architecture.</p>
+
+<pre><code>/* GICv3 identifies cores by their MPIDR affinity hierarchy rather
+   than by a bitmask — which is what allows more than 8 cores. */
+
+        mrs     x0, mpidr_el1
+/*  MPIDR_EL1:
+       Aff0 [7:0]    core within a cluster (or thread)
+       Aff1 [15:8]   cluster
+       Aff2 [23:16]  group of clusters
+       Aff3 [39:32]  higher level still                        */
+
+/* An SPI's target is written to GICD_IROUTER&lt;n&gt;: */
+        GICD_IROUTER(intid) = (aff3 &lt;&lt; 32) | (aff2 &lt;&lt; 16) |
+                              (aff1 &lt;&lt; 8)  |  aff0;
+/* or with bit 31 set (Interrupt_Routing_Mode = 1) it means
+   "any participating core" — 1-of-N delivery, which lets the
+   GIC pick an idle core.                                     */
+
+/* Sending an SGI is a SYSTEM REGISTER write, not MMIO: */
+        msr     ICC_SGI1R_EL1, x0
+/*  x0 encodes: the target affinity, a 16-bit target list within
+    the cluster, and the SGI number. That is how Linux sends a
+    reschedule IPI or a TLB shootdown request.                */</code></pre>
+
+<pre><code># control affinity from userspace
+cat /proc/irq/24/smp_affinity_list
+echo 2 &gt; /proc/irq/24/smp_affinity_list        # pin to CPU2
+echo 3 &gt; /proc/irq/24/smp_affinity             # bitmask form
+
+# irqbalance moves them automatically — and is usually wrong for
+# latency-sensitive work. Disable and pin by hand:
+systemctl stop irqbalance
+
+# keep interrupts entirely off the real-time cores
+# kernel cmdline: irqaffinity=0,1 isolcpus=2,3</code></pre>
+
+<h2 id="groups">Security groups</h2>
+
+<p>Interrupts are partitioned by security state, so that secure-world interrupts cannot be taken, masked or observed by non-secure software. This is the interrupt half of TrustZone.</p>
+
+<pre class="diagram">Every interrupt belongs to a GROUP, and the group determines
+which exception level receives it and as which signal:
+
+   Group 0          → FIQ, always taken to EL3
+                      Secure firmware's interrupts
+
+   Secure Group 1   → IRQ when in the secure world,
+                      FIQ when in the non-secure world
+                      Trusted OS interrupts
+
+   Non-secure Group 1 → IRQ
+                        Ordinary OS interrupts
+
+  THE CONSEQUENCE that matters: a Non-secure OS clearing PSTATE.I
+  cannot mask secure interrupts, because they arrive as FIQ and
+  are routed to EL3. The secure world can always preempt the
+  normal world — which is what makes a TEE's timing guarantees
+  meaningful (security track).
+
+  Configured in GICD_IGROUPR / GICD_IGRPMODR, and only writable
+  from the secure world.</pre>
+
+<h2 id="priority">Priority and preemption</h2>
+
+<p>Priority decides not only which pending interrupt is taken first, but whether an arriving interrupt can preempt one already being handled. That second question is what makes real-time behaviour possible.</p>
+
+<pre><code>/* 8-bit priority values, and LOWER NUMBER = HIGHER PRIORITY.
+   (This trips people up constantly.)                         */
+
+        GICD_IPRIORITYR(intid) = 0x80;     /* mid priority */
+
+/* Not all 8 bits are necessarily implemented — write 0xFF and
+   read back to discover how many are: */
+static unsigned priority_bits(void)
+{
+        writeb(0xFF, GICD_IPRIORITYR(0));
+        return 8 - __builtin_ctz(readb(GICD_IPRIORITYR(0)));
+        /* commonly 4 or 5 bits → 16 or 32 usable levels */
+}
+
+/* THREE registers control what gets through: */
+
+   ICC_PMR_EL1      Priority Mask: interrupts with priority
+                    NUMERICALLY >= this value are blocked.
+                    0xFF = allow everything, 0x00 = block all.
+
+   ICC_BPR1_EL1     Binary Point: splits the priority field into
+                    a GROUP part and a SUB-priority part. Only the
+                    group part participates in PREEMPTION, so this
+                    controls how much nesting you allow.
+
+   ICC_RPR_EL1      Running Priority: the priority of the
+                    interrupt currently being handled. A new
+                    interrupt preempts only if its group priority
+                    is higher.
+
+/* Linux uses PMR for "pseudo-NMI": rather than masking with
+   PSTATE.I (which blocks everything), it raises PMR so that
+   ordinary interrupts are blocked but a high-priority NMI still
+   gets through. That is how arm64 gets NMIs without hardware
+   NMI support.                                               */</code></pre>
+
+<h2 id="its">The ITS and MSIs</h2>
+
+<p>Message-signalled interrupts arrive as memory writes rather than wires, which scales far better and allows vast numbers of them. Translating those messages into interrupts is a dedicated unit's whole job.</p>
+
+<pre class="diagram">A PCIe device signals an interrupt by WRITING to an address —
+there is no wire. The GIC must turn that write into an interrupt
+for a specific core.
+
+   device writes (DeviceID, EventID) to GITS_TRANSLATER
+        │
+   ┌────▼────────────────────────────────────────┐
+   │  ITS — Interrupt Translation Service         │
+   │                                              │
+   │  Device Table:  DeviceID → an ITT            │
+   │  ITT:           EventID  → (LPI ID, Collection) │
+   │  Collection Table: Collection → Redistributor│
+   └────┬────────────────────────────────────────┘
+        ▼
+   the LPI is made pending in the target redistributor's
+   PENDING TABLE (in memory), and the core is signalled
+
+  Two levels of indirection, both table-driven, because there can
+  be tens of thousands of LPIs and they must be redirected when
+  a VM migrates between cores.
+
+  Software configures it with COMMANDS in a queue, exactly like
+  the SMMU (security track):
+     MAPD    map a DeviceID to an ITT
+     MAPTI   map an EventID to an LPI and collection
+     MOVI    move an LPI to a different collection (core)
+     INV     invalidate cached configuration
+     SYNC    wait for completion
+
+  GICv4 adds direct injection: a VM's LPI is delivered to the
+  guest WITHOUT a hypervisor exit at all.</pre>
+
+<h2 id="virt">Virtualisation support</h2>
+
+<p>A guest operating system needs to program an interrupt controller, but must not be allowed to program the real one. The GIC provides a virtual interface for exactly this.</p>
+
+<pre><code>/* Without hardware help, every guest interrupt would need a
+   hypervisor trap: take the interrupt at EL2, work out that it
+   belongs to a guest, and inject it. The GIC provides a LIST
+   REGISTER mechanism to avoid that.                         */
+
+   ICH_LR&lt;n&gt;_EL2      List Registers — the hypervisor writes a
+                      virtual interrupt here, and the GIC delivers
+                      it to the guest DIRECTLY. The guest
+                      acknowledges and EOIs it with its own
+                      ICC_* registers, with NO exit.
+
+   ICH_HCR_EL2        hypervisor control: enable virtual
+                      interfaces, request maintenance interrupts
+
+   ICH_VMCR_EL2       the guest's virtual control state
+
+   ICV_*_EL1          the guest's view — when HCR_EL2.IMO is set,
+                      the guest's ICC_* accesses are REDIRECTED
+                      to these virtual registers
+
+/* Cost: the hypervisor must still populate the list registers on
+   entry and read back state on exit, and there are only a few
+   (typically 4-16). A guest with many pending interrupts causes
+   MAINTENANCE INTERRUPTS to refill them.
+
+   GICv4's direct injection removes even that for LPIs.      */</code></pre>
+
+<h2 id="init">Initialising the GIC</h2>
+
+<p>Bringing the GIC up is a defined sequence, and the ordering matters. This is what a bootloader or an early kernel actually does.</p>
+
+<pre><code>/* Distributor — once, globally */
+        GICD_CTLR = 0;                          /* disable while
+                                                   configuring */
+        for each SPI:
+                GICD_ICENABLER = all;           /* disable      */
+                GICD_ICPENDR   = all;           /* clear pending */
+                GICD_IPRIORITYR = 0xA0;         /* default prio  */
+                GICD_ICFGR     = level or edge;
+                GICD_IGROUPR   = 1;             /* NS Group 1    */
+                GICD_IROUTER   = target affinity;
+        GICD_CTLR = ARE_NS | EnableGrp1NS;      /* affinity routing
+                                                   + enable       */
+
+/* Redistributor — per core */
+        GICR_WAKER &amp;= ~ProcessorSleep;          /* wake it        */
+        wait until (GICR_WAKER &amp; ChildrenAsleep) == 0;
+        configure SGIs and PPIs in GICR_SGI_base
+
+/* CPU interface — per core, SYSTEM REGISTERS */
+        msr     ICC_SRE_EL1, #1        /* enable system register
+                                          access — MUST be first  */
+        isb
+        msr     ICC_PMR_EL1, #0xFF     /* unmask all priorities   */
+        msr     ICC_BPR1_EL1, #0
+        msr     ICC_IGRPEN1_EL1, #1    /* enable Group 1          */
+        isb
+
+/* The GICR_WAKER dance is a common bring-up trap: a
+   redistributor comes out of reset ASLEEP and delivers nothing
+   until woken, with no error to indicate why.               */</code></pre>
+
+<h2 id="dt">Device tree description</h2>
+
+<p>Linux does not probe the GIC's configuration; it is described in the device tree. Reading that description is often the quickest way to understand an unfamiliar system's interrupt topology.</p>
+
+<pre><code>gic: interrupt-controller@2f000000 {
+        compatible = "arm,gic-v3";
+        #interrupt-cells = &lt;3&gt;;
+        interrupt-controller;
+        reg = &lt;0x0 0x2f000000 0x0 0x10000&gt;,     /* GICD  */
+              &lt;0x0 0x2f100000 0x0 0x200000&gt;;    /* GICR  */
+        interrupts = &lt;GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH&gt;;  /* maintenance */
+
+        its: msi-controller@2f020000 {
+                compatible = "arm,gic-v3-its";
+                msi-controller;
+                reg = &lt;0x0 0x2f020000 0x0 0x20000&gt;;
+        };
+};
+
+/* And a device referencing it: */
+        interrupts = &lt;GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH&gt;;
+/*                    ^type    ^number  ^trigger
+   Note the SPI number here is RELATIVE to 32: SPI 56 is INTID 88.
+   Mixing these up is a very common device tree error, and the
+   symptom is an interrupt that never fires.              */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Interrupt count stays at zero</td><td>Wrong INTID (SPI numbering offset), not enabled, or wrong trigger type</td></tr>
+<tr><td>Nothing works on secondary cores</td><td><code>GICR_WAKER</code> not cleared for those redistributors</td></tr>
+<tr><td>All interrupts land on CPU0</td><td>No affinity spreading; <code>GICD_IROUTER</code> or <code>smp_affinity</code></td></tr>
+<tr><td>Latency spikes on real-time cores</td><td>Interrupts not steered away from them</td></tr>
+<tr><td>Interrupt fires once then never again</td><td>Not EOI'd, or an edge interrupt lost while masked</td></tr>
+<tr><td>Spurious INTID 1023 returned</td><td>Acknowledged when nothing was pending — a race or a stale read</td></tr>
+<tr><td>Secure OS cannot preempt the normal world</td><td>Interrupt in the wrong group</td></tr>
+<tr><td>MSI never arrives</td><td>ITS tables not mapped, or <code>MAPD</code>/<code>MAPTI</code> not issued</td></tr>
+<tr><td>Guest misses interrupts under load</td><td>List registers exhausted; maintenance interrupts thrashing</td></tr>
+<tr><td>Higher-priority interrupt does not preempt</td><td>Binary point grouping them at the same preemption level</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give seven jobs the GIC performs that a bare interrupt line cannot.</li>
+  <li>Name the GIC components and what each is responsible for.</li>
+  <li>Give the interrupt ID ranges and an example of each type.</li>
+  <li>Explain affinity routing and why GICv2's bitmask did not scale.</li>
+  <li>Explain the security groups and why a Non-secure OS cannot mask secure interrupts.</li>
+  <li>State the priority convention and explain what PMR, BPR and RPR each do.</li>
+  <li>Explain how Linux implements pseudo-NMIs using PMR.</li>
+  <li>Describe the ITS's two levels of translation and why both are needed.</li>
+  <li>Explain how list registers let a guest handle an interrupt without a hypervisor exit.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMMU: StreamID and identity | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SMMU: StreamID and identity</h1>
+<p class="lead">The CPU's MMU serves one core and knows implicitly whose translation to use. The SMMU serves
+dozens of devices through one block, so every transaction must carry an identifier. Getting that identifier
+right is the single most common SMMU bring-up problem.</p>
+
+<h2 id="problem">The identity problem</h2>
+
+<p>Before the SMMU can apply a policy it must know <em>which device</em> is making a request. Unlike a processor, which has an obvious identity, a transaction arriving on an interconnect carries only whatever identity the hardware was designed to attach to it.</p>
+
+<pre class="diagram">   CPU MMU                          SMMU
+   -------                          ----
+   one core                         MANY devices
+   context is IMPLICIT:             context must be EXPLICIT:
+     "this core, right now"           "whichever device sent this"
+   selected by TTBR0/TTBR1          selected by STREAMID
+     plus the ASID                    plus the SubstreamID
+
+  So the SMMU's first job on every transaction is:
+     look up WHO sent this, and find their translation context.
+
+  StreamID is that "who". It arrives as sideband signalling on
+  the interconnect alongside the address (ARM chapter 25).</pre>
+
+<h2 id="origin">Where a StreamID comes from</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bus</th><th>StreamID derived from</th><th>Assigned by</th></tr></thead>
+<tbody>
+<tr><td><strong>PCIe</strong></td><td>The Requester ID: bus:device:function, 16 bits</td><td>PCIe enumeration, plus a per-root-complex base offset</td></tr>
+<tr><td><strong>On-SoC master</strong></td><td>Hard-wired by the SoC integrator, often via <code>AxUSER</code> or a dedicated sideband</td><td>The chip designer — documented in the TRM</td></tr>
+<tr><td><strong>Behind a bridge</strong></td><td>The bridge may re-ID transactions, or pass them through</td><td>The bridge's configuration</td></tr>
+<tr><td><strong>Multi-queue device</strong></td><td>Often one StreamID per queue or per virtual function</td><td>The device, within a range the SoC allocated</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>The number one SMMU bug</b>
+<p>The device tree says StreamID <code>0x800</code>; the hardware actually emits <code>0x801</code>. The SMMU
+finds no valid Stream Table Entry, aborts every transaction, and the device does not work.</p>
+<p>The fault record tells you the StreamID the SMMU <em>saw</em>. Compare that against what you configured —
+that single comparison resolves most SMMU bring-up problems immediately.</p>
+<pre><code>arm-smmu-v3 2b400000.iommu: event 0x10 received:
+arm-smmu-v3 2b400000.iommu: 0x0000080100000010
+                              ^^^^ StreamID 0x801 — but the DT
+                                   said 0x800</code></pre>
+</div>
+
+<h2 id="describing">Telling software the StreamID</h2>
+
+<p>The mapping from a device to its identifier is a property of how the SoC was wired, so it must be described rather than discovered — and getting that description wrong produces a device that is either unprotected or unable to work at all.</p>
+
+<pre><code>/* Device tree — the embedded case */
+
+smmu: iommu@2b400000 {
+        compatible = "arm,smmu-v3";
+        reg = &lt;0x0 0x2b400000 0x0 0x100000&gt;;
+        interrupts = &lt;GIC_SPI 74 IRQ_TYPE_EDGE_RISING&gt;,   /* eventq   */
+                     &lt;GIC_SPI 75 IRQ_TYPE_EDGE_RISING&gt;,   /* gerror   */
+                     &lt;GIC_SPI 77 IRQ_TYPE_EDGE_RISING&gt;;   /* cmdq-sync */
+        interrupt-names = "eventq", "gerror", "cmdq-sync";
+        #iommu-cells = &lt;1&gt;;              /* one cell: the StreamID */
+};
+
+/* A device with ONE StreamID: */
+dma_engine@2c000000 {
+        compatible = "vendor,dma-engine";
+        reg = &lt;0x0 0x2c000000 0x0 0x1000&gt;;
+        iommus = &lt;&amp;smmu 0x42&gt;;           /* StreamID 0x42 */
+        dma-coherent;
+};
+
+/* A device with SEVERAL — one per queue, for instance: */
+        iommus = &lt;&amp;smmu 0x40&gt;, &lt;&amp;smmu 0x41&gt;,
+                 &lt;&amp;smmu 0x42&gt;, &lt;&amp;smmu 0x43&gt;;
+
+/* A whole bus, with a MAPPING rather than a list — used for
+   PCIe, where devices appear at enumeration time:          */
+pcie@40000000 {
+        /* Requester ID -> StreamID:
+              &lt;rid-base &amp;smmu stream-base count&gt;              */
+        iommu-map = &lt;0x0 &amp;smmu 0x0 0x10000&gt;;
+        iommu-map-mask = &lt;0xffff&gt;;
+};
+
+/* And a bus whose masters are behind a bridge that re-IDs: */
+        iommu-map = &lt;0x100 &amp;smmu 0x800 0x100&gt;;
+/*                   ^RID base    ^SID base ^count            */</code></pre>
+
+<pre><code>/* ACPI — the server and Windows-on-ARM case.
+
+   The IORT (I/O Remapping Table) describes the topology as a
+   graph of nodes, each mapping ID ranges to the next node:
+
+      Named component / PCIe root complex
+              |  ID mapping: input range -> output base
+              v
+      SMMUv3 node
+              |
+              v
+      ITS group  (for MSIs — see below)
+
+   Same information, different encoding. Linux parses both and
+   presents an identical model to drivers.                   */
+
+# inspect it
+sudo cat /sys/firmware/acpi/tables/IORT | xxd | head
+sudo iasl -d /sys/firmware/acpi/tables/IORT &amp;&amp; less IORT.dsl</code></pre>
+
+<h2 id="substream">SubstreamID</h2>
+
+<p>One device can act on behalf of several clients — a GPU running work for several processes, say. A second identifier layer lets each of those get its own translation, which is what makes shared-virtual-memory devices possible.</p>
+
+<pre class="diagram">One device, many contexts.
+
+   StreamID       WHICH DEVICE          "the GPU"
+   SubstreamID    WHICH CONTEXT         "process 4271's GPU work"
+
+  Called PASID on PCIe (Process Address Space ID), SubstreamID in
+  ARM's terminology. Up to 20 bits.
+
+  WHY it exists: a GPU or accelerator serves many processes at
+  once. Without SubstreamIDs, all of them would share one
+  translation context, so any process's GPU work could reach any
+  other's buffers — no isolation at all between GPU clients.
+
+  With them, each process gets its own Context Descriptor, and
+  therefore its own page tables:
+
+     StreamID 0x42 (the GPU)
+        +-- SubstreamID 0   -> kernel context
+        +-- SubstreamID 1   -> process A's page tables
+        +-- SubstreamID 2   -> process B's page tables
+        +-- ...
+
+  This is also the mechanism behind SVA — Shared Virtual
+  Addressing — where the device's Context Descriptor points at a
+  process's OWN page tables, so the device can dereference
+  exactly the pointers the application uses, with no mapping
+  step at all (chapter 05).</pre>
+
+<h2 id="tables">How the SMMU uses it</h2>
+
+<p>The identifier is an index into a table of per-device configuration. How that table is sized and laid out is the first thing to get right, and it is where most early SMMU bring-up fails.</p>
+
+<pre class="diagram">   incoming transaction
+        StreamID, SubstreamID, address, R/W, NS, privilege
+             |
+             v
+   +---------------------------+
+   | STREAM TABLE              |   base = SMMU_STRTAB_BASE
+   |   indexed by StreamID     |   entry = STE, 64 bytes
+   +---------------------------+
+             |
+             v
+   +---------------------------+
+   | STREAM TABLE ENTRY (STE)  |
+   |   V         valid?        |
+   |   Config    bypass/abort/ |
+   |             S1/S2/both    |
+   |   S1ContextPtr -> CD table|
+   |   S2TTB     stage-2 root  |
+   |   VMID, attributes        |
+   +---------------------------+
+             |
+             v
+   +---------------------------+
+   | CONTEXT DESCRIPTOR        |   indexed by SubstreamID
+   |   TTB0/TTB1, TCR, MAIR,   |   — the SAME fields as the CPU's
+   |   ASID                    |     translation context
+   +---------------------------+
+             |
+             v
+   translation tables — IDENTICAL descriptor format to the CPU's
+   (ARM chapter 14)
+
+  The next chapter covers these structures in detail. The point
+  here is the SHAPE: StreamID selects a device, SubstreamID
+  selects a context within it, and from there everything is the
+  ordinary ARM translation machinery.</pre>
+
+<h2 id="sizing">StreamID space and table size</h2>
+
+<p>The identifier space can be large enough that a flat table is impractical, which forces a two-level structure — a decision driven by arithmetic rather than preference.</p>
+
+<pre><code>/* A flat stream table needs 2^StreamIDSize entries of 64 bytes.
+   With 16-bit StreamIDs that is 65536 * 64 = 4 MB. With 20-bit
+   it is 64 MB. Allocating that when only a dozen devices exist
+   is wasteful.                                              */
+
+/* So SMMUv3 supports a TWO-LEVEL stream table: */
+
+   SMMU_STRTAB_BASE_CFG.FMT = 1        /* two-level */
+
+   StreamID[hi] -> L1 descriptor -> a span of L2 entries
+   StreamID[lo] -> index within that span
+
+/* Only the spans actually used are allocated. Exactly the same
+   sparseness argument as multi-level page tables (ARM ch. 13). */
+
+/* How wide is the StreamID space on this SMMU? */
+        SMMU_IDR1.SIDSIZE       /* bits of StreamID supported */
+        SMMU_IDR1.SSIDSIZE      /* bits of SubstreamID        */
+
+# Linux reports it at probe:
+dmesg | grep smmu
+#   arm-smmu-v3 2b400000.iommu: ias 48-bit, oas 48-bit (features 0x00013fbf)
+#   arm-smmu-v3 2b400000.iommu: 2-level strtab only covers 0..0xffff</code></pre>
+
+<h2 id="msi">MSIs and the StreamID</h2>
+
+<div class="warn">
+<b>An MSI is a memory write, so it is also translated</b>
+<p>A device signals an interrupt by writing to an address (<a href="arm-23-gic-architecture.html">ARM 23</a>).
+That write goes through the SMMU like any other, which means the ITS doorbell address must be
+<em>mapped</em> for that device — otherwise the interrupt silently never arrives, with no fault that obviously
+points at interrupts.</p>
+<p>Linux handles this by reserving an MSI region per device
+(<code>iommu_dma_get_resv_regions</code>) and mapping the ITS translater into every device's address space.
+When you see a device that transfers data correctly but never raises an interrupt, this is one of the first
+things to check.</p>
+<pre><code>cat /sys/kernel/iommu_groups/*/reserved_regions
+#   0x0000000008080000 0x000000000808ffff msi
+#                                          ^ the ITS doorbell</code></pre>
+</div>
+
+<h2 id="aliasing">When identity is ambiguous</h2>
+
+<p>If two devices present the same identifier, the SMMU cannot distinguish them and they share a policy. That is sometimes a hardware limitation you must design around rather than a bug you can fix.</p>
+
+<pre class="diagram">Several situations make StreamIDs less trustworthy than they
+look, and each is a real isolation weakness:
+
+  ALIASING — two devices emit the SAME StreamID
+       Some SoCs wire several masters to one ID, either by
+       oversight or to save sideband wires. The SMMU cannot then
+       distinguish them, and they must share one translation
+       context. Whatever one can reach, the other can.
+
+  PCIe WITHOUT ACS
+       Peer-to-peer traffic between devices under a bridge may
+       never reach the SMMU. Linux puts such devices in one
+       IOMMU GROUP (chapter 02) and refuses to isolate them
+       from each other.
+
+  LEGACY PCI BRIDGES
+       Devices behind a PCI-to-PCIe bridge all appear with the
+       BRIDGE's Requester ID. Same consequence.
+
+  DMA ALIASES / QUIRKS
+       Some devices emit a Requester ID that is not their own —
+       a documented hardware bug. Linux keeps a quirk table
+       (pci_for_each_dma_alias) mapping the real device to every
+       ID it might use.
+
+  In every case the honest response is the same: treat the whole
+  ambiguous set as ONE security domain, and do not claim
+  isolation you do not have.</pre>
+
+<h2 id="verify">Verifying the StreamID</h2>
+
+<p>Assuming a device's identifier is correct is a reliable way to spend a day debugging. These are the ways to confirm what the hardware is actually presenting.</p>
+
+<pre><code># 1. what does software think?
+cat /proc/device-tree/soc/dma@2c000000/iommus | xxd
+#   the second cell is the StreamID
+
+# or from the driver's point of view
+ls -l /sys/bus/platform/devices/2c000000.dma/iommu_group
+cat /sys/kernel/iommu_groups/*/devices/* 2&gt;/dev/null
+
+# 2. what does the HARDWARE emit? Trigger a transaction and read
+#    the fault record — the definitive answer.
+dmesg | grep -A4 'event.*received'
+
+# 3. trace map/unmap to confirm the domain is being used at all
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+#   map: IOVA=0x... paddr=0x... size=...
+
+# 4. SMMU driver internals
+ls /sys/kernel/debug/iommu/          # where available
+cat /sys/class/iommu/smmu3.0.auto/devices/</code></pre>
+
+<div class="tip">
+<b>The bring-up sequence that works</b>
+<ol>
+<li>Boot with <code>arm-smmu-v3.disable_bypass=0</code> temporarily, so unmatched streams bypass rather than
+abort. If the device now works, the problem is definitely StreamID configuration, not the driver.</li>
+<li>Re-enable <code>disable_bypass=1</code> and read the fault record to learn the StreamID the hardware
+actually emits.</li>
+<li>Fix the device tree or IORT to match.</li>
+<li>Confirm with the <code>iommu</code> tracepoints that mappings are being created for the right device.</li>
+</ol>
+<p>Never ship with bypass enabled — but it is the fastest way to bisect the problem during bring-up.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>C_BAD_STREAMID</code> on every transfer</td><td>Device tree or IORT StreamID does not match the hardware</td></tr>
+<tr><td>Device works with <code>iommu.passthrough=1</code> only</td><td>Confirms a StreamID or mapping problem</td></tr>
+<tr><td>DMA works but interrupts never arrive</td><td>The MSI doorbell address is not mapped for that device</td></tr>
+<tr><td>Two devices interfere with each other's memory</td><td>StreamID aliasing — they share one context</td></tr>
+<tr><td>Cannot pass one device of a pair to a VM</td><td>They are in the same IOMMU group</td></tr>
+<tr><td>Multi-queue device works on queue 0 only</td><td>Only one of its StreamIDs is described</td></tr>
+<tr><td>Works on one board revision, fails on another</td><td>The integrator changed the StreamID assignment</td></tr>
+<tr><td>Stream table allocation fails at boot</td><td>Flat table for a large StreamID space; needs two-level</td></tr>
+<tr><td>GPU clients can see each other's buffers</td><td>No SubstreamID support, or not used</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the SMMU needs an explicit identifier and the CPU's MMU does not.</li>
+  <li>Say where a StreamID comes from for a PCIe device and for an on-SoC master.</li>
+  <li>Describe the most common SMMU bring-up failure and how the fault record resolves it.</li>
+  <li>Write the device tree for a device with two StreamIDs, and for a PCIe root complex.</li>
+  <li>Explain what a SubstreamID adds and give a concrete case that needs one.</li>
+  <li>Explain why a two-level stream table exists.</li>
+  <li>Explain why an MSI doorbell must be mapped, and the symptom when it is not.</li>
+  <li>Give three situations where StreamID identity is ambiguous, and the correct response.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

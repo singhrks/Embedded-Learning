@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMMU: stages, queues and invalidation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SMMU: stages, queues and invalidation</h1>
+<p class="lead">Two translation stages with two different owners, three queues connecting software to
+hardware, and an invalidation discipline that mirrors the CPU's exactly. Plus the advanced features — ATS,
+PRI and SVA — that let a device share a process's address space directly.</p>
+
+<h2 id="stages">Two stages, two owners</h2>
+
+<p>Like the processor's MMU, the SMMU can translate twice — and crucially the two stages have different owners. That split is what lets a hypervisor contain a device that an untrusted guest is driving.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Stage 1</th><th>Stage 2</th></tr></thead>
+<tbody>
+<tr><td>Translates</td><td>Device address (IOVA) &rarr; IPA</td><td>IPA &rarr; PA</td></tr>
+<tr><td>Owned by</td><td>The OS, or a guest OS</td><td><strong>The hypervisor</strong></td></tr>
+<tr><td>Root held in</td><td>The Context Descriptor's <code>TTB0</code></td><td>The STE's <code>S2TTB</code></td></tr>
+<tr><td>Tagged by</td><td>ASID</td><td>VMID</td></tr>
+<tr><td>Purpose</td><td>Scatter-gather, per-process isolation, confining a device to its buffers</td><td>Confining a whole device to one VM's memory</td></tr>
+<tr><td>Guest can change it?</td><td>Yes — it is the guest's own</td><td><strong>No</strong> — that is the point</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   BARE-METAL OS, stage 1 only
+
+     device --> IOVA --[ stage 1, OS tables ]--> PA
+
+   DEVICE PASSED THROUGH TO A VM, stage 2 only
+
+     device --> IPA ---[ stage 2, hypervisor ]--> PA
+                ^ the guest programs the device with its own
+                  "physical" addresses, and cannot escape
+
+   NESTED — a guest with its own IOMMU driver, both stages
+
+     device --> IOVA --[ stage 1, GUEST ]--> IPA
+                        --[ stage 2, HYPERVISOR ]--> PA
+
+  Exactly the structure of CPU two-stage translation
+  (ARM chapter 16), with the same walk-multiplication cost: each
+  stage-1 table access itself needs a stage-2 translation, so a
+  full nested walk can be up to 24 memory accesses.
+
+  Mitigations are the same too: SMMU TLBs caching the combined
+  IOVA -> PA translation, walk caches for intermediate
+  descriptors, and huge pages at stage 2 (a 1 GB block for the
+  guest's RAM is standard).</pre>
+
+<h2 id="queues">The three queues</h2>
+
+<p>The SMMU communicates with software through memory-based queues rather than registers alone: commands in one direction, events in the other. Understanding that structure is essential to reading a fault.</p>
+
+<pre class="diagram">Software and the SMMU communicate through circular buffers in
+memory, each with producer and consumer indices in registers.
+
+   COMMAND QUEUE          software  ->  SMMU
+      CMDQ_BASE, CMDQ_PROD (software writes), CMDQ_CONS (SMMU)
+      invalidate a cached STE, CD or TLB entry; synchronise;
+      prefetch; respond to a page request
+
+   EVENT QUEUE            SMMU  ->  software
+      EVENTQ_BASE, EVENTQ_PROD (SMMU writes), EVENTQ_CONS
+      fault records: bad StreamID, translation fault, permission
+      fault, external abort. An interrupt signals arrival.
+
+   PRI QUEUE              SMMU  ->  software
+      PRIQ_BASE, PRIQ_PROD, PRIQ_CONS
+      page requests from a device that supports PRI — "please
+      map this address for me". Optional.
+
+  Same design as the GIC's ITS command queue (ARM chapter 23),
+  and as virtio and io_uring (OS chapter 08): a shared ring plus
+  a doorbell. Recognise the pattern.
+
+  Queue memory attributes must match SMMU_CR1's configuration,
+  for the same reason STE memory does (chapter 04).</pre>
+
+<h2 id="commands">Commands worth knowing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Command</th><th>Invalidates</th><th>Issue after</th></tr></thead>
+<tbody>
+<tr><td><code>CMD_CFGI_STE</code></td><td>One cached Stream Table Entry</td><td>Modifying an STE</td></tr>
+<tr><td><code>CMD_CFGI_ALL</code></td><td>Every cached configuration</td><td>Initialisation</td></tr>
+<tr><td><code>CMD_CFGI_CD</code></td><td>One cached Context Descriptor</td><td>Modifying a CD</td></tr>
+<tr><td><code>CMD_CFGI_CD_ALL</code></td><td>All CDs for one StreamID</td><td>Tearing down a device's contexts</td></tr>
+<tr><td><code>CMD_TLBI_NH_VA</code></td><td>One stage-1 address, by ASID</td><td>Unmapping a page</td></tr>
+<tr><td><code>CMD_TLBI_NH_ASID</code></td><td>All stage-1 entries for an ASID</td><td>Tearing down an address space</td></tr>
+<tr><td><code>CMD_TLBI_S2_IPA</code></td><td>One stage-2 IPA</td><td>Changing a stage-2 mapping</td></tr>
+<tr><td><code>CMD_TLBI_S12_VMALL</code></td><td>Both stages for one VMID</td><td>Tearing down a VM</td></tr>
+<tr><td><code>CMD_TLBI_NSNH_ALL</code></td><td>Everything non-secure</td><td>Initialisation</td></tr>
+<tr><td><code>CMD_ATC_INV</code></td><td>A device's own translation cache</td><td><strong>Unmapping, when ATS is in use</strong></td></tr>
+<tr><td><code>CMD_PRI_RESP</code></td><td>—</td><td>Answering a page request</td></tr>
+<tr><td><code>CMD_SYNC</code></td><td>—</td><td><strong>Wait for everything before it to complete</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>The invalidation rule, exactly as for the CPU</b>
+<p>Anything you change in memory — an STE, a CD, a page table entry — is invisible to the SMMU until you issue
+the matching invalidate command <em>and</em> a <code>CMD_SYNC</code>. This mirrors the CPU's
+write &rarr; DSB &rarr; TLBI &rarr; DSB &rarr; ISB sequence (<a href="arm-15-tlb-asid.html">ARM 15</a>), and
+omitting it produces exactly the same class of "works sometimes" bug.</p>
+</div>
+
+<pre><code>/* Unmapping a page, correctly: */
+
+        /* 1. clear the descriptor */
+        *pte = 0;
+
+        /* 2. make the write visible to the SMMU, which is a
+              separate observer reading memory directly       */
+        dsb(ishst);
+
+        /* 3. invalidate the SMMU's TLB entry */
+        cmdq_issue(CMD_TLBI_NH_VA, asid, iova);
+
+        /* 4. if ATS is in use, invalidate the DEVICE's cache too,
+              and WAIT for the device to acknowledge            */
+        cmdq_issue(CMD_ATC_INV, sid, ssid, iova, size);
+
+        /* 5. wait for all of it to complete */
+        cmdq_issue(CMD_SYNC);
+        wait_for_sync_completion();
+
+        /* 6. ONLY NOW is it safe to free or reuse the page */
+        free_page(page);
+
+/* Skipping step 5 and freeing immediately leaves a window in
+   which the device can still write to a page that now belongs
+   to something else. That is a use-after-free with DMA, and it
+   is precisely what iommu.strict=0 trades away for speed.  */</code></pre>
+
+<h2 id="strict">Strict versus deferred invalidation</h2>
+
+<p>Whether an invalidation must complete before a mapping is reused is a genuine trade between safety and throughput, and Linux exposes it as a setting that people change without appreciating what they are giving up.</p>
+
+<pre class="diagram">   iommu.strict=1   (the default)
+        every unmap issues an invalidate and waits for CMD_SYNC
+        before the IOVA is reused or the page freed.
+        SAFE. Costs a command-queue round trip per unmap, which
+        on a high-rate NIC is a measurable fraction of the
+        packet budget.
+
+   iommu.strict=0   ("lazy" / DMA-FQ)
+        unmapped IOVAs go on a flush queue and are invalidated
+        in BATCHES, typically every 10 ms or when the queue
+        fills. Far fewer syncs.
+        UNSAFE WINDOW: between unmap and the batched invalidate,
+        the device can still translate and access the page. If
+        the page has been freed and reallocated, a malicious or
+        buggy device writes to whatever now lives there.
+
+   Which to choose:
+      · trusted, on-SoC devices, throughput-critical -> strict=0
+        may be a reasonable, documented decision
+      · anything hot-pluggable, or any device you do not
+        control -> strict=1, always
+
+   cat /sys/kernel/iommu_groups/*/type
+   #   DMA      strict
+   #   DMA-FQ   deferred (flush queue)
+   #   identity bypass</pre>
+
+<h2 id="ats">ATS: caching translations in the device</h2>
+
+<p>A device can cache its own translations, which removes the SMMU from the critical path and moves trust into the device. That is a significant security decision disguised as a performance feature.</p>
+
+<pre class="diagram">A PCIe device can ask the SMMU to translate an address in
+advance and cache the result in its own ADDRESS TRANSLATION
+CACHE (ATC), then issue PRE-TRANSLATED transactions.
+
+   device --> ATS Translation Request --> SMMU
+          <-- translated address       <--
+   device caches it in the ATC
+   device --> transaction marked "already translated" --> memory
+                                       (SMMU not consulted)
+
+  BENEFIT: removes the SMMU from the data path entirely. On a
+  device doing millions of transfers per second this is a large
+  win.
+
+  COST 1 — a new correctness obligation. When software unmaps a
+  page it must send CMD_ATC_INV and WAIT for the device's
+  response. If the device is slow, buggy, or has been
+  hot-unplugged, that wait can stall. Linux has a timeout and
+  will report:
+       arm-smmu-v3: ATC invalidation timed out
+
+  COST 2 — a TRUST problem. A pre-translated transaction bypasses
+  the SMMU's checks entirely. You are trusting the device to
+    (a) only use translations it was legitimately given, and
+    (b) honour invalidations.
+  A malicious device that ignores both has unrestricted access.
+
+  Hence PCIe ACS and the "translation blocking" controls, and
+  hence: enable ATS only for devices you trust. Linux will not
+  enable it for a device without the appropriate ACS
+  capabilities upstream.</pre>
+
+<h2 id="pri">PRI: page faults for devices</h2>
+
+<p>If a device can tolerate a fault and retry, it can use memory that is not currently resident — which is what makes shared virtual memory between a CPU and an accelerator workable.</p>
+
+<pre><code>/* Normally, a device touching an unmapped address gets an abort.
+   With PRI, it can instead REQUEST that the page be mapped:  */
+
+   device --> Page Request (via the PRI queue) --> software
+   software pages the memory in, maps it
+   software --> CMD_PRI_RESP (success) --> SMMU --> device
+   device retries the access
+
+/* This requires STALL mode: STE.S1STALLD = 0, so a faulting
+   transaction is HELD rather than terminated. The device's
+   pipeline stalls until the response arrives.
+
+   What it enables: DEMAND PAGING for devices. A GPU can be
+   given a pointer to memory that is swapped out, and it will
+   fault it in exactly as a CPU would.
+
+   What it costs: a stalled transaction occupies device
+   resources. A storm of page requests can deadlock a device
+   whose queues fill. And it only works if the device supports
+   it — most do not.                                       */
+
+/* Check support: */
+        SMMU_IDR0.PRI          /* SMMU supports PRI          */
+        SMMU_IDR0.STALL_MODEL  /* can it stall, or only
+                                  terminate?                 */</code></pre>
+
+<h2 id="sva">SVA: sharing a process's address space</h2>
+
+<div class="key">
+<b>The payoff of the identical descriptor format</b>
+<p>Because the SMMU uses exactly the CPU's translation table format
+(<a href="arm-14-descriptors.html">ARM 14</a>), the OS can point a device's Context Descriptor at a
+<em>user process's own page tables</em>, with the same ASID. The device then dereferences precisely the
+pointers the application uses — no <code>dma_map</code>, no IOVA allocation, no copying.</p>
+</div>
+
+<pre class="diagram">   WITHOUT SVA                      WITH SVA
+
+   app allocates a buffer           app allocates a buffer
+   dma_map_single()                 (nothing)
+     -> allocate an IOVA
+     -> build SMMU page tables
+     -> invalidate
+   pass the dma_addr_t to the       pass the ORDINARY POINTER
+     device                           to the device
+   device DMAs                      device DMAs, translating
+   dma_unmap_single()                 through the process's own
+     -> tear it all down              page tables
+                                     (nothing)
+
+  Requirements, all three:
+     1. the device supports ATS and PRI, because process memory
+        can be swapped out or moved at any time
+     2. the SMMU supports SubstreamIDs, so each process gets its
+        own CD
+     3. the OS wires the process's mm to a CD and keeps the ASID
+        in sync, including on TLB invalidation
+
+  Linux API:
+        handle = iommu_sva_bind_device(dev, mm);
+        pasid  = iommu_sva_get_pasid(handle);
+        /* pass pasid to the device; it now sees the process's
+           address space */
+        iommu_sva_unbind_device(handle);
+
+  Used by: GPU compute, smart NICs, accelerators — anywhere the
+  marshalling cost of dma_map dominates the actual work.</pre>
+
+<h2 id="perf">Performance</h2>
+
+<p>Address translation for devices costs the same kinds of thing it costs for the processor: table walks, TLB pressure, and invalidation. These are the numbers and the knobs that affect them.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Cost</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Translation on every transaction</td><td>SMMU TLBs; huge pages at both stages</td></tr>
+<tr><td>Walk on a TLB miss (up to 24 accesses nested)</td><td>Walk caches; cacheable table walks in the CD/STE</td></tr>
+<tr><td>Map/unmap page-table edits</td><td>Persistent mappings; larger buffers; scatter-gather in one call</td></tr>
+<tr><td>Command queue round trip per invalidate</td><td>Batching; <code>iommu.strict=0</code> (with the trade-off above)</td></tr>
+<tr><td>IOVA allocation</td><td>Per-CPU IOVA caches (<code>iova_rcache</code> in Linux)</td></tr>
+<tr><td>SMMU entirely in the data path</td><td>ATS — at the cost of trusting the device</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># is the SMMU the bottleneck?
+perf list | grep -i smmu
+perf stat -e 'arm_smmu_v3_pmcg_*/cycles/,arm_smmu_v3_pmcg_*/transaction/' \
+          -a sleep 10
+
+# many SMMUs have a Performance Monitoring Counter Group (PMCG)
+# exposing translation counts, TLB misses and walk counts —
+# the same idea as the CPU PMU (ARM chapter 34)
+
+# map/unmap rate
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe | head -100
+# a very high map/unmap rate on a networking workload means
+# per-packet mapping — consider persistent buffers or SVA</code></pre>
+
+<h2 id="linux">The Linux picture</h2>
+
+<p>The kernel's IOMMU layer presents all of the above through a small number of APIs, and knowing which kernel concept maps to which hardware structure is what makes kernel SMMU code readable.</p>
+
+<pre><code>/* Almost no driver programs an SMMU directly. The layering: */
+
+   your driver
+        |  dma_map_single(dev, buf, size, DMA_TO_DEVICE)
+        v
+   DMA API   (kernel/dma/mapping.c)
+        |  is there an IOMMU for this device?
+        +-- no  --> dma_direct: dma_addr == phys (+ offset),
+        |           plus cache maintenance if non-coherent
+        |
+        +-- yes --> dma-iommu layer
+                      allocate an IOVA from this device's
+                      iova_domain (an allocator, like a small
+                      address-space malloc)
+                        |
+                        v
+                    iommu_map(domain, iova, phys, size, prot)
+                        |
+                        v
+                    arm-smmu-v3 driver
+                      build page table entries (io-pgtable)
+                      queue CMD_TLBI + CMD_SYNC
+                        |
+                        v
+                    returns dma_addr_t = the IOVA
+        |
+        v
+   program the device with that dma_addr_t
+   — NEVER a virtual address, NEVER a raw physical address
+
+/* Chapter 07 covers the driver-facing API in full. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>STE or page table change has no effect</td><td>Missing <code>CFGI</code>/<code>TLBI</code> and <code>CMD_SYNC</code></td></tr>
+<tr><td>Device writes to a freed page</td><td>Freed before <code>CMD_SYNC</code> completed, or <code>strict=0</code></td></tr>
+<tr><td><code>ATC invalidation timed out</code></td><td>Device slow, unplugged, or not honouring invalidations</td></tr>
+<tr><td>Device stalls indefinitely</td><td>PRI stall mode with no software responding to page requests</td></tr>
+<tr><td>Guest translation works, host sees nothing</td><td>Stage 1 configured, stage 2 not — or vice versa</td></tr>
+<tr><td>Nested guest DMA is very slow</td><td>Walk multiplication; use huge pages at stage 2</td></tr>
+<tr><td>Networking throughput drops with the IOMMU on</td><td>Per-packet map/unmap; batch, or use persistent buffers</td></tr>
+<tr><td>Command queue overflows</td><td>Software not consuming, or issuing faster than the SMMU drains</td></tr>
+<tr><td>SVA bind fails</td><td>Device lacks ATS or PRI, or the SMMU lacks SubstreamIDs</td></tr>
+<tr><td>Stage-2 change corrupts guest memory</td><td>Invalidated stage 1 before stage 2 (<a href="arm-15-tlb-asid.html">ARM 15</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say who owns each translation stage and why the guest cannot change stage 2.</li>
+  <li>Name the three queues and what flows through each.</li>
+  <li>Give the correct unmap sequence, including <code>CMD_SYNC</code>, and say what each step prevents.</li>
+  <li>Explain the <code>iommu.strict=0</code> trade-off and when it is defensible.</li>
+  <li>Explain what ATS buys and the two costs it introduces.</li>
+  <li>Explain PRI and what stall mode requires of the device.</li>
+  <li>Explain SVA and its three prerequisites.</li>
+  <li>Explain why walk multiplication is worse under nesting and how to mitigate it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

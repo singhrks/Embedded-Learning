@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustZone: hardware enforcement blocks | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TrustZone: hardware enforcement blocks</h1>
+<p class="lead">The NS bit is only a promise until something checks it. This chapter covers the blocks that
+actually do the checking — where they sit, what they can express, and what a partial implementation leaves
+open.</p>
+
+<h2 id="map">Where the checks happen</h2>
+
+<p>The NS bit only means something because hardware blocks enforce it. These are those blocks — and a platform missing any of them has a weaker boundary than the architecture implies.</p>
+
+<pre class="diagram">   CPU core                    DMA master
+      |  NS from SCR_EL3 /        |  NS hard-wired, or from
+      |  the security state       |  the SMMU / TZPC
+      v                           v
+   +--------+                 +---------+
+   |  MMU   |                 |  SMMU   |  secure and non-secure
+   | caches |                 |         |  stream tables
+   |  TLBs  |  all TAGGED     +---------+
+   +--------+  by NS state         |
+      |                            |
+      +-------------+--------------+
+                    |
+   +----------------v---------------------------------+
+   |  INTERCONNECT                                     |
+   |  carries: ADDR, AxID (master), AxPROT[1] = NS     |
+   +--+-------------------+----------------------+-----+
+      |                   |                      |
+   +--v-----+       +-----v------+        +------v------+
+   | TZASC  |       |   TZPC     |        |    XPU      |
+   | DRAM   |       | peripheral |        | per-master  |
+   | regions|       | assignment |        | firewall    |
+   +--+-----+       +-----+------+        +------+------+
+      |                   |                      |
+   +--v-----+       +-----v------+        +------v------+
+   |  DRAM  |       | peripherals|        | fuses, PMU, |
+   |        |       |            |        | crypto      |
+   +--------+       +------------+        +-------------+
+
+   Plus, not on the data path:
+     GIC        interrupt groups by security state
+     Debug      SPIDEN / SPNIDEN gate JTAG visibility</pre>
+
+<h2 id="tzasc">TZASC — memory regions</h2>
+
+<p>The block that partitions DRAM between the worlds. Without it, secure memory would be protected only by page tables that the normal world's own hardware could be persuaded to ignore.</p>
+
+<pre><code>/* The TrustZone Address Space Controller sits in front of the
+   memory controller and applies a REGION TABLE.             */
+
+   Per region:
+      base address, size (power of two, or a range)
+      security setting: Secure only / Non-secure only / both
+      per-master read and write permission bitmap
+      subregion disable mask (split a region into 8 parts)
+      LOCK bit — write-once until reset
+
+   A Non-secure access to a Secure region gets an ERROR
+   RESPONSE, which becomes an external abort at the CPU
+   (ARM chapter 29, DFSC 0b010000) — or, on some
+   configurations, silently returns zeros.
+
+/* Arm's TZC-400 is the common licensed implementation; vendors
+   also build their own. Typical: 8 or 9 regions, one of which
+   (region 0) is the DEFAULT covering everything not otherwise
+   described.                                                */
+
+/* Configuring it — firmware only, and once: */
+static void tzc_configure_region(int region, uint64_t base,
+                                 uint64_t top, unsigned sec_attr,
+                                 unsigned ns_master_bitmap)
+{
+        tzc_write_region_base(region, base);
+        tzc_write_region_top(region, top);
+        tzc_write_region_attributes(region,
+                (sec_attr &lt;&lt; TZC_ATTR_SEC_SHIFT) | TZC_ATTR_REGION_EN);
+        tzc_write_region_id_access(region, ns_master_bitmap);
+}
+
+/* And the default region must be RESTRICTIVE: */
+        tzc_set_action(TZC_ACTION_ERR);          /* fail loudly   */
+        tzc_configure_region0(TZC_REGION_S_RDWR, /* secure only   */
+                              0);                /* no NS masters */
+        /* then open up the specific ranges the normal world needs */
+
+/* Getting region 0 wrong — leaving it permissive — means every
+   address you did not explicitly describe is wide open. This is
+   the fail-closed principle from chapter 01, applied.      */</code></pre>
+
+<h2 id="tzpc">TZPC — peripheral assignment</h2>
+
+<p>The equivalent for peripherals: which devices the normal world may even see. A peripheral assigned to the secure world simply does not respond to non-secure accesses.</p>
+
+<pre><code>/* The TrustZone Protection Controller marks whole peripherals
+   Secure or Non-secure, often at RUNTIME.                   */
+
+   TZPCDECPROT&lt;n&gt;SET     mark a peripheral NON-SECURE
+   TZPCDECPROT&lt;n&gt;CLR     mark it SECURE
+   TZPCR0SIZE            how much on-chip SRAM is secure
+
+/* Each bit corresponds to one peripheral, per the SoC's TRM.
+   A Non-secure access to a Secure-marked peripheral is refused
+   at the peripheral's bus interface.                        */
+
+/* Why RUNTIME assignment is useful:
+     · a fingerprint sensor is Secure while enrolling or
+       matching, Non-secure the rest of the time
+     · a display controller becomes Secure for a trusted-UI
+       prompt, then returns
+     · a crypto engine is claimed by the TEE for one operation
+
+   The secure world flips the bit, does the work, and flips it
+   back. The normal world's driver simply finds the device
+   unresponsive in the meantime — which is exactly the
+   "reads all zeros" symptom of chapter 08, appearing and
+   disappearing.                                             */
+
+/* Which makes for a genuinely confusing bug report: "the sensor
+   works, except sometimes". Check whether a TEE operation is
+   claiming it.                                             */</code></pre>
+
+<h2 id="caches">Caches and TLBs</h2>
+
+<p>Caches are tagged with the security state, so a secure line and a non-secure line at the same address are different entries. That is what prevents the obvious cache-based attack across the boundary.</p>
+
+<pre class="diagram">Neither is "banked" — instead every entry is TAGGED with the
+security state that created it.
+
+   cache line tag:   address + NS state
+   TLB entry tag:    VA + ASID + VMID + NS state + regime
+
+  So a Non-secure lookup cannot HIT a Secure line, even at the
+  same address. The two worlds' data coexists in one cache
+  without leaking.
+
+  CONSEQUENCES:
+
+  · no cache flush is needed on a world switch for CORRECTNESS,
+    which is a large part of why the switch is as fast as it is
+
+  · but a flush may be needed for SECURITY: the two worlds share
+    the cache as a RESOURCE, so timing differences leak
+    information (chapter 16). Hardened monitors flush or
+    partition on switch, at a real performance cost.
+
+  · TLB maintenance from the secure world must specify the right
+    regime. TLBI ALLE3 does not invalidate EL1 entries, and
+    Secure EL1 entries are distinct from Non-secure EL1 entries
+    even at the same VA and ASID.
+
+  · a cache line's NS tag comes from the ACCESS, not the
+    address. Secure software creating an NS=1 mapping to shared
+    memory (chapter 08) produces Non-secure lines — which is
+    correct, and is how sharing works without aliasing.</pre>
+
+<h2 id="gic">GIC — interrupt groups</h2>
+
+<p>Interrupts are partitioned by group so that a secure interrupt cannot be taken, masked or even observed by the normal world — the interrupt-controller half of the same boundary.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Group</th><th>Signalled as</th><th>Taken to</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><strong>Group 0</strong></td><td>FIQ</td><td>Always EL3</td><td>Secure firmware's own interrupts</td></tr>
+<tr><td><strong>Secure Group 1</strong></td><td>IRQ in the secure world; FIQ in the non-secure world</td><td>S-EL1, or EL3</td><td>Trusted OS interrupts</td></tr>
+<tr><td><strong>Non-secure Group 1</strong></td><td>IRQ</td><td>EL1 (or EL2)</td><td>The normal OS</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Configured in GICD_IGROUPR and GICD_IGRPMODR, writable only
+   from the secure world.                                     */
+
+/* The property that matters: a Non-secure OS clearing PSTATE.I
+   masks only IRQ. A secure interrupt arrives as FIQ and is
+   routed to EL3 by SCR_EL3.FIQ. The normal world CANNOT
+   suppress it.
+
+   Without this, a compromised kernel could simply disable
+   interrupts and prevent the secure world from ever running —
+   a denial of service against the TEE, and a way to defeat any
+   secure watchdog.                                          */
+
+/* And the reverse: GICD registers themselves are usually
+   Secure-only for the group configuration, so the normal world
+   cannot reassign an interrupt to its own group.
+
+   On GICv3 the redistributor and CPU interface state are also
+   banked by security state.                                */</code></pre>
+
+<h2 id="smmu">SMMU secure interface</h2>
+
+<p>Device transactions carry the security state too, which is why the SMMU from earlier chapters is part of the TrustZone story rather than a separate topic.</p>
+
+<pre><code>/* SMMUv3 has TWO complete programming interfaces (chapter 04): */
+
+   +0x0000   Non-secure   SMMU_*
+   +0x8000   Secure       SMMU_S_*
+
+/* Each with its own stream table, command queue, event queue and
+   enable bit. Independent.
+
+   WHY: a device operating in the secure world must be configured
+   by SECURE firmware. If the Non-secure OS could program that
+   device's translations, it could point a secure DMA engine at
+   normal-world memory — reading secure data out through a
+   device the normal world controls. A complete TrustZone
+   bypass.
+
+   And the STE and CD carry NSCFG fields determining whether the
+   resulting transaction is issued Secure or Non-secure, exactly
+   as the page descriptor NS bit does for the CPU.
+
+   So the SMMU is not merely an isolation device for the normal
+   world — it is part of the TrustZone boundary itself.     */
+
+/* A common integration gap: an SoC implements the SMMU but not
+   its secure interface (SMMU_IDR1.SECURE_IMPL = 0). Secure DMA
+   masters are then unprotected, and must be constrained by an
+   XPU instead (chapters 17-20).                            */</code></pre>
+
+<h2 id="fuses">Fuses and one-time-programmable storage</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Holds</th><th>Read by</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Root of Trust public key hash</td><td>Boot ROM only, or Secure masters</td><td>The anchor for secure boot (<a href="sec-14-secure-boot.html">ch. 14</a>)</td></tr>
+<tr><td>Hardware Unique Key (HUK)</td><td>Often only the crypto engine, never software</td><td>Per-device; the basis for secure storage</td></tr>
+<tr><td>Anti-rollback counters</td><td>Secure firmware</td><td>Monotonic; prevents downgrade</td></tr>
+<tr><td>Lifecycle state</td><td>Boot ROM and firmware</td><td>Blank / development / secured / RMA</td></tr>
+<tr><td>Debug enable</td><td>The debug authentication logic</td><td>Gates <code>SPIDEN</code>/<code>SPNIDEN</code></td></tr>
+<tr><td>Feature disable</td><td>Various</td><td>Vendor SKU differentiation</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The best-designed HUK is never visible to software</b>
+<p>On a well-built SoC, the hardware unique key is wired directly into the crypto engine's key input. Software
+asks the engine to "derive a key using the HUK" and receives a <em>derived</em> key; it never sees the HUK
+itself. Even a compromised trusted OS cannot extract it.</p>
+<p>A design where software reads the HUK into a register is much weaker — a single memory-disclosure bug in
+the secure world then reveals the root of all device storage encryption, permanently and unfixably.</p>
+</div>
+
+<h2 id="debug">Debug authentication</h2>
+
+<p>Debug is a complete bypass of all of the above, which is why it is gated by its own authentication signals and why those are deasserted on production parts.</p>
+
+<pre class="diagram">Four signals gate what a debugger may see:
+
+   DBGEN     invasive debug (halt, single-step) in the NORMAL world
+   NIDEN     non-invasive (trace, PMU) in the normal world
+   SPIDEN    invasive debug of the SECURE world
+   SPNIDEN   non-invasive of the secure world
+
+  Driven by fuses, by a debug authentication module, or by a
+  signed unlock token.
+
+  Typical configurations:
+     development part   all four asserted
+     production part    DBGEN/NIDEN maybe, SPIDEN/SPNIDEN OFF
+     locked-down        all four off
+
+  CONSEQUENCES you will meet:
+     · JTAG attaches but cannot see secure state — you can halt
+       the core in the normal world and not in the secure one
+     · the PMU counts normal-world events only, so a profile
+       silently omits secure execution
+     · CoreSight trace stops at the world boundary
+     · a TEE bug that reproduces only on production silicon is
+       very hard to debug — which is why development firmware
+       should log aggressively
+
+  RMA UNLOCK: a controlled path back, requiring a token signed
+  by the vendor and usually destroying the device keys first so
+  that unlocking cannot expose user data.</pre>
+
+<h2 id="others">The rest</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Block</th><th>Enforces</th></tr></thead>
+<tbody>
+<tr><td><strong>Secure boot ROM</strong></td><td>Immutable first stage; verifies everything after it</td></tr>
+<tr><td><strong>Crypto engine</strong></td><td>Key slots accessible only to Secure masters; some keys never leave the block</td></tr>
+<tr><td><strong>True RNG</strong></td><td>Entropy source, often Secure-only or with a Secure-only health-test interface</td></tr>
+<tr><td><strong>Secure timer / watchdog</strong></td><td>A watchdog the normal world cannot disable — so a hung TEE is recoverable</td></tr>
+<tr><td><strong>Secure SRAM</strong></td><td>On-chip memory, sometimes with no external bus path at all — used for keys in use</td></tr>
+<tr><td><strong>Memory encryption</strong></td><td>Encrypts DRAM contents so bus probing and cold boot recover only ciphertext</td></tr>
+<tr><td><strong>Boot-mode straps</strong></td><td>Latched at reset; often Secure-readable only, so the normal world cannot learn or change the boot source</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="gaps">Where implementations fall short</h2>
+
+<div class="danger">
+<b>Enforcement is only as complete as the silicon</b>
+<p>TrustZone is a system-wide contract, and a partial implementation is a bypass. Real gaps that have shipped:</p>
+<ul>
+<li><strong>A peripheral that ignores the NS bit.</strong> Its registers are reachable from both worlds
+regardless of the TZPC.</li>
+<li><strong>A bus segment that drops or hard-codes NS.</strong> Everything downstream sees a fixed value.</li>
+<li><strong>A DMA master with no SMMU and no XPU.</strong> Full access to all memory, from whichever world can
+program it.</li>
+<li><strong>A TZASC default region left permissive.</strong> Anything not explicitly protected is open.</li>
+<li><strong>Debug signals not fused off in production.</strong> The most common finding in device security
+audits.</li>
+<li><strong>A configuration register left unlocked.</strong> A compromised secure world — or in bad cases the
+normal world — can widen the policy at runtime.</li>
+</ul>
+<p>Verifying each of these is a real part of SoC security review, and it is done by <em>testing the negative
+cases</em>, not by reading the datasheet.</p>
+</div>
+
+<h2 id="verify">Verifying the configuration</h2>
+
+<p>Whether these blocks are actually configured as intended is checkable rather than assumable, and checking is a standard part of any security review of a platform.</p>
+
+<pre><code>/* Write these as a boot-time self-test in development firmware.
+   A policy never exercised is a policy you do not know works. */
+
+static void security_selftest(void)
+{
+        /* 1. Non-secure access to Secure DRAM must FAIL */
+        expect_abort(read32_ns(SECURE_DRAM_BASE));
+
+        /* 2. Non-secure access to a Secure peripheral must FAIL */
+        expect_abort(read32_ns(SECURE_CRYPTO_BASE));
+
+        /* 3. Secure access to Non-secure DRAM must SUCCEED */
+        expect_ok(read32_s(NS_DRAM_BASE));
+
+        /* 4. the TZASC default region must be restrictive */
+        assert(tzc_region0_attr() == TZC_REGION_S_RDWR);
+
+        /* 5. every region that should be locked, is */
+        for (i = 0; i &lt; nr_regions; i++)
+                assert(tzc_region_locked(i) == expected_lock[i]);
+
+        /* 6. debug signals match the lifecycle state */
+        if (lifecycle_state() == LC_SECURED)
+                assert(!spiden_asserted() &amp;&amp; !spniden_asserted());
+
+        /* 7. SCR_EL3 has the expected bits */
+        assert(read_scr_el3() &amp; SCR_SIF);
+        assert(read_scr_el3() &amp; SCR_FIQ);
+        assert(read_scr_el3() &amp; SCR_EA);
+}
+
+/* Run it in development builds, on a part in the FINAL
+   lifecycle state. Chapter 19 covers building the complete
+   access matrix systematically.                            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Peripheral reads zeros or aborts on production units</td><td>TZPC marks it Secure</td></tr>
+<tr><td>A device works "except sometimes"</td><td>Runtime TZPC reassignment during a TEE operation</td></tr>
+<tr><td>Linux cannot see a DRAM region in the TRM</td><td>Carved out as Secure by the TZASC</td></tr>
+<tr><td>External abort, DFSC <code>0b010000</code></td><td>TZASC, TZPC or XPU refused the access</td></tr>
+<tr><td>Access silently returns zeros instead of aborting</td><td>The controller's action is "return zeros" — much harder to debug (<a href="sec-20-xpu-debug.html">ch. 20</a>)</td></tr>
+<tr><td>Normal world reads secure memory successfully</td><td><strong>A security bug</strong> — a permissive default region, or a block ignoring NS</td></tr>
+<tr><td>JTAG halts in Linux but not in the TEE</td><td><code>SPIDEN</code> deasserted — by design</td></tr>
+<tr><td>Profile omits secure execution</td><td><code>SPNIDEN</code> deasserted</td></tr>
+<tr><td>Secure DMA master can be redirected by Linux</td><td>SMMU secure interface not implemented or not used</td></tr>
+<tr><td>Policy changes at runtime</td><td>Configuration registers not locked</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the blocks that check the NS bit and where each sits.</li>
+  <li>Explain what a TZASC region entry contains and why the default must be restrictive.</li>
+  <li>Give a use for runtime TZPC reassignment and the confusing symptom it produces.</li>
+  <li>Explain why caches need no flush on a world switch for correctness, but may for security.</li>
+  <li>Explain why a secure interrupt cannot be masked by the normal OS, and what that prevents.</li>
+  <li>Say why the SMMU needs a separate secure programming interface.</li>
+  <li>Explain why the best HUK designs never expose the key to software.</li>
+  <li>Name the four debug authentication signals and what each gates.</li>
+  <li>List five ways a partial implementation creates a bypass.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

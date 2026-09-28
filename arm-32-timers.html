@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The generic timer and counters | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The generic timer and counters</h1>
+<p class="lead">One architected timer, present on every ARMv8 core, with a counter readable from user space
+and comparators for each exception level. It is why <code>clock_gettime</code> needs no system call, and why
+timekeeping code is portable across every ARM SoC.</p>
+
+<h2 id="counter">The system counter</h2>
+
+<div class="key">
+<b>One counter, shared by everything</b>
+<p>A single free-running 64-bit counter in an always-on power domain, incrementing at a fixed frequency,
+distributed to every core. It never stops, never wraps in any practical timeframe, and is identical on every
+core — which is exactly what a clocksource needs (<a href="os-17-interrupts-time.html">OS chapter 17</a>).</p>
+</div>
+
+<pre><code>        mrs     x0, cntpct_el0          /* PHYSICAL count  */
+        mrs     x0, cntvct_el0          /* VIRTUAL count   */
+        mrs     x0, cntfrq_el0          /* frequency in Hz */
+
+/* Readable from EL0 — no system call, no trap. This is the whole
+   reason the vDSO can implement clock_gettime in user mode
+   (chapter 30).                                            */
+
+/* Frequency is IMPLEMENTATION DEFINED, commonly 1-100 MHz.
+   Typical: 24 MHz, 25 MHz, 50 MHz, 19.2 MHz.
+
+   CNTFRQ_EL0 is NOT set by hardware — FIRMWARE must program it
+   at boot, on every core. If firmware forgets, software reads
+   zero or garbage and all timekeeping is wrong. This is a
+   classic bring-up bug, and Linux warns about it:          */
+//   arch_timer: WARNING: Invalid trigger for IRQ
+//   arch_timer: frequency not available
+
+/* At 24 MHz, a 64-bit counter wraps after ~24,000 years. Treat
+   it as never wrapping — but do use time_after()-style signed
+   comparison anyway (OS chapter 17).                       */</code></pre>
+
+<h2 id="virtual">Physical versus virtual counters</h2>
+
+<p>Every core has access to two counters, and the difference between them exists entirely for virtualisation: one counts real elapsed time, the other can be offset so a guest does not see time pass while it was not scheduled.</p>
+
+<pre class="diagram">   CNTPCT_EL0    the raw physical count
+   CNTVCT_EL0    the physical count MINUS an offset
+
+        CNTVCT = CNTPCT - CNTVOFF_EL2
+
+  CNTVOFF_EL2 is per-VM, written by the hypervisor. Why:
+
+   · a guest suspended for 10 seconds and resumed should not see
+     10 seconds of elapsed CPU time it did not get
+   · a guest MIGRATED to another host must see a continuous
+     timeline, even though the new host's counter differs
+   · a guest booted later should still see its own time starting
+     near zero
+
+  So the hypervisor adjusts CNTVOFF and the guest's view stays
+  coherent, with no traps and no emulation.
+
+  CONSEQUENCE for software:
+     · a guest OS uses the VIRTUAL counter and timer
+     · a hypervisor, and firmware at EL2/EL3, uses the PHYSICAL one
+     · Linux at EL1 uses virtual; Linux at EL2 (VHE) uses physical
+     · reading the wrong one inside a VM gives host time, which
+       breaks after any suspend or migration</pre>
+
+<h2 id="timers">The timers</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Timer</th><th>Registers</th><th>Interrupt</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td>EL1 physical</td><td><code>CNTP_*_EL0</code></td><td>PPI 30</td><td>A kernel with no hypervisor; firmware</td></tr>
+<tr><td>EL1 virtual</td><td><code>CNTV_*_EL0</code></td><td>PPI 27</td><td><strong>A guest OS, and Linux at EL1</strong></td></tr>
+<tr><td>EL2 physical</td><td><code>CNTHP_*_EL2</code></td><td>PPI 26</td><td>The hypervisor</td></tr>
+<tr><td>EL2 virtual</td><td><code>CNTHV_*_EL2</code></td><td>PPI 28</td><td>A VHE host</td></tr>
+<tr><td>EL3 physical</td><td><code>CNTPS_*_EL1</code></td><td>PPI 29</td><td>Secure firmware</td></tr>
+<tr><td>Secure EL1</td><td><code>CNTHPS_*</code>, <code>CNTHVS_*</code></td><td>PPI 20, 19</td><td>A trusted OS (ARMv8.4+)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Each level gets its own comparator so they do not have to coordinate — a hypervisor's timer cannot be
+disturbed by its guest, and secure firmware's cannot be disturbed by the normal world.</p>
+
+<h2 id="programming">Programming a timer</h2>
+
+<p>Setting a timer is a matter of two registers and a comparison, with a choice between an absolute deadline and a relative countdown.</p>
+
+<pre><code>/* Each timer has three registers: */
+
+   CNTV_CTL_EL0    [0] ENABLE
+                   [1] IMASK — mask the interrupt output
+                   [2] ISTATUS — read-only: has it fired?
+   CNTV_CVAL_EL0   64-bit ABSOLUTE compare value
+   CNTV_TVAL_EL0   32-bit RELATIVE value, a convenience:
+                     writing it sets CVAL = CNTVCT + TVAL
+                     reading it gives CVAL - CNTVCT (may go
+                     negative once expired)
+
+/* The timer fires when CNTVCT >= CVAL. It is a COMPARATOR, not a
+   countdown — which is what makes it immune to drift.      */
+
+/* Absolute deadline — the correct way for periodic work: */
+static void timer_set_deadline(uint64_t deadline)
+{
+        asm volatile("msr cntv_cval_el0, %0" :: "r"(deadline));
+        asm volatile("msr cntv_ctl_el0, %0" :: "r"(1UL));  /* enable */
+        asm volatile("isb");
+}
+
+static void timer_periodic(uint64_t period_ticks)
+{
+        static uint64_t next;
+        uint64_t now;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+
+        if (!next) next = now;
+        next += period_ticks;              /* ABSOLUTE, so no drift */
+        timer_set_deadline(next);
+}
+
+/* Contrast with the relative form: */
+        asm volatile("msr cntv_tval_el0, %0" :: "r"(period));
+/* Each period restarts from NOW, so the handler's own execution
+   time accumulates into permanent drift. Over an hour at 1 kHz
+   with a 10 µs handler, that is 36 seconds of drift.
+   Use CVAL and absolute deadlines. (OS chapter 17.)       */</code></pre>
+
+<h2 id="delay">Delays and timeouts</h2>
+
+<p>Busy-waiting for a short interval is common in low-level code, and doing it by counting loop iterations is wrong on any modern processor. The counter gives you a correct, frequency-independent alternative.</p>
+
+<pre><code>/* A portable microsecond delay, with no calibration loop: */
+
+static void udelay(unsigned us)
+{
+        uint64_t freq, start, ticks;
+
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        ticks = (freq * us) / 1000000;
+
+        asm volatile("isb");                       /* order the read */
+        asm volatile("mrs %0, cntvct_el0" : "=r"(start));
+
+        for (;;) {
+                uint64_t now;
+                asm volatile("isb");
+                asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+                if (now - start &gt;= ticks)
+                        break;
+        }
+}
+
+/* The ISB matters: without it the counter read can be speculated
+   or reordered, and a short delay can complete early. Linux's
+   arch_counter_get_cntvct() includes it for exactly this
+   reason.
+
+   And note the subtraction: `now - start >= ticks` is correct
+   across a wrap; `now >= start + ticks` is not.           */
+
+/* A bounded wait — always prefer this to an unbounded loop: */
+static bool wait_for_bit(volatile uint32_t *reg, uint32_t mask,
+                         unsigned timeout_us)
+{
+        uint64_t freq, start, limit, now;
+
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        asm volatile("mrs %0, cntvct_el0" : "=r"(start));
+        limit = (freq * timeout_us) / 1000000;
+
+        do {
+                if (*reg &amp; mask)
+                        return true;
+                asm volatile("mrs %0, cntvct_el0" : "=r"(now));
+        } while (now - start &lt; limit);
+
+        return false;                      /* TIMED OUT — say so */
+}</code></pre>
+
+<h2 id="vdso">Why the vDSO works</h2>
+
+<p>Reading the counter is an ordinary instruction rather than a privileged one, which is precisely what allows the kernel to expose time to user space without a system call.</p>
+
+<pre class="diagram">clock_gettime(CLOCK_MONOTONIC, &ts) with no system call:
+
+   1. read a kernel-maintained page mapped read-only into every
+      process. It holds:
+         · a base time value
+         · the counter value at that base
+         · a multiplier and shift for the conversion
+         · a sequence counter (a seqlock — OS chapter 09)
+
+   2. read CNTVCT_EL0                      ← EL0-readable
+   3. delta = cntvct - base_cycles
+   4. ns = base_ns + ((delta * mult) >> shift)
+   5. re-check the sequence counter; retry if the kernel updated
+      the page mid-read
+
+   ~25 ns, entirely in user mode. Versus ~300 ns for a syscall.
+
+  Two architectural properties make this possible:
+     · the counter is readable from EL0 (CNTKCTL_EL1 permits it)
+     · it is architected, so ONE vDSO implementation works on
+       every ARM SoC
+
+  CNTKCTL_EL1.EL0VCTEN gates EL0 access. A kernel could clear it
+  to hide timing from userspace — some hardened configurations do,
+  as a side-channel mitigation, at the cost of losing the vDSO
+  fast path.</pre>
+
+<h2 id="events">The event stream</h2>
+
+<p>A periodic hardware event can wake cores out of a low-power wait without an interrupt, which is useful for spin-wait loops that should not consume power indefinitely.</p>
+
+<pre><code>/* WFE waits for an event (chapter 22). If the event never comes,
+   the core waits forever — which is a problem for a spinlock
+   whose holder was descheduled.
+
+   The generic timer can generate a PERIODIC EVENT STREAM as a
+   safety net:                                              */
+
+   CNTKCTL_EL1.EVNTEN    enable the event stream
+   CNTKCTL_EL1.EVNTI     which counter bit transition triggers it
+   CNTKCTL_EL1.EVNTDIR   rising or falling edge
+
+/* Typically configured for a ~100 µs period. A WFE therefore
+   never sleeps longer than that, guaranteeing forward progress
+   even if a SEV is missed.
+
+   Linux enables it, and you can see the configuration:     */
+//   dmesg | grep -i 'arch_timer.*event stream'
+//   arch_timer: Architected timer HYP event stream enabled
+
+/* This is also what makes WFE safe to use in a guest: the
+   hypervisor may trap WFE (chapter 31), but the event stream
+   ensures the guest wakes anyway.                          */</code></pre>
+
+<h2 id="firmware">Firmware responsibilities</h2>
+
+<div class="warn">
+<b>What must be set up before Linux boots</b>
+<ul>
+<li><strong><code>CNTFRQ_EL0</code> on every core</strong>, with the actual counter frequency. Hardware does
+not set it. If firmware forgets, all timekeeping is wrong or the kernel refuses to boot.</li>
+<li><strong><code>CNTVOFF_EL2</code> = 0</strong> when handing off to a kernel at EL1 with no hypervisor.
+Firmware sometimes leaves it non-zero, and the guest's virtual time then starts at an arbitrary offset.</li>
+<li><strong><code>CNTHCTL_EL2</code></strong> configured so EL1 may access the physical counter and timer, if
+that is intended.</li>
+<li><strong>The counter must be enabled and running</strong> in the always-on domain before any core reads
+it.</li>
+</ul>
+<p>Linux checks and complains about several of these; the messages are worth recognising during bring-up.</p>
+</div>
+
+<pre><code>/* The device tree describes it: */
+timer {
+        compatible = "arm,armv8-timer";
+        interrupts = &lt;GIC_PPI 13 IRQ_TYPE_LEVEL_LOW&gt;,   /* secure   */
+                     &lt;GIC_PPI 14 IRQ_TYPE_LEVEL_LOW&gt;,   /* physical */
+                     &lt;GIC_PPI 11 IRQ_TYPE_LEVEL_LOW&gt;,   /* virtual  */
+                     &lt;GIC_PPI 10 IRQ_TYPE_LEVEL_LOW&gt;;   /* hyp      */
+        clock-frequency = &lt;24000000&gt;;   /* ONLY if firmware failed
+                                           to set CNTFRQ — a
+                                           documented workaround,
+                                           not the normal path    */
+        always-on;                       /* survives CPU idle      */
+};
+
+/* The PPI numbers here are relative to 16, so PPI 13 is INTID 29
+   (chapter 23). Getting this wrong is a common device tree error
+   and the symptom is a kernel that boots then hangs with no
+   timer interrupts.                                        */</code></pre>
+
+<h2 id="memory-mapped">The memory-mapped timer</h2>
+
+<p>Besides the per-core timer, systems usually provide a memory-mapped timer block that other agents can use. It matters most in power management, when the core's own timer may be off.</p>
+
+<pre><code>/* Besides the per-core system-register timers, the architecture
+   defines an optional MEMORY-MAPPED timer block (CNTControlBase,
+   CNTReadBase, CNTBaseN).                                  */
+
+/* Why it exists: devices other than CPUs may need the counter —
+   a DMA engine timestamping packets, a power controller, a
+   coprocessor. They cannot execute MRS.
+
+   Software rarely touches it directly. It appears in device
+   trees as:                                                */
+        compatible = "arm,armv7-timer-mem";
+
+/* Its one common use in Linux: providing a clocksource on
+   systems where the per-core timer stops in deep idle, since
+   the memory-mapped block is in the always-on domain.     */</code></pre>
+
+<h2 id="linux">The Linux view</h2>
+
+<p>Linux abstracts all of this behind clocksource and clockevent drivers, and mapping the kernel's vocabulary onto the architecture's is necessary when a timer misbehaves.</p>
+
+<pre><code>/* The generic timer is Linux's clocksource AND clockevent
+   (OS chapter 17):                                         */
+
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+#   arch_sys_counter                    ← the generic timer
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+
+cat /proc/interrupts | grep arch_timer
+#    3:  102394  98211  101002  99887  GICv3  27 Level  arch_timer
+#                                             ^^ PPI, so counts on
+#                                                every core
+
+/* Kernel APIs built on it: */
+ktime_get()                     /* CLOCK_MONOTONIC, ns          */
+ktime_get_real()                /* CLOCK_REALTIME               */
+ktime_get_boottime()            /* includes suspend             */
+get_cycles()                    /* the raw counter              */
+arch_timer_read_counter()
+
+udelay(50);                     /* busy-wait, atomic-safe       */
+usleep_range(100, 200);         /* sleeps; allows BATCHING      */
+hrtimer_start(&amp;t, ms_to_ktime(10), HRTIMER_MODE_REL);
+
+/* And the tickless machinery (OS chapter 17) programs CVAL for
+   the next actual deadline rather than a fixed tick, which is
+   what lets an idle core sleep for seconds.               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Kernel hangs after "Calibrating delay loop"</td><td><code>CNTFRQ_EL0</code> not set by firmware</td></tr>
+<tr><td>All delays are wildly wrong</td><td>Wrong <code>CNTFRQ_EL0</code>, or a <code>clock-frequency</code> DT override that disagrees with the hardware</td></tr>
+<tr><td>No timer interrupts; system boots then freezes</td><td>Wrong PPI number in the device tree</td></tr>
+<tr><td>Guest time jumps after migration</td><td>Used the physical counter instead of the virtual one</td></tr>
+<tr><td>Guest sees host uptime</td><td><code>CNTVOFF_EL2</code> not set</td></tr>
+<tr><td>Periodic task drifts over hours</td><td>Used <code>TVAL</code> (relative) instead of <code>CVAL</code> (absolute)</td></tr>
+<tr><td>Short delays complete early</td><td>Missing <code>ISB</code> around the counter read</td></tr>
+<tr><td><code>clock_gettime</code> unexpectedly slow</td><td>vDSO unavailable, or <code>CNTKCTL.EL0VCTEN</code> cleared</td></tr>
+<tr><td>Core stuck in <code>WFE</code></td><td>Event stream not enabled, and the <code>SEV</code> was missed</td></tr>
+<tr><td>Timer stops during deep idle</td><td>Per-core timer not in the always-on domain; needs a broadcast timer</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what makes the system counter suitable as a clocksource.</li>
+  <li>Say who must set <code>CNTFRQ_EL0</code> and what happens if they do not.</li>
+  <li>Explain the difference between the physical and virtual counters and who uses each.</li>
+  <li>Explain why <code>CNTVOFF_EL2</code> exists, with two scenarios.</li>
+  <li>Name the timers per exception level and why each has its own.</li>
+  <li>Explain why <code>CVAL</code> avoids drift and <code>TVAL</code> does not.</li>
+  <li>Explain the two architectural properties that make the vDSO's <code>clock_gettime</code> possible.</li>
+  <li>Say what the event stream is for and what problem it prevents.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

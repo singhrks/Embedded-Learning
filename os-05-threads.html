@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threads and threading models | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Threads and threading models</h1>
+<p class="lead">A thread is an independent execution context sharing an address space with its siblings. That
+sharing is the whole point and the whole danger: communication is free, and so is corruption.</p>
+
+<h2 id="what">What is shared and what is not</h2>
+
+<p>A thread is a separate flow of execution sharing its address space with others. That sharing is the whole point and the whole difficulty: communication is free, and so is corrupting each other's data.</p>
+
+<pre class="diagram">   ONE PROCESS, THREE THREADS
+
+   ┌──────────────────────────────────────────────────────┐
+   │  SHARED — one copy for the whole process              │
+   │    text (code)                                        │
+   │    data, bss, heap                                    │
+   │    memory mappings                                    │
+   │    file descriptor table                              │
+   │    cwd, root, umask                                   │
+   │    signal HANDLERS (the dispositions)                 │
+   │    PID (tgid), UID/GID, namespaces, cgroups           │
+   └──────────────────────────────────────────────────────┘
+        │                  │                  │
+   ┌────▼────┐        ┌────▼────┐        ┌────▼────┐
+   │ thread 1│        │ thread 2│        │ thread 3│
+   │ PRIVATE:│        │         │        │         │
+   │  stack  │        │  stack  │        │  stack  │
+   │  regs+PC│        │  regs+PC│        │  regs+PC│
+   │  TID    │        │  TID    │        │  TID    │
+   │  errno  │        │  errno  │        │  errno  │
+   │  TLS    │        │  TLS    │        │  TLS    │
+   │  sigmask│        │  sigmask│        │  sigmask│
+   │  priority│       │         │        │         │
+   └─────────┘        └─────────┘        └─────────┘
+
+Note the asymmetry in signals: the HANDLER is shared, the MASK is
+per-thread. That is a genuine source of confusion.</pre>
+
+<div class="key">
+<b>The trade</b>
+<p>Threads communicate through ordinary memory — a pointer write is all it takes, at nanosecond cost.
+Processes must use IPC, which is safe but costs microseconds. Threads buy you cheap communication and pay for
+it with the entire class of data races, deadlocks and memory-ordering bugs from
+<a href="ca-15-coherence.html">CA chapter 15</a>.</p>
+</div>
+
+<h2 id="linux-model">The Linux model</h2>
+
+<p>Linux does not implement threads as a distinct kind of object. They are ordinary tasks that happen to share more than usual, which is a simpler model than most systems use and explains several of its behaviours.</p>
+
+<pre><code>/* In Linux, threads and processes are the SAME KERNEL OBJECT.
+   Both are created by clone(); the flags decide what is shared. */
+
+clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+      CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS, ...)
+      /* ^ a THREAD: shares everything */
+
+clone(SIGCHLD, ...)          /* == fork(): shares nothing */
+
+/* So a "process" is a group of tasks with the same tgid. */
+getpid()   /* returns tgid — the same for every thread */
+gettid()   /* returns pid  — unique per thread          */
+
+ls /proc/1234/task/          /* one directory per thread */
+ps -L -p 1234                /* list threads             */
+top -H                       /* per-thread view          */</code></pre>
+
+<div class="note">
+<b>Why this design</b>
+<p>Because the kernel needs one scheduler, one context-switch path and one wait mechanism regardless of how
+much is shared, the sharing is expressed as flags rather than as a separate object type. Windows takes the
+other approach — <code>EPROCESS</code> owns <code>ETHREAD</code>s — which matches intuition more closely at
+the cost of duplicating machinery.</p>
+</div>
+
+<h2 id="models">Threading models</h2>
+
+<p>Threads can be mapped onto kernel-scheduled entities in more than one way, and the choice affects how a blocking call behaves and whether threads can genuinely run in parallel.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Mapping</th><th>Property</th></tr></thead>
+<tbody>
+<tr><td><strong>1:1</strong> (kernel threads)</td><td>Each user thread is one kernel thread</td><td>True parallelism; blocking is fine; context switch costs a syscall. <strong>Linux, Windows, macOS all use this.</strong></td></tr>
+<tr><td><strong>N:1</strong> (green threads)</td><td>Many user threads on one kernel thread</td><td>Very cheap switching; <em>one blocking call stops everything</em>; no multicore. Historical.</td></tr>
+<tr><td><strong>M:N</strong></td><td>M user threads over N kernel threads</td><td>Best of both in theory; scheduler interaction is notoriously hard. Go's runtime does this well; Solaris and NPTL abandoned it.</td></tr>
+<tr><td><strong>Async / coroutines</strong></td><td>Cooperative, one OS thread per core</td><td>No preemption, no locks needed within a task, but a blocking call stalls the whole executor</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Why M:N mostly failed, and where it works
+
+  The kernel scheduler and the user scheduler each make decisions
+  without knowing the other's state. Classic failure: a user thread
+  blocks in a syscall, taking its kernel thread with it, and the
+  user scheduler cannot see that its worker vanished.
+
+  Go succeeds because its runtime OWNS the blocking calls: every
+  channel operation, network read and syscall goes through the
+  runtime, which can park the goroutine and reuse the OS thread.
+  That is only possible in a language with a controlled runtime.
+
+  In C and C++ you get 1:1, and async is a library (io_uring,
+  libuv, ASIO) that you must use consistently or not at all.</pre>
+
+<h2 id="creating">Creating threads</h2>
+
+<p>Creating a thread looks simple and has details that matter — what it runs, what it gets as an argument, how you wait for it, and what happens if you never do.</p>
+
+<pre><code>#include &lt;pthread.h&gt;
+
+static void *worker(void *arg)
+{
+        int id = *(int *)arg;
+        /* ... */
+        return (void *)(intptr_t)result;
+}
+
+pthread_t t[4];
+int ids[4];
+for (int i = 0; i &lt; 4; i++) {
+        ids[i] = i;                    /* NOT &amp;i — see below */
+        if (pthread_create(&amp;t[i], NULL, worker, &amp;ids[i]) != 0)
+                return -1;             /* returns errno, does NOT set it */
+}
+for (int i = 0; i &lt; 4; i++) {
+        void *ret;
+        pthread_join(t[i], &amp;ret);
+}
+
+/* The classic bug: passing &amp;i, the LOOP VARIABLE. Every thread
+   receives the same address, and reads whatever value it holds
+   when the thread happens to run. Pass a distinct object per
+   thread, or pass the value cast to intptr_t.               */</code></pre>
+
+<pre><code>/* C11 threads — standard but thinly supported; pthreads remains
+   the practical choice on POSIX.                              */
+#include &lt;threads.h&gt;
+thrd_create(&amp;t, worker, arg);
+thrd_join(t, &amp;res);
+
+/* Windows */
+HANDLE h = CreateThread(NULL, 0, ThreadProc, param, 0, &amp;tid);
+WaitForSingleObject(h, INFINITE);
+CloseHandle(h);
+/* Prefer _beginthreadex in C code: it initialises the CRT's
+   per-thread state (errno, strtok buffers). Raw CreateThread
+   leaks that state and breaks some CRT functions.           */</code></pre>
+
+<h3>Detached versus joinable</h3>
+
+<pre><code>/* A joinable thread's exit status and stack are retained until
+   someone joins it. Never joining leaks — the thread equivalent
+   of a zombie process.                                        */
+
+pthread_join(t, &amp;ret);          /* wait and reclaim */
+
+/* Or detach, if you never need the result: */
+pthread_detach(t);
+/* or at creation */
+pthread_attr_t a;
+pthread_attr_init(&amp;a);
+pthread_attr_setdetachstate(&amp;a, PTHREAD_CREATE_DETACHED);
+pthread_attr_setstacksize(&amp;a, 256 * 1024);   /* default is 8 MB! */
+pthread_create(&amp;t, &amp;a, worker, arg);
+pthread_attr_destroy(&amp;a);
+
+/* Stack size matters: 8 MB of VIRTUAL address space per thread is
+   fine on 64-bit, but on 32-bit it caps you at ~380 threads, and
+   the guard page plus first-touch cost is real. Size it.      */</code></pre>
+
+<h2 id="tls">Thread-local storage</h2>
+
+<p>Sometimes each thread needs its own copy of a variable despite sharing the address space. There are several mechanisms for that, with different costs and different lifetimes.</p>
+
+<pre><code>_Thread_local int counter;          /* C11              */
+thread_local int counter;            /* C23 / &lt;threads.h&gt; */
+__thread int counter;                /* GCC extension     */
+__declspec(thread) int counter;      /* MSVC              */
+
+/* Each thread gets its own instance, with static duration.
+   Used for: errno, per-thread caches, random number state,
+   the current transaction or request context.            */
+
+/* Dynamic TLS, when the key is not known at compile time: */
+pthread_key_t key;
+pthread_key_create(&amp;key, destructor);   /* destructor runs at thread exit */
+pthread_setspecific(key, ptr);
+void *p = pthread_getspecific(key);
+
+/* Cost: a TLS access is a few instructions via a dedicated register
+   (TPIDR_EL0 on AArch64). In a shared library with dynamic TLS it
+   can require a function call on first access per thread.       */</code></pre>
+
+<h2 id="safety">Thread safety and reentrancy</h2>
+
+<p>"Thread-safe" and "reentrant" are used interchangeably and mean different things. The distinction matters because a function can be one without being the other, and signal handlers need the stricter property.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>Means</th></tr></thead>
+<tbody>
+<tr><td><strong>Thread-safe</strong></td><td>Correct when called concurrently from several threads — usually via internal locking</td></tr>
+<tr><td><strong>Reentrant</strong></td><td>Correct when interrupted and called again, including from a signal handler. Stricter: implies no locks and no static state.</td></tr>
+<tr><td><strong>Async-signal-safe</strong></td><td>Safe to call from a signal handler. Stricter still — see <a href="c-16-stdlib.html">C ch. 16</a>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* NOT thread-safe: returns a pointer to static storage */
+char *strtok(char *s, const char *d);
+struct tm *localtime(const time_t *t);
+char *strerror(int e);
+struct passwd *getpwnam(const char *n);
+
+/* the _r variants take caller-supplied storage instead */
+strtok_r(s, d, &amp;saveptr);
+localtime_r(t, &amp;tm_buf);
+strerror_r(e, buf, sizeof buf);
+getpwnam_r(n, &amp;pwd, buf, sizeof buf, &amp;result);
+
+/* Writing thread-safe code: three strategies, in order of
+   preference.                                            */
+
+/* 1. NO SHARED STATE — by far the best. Give each thread its own
+      data and combine at the end.                            */
+struct alignas(64) partial { long sum; };   /* padded: CA ch. 15 */
+struct partial results[NTHREADS];
+
+/* 2. IMMUTABLE SHARED STATE — read-only after construction needs
+      no synchronisation at all.                               */
+static const struct config *cfg;   /* set once before threads start */
+
+/* 3. EXPLICIT SYNCHRONISATION — locks, atomics, channels.
+      Necessary, but every lock is a chance to deadlock.       */</code></pre>
+
+<h2 id="signals">Signals and threads</h2>
+
+<p>Signals and threads interact badly, because a signal is delivered to a process but must run on some thread. The rules are precise and the naive approach is almost always wrong.</p>
+
+<pre><code>/* The rules, which are unintuitive:
+     · signal HANDLERS are per-PROCESS (shared)
+     · signal MASKS are per-THREAD
+     · a signal sent to the process is delivered to ANY ONE thread
+       that has it unblocked — you do not choose which
+     · pthread_kill() targets a specific thread                */
+
+/* The standard pattern: block signals everywhere, handle them in
+   one dedicated thread. This removes async-signal-safety from the
+   problem entirely.                                            */
+sigset_t set;
+sigemptyset(&amp;set);
+sigaddset(&amp;set, SIGINT);
+sigaddset(&amp;set, SIGTERM);
+pthread_sigmask(SIG_BLOCK, &amp;set, NULL);   /* BEFORE creating threads,
+                                             so all inherit the mask */
+
+/* ...then in one thread: */
+int sig;
+sigwait(&amp;set, &amp;sig);              /* synchronous, ordinary context —
+                                     you may call anything here      */
+shutdown_gracefully();
+
+/* Linux alternative: signalfd() turns signals into a readable fd
+   you can put in an epoll loop.                                */</code></pre>
+
+<h2 id="cancellation">Cancellation</h2>
+
+<p>Stopping a thread from outside is far harder than starting one, because it may be holding locks or halfway through modifying shared state. The mechanisms reflect that difficulty.</p>
+
+<pre><code>pthread_cancel(t);              /* request cancellation */
+
+/* Deferred (the default): the thread dies at the next CANCELLATION
+   POINT — a blocking call such as read, write, sleep, wait.  */
+pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+/* Asynchronous: dies immediately, anywhere. Almost never usable —
+   it can die holding a lock or half-way through an allocation. */
+pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+/* Cleanup handlers run on cancellation */
+pthread_cleanup_push(unlock_it, &amp;mutex);
+        /* ... critical section ... */
+pthread_cleanup_pop(1);         /* 1 = also run it on normal exit */</code></pre>
+
+<div class="warn">
+<b>Prefer cooperative shutdown</b>
+<p><code>pthread_cancel</code> is difficult to use correctly: every resource must have a cleanup handler,
+and a cancellation point can appear inside library code you did not write. In practice, use an atomic flag
+plus a wakeup mechanism (a pipe, an eventfd, a condition variable) and let the thread exit its own loop.
+Windows does not offer cancellation at all — <code>TerminateThread</code> is documented as unsafe and should
+never be used.</p>
+</div>
+
+<h2 id="pools">Thread pools</h2>
+
+<p>Creating a thread per unit of work does not scale. A pool of workers pulling from a queue is the standard answer, and the details that matter are mostly about the queue rather than the threads.</p>
+
+<pre class="diagram">Creating a thread per unit of work does not scale:
+
+   thread creation      ~10-100 µs and ~8 MB of virtual address space
+   context switching    grows with thread count
+   cache footprint      each thread evicts the others
+   scheduler overhead   O(log n) or worse per switch
+
+A POOL fixes the count and queues the work:
+
+   [ task queue ] ──► worker 1
+                 ├──► worker 2
+                 ├──► worker 3
+                 └──► worker 4      (typically nproc, or nproc+1)
+
+Sizing:
+   CPU-bound      ≈ number of cores
+   I/O-bound      more, since most workers are blocked
+   mixed          separate pools, so slow I/O cannot starve compute
+
+Beware of the work-queue lock becoming the bottleneck — that is
+what work-stealing deques solve, and why Rayon, TBB and Go's
+scheduler all use per-worker queues.</pre>
+
+<h2 id="debug">Debugging threaded programs</h2>
+
+<p>Threading bugs are timing-dependent and rarely reproduce on demand. These tools find them by checking the rules on every access rather than waiting for the unlucky interleaving.</p>
+
+<pre><code># ThreadSanitizer — finds data races that have not yet manifested.
+# The single most valuable tool here. ~5-15x slowdown.
+gcc -fsanitize=thread -g prog.c &amp;&amp; ./prog
+
+# Helgrind / DRD — race and lock-order detection, no rebuild needed
+valgrind --tool=helgrind ./prog
+
+# gdb
+info threads
+thread 3
+thread apply all bt          # backtrace of EVERY thread — the first
+                             # thing to run on a deadlock
+
+# what are the threads doing right now?
+top -H -p PID
+ps -L -o pid,tid,psr,pcpu,stat,wchan,comm -p PID
+cat /proc/PID/task/TID/stack        # kernel-side, for D state
+
+# contention
+perf lock record ./prog &amp;&amp; perf lock report
+perf sched latency</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>All threads get the same argument value</td><td>Passed <code>&amp;i</code>, the shared loop variable</td></tr>
+<tr><td>Adding threads makes it slower</td><td>False sharing or lock contention (<a href="ca-15-coherence.html">CA ch. 15</a>)</td></tr>
+<tr><td>Works with 2 threads, fails with 16</td><td>A race whose window widened</td></tr>
+<tr><td>Fails only on ARM, not x86</td><td>Missing barriers; TSO hid it</td></tr>
+<tr><td>Memory grows with each completed thread</td><td>Joinable threads never joined</td></tr>
+<tr><td>Cannot create more than ~380 threads on 32-bit</td><td>8 MB default stack exhausting address space</td></tr>
+<tr><td>Signal handled by an unexpected thread</td><td>Process-directed signals go to any unblocked thread</td></tr>
+<tr><td><code>strtok</code> returns wrong results</td><td>Static state shared between threads; use <code>strtok_r</code></td></tr>
+<tr><td>Deadlock after cancelling a thread</td><td>Cancelled while holding a lock</td></tr>
+<tr><td>Child process hangs after <code>fork</code></td><td>Inherited a lock held by a thread that did not survive</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List what threads share and what is private, including the signal asymmetry.</li>
+  <li>Explain why Linux uses one object for threads and processes, and what <code>tgid</code> distinguishes.</li>
+  <li>Compare 1:1, N:1 and M:N, and say why M:N works for Go but not for C.</li>
+  <li>Give the <code>&amp;i</code> bug and two correct ways to pass per-thread data.</li>
+  <li>Explain joinable versus detached and the leak that follows from confusing them.</li>
+  <li>Distinguish thread-safe, reentrant and async-signal-safe.</li>
+  <li>Describe the standard pattern for handling signals in a threaded program.</li>
+  <li>Explain why <code>pthread_cancel</code> is hard to use and what to do instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

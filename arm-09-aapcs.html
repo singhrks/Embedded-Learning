@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The procedure call standard (AAPCS64) | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The procedure call standard (AAPCS64)</h1>
+<p class="lead">The ABI is the contract that lets separately compiled code interoperate. You need it to write
+assembly that C can call, to read stack traces, to debug a corrupted frame, and to understand why a struct
+passed by value sometimes costs nothing and sometimes costs a memory copy.</p>
+
+<h2 id="registers">Register roles</h2>
+
+<p>The calling convention is an agreement about who may use which register and who must put it back. Nothing in the hardware enforces it, which is exactly why breaking it produces symptoms that look like anything except a calling error.</p>
+
+<pre class="diagram">   X0-X7     arguments 1-8, and return value in X0
+             (X0:X1 for a 128-bit return)          CALLER-saved
+   X8        indirect result location register
+             — and, on Linux, the syscall number   CALLER-saved
+   X9-X15    temporaries                           CALLER-saved
+   X16,X17   IP0/IP1 — linker veneers, PLT stubs   may be clobbered
+                                                   by the LINKER
+   X18       platform register — OS-specific       don't touch
+   X19-X28   general use                           CALLEE-saved
+   X29       FP  frame pointer                     CALLEE-saved
+   X30       LR  link register                     CALLEE-saved
+   SP        stack pointer                         CALLEE-saved
+
+   V0-V7     FP/SIMD arguments and return          CALLER-saved
+   V8-V15    LOWER 64 BITS callee-saved            partially saved
+   V16-V31   temporaries                           CALLER-saved
+
+  Note the oddity in V8-V15: only the low 64 bits are preserved.
+  Assembly that uses the full 128 bits of V8 must save it itself.
+  This catches out hand-written SIMD kernels regularly.</pre>
+
+<div class="key">
+<b>Caller-saved versus callee-saved</b>
+<p><strong>Caller-saved</strong> (volatile): if you need the value after a call, <em>you</em> save it. The
+callee may destroy it freely.</p>
+<p><strong>Callee-saved</strong> (non-volatile): if a function uses one, it must restore the original value
+before returning. The caller may assume it survives.</p>
+<p>The split exists so neither side saves more than necessary: values needed across a call go in callee-saved
+registers, short-lived temporaries go in caller-saved ones, and the compiler allocates accordingly.</p>
+</div>
+
+<h2 id="stack">The stack</h2>
+
+<p>The stack has rules beyond "grows downwards": an alignment requirement the hardware will fault on, and a layout that tools rely on to make sense of a crash.</p>
+
+<pre class="diagram">   higher addresses
+   ┌─────────────────────────┐
+   │ caller's frame          │
+   ├─────────────────────────┤
+   │ arguments 9, 10, ...    │  ← beyond the 8 register arguments
+   ├─────────────────────────┤  ← SP on entry, 16-byte aligned
+   │ saved X29 (caller's FP) │  ┐
+   │ saved X30 (return addr) │  │ this frame
+   ├─────────────────────────┤  │
+   │ saved X19-X28 (as used) │  │
+   ├─────────────────────────┤  │
+   │ local variables         │  │
+   │ spilled temporaries     │  ┘
+   └─────────────────────────┘  ← SP now
+   lower addresses            (grows DOWN)
+
+RULES:
+  · SP must be 16-BYTE ALIGNED at every public interface.
+    Not 8. Sixteen. This is not advisory — instructions that
+    assume it will fault, and the fault looks like random
+    corruption.
+  · SP must always be valid: an exception can occur at any
+    instruction and the handler may use it.
+  · The RED ZONE that exists on x86-64 does NOT exist here.
+    You may not write below SP.</pre>
+
+<pre><code>/* A standard non-leaf function */
+func:
+        stp     x29, x30, [sp, #-32]!   // allocate 32, save FP and LR
+        mov     x29, sp                 // establish the frame pointer
+        stp     x19, x20, [sp, #16]     // save what we will use
+        ...
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #32     // restore, deallocate
+        ret
+
+/* A LEAF function — calls nothing, so LR is untouched and no
+   frame is needed at all:                                    */
+square: mul     w0, w0, w0
+        ret
+
+/* Large frames need an explicit adjustment, because the
+   pre-index immediate is limited to ±512 for STP:           */
+big:    stp     x29, x30, [sp, #-16]!
+        mov     x29, sp
+        sub     sp, sp, #4096           // room for locals
+        ...
+        add     sp, sp, #4096
+        ldp     x29, x30, [sp], #16
+        ret</code></pre>
+
+<h2 id="frame-pointer">The frame pointer chain</h2>
+
+<p>Linking each stack frame to the one that called it costs a register and one instruction. What it buys is the ability to produce a backtrace from a running or crashed program, which is why kernels generally keep it.</p>
+
+<pre class="diagram">   X29 points at a two-word record: {caller's X29, return address}
+   Each record points to the previous one, forming a linked list:
+
+        X29 ──► ┌──────────────┐
+                │ caller's X29 │──► ┌──────────────┐
+                │ return addr  │    │ caller's X29 │──► ...
+                └──────────────┘    │ return addr  │
+                                    └──────────────┘
+
+   THIS is how a debugger or profiler walks a stack:
+        fp = X29
+        while (fp) {
+                print_symbol(*(fp + 8));   // return address
+                fp = *(fp + 0);            // previous frame
+        }
+
+   Which is why -fomit-frame-pointer breaks naive stack walking,
+   and why perf and the kernel want -fno-omit-frame-pointer.
+   The alternative is DWARF CFI unwinding, which is exact but
+   requires parsing .eh_frame — far more expensive, and not
+   usable from an interrupt handler.
+
+   Linux arm64 builds with frame pointers ON for this reason.</pre>
+
+<h2 id="arguments">How arguments are assigned</h2>
+
+<p>Assigning arguments to registers is more involved than "first eight go in x0 to x7", because types have different sizes and floating-point values use a different register file entirely.</p>
+
+<pre><code>/* The rules, applied left to right: */
+
+/* 1. Integers and pointers → the next free X register (X0-X7) */
+void f(int a, long b, void *c, char d);
+/*     w0      x1       x2      w3                            */
+
+/* 2. Floats and vectors → the next free V register (V0-V7),
+      in a SEPARATE sequence from the integer registers        */
+void g(int a, double b, int c, float d);
+/*     w0      d0        w1      s1
+   Note: integers and floats do not compete for slots.        */
+
+/* 3. Small structs (≤ 16 bytes) → passed in up to two registers */
+struct pair { long a, b; };
+void h(struct pair p);
+/*     x0 = p.a, x1 = p.b   — no memory involved              */
+
+/* 4. HFAs/HVAs — a struct of 1-4 identical float members —
+      go in consecutive V registers                            */
+struct vec3 { float x, y, z; };
+void i(struct vec3 v);
+/*     s0, s1, s2                                             */
+
+/* 5. Larger structs → COPIED TO THE STACK, and a pointer to
+      that copy is passed                                      */
+struct big { long a[10]; };
+void j(struct big b);
+/*     the caller memcpys 80 bytes onto the stack             */
+
+/* 6. Large RETURN values → the caller allocates space and
+      passes its address in X8                                 */
+struct big k(void);
+/*     caller: add x8, sp, #N ; bl k
+       callee writes the result through x8                    */
+
+/* 7. Remaining arguments → the stack, right after the frame  */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Return type</th><th>Returned in</th></tr></thead>
+<tbody>
+<tr><td><code>int</code>, <code>long</code>, pointer</td><td><code>X0</code></td></tr>
+<tr><td>128-bit integer</td><td><code>X0</code>:<code>X1</code></td></tr>
+<tr><td><code>float</code>, <code>double</code></td><td><code>S0</code> / <code>D0</code></td></tr>
+<tr><td>Struct &le; 16 bytes</td><td><code>X0</code>:<code>X1</code></td></tr>
+<tr><td>HFA of &le; 4 floats</td><td><code>V0</code>–<code>V3</code></td></tr>
+<tr><td>Anything larger</td><td>Memory, via the pointer in <code>X8</code></td></tr>
+<tr><td><code>void</code></td><td>Nothing</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tip">
+<b>The practical consequence</b>
+<p>A struct of two <code>long</code>s costs nothing to pass — it goes in two registers. A struct of three
+costs a stack copy on every call. That 16-byte boundary is a real, measurable cliff, and it is a good reason
+to keep small value types genuinely small, or to pass a <code>const</code> pointer instead
+(<a href="c-11-functions-abi.html">C ch. 11</a>).</p>
+</div>
+
+<h2 id="varargs">Variadic functions</h2>
+
+<p>A function that accepts a variable number of arguments cannot know where they are at compile time, so the ABI has to describe them in a way the callee can walk at runtime.</p>
+
+<pre><code>/* Variadic arguments follow the same register rules, but the
+   callee must be able to walk them, so va_start saves ALL the
+   argument registers into a "register save area" on the stack. */
+
+int printf(const char *fmt, ...);
+/*  X0 = fmt, then X1-X7 and V0-V7 hold the variadic args.
+    va_start spills X1-X7 and V0-V7 to the stack, then va_arg
+    walks that area and then the overflow stack area.        */
+
+/* Which is why:
+     · a variadic function has a larger prologue than it looks
+     · Apple's arm64 ABI differs here: it passes ALL variadic
+       arguments on the STACK, which is a real portability
+       difference for hand-written assembly and for JITs
+     · default argument promotions apply: float → double,
+       narrow ints → int (C chapter 11)                     */
+
+/* The va_list layout is defined by the ABI: */
+typedef struct {
+        void *__stack;          // next stack argument
+        void *__gr_top;         // top of the general register area
+        void *__vr_top;         // top of the vector register area
+        int   __gr_offs;        // offset into the GP area (negative)
+        int   __vr_offs;
+} va_list[1];</code></pre>
+
+<h2 id="asm">Writing assembly C can call</h2>
+
+<p>Hand-written assembly that C can call must honour every rule above exactly. This is the checklist, and each item corresponds to a failure mode that is painful to debug from the symptom.</p>
+
+<pre><code>        .text
+        .global my_memcpy
+        .type   my_memcpy, %function
+my_memcpy:
+        // x0 = dst, x1 = src, x2 = n   — per the ABI
+        // returns dst in x0, so save it
+        mov     x3, x0                  // x3 is caller-saved: free
+
+        cbz     x2, 2f
+1:      ldrb    w4, [x1], #1            // x4, x5: caller-saved
+        strb    w4, [x3], #1
+        subs    x2, x2, #1
+        b.ne    1b
+2:      ret                             // x0 still holds dst
+        .size   my_memcpy, . - my_memcpy
+
+/* CHECKLIST for hand-written assembly:
+     ☐ arguments read from X0-X7 in order
+     ☐ return value placed in X0
+     ☐ X19-X28, X29, X30 saved if used
+     ☐ low 64 bits of V8-V15 saved if used
+     ☐ SP 16-byte aligned at every call you make
+     ☐ SP restored exactly before RET
+     ☐ X18 untouched
+     ☐ .type %function and .size set, so the debugger and
+       unwinder recognise it                                */</code></pre>
+
+<pre><code>/* Calling assembly from C: declare it with a matching prototype.
+   A mismatch is a LINK-time success and a RUNTIME disaster —
+   the linker matches by NAME only (C chapter 01).           */
+
+extern void *my_memcpy(void *dst, const void *src, size_t n);
+
+/* And from C++, wrap it: */
+extern "C" void *my_memcpy(void *, const void *, size_t);</code></pre>
+
+<h2 id="unwinding">Stack unwinding</h2>
+
+<p>Producing a backtrace means reconstructing a chain of frames from nothing but a stack pointer. There are two ways to make that possible, and which one is in use determines whether your crash reports are readable.</p>
+
+<pre><code>/* Two mechanisms, with different trade-offs: */
+
+/* 1. FRAME POINTER walking — fast, simple, works anywhere,
+      including in an interrupt handler. Requires that every
+      frame in the chain has a frame pointer.               */
+        -fno-omit-frame-pointer
+
+/* 2. DWARF CFI (.eh_frame) — exact, works without frame
+      pointers, but requires parsing unwind tables. Used by
+      C++ exceptions, backtrace(), and gdb.                 */
+        -funwind-tables
+        readelf --debug-dump=frames prog
+
+/* In the kernel, arm64 supports both: frame-pointer unwinding
+   for oops traces and ftrace, and now ORC-style tables for
+   reliable stacktraces used by live patching.
+
+   The practical rule: if your profiler shows broken or
+   truncated stacks, either build with frame pointers or ensure
+   the profiler uses DWARF:                                 */
+perf record --call-graph=fp   ./prog     # needs frame pointers
+perf record --call-graph=dwarf ./prog    # slower, more accurate</code></pre>
+
+<h2 id="pac">Pointer authentication and the ABI</h2>
+
+<p>Pointer authentication signs return addresses so that overwriting one on the stack is detected. It changes the prologue and epilogue of every protected function, which is why disassembly on modern systems looks slightly different.</p>
+
+<pre><code>/* With -mbranch-protection=standard, the prologue and epilogue
+   gain two instructions:                                    */
+
+func:   paciasp                          // sign LR using SP as context
+        stp     x29, x30, [sp, #-16]!
+        ...
+        ldp     x29, x30, [sp], #16
+        autiasp                          // authenticate LR
+        ret                              // faults if it was tampered
+
+/* The signature occupies the unused upper bits of the pointer.
+   An attacker who overwrites the saved LR cannot produce a valid
+   signature, so the AUT fails and the RET faults.
+
+   Note the interaction with unwinding: a debugger walking the
+   stack sees SIGNED return addresses and must strip the
+   authentication bits (XPACI) before symbolising them. Older
+   tools show garbage addresses on PAC-enabled binaries.    */
+
+/* BTI adds a landing-pad requirement on indirect branches: */
+func:   bti     c                        // valid target for BLR
+        ...</code></pre>
+
+<h2 id="debug">Debugging ABI problems</h2>
+
+<p>ABI violations rarely announce themselves. These are the signatures they leave, and recognising them saves you from hunting for memory corruption that was never there.</p>
+
+<pre><code># check the arguments a function actually received
+gdb) info args
+gdb) info frame
+gdb) p $x0
+gdb) bt
+
+# the frame pointer chain, by hand
+gdb) p/x $x29
+gdb) x/2gx $x29          # {caller's fp, return address}
+
+# see what the compiler expects
+gcc -O2 -S test.c        # look at the prologue and argument use
+
+# verify alignment at a call site
+gdb) p $sp % 16          # must be 0
+
+# a corrupted stack trace, or a return to a garbage address,
+# almost always means:
+#   · SP misaligned
+#   · a callee-saved register clobbered
+#   · the frame pointer not established or not restored
+#   · a prototype mismatch between caller and callee</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Caller's local variables corrupted after a call</td><td>Callee clobbered a callee-saved register</td></tr>
+<tr><td>Return to a garbage address</td><td><code>X30</code> not saved, or the stack was corrupted</td></tr>
+<tr><td>Alignment fault deep inside libc</td><td>SP not 16-byte aligned at the call</td></tr>
+<tr><td>Float arguments arrive as garbage</td><td>Missing prototype, so they went in the wrong register class</td></tr>
+<tr><td>Struct-by-value call is unexpectedly slow</td><td>Larger than 16 bytes — a memory copy per call</td></tr>
+<tr><td>Assembly works on Linux, fails on Windows or macOS</td><td><code>X18</code> use, or Apple's variadic-on-stack rule</td></tr>
+<tr><td>SIMD kernel corrupts the caller</td><td>Used the full 128 bits of <code>V8</code>–<code>V15</code>; only the low 64 are preserved</td></tr>
+<tr><td>Stack traces truncated in perf</td><td>Built with <code>-fomit-frame-pointer</code></td></tr>
+<tr><td>Backtrace shows nonsense addresses on a hardened build</td><td>PAC-signed return addresses not stripped by the tool</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the argument registers, the return register, and the callee-saved set.</li>
+  <li>Explain caller-saved versus callee-saved and why both exist.</li>
+  <li>State the stack alignment rule and one symptom of violating it.</li>
+  <li>Draw the frame pointer chain and show how a debugger walks it.</li>
+  <li>Explain how a 12-byte struct, a 24-byte struct and a <code>struct vec3</code> are each passed.</li>
+  <li>Say what <code>X8</code> is for on a large struct return.</li>
+  <li>Give the checklist for hand-written assembly that C will call.</li>
+  <li>Explain what <code>PACIASP</code>/<code>AUTIASP</code> do and how they interact with unwinding.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

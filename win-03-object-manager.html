@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The object manager and handles | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The object manager and handles</h1>
+<p class="lead">Windows unifies processes, files, devices, events and the registry into one object system
+with uniform naming, reference counting and security. Understanding it explains handle leaks, access checks,
+and a whole class of privilege-escalation bugs.</p>
+
+<h2 id="anatomy">Anatomy of an object</h2>
+
+<p>Every object in the system shares a common header before its type-specific body. That header is where the name, the security descriptor and the reference counts live, which is what allows one implementation to manage files, devices and events identically.</p>
+
+<pre class="diagram">   +-----------------------------------+
+   |  OBJECT HEADER                    |
+   |    PointerCount   kernel refs     |  &lt;-- ObReference/
+   |    HandleCount    open handles    |      ObDereference
+   |    Type           -&gt; OBJECT_TYPE  |
+   |    SecurityDescriptor             |
+   |    Name / Directory  (optional)   |
+   |    Flags: permanent, exclusive... |
+   +-----------------------------------+
+   |  OBJECT BODY                      |
+   |    type-specific data:            |
+   |      FILE_OBJECT, DEVICE_OBJECT,  |
+   |      EPROCESS, ETHREAD, KEVENT... |
+   +-----------------------------------+
+
+  A POINTER to an object points at the BODY. The header is at
+  a negative offset, which is why you never touch it directly.
+
+  TWO INDEPENDENT COUNTS:
+     HandleCount    how many open handles exist
+     PointerCount   how many kernel references exist
+                    (includes one per handle)
+
+  The object is destroyed when BOTH reach zero. That is what
+  makes it safe for a driver to keep using an object after
+  userspace has closed its handle - as long as it took a
+  reference.
+
+  THE TYPE OBJECT holds the procedures for that type:
+     OpenProcedure, CloseProcedure, DeleteProcedure,
+     ParseProcedure, SecurityProcedure, QueryNameProcedure
+
+  The ParseProcedure is how \Device\HarddiskVolume1\foo\bar
+  works: the object manager resolves as far as the device
+  object, then hands the REST OF THE PATH to the file system,
+  which parses it. That single mechanism is why the object
+  namespace and file system namespaces compose.</pre>
+
+<h2 id="namespace">The namespace</h2>
+
+<p>Objects can be named, and the names live in a single hierarchical namespace that has nothing to do with the filesystem you see in Explorer. Knowing how to browse it is the quickest way to confirm that your device object actually exists.</p>
+
+<pre><code>\                          root
+\Device\                   device objects created by drivers
+    \Device\HarddiskVolume1
+    \Device\MyDevice           &lt;-- yours
+\GLOBAL??\  (was \DosDevices\)  symbolic links
+    \GLOBAL??\C:      -&gt; \Device\HarddiskVolume3
+    \GLOBAL??\MyDev   -&gt; \Device\MyDevice
+\Driver\                   loaded driver objects
+\FileSystem\
+\BaseNamedObjects\         named events, mutexes, sections
+                           created by user mode
+\Sessions\&lt;n&gt;\             per-session namespace
+\KernelObjects\
+\REGISTRY\MACHINE\...      the registry, as objects
+\ObjectTypes\              the type objects themselves
+
+/* WHY \GLOBAL?? MATTERS TO YOU: user mode cannot open
+   \Device\MyDevice directly with CreateFile - it resolves
+   names relative to \GLOBAL?? (and the per-session \??).
+   So a driver that wants to be reachable creates a symbolic
+   link:                                                    */
+
+        DECLARE_CONST_UNICODE_STRING(devName,
+                                     L"\\Device\\MyDevice");
+        DECLARE_CONST_UNICODE_STRING(symLink,
+                                     L"\\DosDevices\\MyDevice");
+
+        status = IoCreateSymbolicLink(&amp;symLink, &amp;devName);
+        ...
+        IoDeleteSymbolicLink(&amp;symLink);    /* in unload! */
+
+/* then user mode opens: */
+        h = CreateFileW(L"\\\\.\\MyDevice", ...);
+              /* \\.\ maps to \GLOBAL?? */
+
+/* BROWSE IT with Sysinternals WinObj. Do this once - seeing
+   the real namespace makes the model concrete in a way no
+   description does.                                        */</code></pre>
+
+<h2 id="handles">Handles</h2>
+
+<p>User mode never holds a pointer to a kernel object. It holds a handle — an opaque index into a per-process table — and understanding that indirection explains several behaviours that otherwise look arbitrary.</p>
+
+<pre><code>/* A handle is a per-process index into a handle table, not a
+   pointer. Each entry holds:
+        a pointer to the object
+        a GRANTED ACCESS MASK
+        flags: inheritable, protect-from-close, audit        */
+
+/* THE ACCESS MASK is fixed at OPEN time. The object manager
+   checks the requested access against the object's security
+   descriptor once, then records what was granted. Every later
+   operation is checked against the RECORDED mask - which is
+   why a handle opened for read cannot later be used to
+   write, even if the security descriptor changes.        */
+
+        GENERIC_READ / GENERIC_WRITE / GENERIC_ALL
+        FILE_READ_DATA / FILE_WRITE_DATA
+        SYNCHRONIZE
+        DELETE / READ_CONTROL / WRITE_DAC / WRITE_OWNER
+
+/* CONVERTING A HANDLE TO AN OBJECT, in a driver: */
+        PFILE_OBJECT fileObject;
+        NTSTATUS status;
+
+        status = ObReferenceObjectByHandle(
+                        handle,
+                        FILE_READ_DATA,     /* required access */
+                        *IoFileObjectType,  /* expected TYPE   */
+                        UserMode,           /* &lt;-- CRITICAL    */
+                        (PVOID *)&amp;fileObject,
+                        NULL);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* ... use fileObject ... */
+
+        ObDereferenceObject(fileObject);    /* ALWAYS */</code></pre>
+
+<div class="danger">
+<b>The <code>AccessMode</code> parameter is a security control, not a formality</b>
+<p><code>UserMode</code> tells the object manager to validate the handle as if a user-mode caller presented
+it: check that it is a user handle, that the type matches, and that the granted access covers what you asked
+for. <code>KernelMode</code> skips all of that.</p>
+<p>Passing <code>KernelMode</code> while handling a request that <em>came from user mode</em> lets an
+unprivileged caller hand you a kernel handle value, or a handle without the access you require, and have
+your driver operate on it with full privilege. This is a textbook elevation-of-privilege bug and it has
+shipped in real drivers repeatedly. When servicing a user request, pass
+<code>Irp-&gt;RequestorMode</code> or <code>UserMode</code> — never a hard-coded
+<code>KernelMode</code>.</p>
+</div>
+
+<h2 id="refs">Reference counting</h2>
+
+<p>An object can be referenced by a handle, by a pointer held in kernel code, or both. It is freed only when every one of those is released, which is what allows an object to safely outlive the handle that created it.</p>
+
+<pre><code>/* THE RULE: every ObReferenceObject* must be matched by
+   exactly one ObDereferenceObject, on EVERY path including
+   errors.                                                   */
+
+        ObReferenceObject(object);              /* +1 */
+        ObDereferenceObject(object);            /* -1 */
+
+        ObReferenceObjectByPointer(object,
+                                   DesiredAccess,
+                                   ObjectType,
+                                   AccessMode);
+
+/* WHY A DRIVER TAKES A REFERENCE: you want to keep using an
+   object after the operation that gave it to you returns -
+   for example, storing a FILE_OBJECT to complete a request
+   later. Without a reference, the object can be freed the
+   moment the handle is closed, and you have a use-after-free
+   in a place you cannot reproduce.                        */
+
+/* THE FAILURE MODES:
+     · leaked reference -&gt; the object never dies. A device that
+       cannot be removed, a process stuck in "Terminated"
+       state, a driver that cannot be unloaded. Diagnosed with
+       !object and !handle in WinDbg (chapter 23).
+     · extra dereference -&gt; premature free, then a
+       use-after-free crash somewhere unrelated. Verifier's
+       special pool catches it.
+
+/* HANDLES YOU OPEN must be closed: */
+        ZwClose(handle);
+
+/* AND ALWAYS ASK: does this function return a referenced
+   object? The documentation says so explicitly, and the
+   answer determines whether you owe a dereference. Examples:
+
+     IoGetCurrentProcess()            NO reference
+     PsGetCurrentProcess()            NO reference
+     ObReferenceObjectByHandle()      YES - dereference it
+     IoGetDeviceObjectPointer()       YES - two things to
+                                      release, actually       */</code></pre>
+
+<h2 id="device">Creating a device object</h2>
+
+<p>Now the practical part: your driver creates a device object so that the rest of the system has something to send requests to. Almost every decision here has consequences for how — and whether — user mode can reach you.</p>
+
+<pre><code>/* The classic WDM way. WDF wraps this (chapter 15), but you
+   should see it once because it explains what WDF is doing. */
+
+NTSTATUS
+DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
+            _In_ PUNICODE_STRING RegistryPath)
+{
+        UNICODE_STRING devName, symLink;
+        PDEVICE_OBJECT deviceObject;
+        NTSTATUS status;
+
+        RtlInitUnicodeString(&amp;devName, L"\\Device\\MyDevice");
+
+        status = IoCreateDevice(
+                        DriverObject,
+                        sizeof(MY_DEVICE_EXTENSION),  /* your
+                                                         state */
+                        &amp;devName,
+                        FILE_DEVICE_UNKNOWN,
+                        FILE_DEVICE_SECURE_OPEN,      /* apply
+                                                         ACLs to
+                                                         opens  */
+                        FALSE,          /* not exclusive */
+                        &amp;deviceObject);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* the extension is YOUR per-device data - the Windows
+           equivalent of drvdata (Linux ch. 19)             */
+        PMY_DEVICE_EXTENSION ext = deviceObject-&gt;DeviceExtension;
+        RtlZeroMemory(ext, sizeof(*ext));
+        KeInitializeSpinLock(&amp;ext-&gt;Lock);
+
+        RtlInitUnicodeString(&amp;symLink, L"\\DosDevices\\MyDevice");
+        status = IoCreateSymbolicLink(&amp;symLink, &amp;devName);
+        if (!NT_SUCCESS(status)) {
+                IoDeleteDevice(deviceObject);
+                return status;
+        }
+
+        DriverObject-&gt;MajorFunction[IRP_MJ_CREATE] = MyCreate;
+        DriverObject-&gt;MajorFunction[IRP_MJ_CLOSE]  = MyClose;
+        DriverObject-&gt;MajorFunction[IRP_MJ_READ]   = MyRead;
+        DriverObject-&gt;MajorFunction[IRP_MJ_DEVICE_CONTROL] =
+                                                     MyIoctl;
+        DriverObject-&gt;DriverUnload = MyUnload;
+
+        /* THE LAST STEP - until this clears, the device
+           reports itself as still initialising and I/O is
+           refused: */
+        deviceObject-&gt;Flags &amp;= ~DO_DEVICE_INITIALIZING;
+
+        return STATUS_SUCCESS;
+}
+
+/* FILE_DEVICE_SECURE_OPEN IS IMPORTANT. Without it, a caller
+   can open \Device\MyDevice\anything and BYPASS the device's
+   ACL, because the security check is only applied to the
+   exact device name. Set it unless you have a namespace of
+   your own to parse.                                       */</code></pre>
+
+<h2 id="security">Securing a device</h2>
+
+<p>A device object is a security boundary. Whatever you allow here is what any process on the machine may do to your driver, so the default is deliberately restrictive and loosening it is a decision rather than a formality.</p>
+
+<pre><code>/* By default, a device object created by a driver may be
+   openable by any user. Decide deliberately who may open it. */
+
+/* 1. AN SDDL STRING in the INF (chapter 20) - the normal way: */
+        [MyDevice_AddReg]
+        HKR,,DeviceCharacteristics,0x10001,0x0100  ; SECURE_OPEN
+        HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+/*    D:P                     a protected DACL
+      (A;;GA;;;SY)            Allow, Generic All, SYSTEM
+      (A;;GA;;;BA)            Allow, Generic All, Builtin Admins
+   Add (A;;GRGW;;;WD) to allow read+write for Everyone - and
+   think hard before you do.
+
+/* 2. IoCreateDeviceSecure, in code: */
+        DECLARE_CONST_UNICODE_STRING(sddl,
+                L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)");
+
+        status = IoCreateDeviceSecure(DriverObject,
+                        sizeof(MY_DEVICE_EXTENSION),
+                        &amp;devName, FILE_DEVICE_UNKNOWN,
+                        FILE_DEVICE_SECURE_OPEN, FALSE,
+                        &amp;sddl, NULL, &amp;deviceObject);
+
+/* 3. IN WDF (chapter 15): */
+        WdfDeviceInitAssignSDDLString(deviceInit, &amp;sddl);
+
+/* THE COMMON SDDL ACRONYMS:
+        SY  Local System        BA  Builtin Administrators
+        WD  Everyone            AU  Authenticated Users
+        IU  Interactive Users   RC  Restricted Code
+        GA  Generic All         GR  Generic Read
+        GW  Generic Write       GX  Generic Execute
+
+/* AND A CHECK INSIDE AN OPERATION, when a specific action
+   needs more privilege than opening does: */
+        if (!SeSinglePrivilegeCheck(SeLoadDriverPrivilege,
+                                    Irp-&gt;RequestorMode))
+                return STATUS_PRIVILEGE_NOT_HELD;
+
+/* THE DESIGN QUESTION to answer explicitly: if any user can
+   open this device, then every IOCTL you expose is reachable
+   by every user, including from a sandboxed process. Size the
+   ACL to the least privilege your device genuinely needs -
+   this is the Windows form of the least-privilege argument
+   from isolation chapter 19.                              */</code></pre>
+
+<h2 id="inspect">Inspecting objects</h2>
+
+<p>All of this is visible from a debugger, which turns questions like "does my device exist" and "who has it open" from guesswork into a single command.</p>
+
+<pre><code># --- Tools on the running machine ---
+    WinObj              (Sysinternals) browse the namespace
+    Process Explorer    per-process handle list, lower pane
+    handle.exe          command line: who has this file open?
+        handle.exe MyDevice
+
+# --- In WinDbg (chapter 23) ---
+    !object \Device                 list a directory
+    !object \Device\MyDevice        one object's header
+    !object ffff8a0c12345678
+
+      Object: ffff8a0c12345678  Type: (ffff8a0c00112233) Device
+        ObjectHeader: ffff8a0c12345650
+        HandleCount: 2  PointerCount: 5
+        Directory Object: ffffc00012340000  Name: MyDevice
+
+    !handle                         all handles, this process
+    !handle 0x1c4 f                 full detail on one
+    !devobj ffff8a0c12345678        device object detail
+    !drvobj \Driver\MyDriver 7      the driver and its
+                                    dispatch table
+    !object \ObjectTypes            every type, with counts
+
+# --- FINDING A HANDLE LEAK ---
+    !htrace -enable                 (before reproducing)
+    ... run the workload ...
+    !htrace -diff
+# Shows every handle opened since the enable, with the stack
+# that opened it. This is the tool for "handles keep climbing".
+
+# Or from user mode:
+    Process Explorer -> the process -> lower pane -> Handles
+    and watch the count climb.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>CreateFile</code> fails with ERROR_FILE_NOT_FOUND</td><td>No symbolic link, or the wrong name — check WinObj</td></tr>
+<tr><td><code>CreateFile</code> fails with ACCESS_DENIED</td><td>The device's ACL excludes the caller</td></tr>
+<tr><td>Any user can open a privileged device</td><td>No SDDL set — the default is permissive</td></tr>
+<tr><td>ACL bypassed by opening a sub-path</td><td><code>FILE_DEVICE_SECURE_OPEN</code> not set</td></tr>
+<tr><td>Unprivileged caller operates on a kernel object</td><td><code>KernelMode</code> passed to <code>ObReferenceObjectByHandle</code> — a real EoP bug</td></tr>
+<tr><td>Handle count climbs forever</td><td>Missing <code>ZwClose</code> — use <code>!htrace</code></td></tr>
+<tr><td>Driver cannot be unloaded</td><td>Leaked object reference — <code>!object</code> shows PointerCount</td></tr>
+<tr><td>Use-after-free on a FILE_OBJECT</td><td>Kept a pointer without taking a reference</td></tr>
+<tr><td>Crash on the extra dereference</td><td>Unbalanced <code>ObDereferenceObject</code></td></tr>
+<tr><td>I/O refused right after <code>IoCreateDevice</code></td><td><code>DO_DEVICE_INITIALIZING</code> never cleared</td></tr>
+<tr><td>Symbolic link left behind after unload</td><td>No <code>IoDeleteSymbolicLink</code> in the unload path</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe an object's header, body and type, and the two reference counts.</li>
+  <li>Explain how a parse procedure lets file paths extend the object namespace.</li>
+  <li>Explain why a driver needs a symbolic link for user mode to reach it.</li>
+  <li>Explain what a handle is and when its access mask is checked.</li>
+  <li>State exactly what <code>UserMode</code> versus <code>KernelMode</code> changes, and the bug the
+  wrong choice creates.</li>
+  <li>Explain when a driver must take a reference, and both failure modes of getting it wrong.</li>
+  <li>Create a device object with a device extension and a symbolic link, with correct cleanup.</li>
+  <li>Explain what <code>FILE_DEVICE_SECURE_OPEN</code> prevents.</li>
+  <li>Write an SDDL string granting access to SYSTEM and Administrators only.</li>
+  <li>Find a handle leak with <code>!htrace</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RS-485, Modbus and industrial serial | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>RS-485, Modbus and industrial serial</h1>
+<p class="lead">A UART reaches a few metres. RS-485 takes the same UART and carries it a kilometre, to 32
+devices, through a factory full of electrical noise — for the cost of one transceiver chip and one piece of
+software discipline you must get exactly right.</p>
+
+<h2 id="rs485">What RS-485 changes</h2>
+
+<pre class="diagram">   RS-232 (what a plain UART pin is, roughly)
+     Single-ended: the voltage is measured against GROUND.
+     Noise couples onto the signal wire and is
+     indistinguishable from data. Ground offset between two
+     buildings can exceed the signal itself.
+     Reach: ~15 m at 9600 baud. One device per wire.
+
+   RS-485
+     DIFFERENTIAL: two wires, A and B. The receiver reads
+     the DIFFERENCE. Noise couples equally onto both and
+     cancels. Same idea as CAN (chapter 09).
+     Reach: 1200 m at 100 kbit/s. 32 standard loads,
+     more with low-load transceivers.
+
+              +--[120]--+                    +--[120]--+
+              |         |                    |         |
+     A  ------+---------+--------------------+---------+---
+     B  ------+---------+--------------------+---------+---
+              |         |                    |
+          +---+---+  +--+----+           +---+---+
+          |master |  |slave 1|    ...    |slave n|
+          +-------+  +-------+           +-------+
+
+   HALF DUPLEX, and this is the crucial difference from
+   everything else in this track: ONE PAIR, shared, and only
+   one transmitter may be enabled at a time. There is NO
+   arbitration - unlike CAN or I2C, two simultaneous
+   transmitters simply corrupt each other and may damage the
+   drivers.
+
+   So the protocol on top MUST guarantee that only one node
+   talks at a time. In practice that means a master polls
+   and slaves answer only when addressed - which is exactly
+   what Modbus does.
+
+   RS-422 is the full-duplex cousin: two pairs, one master
+   transmitting to many receivers. No direction control
+   needed, but no multi-drop from the slaves either.</pre>
+
+<h2 id="de">Direction control, the thing everyone gets wrong</h2>
+
+<pre><code>/* The transceiver has a DRIVER ENABLE pin. Assert it to
+   transmit, release it to listen. The timing of the
+   RELEASE is where the bugs live.                        */
+
+#define DE_HIGH()  (GPIOB-&gt;BSRR = (1u &lt;&lt; 1))       /* TX     */
+#define DE_LOW()   (GPIOB-&gt;BSRR = (1u &lt;&lt; (1 + 16)))/* RX     */
+
+/* WRONG - truncates the last byte, always.               */
+void rs485_send_broken(const uint8_t *p, size_t n)
+{
+    DE_HIGH();
+    while (n--) {
+        while (!(USART2-&gt;ISR &amp; USART_ISR_TXE)) { }
+        USART2-&gt;TDR = *p++;
+    }
+    DE_LOW();          /* TXE means the DATA REGISTER is
+                          free. The last byte is STILL IN
+                          THE SHIFT REGISTER (chapter 01).
+                          Disabling the driver now cuts it
+                          off mid-character.               */
+}
+
+/* RIGHT - wait for TRANSMISSION COMPLETE.                */
+void rs485_send(const uint8_t *p, size_t n)
+{
+    DE_HIGH();
+    delay_us(1);                       /* driver settle    */
+
+    while (n--) {
+        while (!(USART2-&gt;ISR &amp; USART_ISR_TXE)) { }
+        USART2-&gt;TDR = *p++;
+    }
+
+    while (!(USART2-&gt;ISR &amp; USART_ISR_TC)) { }   /* THE FIX  */
+    DE_LOW();
+}
+
+/* BETTER STILL - let the hardware do it. Many modern UARTs
+   drive the DE pin themselves with programmable setup and
+   hold times, which removes the software race entirely.  */
+USART2-&gt;CR3 |= USART_CR3_DEM;              /* DE mode      */
+USART2-&gt;CR1 |= (8u &lt;&lt; USART_CR1_DEAT_Pos)  /* assertion    */
+            |  (8u &lt;&lt; USART_CR1_DEDT_Pos); /* deassertion  */
+/* Now DE is an alternate function pin and the timing is
+   exact regardless of interrupts. If your part has this,
+   use it - it eliminates a whole class of intermittent
+   "the last byte is sometimes wrong" bugs.
+
+   WITH DMA the same trap appears: the DMA transfer-complete
+   interrupt fires when the last byte enters the UART, not
+   when it leaves the pin. Wait for TC in the DMA callback
+   before dropping DE.                                    */
+</code></pre>
+
+<div class="danger">
+<b>Fail-safe biasing: an idle bus is not a safe bus</b>
+<p>When no driver is enabled, the A/B pair floats. Noise then flips the receiver randomly and every node sees
+garbage that may resemble a start bit — so every node's UART reports framing errors continuously, and a
+receiver may lock onto noise as though it were a frame. The fix is fail-safe biasing: a pull-up on A and a
+pull-down on B, typically 560 Ω to 1 kΩ, fitted <em>once</em> on the bus, holding the idle state at a defined
+logical high. Many transceivers include internal fail-safe; many do not. If an RS-485 bus produces garbage
+when nothing is transmitting, this is the first thing to check.</p>
+</div>
+
+<h2 id="modbus">Modbus RTU</h2>
+
+<pre class="diagram">   Published in 1979 and still the default in industrial
+   automation, because it is simple enough to implement in
+   an afternoon and everything supports it.
+
+   FRAME:
+   +---------+----------+---------------+---------+
+   | ADDRESS | FUNCTION |      DATA     | CRC-16  |
+   |  1 byte |  1 byte  |   0-252 bytes | 2 bytes |
+   +---------+----------+---------------+---------+
+
+   FRAMING BY SILENCE: a frame starts after 3.5 character
+   times of silence and ends the same way. There is no start
+   or end delimiter byte at all.
+
+   AT 9600 BAUD, 8N1: one character is 11 bits = 1.146 ms
+     t3.5 = 4.01 ms
+     t1.5 = 1.72 ms  (max gap WITHIN a frame)
+
+   ABOVE 19200 BAUD the standard fixes these at 1.75 ms and
+   750 us rather than scaling them, because the character
+   times become impractically short.
+
+   THIS IS EXACTLY WHAT UART IDLE DETECTION IS FOR
+   (chapter 03). Modbus RTU was designed around a timing
+   gap, and the IDLE interrupt implements it in hardware.
+   The alternative - a timer restarted on every byte - works
+   but costs an interrupt per character.
+
+   COMMON FUNCTION CODES:
+     0x01  read coils            (bits, read/write)
+     0x02  read discrete inputs  (bits, read only)
+     0x03  read holding registers  (16-bit, read/write)
+     0x04  read input registers    (16-bit, read only)
+     0x05  write single coil
+     0x06  write single register
+     0x10  write multiple registers
+
+   ADDRESS 0 IS BROADCAST - all slaves act, none reply.
+   Addresses 1-247 are valid slaves.
+
+   EXCEPTION RESPONSE: the slave replies with the function
+   code OR 0x80, plus an exception code. 0x02 is "illegal
+   data address", which is what you get when your register
+   map does not match the master's expectation - the single
+   most common Modbus integration problem.</pre>
+
+<pre><code>/* CRC-16/MODBUS. Note the reflected polynomial 0xA001 and
+   the 0xFFFF seed - both are specific to Modbus and using
+   the wrong CRC-16 variant is a classic error, because
+   there are at least a dozen of them.                    */
+
+static uint16_t modbus_crc(const uint8_t *d, size_t n)
+{
+    uint16_t crc = 0xFFFFu;
+    while (n--) {
+        crc ^= *d++;
+        for (int i = 0; i &lt; 8; i++) {
+            crc = (crc &amp; 1u) ? (uint16_t)((crc &gt;&gt; 1) ^ 0xA001u)
+                              : (uint16_t)(crc &gt;&gt; 1);
+        }
+    }
+    return crc;                    /* transmitted LOW byte
+                                      first - the ONLY
+                                      little-endian field
+                                      in the protocol      */
+}
+
+/* EVERYTHING ELSE IN MODBUS IS BIG-ENDIAN. Register values,
+   addresses, counts: all high byte first. The CRC alone is
+   low byte first. This inconsistency is a permanent source
+   of bugs and it is not a mistake in your reading - it
+   really is like that.                                    */
+
+/* A slave, receiving via IDLE-triggered DMA (chapter 03). */
+void modbus_on_frame(const uint8_t *f, uint16_t len)
+{
+    if (len &lt; 4) { return; }                 /* runt        */
+    if (f[0] != MY_ADDRESS &amp;&amp; f[0] != 0) { return; }
+
+    uint16_t rx_crc = (uint16_t)(f[len-2] | (f[len-1] &lt;&lt; 8));
+    if (rx_crc != modbus_crc(f, len - 2u)) {
+        stats.crc_errors++;
+        return;               /* SILENTLY DISCARD - a bad
+                                 CRC may mean the frame was
+                                 not even for us            */
+    }
+
+    switch (f[1]) {
+    case 0x03: handle_read_holding(f, len);  break;
+    case 0x06: handle_write_single(f, len);  break;
+    default:
+        modbus_exception(f[1], 0x01);        /* illegal fn  */
+    }
+}
+
+/* NEVER REPLY TO A BAD CRC. You cannot trust the address
+   byte either, so replying risks two slaves transmitting
+   at once - which on a half-duplex bus corrupts the next
+   valid exchange too.                                     */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Last byte of every reply corrupt</td><td>DE dropped on TXE instead of TC</td></tr>
+<tr><td>Continuous framing errors when idle</td><td>No fail-safe biasing — the bus floats</td></tr>
+<tr><td>Works with two nodes, fails with ten</td><td>Termination, biasing, or too many unit loads</td></tr>
+<tr><td>Intermittent errors at the far end only</td><td>Missing terminator, or a stub too long</td></tr>
+<tr><td>Exception code 0x02 on every read</td><td>Register map offset — vendors disagree about 0-based versus
+1-based</td></tr>
+<tr><td>CRC never matches</td><td>Wrong CRC-16 variant, or byte order of the CRC field</td></tr>
+<tr><td>Values are byte-swapped</td><td>Modbus is big-endian except the CRC</td></tr>
+<tr><td>Two slaves reply at once</td><td>Duplicate addresses, or a slave replying to a bad
+CRC</td></tr>
+<tr><td>Frames merge together</td><td>Inter-frame silence not enforced — use IDLE detection</td></tr>
+<tr><td>Master times out on a slow slave</td><td>Response timeout shorter than the slave's processing
+time</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why differential signalling reaches a kilometre where single-ended reaches fifteen metres.</li>
+  <li>Say why RS-485 has no arbitration and what that requires of the protocol above it.</li>
+  <li>Explain the difference between TXE and TC for driver-enable timing.</li>
+  <li>Describe hardware DE control and why it is preferable.</li>
+  <li>Explain fail-safe biasing and the symptom of its absence.</li>
+  <li>State how Modbus RTU delimits frames and compute t3.5 at 9600 baud.</li>
+  <li>Say which UART feature implements Modbus framing in hardware.</li>
+  <li>Give the byte order of Modbus fields, including the exception.</li>
+  <li>Explain why a slave must not reply to a frame with a bad CRC.</li>
+  <li>Say what exception code 0x02 usually indicates in an integration.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

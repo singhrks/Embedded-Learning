@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pseudo TAs and core drivers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Pseudo TAs and core drivers</h1>
+<p class="lead">A pseudo TA is a service compiled into OP-TEE itself, running at S-EL1 with the trusted OS's
+full privilege and none of its isolation. Sometimes that is the only way to do the job. Usually it is not,
+and the difference is worth being precise about before you write one.</p>
+
+<h2 id="compare">Where a pseudo TA sits</h2>
+
+<p>Code can live inside the trusted OS itself rather than as a loadable application, and the two options differ in isolation, privilege and update path.</p>
+
+<pre class="diagram">   S-EL0   +----------+  +----------+
+           | user TA  |  | user TA  |   isolated from each
+           |          |  |          |   other and from the core
+           +----------+  +----------+   by the MMU
+                 |             |
+                 |  SVC        |
+                 v             v
+   S-EL1   +--------------------------------------------+
+           |  OP-TEE CORE                               |
+           |   scheduler, MMU, crypto, drivers          |
+           |                                            |
+           |   +------------------------------------+   |
+           |   |  PSEUDO TA                         |   |
+           |   |  same privilege as the core.       |   |
+           |   |  same address space as the core.   |   |
+           |   |  can call ANY core function.       |   |
+           |   |  a bug here is a bug in the        |   |
+           |   |  trusted OS.                        |   |
+           |   +------------------------------------+   |
+           +--------------------------------------------+
+
+   A user TA that dereferences a wild pointer: that TA panics,
+   its session dies, the system continues.
+
+   A pseudo TA that dereferences a wild pointer: the trusted OS
+   panics, or worse, silently corrupts another TA's memory or
+   its own key material.
+
+   The privilege is the same as writing kernel code. Treat it
+   that way.</pre>
+
+<h2 id="when">When it is actually right</h2>
+
+<p>The choice is not a matter of convenience. Running inside the OS removes a protection boundary, so it needs a reason beyond avoiding the build steps.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Reason</th><th>Valid?</th></tr></thead>
+<tbody>
+<tr><td>You need a core API not exposed to S-EL0 — direct hardware access, a core driver, internal
+state</td><td><strong>Yes.</strong> This is the main reason</td></tr>
+<tr><td>You must work before the normal world can load anything — early boot, before
+<code>tee-supplicant</code></td><td><strong>Yes</strong> — though an <em>early TA</em> may serve, and keeps
+S-EL0 isolation</td></tr>
+<tr><td>You are implementing a service other TAs will call</td><td><strong>Sometimes.</strong> A user TA can
+also be called by another TA</td></tr>
+<tr><td>You need to service an interrupt in the secure world</td><td><strong>Yes</strong> — as a core driver,
+not really as a TA</td></tr>
+<tr><td>"It is faster"</td><td><strong>No.</strong> You save one privilege transition, tens of nanoseconds,
+against a call that costs tens of microseconds</td></tr>
+<tr><td>"It is simpler than packaging a .ta"</td><td><strong>No.</strong> That is an hour of build setup
+against a permanent expansion of the trusted computing base</td></tr>
+<tr><td>"It avoids depending on tee-supplicant"</td><td><strong>Use an early TA instead</strong> — same
+benefit, keeps isolation</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="write">Writing one</h2>
+
+<p>Writing one looks similar to a normal trusted application with a different registration mechanism — and the similarity is slightly deceptive given the different privilege.</p>
+
+<pre><code>/* core/pta/my_service.c */
+
+#include &lt;kernel/pseudo_ta.h&gt;
+#include &lt;kernel/user_access.h&gt;
+#include &lt;mm/core_memprot.h&gt;
+#include &lt;string.h&gt;
+#include &lt;trace.h&gt;
+
+#define PTA_MY_SERVICE_UUID \
+        { 0x7c1a9e30, 0x4d6b, 0x4f21, \
+          { 0x9a, 0x3c, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 } }
+
+#define TA_NAME  "my_service.pta"
+
+#define PTA_CMD_READ_REG    0
+#define PTA_CMD_WRITE_REG   1
+
+static TEE_Result read_reg(uint32_t ptypes, TEE_Param params[4])
+{
+        uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT,
+                                       TEE_PARAM_TYPE_VALUE_OUTPUT,
+                                       TEE_PARAM_TYPE_NONE,
+                                       TEE_PARAM_TYPE_NONE);
+        vaddr_t base;
+        uint32_t off;
+
+        if (ptypes != exp)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        off = params[0].value.a;
+
+        /* WHITELIST. A pseudo TA can read ANY address in the
+           system. The client must never choose one. */
+        if (off &gt;= MY_DEVICE_SIZE || (off &amp; 3))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        base = (vaddr_t)phys_to_virt_io(MY_DEVICE_BASE,
+                                        MY_DEVICE_SIZE);
+        if (!base)
+                return TEE_ERROR_GENERIC;
+
+        params[1].value.a = io_read32(base + off);
+        return TEE_SUCCESS;
+}
+
+static TEE_Result invoke_command(void *sess __unused,
+                                 uint32_t cmd,
+                                 uint32_t ptypes,
+                                 TEE_Param params[4])
+{
+        switch (cmd) {
+        case PTA_CMD_READ_REG:  return read_reg(ptypes, params);
+        case PTA_CMD_WRITE_REG: return write_reg(ptypes, params);
+        default:                return TEE_ERROR_NOT_SUPPORTED;
+        }
+}
+
+static TEE_Result open_session(uint32_t ptypes __unused,
+                               TEE_Param params[4] __unused,
+                               void **sess __unused)
+{
+        /* WHO may call this? A pseudo TA can and should
+           restrict its callers. */
+        struct ts_session *s = ts_get_calling_session();
+
+        if (!s || !is_user_ta_ctx(s-&gt;ctx)) {
+                /* called from the normal world directly */
+                return TEE_ERROR_ACCESS_DENIED;
+        }
+        return TEE_SUCCESS;
+}
+
+pseudo_ta_register(.uuid  = PTA_MY_SERVICE_UUID,
+                   .name  = TA_NAME,
+                   .flags = PTA_DEFAULT_FLAGS,
+                   .open_session_entry_point = open_session,
+                   .invoke_command_entry_point = invoke_command);
+
+/* Flags:
+     TA_FLAG_SINGLE_INSTANCE     always, for a PTA
+     TA_FLAG_MULTI_SESSION
+     TA_FLAG_INSTANCE_KEEP_ALIVE
+     TA_FLAG_CONCURRENT          allow concurrent invocations -
+                                 you must then be thread safe
+     PTA_DEFAULT_FLAGS = SINGLE_INSTANCE | MULTI_SESSION |
+                         INSTANCE_KEEP_ALIVE                 */</code></pre>
+
+<pre><code># core/pta/sub.mk
+srcs-$(CFG_MY_SERVICE_PTA) += my_service.c
+
+# core/pta/pta.mk  (or the platform's conf.mk)
+CFG_MY_SERVICE_PTA ?= y
+
+$ make CFG_MY_SERVICE_PTA=y
+# It is now inside tee.elf. No .ta file, no signing, no
+# tee-supplicant, and no way to update it without replacing
+# OP-TEE.</code></pre>
+
+<div class="danger">
+<b>Two rules that are not optional in a pseudo TA</b>
+<p><strong>Validate every address.</strong> A user TA that dereferences a client-supplied pointer faults
+harmlessly at S-EL0. A pseudo TA reads or writes whatever is there — another TA's key, the core's own state,
+a device register. Whitelist offsets against a known region; never accept an address.</p>
+<p><strong>Copy client data before using it.</strong> The double-fetch rule from
+<a href="tee-07-shared-memory.html">chapter 7</a> applies with much worse consequences here. Use
+<code>copy_from_user</code>/<code>copy_to_user</code> when the caller is a user TA, and never act on shared
+memory in place.</p>
+</div>
+
+<h2 id="builtin">The pseudo TAs that ship</h2>
+
+<p>Several ship as part of the OS and provide core services. Knowing what they are tells you what is already available before you write anything.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>PTA</th><th>Provides</th></tr></thead>
+<tbody>
+<tr><td><code>device.pta</code></td><td>Enumerates TAs for the Linux TEE bus
+(<a href="tee-10-linux-driver.html">chapter 10</a>)</td></tr>
+<tr><td><code>system.pta</code></td><td>Dynamic shared memory, TA-to-TA calls, entropy</td></tr>
+<tr><td><code>attestation.pta</code></td><td>Measures a TA's binary and signs the measurement — remote
+attestation</td></tr>
+<tr><td><code>stats.pta</code></td><td>The memory and TA statistics <code>xtest --stats</code> reads</td></tr>
+<tr><td><code>rtc.pta</code>, <code>scmi.pta</code>, <code>gprof.pta</code></td><td>Real-time clock, SCMI, profiling</td></tr>
+<tr><td><code>secstor_ta_mgmt.pta</code></td><td>Installing TAs into secure storage</td></tr>
+<tr><td><code>apply_patch.pta</code></td><td>Live patching of the core</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Read these before writing your own - they are the reference
+# for style and for how much validation is expected:
+$ ls optee_os/core/pta/
+attestation.c  benchmark.c  device.c  gprof.c  invoke_tests.c
+rtc.c  scmi.c  secstor_ta_mgmt.c  stats.c  system.c ...
+
+# attestation.c is the most instructive: it is short, it
+# handles untrusted input carefully, and it does something a
+# user TA genuinely cannot.</code></pre>
+
+<h2 id="early">Early TAs: the middle option</h2>
+
+<p>Some services must exist before the filesystem does, which is one of the few genuinely compelling reasons to build code into the OS rather than load it.</p>
+
+<pre><code>/* An early TA is an ORDINARY user TA, at S-EL0, with full MMU
+   isolation - but its binary is linked into tee.elf rather
+   than loaded from the normal world.
+
+   You get:
+     + available before tee-supplicant, before Linux
+     + no dependency on the normal-world filesystem
+     + full S-EL0 isolation - a bug is contained
+     + no separate signing/installation step
+   You lose:
+     - it cannot be updated without replacing OP-TEE
+     - it occupies TEE_RAM permanently
+
+   This is almost always the right answer when the reason you
+   were reaching for a pseudo TA was "it must work early" or
+   "I do not want to depend on the supplicant".            */
+
+$ make CFG_EARLY_TA=y \
+       EARLY_TA_PATHS="path/to/7f2e9c1a-....ta"
+
+/* The TA is still signed, still verified, and still runs at
+   S-EL0 - it is simply carried inside the OP-TEE image
+   instead of fetched at runtime.                          */</code></pre>
+
+<h2 id="ta2ta">TA-to-TA calls</h2>
+
+<p>Trusted applications can call each other, which allows a service to be factored out — and introduces the question of how the callee authenticates the caller.</p>
+
+<pre><code>/* A user TA can open a session to another TA. Often this is
+   what you actually wanted when you considered a pseudo TA -
+   a shared service, without giving it core privilege.      */
+
+    TEE_TASessionHandle sess = TEE_HANDLE_NULL;
+    TEE_UUID other = OTHER_TA_UUID;
+    uint32_t origin;
+    TEE_Param params[4] = {0};
+    TEE_Result res;
+
+    res = TEE_OpenTASession(&amp;other, TEE_TIMEOUT_INFINITE,
+                            0, params, &amp;sess, &amp;origin);
+    if (res) return res;
+
+    res = TEE_InvokeTACommand(sess, TEE_TIMEOUT_INFINITE,
+                              CMD_DO_THING,
+                              TEE_PARAM_TYPES(
+                                  TEE_PARAM_TYPE_MEMREF_INPUT,
+                                  TEE_PARAM_TYPE_NONE,
+                                  TEE_PARAM_TYPE_NONE,
+                                  TEE_PARAM_TYPE_NONE),
+                              params, &amp;origin);
+
+    TEE_CloseTASession(sess);
+
+/* The callee sees the caller's identity as
+   TEE_LOGIN_TRUSTED_APP, with the caller's UUID - so it can
+   authorise. Two S-EL0 TAs, isolated from each other, with an
+   authenticated channel between them.
+
+   CAUTION: the calling TA's thread is held for the duration
+   (chapter 5), so a chain of TA-to-TA calls consumes one
+   thread, not several - but a CYCLE deadlocks immediately.
+   Keep the call graph acyclic and shallow.                */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>The whole TEE panics when a client misbehaves</td><td>A pseudo TA dereferencing a client-supplied
+address</td></tr>
+<tr><td>One TA's data appears in another</td><td>A pseudo TA writing outside its intended region — no
+isolation to stop it</td></tr>
+<tr><td>Pseudo TA works, cannot be updated in the field</td><td>By design: it is inside a signed OP-TEE
+image</td></tr>
+<tr><td>Intermittent corruption under concurrency</td><td><code>TA_FLAG_CONCURRENT</code> set without making
+the code thread safe</td></tr>
+<tr><td>Normal-world client can reach an internal service</td><td>No caller check in
+<code>open_session</code></td></tr>
+<tr><td>TA-to-TA call hangs for ever</td><td>A cycle in the call graph, or the callee blocked</td></tr>
+<tr><td>Service needed before <code>tee-supplicant</code></td><td>Use an early TA rather than a pseudo
+TA</td></tr>
+<tr><td>Security review rejects a pseudo TA</td><td>Usually correctly. Justify the privilege or move it to
+S-EL0</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the privilege and isolation difference between a user TA and a pseudo TA.</li>
+  <li>Give two valid reasons to write a pseudo TA and three invalid ones.</li>
+  <li>Explain why "it is faster" does not justify one.</li>
+  <li>Write a pseudo TA that exposes one register, with correct validation.</li>
+  <li>Explain why address whitelisting is mandatory here and merely advisable in a user TA.</li>
+  <li>Say how a pseudo TA restricts who may call it.</li>
+  <li>Name four built-in pseudo TAs and what each provides.</li>
+  <li>Describe an early TA and say which pseudo-TA use cases it replaces.</li>
+  <li>Explain TA-to-TA calls, what identity the callee sees, and the deadlock hazard.</li>
+  <li>Given a proposed pseudo TA, decide whether a user TA or an early TA would do instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

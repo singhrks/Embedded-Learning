@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: layer 4 — a crypto driver inside the secure world | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: layer 4 — a crypto driver inside the secure world</h1>
+<p class="lead">The deepest layer, and the one nothing else in this curriculum has built: a driver that runs at
+S-EL1, inside OP-TEE itself, driving a hash accelerator whose registers the normal world cannot address. When
+it is registered, the TA's <code>TEE_DigestDoFinal</code> reaches hardware instead of software — and not one
+line of the three layers above it changes.</p>
+
+<h2 id="where">Where secure-world drivers live, and why this is different</h2>
+
+<p>A trusted application is a program; this is not. It is compiled into OP-TEE, runs at the trusted OS's own
+privilege level, and is subject to the same rules a Linux kernel driver is — with the difference that a bug
+here compromises the thing the whole design exists to protect.</p>
+
+<pre class="diagram">   A TRUSTED APPLICATION          A CORE DRIVER
+   ─────────────────────          ─────────────
+   S-EL0, unprivileged            S-EL1, privileged
+   loaded from a file             linked INTO OP-TEE
+   signed and verified            part of the signed OS image
+   isolated from other TAs        no isolation from OP-TEE
+   uses the Internal API          uses OP-TEE internals
+   crashes → one TA dies          crashes → the secure world
+                                  dies
+
+   SO THE BAR IS HIGHER. A core driver is written only when
+   the job genuinely requires privilege that S-EL0 does not
+   have — which for us it does: MMIO to a peripheral, and an
+   interrupt.
+
+   IN THE OP-TEE TREE:
+     core/drivers/                general peripheral drivers
+     core/drivers/crypto/         drivers that plug into the
+                                  CRYPTO DISPATCH layer - which
+                                  is what makes them reachable
+                                  from a TA's Internal API call
+                                  without the TA knowing
+
+   THE DISPATCH LAYER IS THE WHOLE TRICK. The TA calls a
+   standard API. OP-TEE asks "is a driver registered for
+   SHA-256?" If yes, the driver runs; if no, the software
+   implementation does. Layer 3 cannot tell the difference,
+   and that is exactly the property we want from a seam.</pre>
+
+<div class="danger">
+<b>The exact registration API here has changed across OP-TEE releases</b>
+<p>The crypto driver framework, its registration functions and the operation structures have all been revised
+more than once — this is <a href="lx-02-kernel-vs-user.html">the "no stable internal API" rule</a> applying to
+a second kernel. The code below is written against the shape the framework has had recently, and the
+<em>structure</em> — a context allocated per operation, an ops table registered at init, a fallback when no
+driver is present — has been stable throughout. Before building, open
+<code>core/include/drvcrypt.h</code> and one existing driver under <code>core/drivers/crypto/</code> in the
+tree you are actually compiling, and match what is there.</p>
+</div>
+
+<h2 id="hw">The device we are driving</h2>
+
+<p>A deliberately simple memory-mapped hash accelerator. It is simple enough to drive in a page of code, and it
+has every characteristic that makes a real one awkward: it is asynchronous, it has alignment rules, and it can
+fail.</p>
+
+<pre><code>/* core/drivers/crypto/hwsha/hwsha_regs.h
+   A hypothetical SHA-256 block. Substitute your SoC's
+   real accelerator; the shape is representative.        */
+
+#define HWSHA_BASE          0x0e100000      /* secure-only */
+#define HWSHA_SIZE          0x1000
+
+#define HWSHA_CTRL          0x00
+#define  HWSHA_CTRL_START   BIT32(0)
+#define  HWSHA_CTRL_RESET   BIT32(1)
+#define  HWSHA_CTRL_SHA256  (0x2u &lt;&lt; 4)
+#define HWSHA_STATUS        0x04
+#define  HWSHA_STATUS_BUSY  BIT32(0)
+#define  HWSHA_STATUS_DONE  BIT32(1)
+#define  HWSHA_STATUS_ERR   BIT32(2)
+#define HWSHA_SRC_ADDR      0x08            /* PHYSICAL addr */
+#define HWSHA_SRC_LEN       0x10
+#define HWSHA_DIGEST        0x20            /* 8 x 32-bit   */
+
+/* THE CONSTRAINTS THAT MAKE IT REAL:
+     · SRC_ADDR is a PHYSICAL address - the accelerator has
+       no MMU and does not see OP-TEE's virtual addresses
+     · the source must be 64-byte aligned
+     · the source must be in SECURE memory, or the device's
+       own filtering will reject the read
+     · DONE is set asynchronously; polling or an interrupt   */</code></pre>
+
+<h2 id="driver">The driver, in full</h2>
+
+<p>Three parts: the register plumbing, the operation context that the dispatch layer allocates per hash, and
+the registration that makes it visible to the TA's API call.</p>
+
+<pre><code>// SPDX-License-Identifier: BSD-2-Clause
+/* core/drivers/crypto/hwsha/hwsha.c  —  LAYER 4 */
+
+#include &lt;drvcrypt.h&gt;
+#include &lt;drvcrypt_hash.h&gt;
+#include &lt;initcall.h&gt;
+#include &lt;io.h&gt;
+#include &lt;kernel/boot.h&gt;
+#include &lt;kernel/delay.h&gt;
+#include &lt;kernel/mutex.h&gt;
+#include &lt;mm/core_memprot.h&gt;
+#include &lt;string.h&gt;
+#include &lt;tee/cache.h&gt;
+#include &lt;trace.h&gt;
+#include &lt;util.h&gt;
+
+#include "hwsha_regs.h"
+
+#define HWSHA_ALIGN     64
+#define HWSHA_TIMEOUT_US 100000
+#define HWSHA_BLOCK     64
+#define HWSHA_DIGEST_SZ 32
+
+static vaddr_t hwsha_base;
+static struct mutex hwsha_lock = MUTEX_INITIALIZER;
+
+/* Per-operation context. The dispatch layer allocates one
+   per TEE_AllocateOperation and hands it back on every
+   call, exactly like a driver's private data.            */
+struct hwsha_ctx {
+        struct crypto_hash_ctx ctx;   /* MUST be first      */
+        uint8_t *buf;                 /* accumulated input  */
+        size_t   len;
+        size_t   cap;
+};
+
+static struct hwsha_ctx *to_hwsha(struct crypto_hash_ctx *c)
+{
+        return container_of(c, struct hwsha_ctx, ctx);
+}
+
+/* ---------------------------------------------------------
+   The hardware operation
+   --------------------------------------------------------- */
+
+static TEE_Result hwsha_run(const uint8_t *src, size_t len,
+                            uint8_t *digest)
+{
+        paddr_t pa;
+        uint32_t status;
+        uint64_t timeout;
+        TEE_Result res = TEE_SUCCESS;
+        unsigned int i;
+
+        /* The accelerator reads PHYSICAL memory with no MMU
+           of its own, so hand it a physical address. */
+        pa = virt_to_phys((void *)src);
+        if (!pa)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        if (pa &amp; (HWSHA_ALIGN - 1))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* The device reads memory directly, so anything we
+           wrote must be out of the cache first - exactly the
+           DMA rule from ARM chapter 18, in the secure world. */
+        cache_operation(TEE_CACHEFLUSH, (void *)src, len);
+
+        mutex_lock(&amp;hwsha_lock);
+
+        io_write32(hwsha_base + HWSHA_CTRL, HWSHA_CTRL_RESET);
+        io_write32(hwsha_base + HWSHA_SRC_ADDR, (uint32_t)pa);
+        io_write32(hwsha_base + HWSHA_SRC_LEN, (uint32_t)len);
+        io_write32(hwsha_base + HWSHA_CTRL,
+                   HWSHA_CTRL_SHA256 | HWSHA_CTRL_START);
+
+        /* Poll with a BOUND. A device that never sets DONE
+           must not hang the secure world - which would deny
+           service to the entire normal world too.          */
+        timeout = timeout_init_us(HWSHA_TIMEOUT_US);
+        do {
+                status = io_read32(hwsha_base + HWSHA_STATUS);
+                if (status &amp; HWSHA_STATUS_ERR) {
+                        res = TEE_ERROR_GENERIC;
+                        goto out;
+                }
+                if (status &amp; HWSHA_STATUS_DONE)
+                        break;
+        } while (!timeout_elapsed(timeout));
+
+        if (!(status &amp; HWSHA_STATUS_DONE)) {
+                EMSG("hwsha: timeout, status 0x%" PRIx32, status);
+                res = TEE_ERROR_BUSY;
+                goto out;
+        }
+
+        for (i = 0; i &lt; HWSHA_DIGEST_SZ / 4; i++) {
+                uint32_t w = io_read32(hwsha_base +
+                                       HWSHA_DIGEST + i * 4);
+                /* The block presents the digest big-endian. */
+                digest[i * 4 + 0] = (w &gt;&gt; 24) &amp; 0xff;
+                digest[i * 4 + 1] = (w &gt;&gt; 16) &amp; 0xff;
+                digest[i * 4 + 2] = (w &gt;&gt; 8)  &amp; 0xff;
+                digest[i * 4 + 3] = w &amp; 0xff;
+        }
+
+out:
+        mutex_unlock(&amp;hwsha_lock);
+        return res;
+}
+
+/* ---------------------------------------------------------
+   The dispatch-layer operations
+   --------------------------------------------------------- */
+
+static TEE_Result hwsha_init(struct crypto_hash_ctx *c)
+{
+        struct hwsha_ctx *h = to_hwsha(c);
+
+        h-&gt;len = 0;
+        return TEE_SUCCESS;
+}
+
+static TEE_Result hwsha_update(struct crypto_hash_ctx *c,
+                               const uint8_t *data, size_t len)
+{
+        struct hwsha_ctx *h = to_hwsha(c);
+        uint8_t *nbuf;
+        size_t ncap;
+
+        if (!len)
+                return TEE_SUCCESS;
+        if (!data)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* This block hashes one contiguous region, so
+           accumulate until final(). A device supporting
+           incremental state would not need this.          */
+        if (h-&gt;len + len &gt; h-&gt;cap) {
+                ncap = ROUNDUP(h-&gt;len + len, 4096);
+                nbuf = memalign(HWSHA_ALIGN, ncap);
+                if (!nbuf)
+                        return TEE_ERROR_OUT_OF_MEMORY;
+                if (h-&gt;buf) {
+                        memcpy(nbuf, h-&gt;buf, h-&gt;len);
+                        memzero_explicit(h-&gt;buf, h-&gt;len);
+                        free(h-&gt;buf);
+                }
+                h-&gt;buf = nbuf;
+                h-&gt;cap = ncap;
+        }
+
+        memcpy(h-&gt;buf + h-&gt;len, data, len);
+        h-&gt;len += len;
+        return TEE_SUCCESS;
+}
+
+static TEE_Result hwsha_final(struct crypto_hash_ctx *c,
+                              uint8_t *digest, size_t len)
+{
+        struct hwsha_ctx *h = to_hwsha(c);
+
+        if (len &lt; HWSHA_DIGEST_SZ)
+                return TEE_ERROR_SHORT_BUFFER;
+        if (!h-&gt;buf || !h-&gt;len)
+                return TEE_ERROR_BAD_STATE;
+
+        return hwsha_run(h-&gt;buf, h-&gt;len, digest);
+}
+
+static void hwsha_free(struct crypto_hash_ctx *c)
+{
+        struct hwsha_ctx *h = to_hwsha(c);
+
+        if (h-&gt;buf) {
+                memzero_explicit(h-&gt;buf, h-&gt;cap);
+                free(h-&gt;buf);
+        }
+        free(h);
+}
+
+static void hwsha_copy_state(struct crypto_hash_ctx *dst,
+                             struct crypto_hash_ctx *src)
+{
+        struct hwsha_ctx *d = to_hwsha(dst);
+        struct hwsha_ctx *s = to_hwsha(src);
+
+        if (s-&gt;len &gt; d-&gt;cap)
+                return;           /* caller allocated too small */
+        memcpy(d-&gt;buf, s-&gt;buf, s-&gt;len);
+        d-&gt;len = s-&gt;len;
+}
+
+static const struct crypto_hash_ops hwsha_ops = {
+        .init       = hwsha_init,
+        .update     = hwsha_update,
+        .final      = hwsha_final,
+        .free_ctx   = hwsha_free,
+        .copy_state = hwsha_copy_state,
+};
+
+/* Called by the dispatch layer when a TA allocates a
+   SHA-256 operation.                                     */
+TEE_Result drvcrypt_hash_alloc_sha256(struct crypto_hash_ctx **c)
+{
+        struct hwsha_ctx *h;
+
+        h = calloc(1, sizeof(*h));
+        if (!h)
+                return TEE_ERROR_OUT_OF_MEMORY;
+
+        h-&gt;ctx.ops = &amp;hwsha_ops;
+        *c = &amp;h-&gt;ctx;
+        return TEE_SUCCESS;
+}
+
+/* ---------------------------------------------------------
+   Registration
+   --------------------------------------------------------- */
+
+static TEE_Result hwsha_probe(void)
+{
+        /* Map the registers. SECURE and DEVICE memory -
+           MEM_AREA_IO_SEC is what makes both true, and it is
+           why the normal world cannot reach this block.   */
+        hwsha_base = (vaddr_t)phys_to_virt(HWSHA_BASE,
+                                           MEM_AREA_IO_SEC,
+                                           HWSHA_SIZE);
+        if (!hwsha_base) {
+                EMSG("hwsha: cannot map 0x%x", HWSHA_BASE);
+                return TEE_ERROR_GENERIC;
+        }
+
+        io_write32(hwsha_base + HWSHA_CTRL, HWSHA_CTRL_RESET);
+
+        if (io_read32(hwsha_base + HWSHA_STATUS) &amp;
+            HWSHA_STATUS_BUSY) {
+                EMSG("hwsha: stuck busy after reset");
+                return TEE_ERROR_GENERIC;
+        }
+
+        DMSG("hwsha: SHA-256 accelerator registered");
+        return TEE_SUCCESS;
+}
+
+/* Runs during OP-TEE initialisation, before any TA loads. */
+driver_init(hwsha_probe);</code></pre>
+
+<pre><code># core/drivers/crypto/hwsha/sub.mk
+srcs-y += hwsha.c
+
+# core/drivers/crypto/sub.mk  — add:
+subdirs-$(CFG_HWSHA) += hwsha
+
+# The platform conf.mk that selects it:
+#   CFG_CRYPTO_DRIVER ?= y
+#   CFG_HWSHA ?= y
+#
+# And the register block must be declared to OP-TEE's memory
+# map, or phys_to_virt() returns NULL:
+#   register_phys_mem_pgdir(MEM_AREA_IO_SEC, HWSHA_BASE, HWSHA_SIZE);</code></pre>
+
+<div class="key">
+<b>Three details that are easy to get wrong and hard to debug</b>
+<p><strong>Physical addresses:</strong> the accelerator has no MMU, so it needs <code>virt_to_phys</code> —
+passing a virtual address produces a read from whatever happens to live at that physical address. <strong>Cache
+maintenance:</strong> the driver wrote the buffer through the cache and the device reads memory directly, so a
+flush is required exactly as it would be for a Linux DMA buffer. <strong>Bounded polling:</strong> a device
+that never signals completion must not spin forever, because the secure world holds the processor and the
+normal world cannot preempt it — an unbounded loop here hangs the entire machine.</p>
+</div>
+
+<h2 id="wire">Building it in and confirming the dispatch</h2>
+
+<p>The point of this layer is that nothing above it changes. The test is therefore not "does the signature
+work" — it worked before — but "did the call actually reach the driver".</p>
+
+<pre><code># Rebuild OP-TEE with the driver enabled (chapter 03):
+$ make -C optee_os PLATFORM=vexpress-qemu_armv8a \
+        CFG_CRYPTO_DRIVER=y CFG_HWSHA=y \
+        CFG_TEE_CORE_LOG_LEVEL=3
+
+# At boot you should see the probe run BEFORE any TA loads:
+D/TC:0 hwsha_probe:xxx hwsha: SHA-256 accelerator registered
+
+# Now run the UNCHANGED stack from chapters 27 and 28:
+$ sudo ./secsign-cli sign /tmp/msg
+wrote /tmp/msg.sig (64 bytes)
+
+# DID IT ACTUALLY USE THE DRIVER? Add a trace to
+# hwsha_final() temporarily and watch:
+D/TC:0 hwsha_final:xxx len=11
+
+# THE REAL TEST is that the signature is IDENTICAL to the one
+# produced before the driver existed. Same key, same message,
+# same digest — a different digest means the driver is wrong,
+# not the design.
+$ sha256sum /tmp/msg.sig.before /tmp/msg.sig
+&lt;same hash twice&gt;</code></pre>
+
+<h2 id="verify">Verifying the signature from outside</h2>
+
+<p>A signature nothing else can check proves nothing. This is the independent verification, using tooling that
+knows nothing about any of the four layers.</p>
+
+<pre><code># Get the public key and rebuild it into something OpenSSL
+# will read (the TA returns raw x||y):
+$ sudo ./secsign-cli pubkey &gt; pub.hex
+
+$ { printf '3059301306072a8648ce3d020106082a8648ce3d030107034200\04'
+    cat pub.hex; } | xxd -r -p &gt; pub.der
+$ openssl ec -pubin -inform DER -in pub.der -text -noout
+
+# The TA emits r||s raw; OpenSSL wants DER. Convert:
+$ python3 - &lt;&lt;'PY'
+import sys
+raw = open('/tmp/msg.sig','rb').read()
+r = int.from_bytes(raw[:32],'big'); s = int.from_bytes(raw[32:],'big')
+def der_int(x):
+    b = x.to_bytes((x.bit_length()+8)//8 or 1,'big')
+    return b'\x02' + bytes([len(b)]) + b
+body = der_int(r) + der_int(s)
+open('/tmp/msg.sig.der','wb').write(b'\x30'+bytes([len(body)])+body)
+PY
+
+$ openssl dgst -sha256 -verify pub.der -keyform DER \
+      -signature /tmp/msg.sig.der /tmp/msg
+Verified OK
+
+# THAT LINE IS THE PROJECT WORKING. A signature made by a key
+# that has never existed outside the secure world, verified by
+# a tool that knows nothing about any of this.</code></pre>
+
+<h2 id="attack">Proving the property, not the happy path</h2>
+
+<p>The tests that matter are the ones that try to break the design. If any of these succeeds, the four layers
+are decoration — so write them before you believe the result.</p>
+
+<pre><code># 1. Can an unprivileged user get a signature?
+$ ./secsign-cli sign /tmp/msg
+/dev/secsign: Permission denied
+#    Blocked by layer 2's device mode. This is POLICY, and it
+#    is the weakest of the four checks - root defeats it.
+
+# 2. Can a process bypass the kernel and talk to the TA?
+$ sudo ./direct_ta_client            # opens /dev/tee0 itself
+TEEC_OpenSession: 0xffff0001 (ACCESS_DENIED)
+#    Blocked by the login check in TA_OpenSessionEntryPoint.
+#    Layer 2 really is the only gateway.
+
+# 3. Can we read the key out of the storage blob?
+$ sudo xxd /data/tee/*.db | head
+#    Encrypted with a HUK-derived key. Copying this file to
+#    another device yields nothing usable (chapter 15).
+
+# 4. Can a malicious caller make the TA read SECURE memory?
+$ sudo ./evil_client --buffer 0x0e100000 --len 4096
+TEEC_InvokeCommand: 0xffff000f (ACCESS_DENIED)
+#    Blocked by TEE_CheckMemoryAccessRights with ANY_OWNER.
+#    Remove that call and this test SUCCEEDS - try it once,
+#    deliberately, so you have seen it work.
+
+# 5. Can we exhaust the secure world and deny service?
+$ for i in $(seq 200); do sudo ./secsign-cli sign /tmp/msg &amp; done
+#    Layer 2's mutex serialises them. Without it, concurrent
+#    callers exhaust secure-world contexts (chapter 05).
+
+# 6. Does an over-long input get rejected at every layer?
+$ head -c $((2*1024*1024)) /dev/urandom &gt; /tmp/big
+$ sudo ./secsign-cli sign /tmp/big
+/tmp/big: must be 1..1048576 bytes
+#    Layer 1 refuses. Then remove that check and confirm
+#    layer 2 refuses. Then remove THAT and confirm layer 3
+#    refuses. Defence in depth is only real if each layer
+#    independently says no.
+
+# IF ANY OF 2, 4 OR 6 SUCCEEDS, STOP. The design does not do
+# what this chapter claims.</code></pre>
+
+<div class="warn">
+<b>Test 6 is the one most projects skip, and it is the one that matters most</b>
+<p>It is tempting to validate at one layer and let the others trust it — and it even looks tidier. But each
+layer has a different attacker: layer 1 protects against mistakes, layer 2 against a hostile application, layer
+3 against a hostile kernel. A check that exists only at layer 1 protects against nobody who matters. Deleting
+each check in turn and confirming the next one still refuses is the only way to know the depth is real rather
+than assumed.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>OP-TEE panics at boot in <code>hwsha_probe</code></td><td>The register block was not added to the
+platform memory map, so the mapping returned NULL</td></tr>
+<tr><td>Driver probes, but the TA still uses software</td><td><code>CFG_CRYPTO_DRIVER</code> not set, or the
+allocation hook is not the one this OP-TEE version calls</td></tr>
+<tr><td>Digest is wrong, consistently</td><td>Byte order when reading the digest registers</td></tr>
+<tr><td>Digest is wrong, intermittently</td><td>Missing cache flush — the device read stale memory</td></tr>
+<tr><td>Accelerator reads nonsense</td><td>A virtual address passed where a physical one was needed</td></tr>
+<tr><td>The whole machine hangs during signing</td><td>Unbounded poll in the secure world; nothing can preempt
+it</td></tr>
+<tr><td><code>TEE_ERROR_BAD_PARAMETERS</code> from <code>final</code></td><td>Alignment — the accumulation
+buffer was not allocated with <code>memalign</code></td></tr>
+<tr><td>Works for small inputs, fails for large</td><td>The accumulation buffer's growth path, or the device's
+own maximum length</td></tr>
+<tr><td>Signature differs from the software-only build</td><td>The driver is computing a different digest —
+the driver is wrong, not the key</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name four ways a core driver differs from a trusted application, and what each implies.</li>
+  <li>Explain how the dispatch layer lets layer 4 appear without layer 3 changing.</li>
+  <li>Explain why the driver converts to a physical address before programming the device.</li>
+  <li>Explain why a cache flush is required, and which chapter's rule this is.</li>
+  <li>Explain why an unbounded poll is more dangerous here than in a Linux driver.</li>
+  <li>Say how you would confirm the call actually reached the driver rather than the software path.</li>
+  <li>Explain why the signature must be byte-identical to the software-only build.</li>
+  <li>Verify a signature with OpenSSL and explain what that proves.</li>
+  <li>Run attack test 4, then remove the access-rights check and run it again.</li>
+  <li>Explain why validating at only one layer is insufficient, naming each layer's attacker.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

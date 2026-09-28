@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DX12: fences, barriers and residency | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DX12: fences, barriers and residency</h1>
+<p class="lead">The hardest part of the explicit APIs, and the one the old drivers were silently doing for
+you. Fences order the CPU against the GPU; barriers order the GPU against itself. Get either wrong and you
+get corruption, a hang, or a device removal — usually far from the cause.</p>
+
+<h2 id="fences">Fences: CPU-to-GPU ordering</h2>
+
+<pre><code>/* A fence is a monotonically increasing 64-bit counter that
+   the GPU writes and either side can read or wait on. That
+   is the entire abstraction. */
+
+ComPtr&lt;ID3D12Fence&gt; fence;
+device-&gt;CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&amp;fence));
+HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+/* GPU side: "when you reach this point in the queue, set the
+   counter to n". Signal is QUEUED - it happens when the GPU
+   gets there, not when you call it. */
+queue-&gt;Signal(fence.Get(), n);
+
+/* CPU side: wait until the counter reaches n. */
+if (fence-&gt;GetCompletedValue() &lt; n) {
+    fence-&gt;SetEventOnCompletion(n, event);
+    WaitForSingleObject(event, INFINITE);
+}
+
+/* GPU side waiting on another queue - no CPU involvement: */
+otherQueue-&gt;Wait(fence.Get(), n);
+
+/* THE CANONICAL USE - frames in flight (chapter 13): */
+UINT64 frameFence[kFrames] = {};
+UINT64 next = 1;
+
+/* end of frame: */
+    frameFence[i] = next;
+    queue-&gt;Signal(fence.Get(), next++);
+
+/* start of the frame that reuses slot i, kFrames later: */
+    WaitForFence(frameFence[i]);
+    alloc[i]-&gt;Reset();            /* now provably safe         */
+
+/* THE THREE THINGS FENCES PROTECT
+
+   1. command allocators   - do not reset while executing
+   2. upload buffers       - do not overwrite while being read
+   3. resource destruction - do not free while referenced
+
+   Every "it corrupts a few frames later" bug is one of these
+   three. If you take one habit from this chapter, take this:
+   NOTHING IS REUSED OR RELEASED UNTIL A FENCE PROVES THE GPU
+   IS DONE WITH IT.                                          */</code></pre>
+
+<div class="warn">
+<b>Do not wait on the fence you just signalled</b>
+<p><code>queue-&gt;Signal(f, n); WaitForFence(n);</code> is a full CPU/GPU stall — you have serialised the
+two processors and thrown away all the pipelining the API exists to provide. It is correct, and it is what
+"flush" means. Use it at shutdown, on resize, and nowhere in a frame loop. If your frame time equals CPU time
+plus GPU time rather than the maximum of the two, this is why.</p>
+</div>
+
+<h2 id="barriers">Barriers: GPU-to-GPU ordering</h2>
+
+<pre class="diagram">   A resource is in exactly ONE STATE at a time, and the state
+   tells the hardware how to lay it out and cache it.
+
+     RENDER_TARGET            being drawn into
+     PIXEL_SHADER_RESOURCE    being sampled
+     DEPTH_WRITE / DEPTH_READ
+     UNORDERED_ACCESS         compute reads and writes
+     COPY_SOURCE / COPY_DEST
+     PRESENT                  handed to the display
+     COMMON                   the neutral state; required at
+                              queue boundaries
+
+   You cannot sample a texture you are still rendering into.
+   The TRANSITION between states is a barrier, and it does
+   three things:
+
+     1. WAITS for prior work touching the resource to finish
+     2. FLUSHES/INVALIDATES the relevant caches
+     3. DECOMPRESSES or re-lays-out the memory if the two
+        states use different layouts
+
+   That third one is why barriers are not free: moving a
+   render target to a shader resource may involve a full
+   depth or colour decompression pass over the surface.</pre>
+
+<pre><code>/* The three barrier types. */
+
+/* 1. TRANSITION - the common one. */
+D3D12_RESOURCE_BARRIER b = {};
+b.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+b.Transition.pResource   = tex.Get();
+b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+cmd-&gt;ResourceBarrier(1, &amp;b);
+
+/* 2. UAV - no state change, but "finish all writes before any
+      reads". Needed between two dispatches where the second
+      reads what the first wrote. */
+D3D12_RESOURCE_BARRIER u = {};
+u.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+u.UAV.pResource = buffer.Get();
+cmd-&gt;ResourceBarrier(1, &amp;u);
+
+/* 3. ALIASING - when two placed resources share heap memory
+      and you switch which one is live. */
+
+/* BATCH THEM. One call with five barriers is much cheaper
+   than five calls, because the driver can merge the waits. */
+D3D12_RESOURCE_BARRIER batch[3] = { b0, b1, b2 };
+cmd-&gt;ResourceBarrier(3, batch);
+
+/* SPLIT BARRIERS - start the transition early, finish it
+   later, so the GPU can overlap the decompression with other
+   work: */
+b.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+cmd-&gt;ResourceBarrier(1, &amp;b);
+    /* ... unrelated work happens here ... */
+b.Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+cmd-&gt;ResourceBarrier(1, &amp;b);
+/* Between BEGIN and END the resource may not be used at all. */</code></pre>
+
+<pre><code>/* THE TYPICAL FRAME, as a state machine. */
+
+  backbuffer:  PRESENT
+        |  transition
+        v
+      RENDER_TARGET      <- draw the scene
+        |  transition
+        v
+      PRESENT            <- Present()
+
+  shadowMap:   DEPTH_WRITE     <- render shadows
+        |  transition
+        v
+      PIXEL_SHADER_RESOURCE    <- sample during lighting
+        |  transition (next frame)
+        v
+      DEPTH_WRITE
+
+  gbuffer:     RENDER_TARGET   <- geometry pass
+        |
+        v
+      PIXEL_SHADER_RESOURCE    <- lighting pass
+
+/* A helper, because writing the struct out every time is how
+   mistakes happen: */
+inline void Transition(ID3D12GraphicsCommandList *cmd,
+                       ID3D12Resource *res,
+                       D3D12_RESOURCE_STATES from,
+                       D3D12_RESOURCE_STATES to)
+{
+    if (from == to) return;                 /* no-op, and the
+                                               debug layer
+                                               complains       */
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = res;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter  = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd-&gt;ResourceBarrier(1, &amp;b);
+}
+
+/* AND TRACK THE STATE YOURSELF. The runtime does not tell you
+   what state a resource is in; you must know. A small
+   wrapper that stores the current state per resource and
+   asserts on mismatch pays for itself immediately - the debug
+   layer catches errors, but only at execute time, and only
+   the ones that actually execute. */</code></pre>
+
+<div class="key">
+<b>Enhanced barriers are the newer, better model</b>
+<p>DX12's original barriers conflate three separate things: execution dependency, memory visibility, and
+layout transition. <strong>Enhanced barriers</strong> (Agility SDK 1.7+) split them, matching Vulkan's model
+and letting you express "wait for compute, but do not decompress" — which the old model could not say. New
+code should prefer them; the concepts in this chapter map across directly.</p>
+</div>
+
+<h2 id="overhead">Too many barriers, and too few</h2>
+
+<pre><code>/* TOO FEW: corruption, hangs, or the classic "works on
+   NVIDIA, breaks on AMD" - because one driver happened to
+   flush a cache the other did not.
+
+   TOO MANY: every barrier is a potential pipeline drain. A
+   barrier between every draw serialises the GPU completely
+   and can cost more than the draws.                        */
+
+/* BAD - a barrier per object. */
+for (auto &amp;o : objects) {
+    Transition(cmd, o.tex, COPY_DEST, PIXEL_SHADER_RESOURCE);
+    Draw(o);
+}
+
+/* GOOD - transition everything once, then draw. */
+std::vector&lt;D3D12_RESOURCE_BARRIER&gt; barriers;
+for (auto &amp;o : objects)
+    barriers.push_back(MakeTransition(o.tex, COPY_DEST,
+                                      PIXEL_SHADER_RESOURCE));
+cmd-&gt;ResourceBarrier((UINT)barriers.size(), barriers.data());
+for (auto &amp;o : objects) Draw(o);
+
+/* THE GENERAL PATTERN: group your frame into PASSES, and put
+   all the barriers at pass boundaries. Inside a pass, nothing
+   changes state.
+
+   A RENDER GRAPH is the industrial version of this idea: you
+   declare which passes read and write which resources, and
+   the graph derives the minimal barrier set, the state
+   transitions and the aliasing opportunities automatically.
+   Every large engine has one, for exactly this reason.    */</code></pre>
+
+<h2 id="residency">Residency</h2>
+
+<pre><code>/* VRAM is not infinite and you are not the only application.
+   Windows may EVICT your resources to system memory when
+   another app needs the memory. */
+
+DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+adapter-&gt;QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                              &amp;info);
+/* info.Budget       - what the OS says you may use
+   info.CurrentUsage - what you are using
+   Exceeding the budget does not fail; it makes the OS start
+   evicting, and your frame time falls off a cliff. */
+
+/* Explicit control, for streaming systems: */
+ID3D12Pageable *res[] = { texture.Get() };
+device-&gt;Evict(1, res);                /* push to system memory */
+device-&gt;MakeResident(1, res);         /* pull back - BLOCKING  */
+
+/* The async form, so you can prefetch without stalling: */
+device-&gt;EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, res,
+                            fence.Get(), fenceValue);
+
+/* THE PRACTICAL ADVICE
+     * poll the budget each frame and shed quality if you are
+       over - drop mip levels, reduce the shadow atlas
+     * do not fight the OS: if the budget shrinks because the
+       user alt-tabbed to a browser, respect it
+     * a frame time that suddenly doubles with no code change
+       is very often eviction, not your rendering            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Corruption a few frames after a change</td><td>Allocator or upload buffer reused without a fence
+wait</td></tr>
+<tr><td>Page fault after freeing a resource</td><td>Released while in-flight work still referenced it</td></tr>
+<tr><td>Frame time equals CPU + GPU rather than max</td><td>A full flush in the frame loop</td></tr>
+<tr><td>Works on NVIDIA, corrupts on AMD</td><td>Missing barrier that one driver's cache behaviour
+hid</td></tr>
+<tr><td>Sampling a render target returns garbage</td><td>No transition from <code>RENDER_TARGET</code> to
+<code>PIXEL_SHADER_RESOURCE</code></td></tr>
+<tr><td>Second dispatch reads stale data</td><td>Missing UAV barrier between dispatches</td></tr>
+<tr><td>Debug layer: "resource is in state X, expected Y"</td><td>Your state tracking and reality have
+diverged</td></tr>
+<tr><td>GPU serialised, poor utilisation</td><td>Barriers per draw instead of per pass</td></tr>
+<tr><td>Frame time doubles when another app opens</td><td>VRAM eviction — check the budget</td></tr>
+<tr><td>Hang with a fence never reaching its value</td><td>Signalled on a different queue, or the value was
+never signalled at all</td></tr>
+<tr><td>Debug layer complains about a same-state transition</td><td>Guard with <code>if (from ==
+to) return;</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe a fence in one sentence and say who signals and who waits.</li>
+  <li>Name the three things fences protect and the bug from each.</li>
+  <li>Explain why signalling and immediately waiting is a stall, and when it is legitimate.</li>
+  <li>List six resource states and say what a transition barrier actually does.</li>
+  <li>Explain why a transition is not free.</li>
+  <li>Name the three barrier types and when the UAV one is needed.</li>
+  <li>Explain what a split barrier buys.</li>
+  <li>Give the failure mode for too few barriers and for too many.</li>
+  <li>Explain what a render graph automates.</li>
+  <li>Say what residency is and how a frame-time cliff can come from another application.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

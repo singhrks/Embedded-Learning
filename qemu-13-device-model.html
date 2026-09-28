@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Writing a QEMU device model | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Writing a QEMU device model</h1>
+<p class="lead">When the silicon does not exist yet, you write the device first and the driver against it.
+This chapter builds a complete, working QEMU device — registers, interrupt, device tree node, migration state
+— and then a Linux driver for it, so you have the full loop that hardware bring-up teams actually use.</p>
+
+<h2 id="why">Why you would do this</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>What the model buys you</th></tr></thead>
+<tbody>
+<tr><td>Silicon is six months away</td><td>The driver is written, reviewed and tested before tape-out. This is
+the normal way large SoC drivers are developed</td></tr>
+<tr><td>The board is on someone else's desk</td><td>Every engineer gets a target</td></tr>
+<tr><td>You need to test an error path</td><td>Make the model return the error. No fault injector on real
+hardware can do this as precisely</td></tr>
+<tr><td>CI must run driver tests</td><td>No board farm required</td></tr>
+<tr><td>You are learning</td><td>Writing the device teaches you what the driver's assumptions actually
+are</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="qom">QOM: QEMU's object model, in one page</h2>
+
+<pre class="diagram">   Every device is a QOM object. Three things to declare:
+
+   1. A STATE struct - your instance data, beginning with the
+      parent's state struct.
+
+        struct MyDevState {
+                SysBusDevice parent_obj;   &lt;- MUST be first
+                MemoryRegion iomem;
+                qemu_irq     irq;
+                uint32_t     regs[8];
+        };
+
+   2. A TYPE registration - name, parent, sizes, class init.
+
+        static const TypeInfo mydev_info = {
+                .name          = TYPE_MYDEV,
+                .parent        = TYPE_SYS_BUS_DEVICE,
+                .instance_size = sizeof(MyDevState),
+                .instance_init = mydev_init,
+                .class_init    = mydev_class_init,
+        };
+
+   3. LIFECYCLE callbacks:
+
+        instance_init  object created. Set defaults only.
+        realize        properties are set; NOW create memory
+                       regions, allocate, connect IRQs. This is
+                       where the real work goes.
+        reset          system reset. Restore register defaults.
+        unrealize      teardown.
+
+   Parent classes you will use:
+        TYPE_SYS_BUS_DEVICE   memory-mapped, on the system bus
+        TYPE_PCI_DEVICE       a PCIe function
+        TYPE_VIRTIO_DEVICE    a virtio device
+        TYPE_DEVICE           anything else</pre>
+
+<h2 id="device">A complete device</h2>
+
+<pre><code>/* hw/misc/acme-widget.c
+   A device with an ID register, a scratch register, a counter
+   that increments on read, and an interrupt you can trigger. */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
+#include "qemu/log.h"
+#include "qom/object.h"
+#include "trace.h"
+
+#define TYPE_ACME_WIDGET "acme-widget"
+OBJECT_DECLARE_SIMPLE_TYPE(AcmeWidgetState, ACME_WIDGET)
+
+/* Register map - document it here, it is the contract. */
+#define R_ID        0x00   /* RO  magic 0xACE00001            */
+#define R_CTRL      0x04   /* RW  bit0 enable, bit1 irq enable */
+#define R_STATUS    0x08   /* RO  bit0 irq pending             */
+#define R_SCRATCH   0x0c   /* RW  anything                     */
+#define R_COUNTER   0x10   /* RO  increments on each read      */
+#define R_IRQ_SET   0x14   /* WO  write 1 to raise the irq     */
+#define R_IRQ_CLR   0x18   /* WO  write 1 to clear it          */
+#define R_MAX       0x1c
+
+#define CTRL_ENABLE   (1u &lt;&lt; 0)
+#define CTRL_IRQ_EN   (1u &lt;&lt; 1)
+#define STATUS_IRQ    (1u &lt;&lt; 0)
+
+struct AcmeWidgetState {
+        SysBusDevice parent_obj;
+
+        MemoryRegion iomem;
+        qemu_irq     irq;
+
+        uint32_t ctrl;
+        uint32_t status;
+        uint32_t scratch;
+        uint32_t counter;
+        uint32_t id;          /* a property, so it is settable */
+};
+
+static void acme_update_irq(AcmeWidgetState *s)
+{
+        int level = !!(s-&gt;status &amp; STATUS_IRQ) &amp;&amp;
+                    !!(s-&gt;ctrl &amp; CTRL_IRQ_EN);
+        trace_acme_widget_irq(level);
+        qemu_set_irq(s-&gt;irq, level);      /* LEVEL, not pulse */
+}
+
+static uint64_t acme_read(void *opaque, hwaddr off, unsigned size)
+{
+        AcmeWidgetState *s = opaque;
+        uint64_t v = 0;
+
+        switch (off) {
+        case R_ID:      v = s-&gt;id;                  break;
+        case R_CTRL:    v = s-&gt;ctrl;                break;
+        case R_STATUS:  v = s-&gt;status;              break;
+        case R_SCRATCH: v = s-&gt;scratch;             break;
+        case R_COUNTER: v = s-&gt;counter++;           break;
+        default:
+                /* NEVER fault. Log and return zero, like real
+                   silicon. */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                        "acme-widget: read of unknown offset 0x%"
+                        HWADDR_PRIx "\n", off);
+                break;
+        }
+        trace_acme_widget_read(off, v, size);
+        return v;
+}
+
+static void acme_write(void *opaque, hwaddr off, uint64_t val,
+                       unsigned size)
+{
+        AcmeWidgetState *s = opaque;
+
+        trace_acme_widget_write(off, val, size);
+
+        switch (off) {
+        case R_CTRL:
+                s-&gt;ctrl = val &amp; (CTRL_ENABLE | CTRL_IRQ_EN);
+                acme_update_irq(s);
+                break;
+        case R_SCRATCH:
+                s-&gt;scratch = val;
+                break;
+        case R_IRQ_SET:
+                if (val &amp; 1) {
+                        s-&gt;status |= STATUS_IRQ;
+                        acme_update_irq(s);
+                }
+                break;
+        case R_IRQ_CLR:
+                if (val &amp; 1) {
+                        s-&gt;status &amp;= ~STATUS_IRQ;
+                        acme_update_irq(s);
+                }
+                break;
+        case R_ID:
+        case R_STATUS:
+        case R_COUNTER:
+                qemu_log_mask(LOG_GUEST_ERROR,
+                        "acme-widget: write to RO offset 0x%"
+                        HWADDR_PRIx "\n", off);
+                break;
+        default:
+                qemu_log_mask(LOG_GUEST_ERROR,
+                        "acme-widget: write to unknown offset 0x%"
+                        HWADDR_PRIx "\n", off);
+                break;
+        }
+}
+
+static const MemoryRegionOps acme_ops = {
+        .read       = acme_read,
+        .write      = acme_write,
+        .endianness = DEVICE_LITTLE_ENDIAN,
+        .valid = {                 /* what the GUEST may do    */
+                .min_access_size = 4,
+                .max_access_size = 4,
+                .unaligned       = false,
+        },
+        .impl = {                  /* what WE implement; QEMU
+                                      splits/combines to match */
+                .min_access_size = 4,
+                .max_access_size = 4,
+        },
+};
+
+static void acme_reset(DeviceState *dev)
+{
+        AcmeWidgetState *s = ACME_WIDGET(dev);
+
+        s-&gt;ctrl    = 0;
+        s-&gt;status  = 0;
+        s-&gt;scratch = 0;
+        s-&gt;counter = 0;
+        acme_update_irq(s);
+}
+
+static void acme_realize(DeviceState *dev, Error **errp)
+{
+        AcmeWidgetState *s = ACME_WIDGET(dev);
+        SysBusDevice   *sbd = SYS_BUS_DEVICE(dev);
+
+        memory_region_init_io(&amp;s-&gt;iomem, OBJECT(s), &amp;acme_ops, s,
+                              TYPE_ACME_WIDGET, 0x1000);
+        sysbus_init_mmio(sbd, &amp;s-&gt;iomem);
+        sysbus_init_irq(sbd, &amp;s-&gt;irq);
+}
+
+/* Migration state. Without this, savevm/loadvm and migration
+   silently lose your device's registers.                     */
+static const VMStateDescription acme_vmstate = {
+        .name    = TYPE_ACME_WIDGET,
+        .version_id = 1,
+        .minimum_version_id = 1,
+        .fields = (const VMStateField[]) {
+                VMSTATE_UINT32(ctrl,    AcmeWidgetState),
+                VMSTATE_UINT32(status,  AcmeWidgetState),
+                VMSTATE_UINT32(scratch, AcmeWidgetState),
+                VMSTATE_UINT32(counter, AcmeWidgetState),
+                VMSTATE_END_OF_LIST()
+        },
+};
+
+static const Property acme_properties[] = {
+        DEFINE_PROP_UINT32("id", AcmeWidgetState, id, 0xACE00001),
+};
+
+static void acme_class_init(ObjectClass *klass, void *data)
+{
+        DeviceClass *dc = DEVICE_CLASS(klass);
+
+        dc-&gt;realize  = acme_realize;
+        device_class_set_legacy_reset(dc, acme_reset);
+        dc-&gt;vmsd     = &amp;acme_vmstate;
+        dc-&gt;desc     = "Acme Widget";
+        device_class_set_props(dc, acme_properties);
+        set_bit(DEVICE_CATEGORY_MISC, dc-&gt;categories);
+}
+
+static const TypeInfo acme_info = {
+        .name          = TYPE_ACME_WIDGET,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AcmeWidgetState),
+        .class_init    = acme_class_init,
+};
+
+static void acme_register_types(void)
+{
+        type_register_static(&amp;acme_info);
+}
+type_init(acme_register_types)</code></pre>
+
+<h2 id="wire">Wiring it into the build and the machine</h2>
+
+<pre><code># 1. hw/misc/trace-events - add your tracepoints
+acme_widget_read(uint64_t off, uint64_t val, unsigned sz) \
+    "off 0x%" PRIx64 " val 0x%" PRIx64 " size %u"
+acme_widget_write(uint64_t off, uint64_t val, unsigned sz) \
+    "off 0x%" PRIx64 " val 0x%" PRIx64 " size %u"
+acme_widget_irq(int level) "level %d"
+
+# 2. hw/misc/Kconfig
+config ACME_WIDGET
+    bool
+    default y if TEST_DEVICES
+
+# 3. hw/misc/meson.build
+system_ss.add(when: 'CONFIG_ACME_WIDGET',
+              if_true: files('acme-widget.c'))
+
+# 4. configs/devices/aarch64-softmmu/default.mak
+CONFIG_ACME_WIDGET=y
+
+# 5. Rebuild
+$ ninja -C build
+
+# 6. Instantiate it. The dynamic sysbus lets you do this from
+#    the command line without touching the machine code:
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image -append "console=ttyAMA0" \
+    -device acme-widget \
+    --trace 'acme_widget_*' -D acme.log
+
+# Confirm it exists:
+(qemu) info qtree
+    dev: acme-widget, id ""
+      id = 2900361217 (0xace00001)
+      mmio 000000000c000000/0000000000001000
+(qemu) info mtree | grep acme
+      000000000c000000-000000000c000fff (prio 0, i/o): acme-widget
+
+# Poke it from the monitor, before writing any driver at all:
+(qemu) xp/1xw 0x0c000000
+000000000c000000: 0xace00001
+(qemu) xp/1xw 0x0c000010
+000000000c000010: 0x00000000
+(qemu) xp/1xw 0x0c000010
+000000000c000010: 0x00000001      # the counter increments</code></pre>
+
+<div class="key">
+<b>Test the model before writing the driver</b>
+<p><code>xp</code> from the monitor exercises every register without a single line of guest code. If the ID
+register does not read back, the problem is in your model; if it does, every later failure is in the driver.
+That separation saves hours, and it is only available because you are on QEMU.</p>
+</div>
+
+<h2 id="dt">The device tree node</h2>
+
+<pre><code>/* A dynamic sysbus device gets an auto-generated node with a
+   generic compatible string, which no driver will match. For a
+   real device you add it to the machine.                     */
+
+/* hw/arm/virt.c, in the machine's device creation: */
+
+static void create_acme_widget(const VirtMachineState *vms)
+{
+        hwaddr base = 0x0c000000;
+        int    irq  = 48;
+        DeviceState *dev;
+        MachineState *ms = MACHINE(vms);
+        char *nodename;
+
+        dev = qdev_new(TYPE_ACME_WIDGET);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &amp;error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(vms-&gt;gic,
+                                            irq));
+
+        nodename = g_strdup_printf("/acme-widget@%" PRIx64, base);
+        qemu_fdt_add_subnode(ms-&gt;fdt, nodename);
+        qemu_fdt_setprop_string(ms-&gt;fdt, nodename,
+                                "compatible", "acme,widget-1.0");
+        qemu_fdt_setprop_sized_cells(ms-&gt;fdt, nodename, "reg",
+                                     2, base, 2, 0x1000);
+        qemu_fdt_setprop_cells(ms-&gt;fdt, nodename, "interrupts",
+                               GIC_FDT_IRQ_TYPE_SPI, irq,
+                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
+        g_free(nodename);
+}
+
+/* Verify it landed: */
+$ qemu-system-aarch64 -M virt,dumpdtb=v.dtb ... &amp;&amp; \
+  dtc -I dtb -O dts v.dtb | grep -A5 acme</code></pre>
+
+<h2 id="driver">The driver, for the loop to close</h2>
+
+<pre><code>// acme_widget.c - a Linux platform driver for the model above.
+#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+#define R_ID 0x00
+#define R_CTRL 0x04
+#define R_STATUS 0x08
+#define R_SCRATCH 0x0c
+#define R_COUNTER 0x10
+#define R_IRQ_SET 0x14
+#define R_IRQ_CLR 0x18
+
+struct acme {
+        void __iomem *base;
+        int irq;
+};
+
+static irqreturn_t acme_isr(int irq, void *dev_id)
+{
+        struct acme *a = dev_id;
+
+        writel(1, a-&gt;base + R_IRQ_CLR);     /* level: must clear */
+        pr_info("acme: interrupt\n");
+        return IRQ_HANDLED;
+}
+
+static int acme_probe(struct platform_device *pdev)
+{
+        struct acme *a;
+        u32 id;
+
+        a = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*a), GFP_KERNEL);
+        if (!a)
+                return -ENOMEM;
+
+        a-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(a-&gt;base))
+                return PTR_ERR(a-&gt;base);
+
+        id = readl(a-&gt;base + R_ID);
+        if (id != 0xACE00001) {
+                dev_err(&amp;pdev-&gt;dev, "bad id 0x%08x\n", id);
+                return -ENODEV;
+        }
+
+        a-&gt;irq = platform_get_irq(pdev, 0);
+        if (a-&gt;irq &lt; 0)
+                return a-&gt;irq;
+
+        if (devm_request_irq(&amp;pdev-&gt;dev, a-&gt;irq, acme_isr, 0,
+                             "acme-widget", a))
+                return -EBUSY;
+
+        writel(3, a-&gt;base + R_CTRL);        /* enable + irq en   */
+        platform_set_drvdata(pdev, a);
+
+        dev_info(&amp;pdev-&gt;dev, "probed, id 0x%08x, counter %u\n",
+                 id, readl(a-&gt;base + R_COUNTER));
+
+        writel(1, a-&gt;base + R_IRQ_SET);     /* fire one          */
+        return 0;
+}
+
+static const struct of_device_id acme_of_match[] = {
+        { .compatible = "acme,widget-1.0" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, acme_of_match);
+
+static struct platform_driver acme_driver = {
+        .probe  = acme_probe,
+        .driver = {
+                .name           = "acme-widget",
+                .of_match_table = acme_of_match,
+        },
+};
+module_platform_driver(acme_driver);
+MODULE_LICENSE("GPL");</code></pre>
+
+<pre><code># Build it against your kernel, put it in the initramfs
+# (chapter 6), and run:
+
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image -initrd initramfs.cpio.gz \
+    -append "console=ttyAMA0" \
+    --trace 'acme_widget_*' -D acme.log
+
+/ # insmod /lib/modules/acme_widget.ko
+acme-widget c000000.acme-widget: probed, id 0xace00001, counter 0
+acme: interrupt
+
+$ cat acme.log
+acme_widget_read  off 0x0 val 0xace00001 size 4
+acme_widget_read  off 0x10 val 0x0 size 4
+acme_widget_write off 0x4 val 0x3 size 4
+acme_widget_irq   level 0
+acme_widget_write off 0x14 val 0x1 size 4
+acme_widget_irq   level 1
+acme_widget_write off 0x18 val 0x1 size 4
+acme_widget_irq   level 0
+
+# Both sides of the boundary, in one log. This is the loop:
+# change the model, rebuild, rerun, see exactly what the driver
+# did. No hardware exists and none is needed.</code></pre>
+
+<div class="warn">
+<b>Level, not pulse</b>
+<p>Model the interrupt as a level that you recompute from state (<code>qemu_set_irq(irq, level)</code>), never
+as a pulse. A pulse can be lost, and worse, it hides driver bugs: a driver that forgets to clear the interrupt
+source works fine against a pulse model and locks the machine up on real hardware. The model should be as
+unforgiving as the silicon.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device does not appear in <code>info qtree</code></td><td>Not in <code>meson.build</code>, or
+<code>CONFIG_</code> not enabled, or not rebuilt</td></tr>
+<tr><td>Driver never probes</td><td><code>compatible</code> string mismatch — check the dumped DTB</td></tr>
+<tr><td>Reads return zero</td><td>Wrong base address, or the region size is smaller than the offset you are
+reading</td></tr>
+<tr><td>Guest hangs on the first access</td><td><code>valid.min_access_size</code> excludes the access the
+driver made</td></tr>
+<tr><td>Interrupt storm</td><td>Level modelled but the driver's clear path does not actually lower it</td></tr>
+<tr><td>Interrupt fires once, never again</td><td>Modelled as a pulse, or <code>acme_update_irq</code> not
+called after a state change</td></tr>
+<tr><td>Registers wrong after <code>loadvm</code></td><td>No <code>VMStateDescription</code>, or a field
+missing from it</td></tr>
+<tr><td>Byte access from the guest behaves oddly</td><td><code>impl</code> and <code>valid</code> access sizes
+inconsistent</td></tr>
+<tr><td>Guest kernel panics probing your device</td><td>Model faulting on an unknown offset instead of logging
+and returning zero</td></tr>
+<tr><td>Works in <code>-device</code> form, not on the machine</td><td>The dynamic sysbus node has a generic
+<code>compatible</code>; add a proper node in the machine</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three situations where writing the device model comes before the driver.</li>
+  <li>Name the three things a QOM type declaration needs and the four lifecycle callbacks.</li>
+  <li>Explain why the parent state struct must be the first member.</li>
+  <li>Say what belongs in <code>instance_init</code> and what belongs in <code>realize</code>.</li>
+  <li>Explain the difference between <code>valid</code> and <code>impl</code> access sizes.</li>
+  <li>Explain why an unknown register offset must not fault.</li>
+  <li>Explain why the interrupt must be modelled as a level, and what bug a pulse model hides.</li>
+  <li>Say what <code>VMStateDescription</code> is for and what breaks without it.</li>
+  <li>Test a device model from the QEMU monitor before writing any driver.</li>
+  <li>Add a device tree node so a real driver's <code>compatible</code> string matches.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

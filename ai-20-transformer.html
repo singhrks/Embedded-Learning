@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The transformer architecture | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The transformer architecture</h1>
+<p class="lead">Attention, a feed-forward network, normalisation and a residual connection, repeated N
+times. Every large language model in existence is this diagram with different numbers in it.</p>
+
+<h2 id="diagram">The whole thing</h2>
+
+<p>Every component has been built separately by now. This is how they assemble, and it is worth tracing a single token's path through the whole thing once.</p>
+
+<pre class="diagram">   INPUT: token ids            (batch, seq)
+       |
+       v
+   TOKEN EMBEDDING             (batch, seq, d_model)
+       + POSITIONAL INFORMATION            (chapter 21)
+       |
+       v
+   +===========================================+
+   |  TRANSFORMER BLOCK  x N_LAYERS            |
+   |                                           |
+   |    x ---------------------------+         |
+   |    |                            |         |
+   |    v                            |         |
+   |  LayerNorm                      | residual|
+   |    |                            |         |
+   |    v                            |         |
+   |  MULTI-HEAD SELF-ATTENTION      |         |
+   |    |                            |         |
+   |    v                            |         |
+   |   (+)  <-----------------------+          |
+   |    |                                      |
+   |    x ---------------------------+         |
+   |    |                            |         |
+   |    v                            |         |
+   |  LayerNorm                      | residual|
+   |    |                            |         |
+   |    v                            |         |
+   |  FEED-FORWARD NETWORK           |         |
+   |    |                            |         |
+   |    v                            |         |
+   |   (+)  <-----------------------+          |
+   |    |                                      |
+   +====|======================================+
+        v
+   FINAL LayerNorm
+        |
+        v
+   LINEAR to VOCABULARY         (batch, seq, vocab)
+        |
+        v
+   LOGITS -> softmax -> next-token distribution
+
+   THAT IS IT. There is nothing else. Two sublayers, each
+   wrapped in a normalisation and a residual, stacked.
+
+   TWO THINGS ARE WORTH NOTICING IMMEDIATELY:
+
+   1. THE RESIDUAL STREAM. The straight path down the middle
+      is never transformed - every block READS from it and
+      ADDS to it. It is best understood as a shared
+      communication bus of width d_model that all layers
+      write into. This framing is central to modern
+      interpretability work.
+
+   2. PRE-NORM. The LayerNorm is INSIDE the residual branch,
+      before the sublayer - not after the addition. The
+      original 2017 paper used post-norm and needed careful
+      warmup to train at all. PRE-NORM IS WHAT EVERY MODERN
+      MODEL USES because it trains stably at depth
+      (chapter 22).</pre>
+
+<h2 id="sizes">The numbers</h2>
+
+<p>Having concrete numbers for real models makes the parameter counts and memory figures in the rest of the track meaningful rather than abstract.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>d_model</th><th>Layers</th><th>Heads</th><th>Params</th></tr></thead>
+<tbody>
+<tr><td>Original (2017)</td><td>512</td><td>6</td><td>8</td><td>65 M</td></tr>
+<tr><td>BERT-base</td><td>768</td><td>12</td><td>12</td><td>110 M</td></tr>
+<tr><td>GPT-2 small</td><td>768</td><td>12</td><td>12</td><td>124 M</td></tr>
+<tr><td>GPT-2 XL</td><td>1600</td><td>48</td><td>25</td><td>1.5 B</td></tr>
+<tr><td>GPT-3</td><td>12288</td><td>96</td><td>96</td><td>175 B</td></tr>
+<tr><td>Llama 3 8B</td><td>4096</td><td>32</td><td>32 (8 KV)</td><td>8 B</td></tr>
+<tr><td>Llama 3 70B</td><td>8192</td><td>80</td><td>64 (8 KV)</td><td>70 B</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE PARAMETER COUNT, per layer, in terms of d = d_model:
+
+    ATTENTION
+      W_Q, W_K, W_V, W_O    4 * d * d      = 4 d^2
+    FEED-FORWARD (d_ff = 4d, the standard ratio)
+      W_1: d x 4d, W_2: 4d x d             = 8 d^2
+    LayerNorms                              ~ negligible
+                                            ----------
+                            PER LAYER      = 12 d^2
+
+    TOTAL ~= 12 * n_layers * d^2  +  vocab * d
+
+    CHECK IT AGAINST GPT-3:
+      12 * 96 * 12288^2 = 174 billion.  Correct.
+
+    NOTE THE PROPORTIONS: the FEED-FORWARD NETWORK IS TWO
+    THIRDS OF THE PARAMETERS. Attention gets the attention;
+    the FFN holds the weights. Chapter 22 discusses what it
+    is believed to be doing.
+
+/* SOME CONVENTIONS THAT ARE ALMOST ALWAYS TRUE:
+     d_head  = d_model / n_heads      (usually 64 or 128)
+     d_ff    = 4 * d_model            (or 8/3 * d for gated
+                                       SwiGLU variants,
+                                       which keeps the
+                                       parameter count
+                                       equal)
+     depth and width scale together as models grow
+
+/* AND THE MEMORY, which is what you actually plan around:
+     WEIGHTS, fp16          2 bytes/param
+       7B model  -> 14 GB
+       70B model -> 140 GB   (chapter 26 halves or quarters
+                              this)
+     KV CACHE per token:
+       2 * n_layers * n_kv_heads * d_head * 2 bytes
+       Llama-3-8B: 2*32*8*128*2 = 131 KB PER TOKEN
+       -> 8k context = 1 GB. This is why GQA exists
+          (chapter 19).                                  */</code></pre>
+
+<h2 id="code">The complete implementation</h2>
+
+<p>The complete architecture, short enough to read in one sitting. Almost all of the apparent complexity of a language model lives in the training and serving around this, not in the model itself.</p>
+
+<pre><code>"""A working GPT-style transformer. This is the real thing -
+   about a hundred lines, and it is what chapter 33 trains."""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class Config:
+    vocab_size = 50257
+    n_layer    = 12
+    n_head     = 12
+    d_model    = 768
+    block_size = 1024        # max sequence length
+    dropout    = 0.1
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        assert cfg.d_model % cfg.n_head == 0
+        # Q, K and V in ONE matrix - a single larger matmul
+        # is faster than three (chapter 04)
+        self.qkv  = nn.Linear(cfg.d_model, 3 * cfg.d_model)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model)
+        self.n_head = cfg.n_head
+        self.d_head = cfg.d_model // cfg.n_head
+        self.dropout = cfg.dropout
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+
+        # (B, T, C) -> (B, n_head, T, d_head)
+        # so the batched matmul runs every head at once
+        q = q.view(B, T, self.n_head,
+                   self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head,
+                   self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head,
+                   self.d_head).transpose(1, 2)
+
+        # Flash Attention when available (chapter 19)
+        y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout if self.training
+                          else 0.0)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.fc   = nn.Linear(cfg.d_model, 4 * cfg.d_model)
+        self.proj = nn.Linear(4 * cfg.d_model, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+    def forward(self, x):
+        return self.drop(self.proj(F.gelu(self.fc(x))))
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.mlp = MLP(cfg)
+    def forward(self, x):
+        # PRE-NORM, and note that x is returned unchanged
+        # through the additions - that is the residual stream
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.wte = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.wpe = nn.Embedding(cfg.block_size, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList(
+            [Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size,
+                              bias=False)
+
+        # WEIGHT TYING (chapter 17)
+        self.head.weight = self.wte.weight
+
+        self.apply(self._init)
+        # scale the residual projections by 1/sqrt(2*n_layer)
+        # (chapter 15)
+        for name, p in self.named_parameters():
+            if name.endswith('proj.weight'):
+                nn.init.normal_(p, mean=0.0, std=0.02 /
+                                math.sqrt(2 * cfg.n_layer))
+
+    def _init(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.drop(self.wte(idx) + self.wpe(pos))
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.head(x)              # (B, T, vocab)
+
+        loss = None
+        if targets is not None:
+            # EVERY POSITION PREDICTS THE NEXT TOKEN -
+            # T training examples from one pass (chapter 19)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1)
+        return logits, loss
+
+model = GPT(Config())
+n = sum(p.numel() for p in model.parameters())
+print(f"{n/1e6:.1f}M parameters")     # ~124M - GPT-2 small</code></pre>
+
+<div class="key">
+<b>The whole training objective</b>
+<pre>input:   [The, cat, sat, on, the]
+targets: [cat, sat, on, the, mat]
+
+Shift by one. Cross-entropy at every position. That is
+the entire pretraining objective of every large language
+model — no labels, no annotation, just text
+(chapter 23).</pre>
+</div>
+
+<h2 id="variants">The families, and what changed since 2017</h2>
+
+<p>The 2017 architecture is not what anybody ships now. These are the changes that stuck, and each one replaced a component that was measurably holding things back.</p>
+
+<pre><code>/* --- THE THREE ARCHITECTURES --- */
+    ENCODER-ONLY     bidirectional attention, masked-token
+                     objective. BERT, RoBERTa, DeBERTa.
+                     Classification, NER, EMBEDDINGS
+                     (chapter 17).
+    DECODER-ONLY     causal attention, next-token objective.
+                     GPT, Llama, Mistral, Claude, Gemma.
+                     GENERATION - and, it turned out,
+                     everything else too.
+    ENCODER-DECODER  cross-attention from decoder to
+                     encoder. T5, BART, Whisper.
+                     Translation, summarisation,
+                     speech-to-text.
+
+    DECODER-ONLY DOMINATES general-purpose models. The
+    lesson the field drew: one simple objective plus scale
+    outperformed architectural specialisation - the same
+    lesson as chapter 14's prior-strength trade-off.
+
+/* --- WHAT ACTUALLY CHANGED BETWEEN 2017 AND NOW --- */
+
+    2017 ORIGINAL              MODERN (Llama 3 and similar)
+    ---------------------------------------------------------
+    post-norm                  PRE-NORM
+    LayerNorm                  RMSNORM (cheaper, no mean)
+    learned absolute positions  ROPE (rotary, relative)
+    ReLU FFN                   SWIGLU (gated)
+    MHA                        GQA (smaller KV cache)
+    d_ff = 4d                  d_ff = 8/3 d (to keep the
+                               parameter count with gating)
+    dropout 0.1                often 0 for pretraining
+    biases everywhere          MOSTLY NO BIASES
+    2k context                 128k+ context
+
+    EVERY ONE OF THESE IS A SMALL CHANGE. There has been no
+    architectural revolution since 2017 - the transformer
+    block is essentially unchanged, and the gains have come
+    from SCALE, DATA and SYSTEMS ENGINEERING. That is worth
+    stating plainly, because it is not the impression the
+    press gives.
+
+/* --- MIXTURE OF EXPERTS, the one structural change --- */
+    Replace the FFN with N expert FFNs and a router that
+    sends each token to the top-k of them (usually k = 2).
+
+      · TOTAL parameters go up enormously
+      · ACTIVE parameters per token stay small
+      · so capacity grows without proportional compute
+
+    Mixtral 8x7B: 47B total, ~13B active per token.
+    THE COSTS: all experts must be in memory, load balancing
+    across experts needs an auxiliary loss, and distributed
+    training becomes considerably harder.
+
+/* --- AND THE MULTIMODAL EXTENSION --- */
+    Nothing about the block is text-specific. Feed it image
+    patches (ViT), audio frames (Whisper), or a mixture, and
+    the same architecture applies. Chapter 17's point
+    exactly: once everything is a sequence of vectors, the
+    transformer does not care.                           */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Training diverges past ~12 layers</td><td>Post-norm without warmup — use pre-norm</td></tr>
+<tr><td>Loss drops to near zero, generation fails</td><td>No causal mask</td></tr>
+<tr><td>Parameter count is far off the expected value</td><td>Check the 12·n_layer·d² estimate — usually a wrong <code>d_ff</code> or untied weights</td></tr>
+<tr><td>Output is identical for shuffled input</td><td>Positional embedding missing or not added</td></tr>
+<tr><td>Sequence longer than <code>block_size</code> crashes</td><td>Learned absolute positions have a hard limit</td></tr>
+<tr><td>Activations grow with depth</td><td>Residual projections not scaled at initialisation</td></tr>
+<tr><td>KV cache dominates memory</td><td>Full MHA — use GQA</td></tr>
+<tr><td>Attention is slower than expected</td><td>Manual implementation instead of the fused kernel</td></tr>
+<tr><td>MoE model has idle experts</td><td>No load-balancing auxiliary loss</td></tr>
+<tr><td>Model is huge but the FFN is small</td><td>Wrong <code>d_ff</code> ratio — it should be two thirds of the parameters</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the transformer block from memory, including both residuals.</li>
+  <li>Explain the residual stream as a communication bus.</li>
+  <li>Explain pre-norm versus post-norm and which trains at depth.</li>
+  <li>Derive the 12·d² per-layer parameter count and verify it against GPT-3.</li>
+  <li>Say which sublayer holds two thirds of the parameters.</li>
+  <li>Compute the KV cache per token for Llama-3-8B.</li>
+  <li>Implement causal self-attention including the head reshape.</li>
+  <li>Explain the input/target shift and why one pass gives T examples.</li>
+  <li>Name the three architecture families and what each is used for.</li>
+  <li>List eight changes between the 2017 transformer and a modern one.</li>
+  <li>Explain mixture of experts and its three costs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

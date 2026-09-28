@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Networking | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Networking</h1>
+<p class="lead">Four backends, each with a different answer to "who can talk to whom". Picking the wrong one
+is why guests cannot reach the internet, why you cannot SSH in, and why two guests that should see each other
+do not. This chapter is the decision table plus the exact commands.</p>
+
+<h2 id="choose">The four backends</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Backend</th><th>Guest → internet</th><th>Host → guest</th><th>Guest ↔ guest</th><th>Root
+needed</th></tr></thead>
+<tbody>
+<tr><td><strong>user</strong> (SLIRP)</td><td>Yes, NAT</td><td>Only via <code>hostfwd</code></td><td>No</td><td>No</td></tr>
+<tr><td><strong>tap</strong></td><td>Yes, if you route/NAT</td><td>Yes</td><td>Yes, via a
+bridge</td><td>Yes (or a pre-made tap)</td></tr>
+<tr><td><strong>bridge</strong></td><td>Yes, as a peer on the LAN</td><td>Yes</td><td>Yes</td><td>Yes (or
+<code>qemu-bridge-helper</code> setuid)</td></tr>
+<tr><td><strong>socket</strong> / <strong>vde</strong></td><td>No</td><td>No</td><td>Yes</td><td>No</td></tr>
+<tr><td><strong>none</strong></td><td>No</td><td>No</td><td>No</td><td>No</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   Decide in this order:
+
+   Do I just need the guest to reach the internet and to
+   SSH in?                         -> USER + hostfwd. Done.
+                                      No root, no setup, works
+                                      on every host including
+                                      macOS and Windows.
+
+   Do I need the guest to be a real host on my LAN, with its
+   own IP, reachable by other machines?
+                                   -> BRIDGE.
+
+   Do I need several guests on a private network, with the host
+   as a router or observer?
+                                   -> TAP + a host bridge.
+
+   Do I need two guests to talk to each other and nothing else,
+   without root?
+                                   -> SOCKET.
+
+   Am I testing a driver and do not care about connectivity?
+                                   -> USER, or none at all.</pre>
+
+<h2 id="user">user: the default that is almost always right</h2>
+
+<pre><code># SLIRP implements a TCP/IP stack in QEMU's own process. The
+# guest gets 10.0.2.15, a gateway at 10.0.2.2 and DNS at
+# 10.0.2.3. No configuration on the host at all.
+
+$ qemu-system-aarch64 -M virt ... \
+    -netdev user,id=n0 \
+    -device virtio-net-device,netdev=n0
+
+# Guest:
+$ udhcpc -i eth0          # or: dhclient eth0
+$ ip addr show eth0
+    inet 10.0.2.15/24
+$ ping -c1 10.0.2.2       # the gateway = QEMU itself
+$ curl https://example.com   # works, NATted through the host
+
+# SSH IN - this is the option you will use every day:
+$ qemu-system-aarch64 ... \
+    -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+    -device virtio-net-device,netdev=n0
+$ ssh -p 2222 root@localhost
+
+# Several forwards at once:
+-netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80,\
+hostfwd=udp::5353-:53
+
+# Bind a forward to one host interface only:
+-netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22
+
+# Serve a directory over TFTP, for netbooting the guest:
+-netdev user,id=n0,tftp=/srv/tftp,bootfile=/Image
+
+# Give the guest a share over SMB (needs samba on the host):
+-netdev user,id=n0,smb=/home/me/share
+# guest: mount -t cifs //10.0.2.4/qemu /mnt
+
+# Change the network:
+-netdev user,id=n0,net=192.168.76.0/24,host=192.168.76.9,\
+dhcpstart=192.168.76.20
+
+# Restrict the guest to only what you forward:
+-netdev user,id=n0,restrict=on,hostfwd=tcp::2222-:22
+# No internet, no host access except the forward. Good for
+# running something you do not trust.</code></pre>
+
+<div class="warn">
+<b>What user networking cannot do</b>
+<p>ICMP from the guest often does not work (SLIRP needs raw sockets or <code>ping_group_range</code>), so
+<code>ping</code> failing does not mean the network is broken — test with <code>curl</code> instead. Guests
+cannot see each other. The host cannot initiate a connection except through <code>hostfwd</code>. And
+throughput is limited by SLIRP's userspace stack: expect hundreds of Mbit/s, not tens of Gbit/s.</p>
+</div>
+
+<h2 id="tap">tap: a real interface on the host</h2>
+
+<pre><code># A tap device is a virtual Ethernet interface the kernel
+# exposes as a file descriptor. QEMU writes frames into it; the
+# host's network stack sees them arriving on an interface.
+
+# 1. Create a persistent tap owned by you (do this once):
+$ sudo ip tuntap add dev tap0 mode tap user $USER
+$ sudo ip link set tap0 up
+$ sudo ip addr add 192.168.100.1/24 dev tap0
+
+# 2. Use it - no root needed now, because you own tap0:
+$ qemu-system-aarch64 -M virt ... \
+    -netdev tap,id=n0,ifname=tap0,script=no,downscript=no \
+    -device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56
+
+# 3. Guest:
+$ ip addr add 192.168.100.2/24 dev eth0
+$ ip link set eth0 up
+$ ip route add default via 192.168.100.1
+$ ping 192.168.100.1              # the host. Works.
+
+# 4. Give the guest internet, by NATting on the host:
+$ sudo sysctl -w net.ipv4.ip_forward=1
+$ sudo iptables -t nat -A POSTROUTING -s 192.168.100.0/24 \
+       -o eth0 -j MASQUERADE
+$ sudo iptables -A FORWARD -i tap0 -j ACCEPT
+$ sudo iptables -A FORWARD -o tap0 -m state \
+       --state RELATED,ESTABLISHED -j ACCEPT
+
+# 5. vhost, for near-native throughput (virt chapter 15):
+-netdev tap,id=n0,ifname=tap0,script=no,downscript=no,vhost=on
+
+# ALWAYS set an explicit MAC. QEMU's default is the same for
+# every guest, so two guests on one bridge collide, and the
+# symptom is intermittent packet loss that looks like a driver
+# bug.</code></pre>
+
+<h2 id="bridge">bridge: the guest as a peer on your LAN</h2>
+
+<pre><code># The guest gets an address from your real DHCP server and is
+# reachable from any machine on the network.
+
+# 1. Build a bridge and move your physical NIC onto it.
+#    WARNING: this drops your connection momentarily. Do not do
+#    it over SSH without a console.
+$ sudo ip link add br0 type bridge
+$ sudo ip link set eth0 master br0
+$ sudo ip addr flush dev eth0
+$ sudo ip link set br0 up
+$ sudo dhclient br0
+
+# NetworkManager equivalent, which survives reboots:
+$ nmcli con add type bridge ifname br0 con-name br0
+$ nmcli con add type ethernet ifname eth0 master br0
+$ nmcli con up br0
+
+# 2. Allow QEMU's helper to use it:
+$ echo "allow br0" | sudo tee /etc/qemu/bridge.conf
+$ sudo chmod u+s /usr/lib/qemu/qemu-bridge-helper
+
+# 3. Run:
+$ qemu-system-aarch64 -M virt ... \
+    -netdev bridge,id=n0,br=br0 \
+    -device virtio-net-device,netdev=n0,mac=52:54:00:aa:bb:cc
+
+# Guest gets a LAN address by DHCP. Colleagues can reach it.
+# So can anything else on that network - treat it accordingly.</code></pre>
+
+<h2 id="socket">socket: guests talking to each other, no root</h2>
+
+<pre><code># A pure userspace virtual switch. Ideal for testing a network
+# protocol between two guests on a laptop.
+
+# Guest A listens:
+$ qemu-system-aarch64 ... \
+    -netdev socket,id=n0,listen=:1234 \
+    -device virtio-net-device,netdev=n0,mac=52:54:00:00:00:01
+
+# Guest B connects:
+$ qemu-system-aarch64 ... \
+    -netdev socket,id=n0,connect=127.0.0.1:1234 \
+    -device virtio-net-device,netdev=n0,mac=52:54:00:00:00:02
+
+# More than two, using multicast as a shared bus:
+$ qemu-system-aarch64 ... \
+    -netdev socket,id=n0,mcast=230.0.0.1:1234 \
+    -device virtio-net-device,netdev=n0,mac=52:54:00:00:00:0N
+
+# Then inside each guest, configure static addresses on the
+# same subnet. Nothing leaves the host.
+
+# Two NICs in one guest - one for management, one for the test
+# network. This is the standard shape for a router or firewall
+# under test:
+$ qemu-system-aarch64 ... \
+    -netdev user,id=mgmt,hostfwd=tcp::2222-:22 \
+    -device virtio-net-device,netdev=mgmt,mac=52:54:00:00:00:10 \
+    -netdev socket,id=lab,mcast=230.0.0.1:1234 \
+    -device virtio-net-device,netdev=lab,mac=52:54:00:00:00:11</code></pre>
+
+<h2 id="capture">Capturing traffic</h2>
+
+<pre><code># QEMU can write a pcap of everything on a netdev. No tcpdump
+# in the guest, no host interface to find - and it captures
+# frames the guest never successfully received, which is
+# exactly what you want when debugging a NIC driver.
+
+$ qemu-system-aarch64 ... \
+    -netdev user,id=n0 \
+    -object filter-dump,id=f0,netdev=n0,file=capture.pcap
+
+$ wireshark capture.pcap
+$ tcpdump -r capture.pcap -nn
+
+# Attach a dump filter at runtime, from the monitor:
+(qemu) object_add filter-dump,id=f1,netdev=n0,file=/tmp/live.pcap
+(qemu) object_del f1
+
+# Other filters worth knowing:
+-object filter-buffer,id=f1,netdev=n0,interval=1000
+      # delay all traffic by 1 ms - test timeout handling
+-object filter-mirror,id=f2,netdev=n0,outdev=chr0
+      # mirror to a chardev, for a live analyser
+-object filter-redirector,...
+      # send traffic somewhere else entirely
+
+# On a tap, the host interface is real, so ordinary tools work:
+$ sudo tcpdump -i tap0 -nn
+$ sudo tcpdump -i br0 -nn 'ether host 52:54:00:12:34:56'</code></pre>
+
+<h2 id="perf">Throughput, and what limits it</h2>
+
+<pre><code># Measure honestly: run iperf3 in the guest against the host.
+$ iperf3 -s                       # host
+$ iperf3 -c 10.0.2.2 -t 20        # guest
+
+# Rough expectations on a modern machine:
+#   user (SLIRP), TCG guest        50-200 Mbit/s
+#   user (SLIRP), KVM guest        0.5-2 Gbit/s   (SLIRP is the
+#                                                  bottleneck)
+#   tap, no vhost, KVM             2-5 Gbit/s
+#   tap + vhost=on, KVM            10-40 Gbit/s
+#   tap + vhost + multiqueue       scales with vCPUs
+#   passthrough VF (SR-IOV)        line rate
+
+# The three changes that matter, in order:
+#  1. -accel kvm            (if the architectures match)
+#  2. vhost=on              (tap only; SLIRP cannot use it)
+#  3. multiqueue:
+-netdev tap,id=n0,ifname=tap0,script=no,downscript=no,\
+vhost=on,queues=4 \
+-device virtio-net-pci,netdev=n0,mq=on,vectors=10
+# vectors = 2*queues + 2. Too few silently reduces the queue
+# count.
+
+# Guest side, confirm what you got:
+$ ethtool -l eth0
+$ ethtool -k eth0 | grep -E 'tso|gso|gro|checksum'</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest has no interface at all</td><td>No <code>-device</code> for the netdev, or the guest kernel lacks
+<code>CONFIG_VIRTIO_NET</code></td></tr>
+<tr><td>Interface exists, no address</td><td>No DHCP client ran; with user networking run
+<code>udhcpc</code>/<code>dhclient</code></td></tr>
+<tr><td><code>ping</code> fails but <code>curl</code> works</td><td>SLIRP and ICMP. Not a
+problem</td></tr>
+<tr><td>Cannot SSH in</td><td>No <code>hostfwd</code>, or sshd not running, or the guest firewall</td></tr>
+<tr><td>Two guests cannot see each other</td><td>Both on <code>user</code>, which is isolated by design. Use
+socket, tap or bridge</td></tr>
+<tr><td>Intermittent loss with two guests on a bridge</td><td>Both using QEMU's default MAC — set them
+explicitly</td></tr>
+<tr><td><code>could not open /dev/net/tun</code></td><td>Tap not created, not owned by you, or no
+<code>CAP_NET_ADMIN</code></td></tr>
+<tr><td><code>bridge helper failed</code></td><td>Bridge not listed in <code>/etc/qemu/bridge.conf</code>, or
+the helper is not setuid</td></tr>
+<tr><td>Host loses network when creating a bridge</td><td>Expected while the NIC moves; reconfigure
+<code>br0</code></td></tr>
+<tr><td>Throughput far below expectation</td><td>SLIRP, or <code>vhost=on</code> missing, or TCG</td></tr>
+<tr><td>Multiqueue configured, one queue used</td><td><code>vectors</code> too small</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the four backends and fill in the connectivity table from memory.</li>
+  <li>Write the <code>user</code> networking options that let you SSH into a guest on port 2222.</li>
+  <li>Explain what <code>restrict=on</code> does and when you would want it.</li>
+  <li>Create a tap device you own and attach a guest to it without root.</li>
+  <li>Give the host commands that NAT a tap network to the internet.</li>
+  <li>Explain why every guest needs an explicit MAC address on a shared network.</li>
+  <li>Connect two guests with <code>socket</code> and say why no root is needed.</li>
+  <li>Capture guest traffic to a pcap without running anything in the guest.</li>
+  <li>List the three changes that most improve throughput, in order.</li>
+  <li>Diagnose "the guest has an interface but no connectivity" in three steps.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

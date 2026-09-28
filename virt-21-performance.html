@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtualisation performance and how to measure it | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Virtualisation performance and how to measure it</h1>
+<p class="lead">Virtualised code runs at native speed until it does not. All the cost is at boundaries —
+exits, page walks, interrupts, stolen time — and each has a specific measurement that identifies it. This
+chapter is the diagnostic procedure, in the order that finds problems fastest.</p>
+
+<h2 id="model">The cost model</h2>
+
+<p>Virtualisation overhead comes from a small number of identifiable sources, and having the model in mind is what turns a vague "it is slow in a VM" into a measurement.</p>
+
+<pre class="diagram">   Guest execution time =
+
+       instructions that just run          (free)
+     + stage-2 page walks                  (bounded, cacheable)
+     + exits x cost-per-exit               (the big one)
+     + time the vCPU was not scheduled     (steal)
+     + interference from other guests      (cache, bandwidth)
+
+   Every performance problem you will meet is one of the last
+   four, and they are distinguishable:
+
+     high exit count          -> the guest is asking too often
+     high cost per exit       -> the wrong handler tier
+     high steal time          -> the host is oversubscribed
+     high cache miss rate,    -> a neighbour is thrashing the
+       low exits, low steal      shared cache
+
+   Diagnose in that order. It is roughly the order of
+   likelihood, and each test is cheap.</pre>
+
+<h2 id="step1">Step 1: is it exits?</h2>
+
+<p>Exits are the first thing to rule in or out, because they are both the most common cause and the easiest to count.</p>
+
+<pre><code># The single most informative command:
+$ sudo perf kvm --host stat live
+
+Analyze events for all VMs, all VCPUs:
+   VM-EXIT   Samples  Samples%  Time%  Min Time  Max Time  Avg time
+      MMIO     48112    71.20%  44.1%    1.90us  180.11us   9.44us
+       WFx     15003    22.20%  51.2%    0.50us   19.98ms   1.44ms
+       HVC      3201     4.74%   1.1%    1.20us    9.02us   2.11us
+    SYS64      1250     1.85%   3.6%    2.10us   14.44us   4.02us
+
+# Read it as:
+#   MMIO dominating      -> device emulation. Which device?
+#   WFx dominating       -> the guest is idle, or spinning on a
+#                           lock it cannot get (lock-holder
+#                           preemption)
+#   SYS64 significant    -> a trapped system register in a hot
+#                           path; find which one
+#   Huge Max Time on WFx -> normal (it is a sleep), ignore
+
+# Which addresses are the MMIO exits hitting?
+$ sudo perf record -e kvm:kvm_mmio -a -- sleep 5
+$ sudo perf script | grep -o 'gpa 0x[0-9a-f]*' | sort | uniq -c | sort -rn
+  41022 gpa 0x0a000050        # a virtio QueueNotify
+   4180 gpa 0x08010000        # the GIC redistributor
+    900 gpa 0x09000000        # the UART
+
+# 41k exits on a QueueNotify means no ioeventfd. That is a
+# one-line fix (chapter 14) worth an order of magnitude.
+
+# Which system registers?
+$ sudo perf record -e kvm:kvm_sys_access -a -- sleep 5
+$ sudo perf script | head</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Dominant exit</th><th>Usual cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>MMIO on a virtio notify address</td><td>No <code>ioeventfd</code></td><td>Register one; enable
+<code>EVENT_IDX</code></td></tr>
+<tr><td>MMIO on the GIC distributor</td><td>Guest reprogramming interrupts constantly</td><td>Fix the guest
+driver; configure once at init</td></tr>
+<tr><td>MMIO on a legacy device</td><td>Emulating an old NIC or IDE controller</td><td>Switch to
+virtio</td></tr>
+<tr><td>MMIO scattered across a device's whole register block</td><td>A polling driver</td><td>Interrupts, or
+passthrough</td></tr>
+<tr><td>WFx with short durations</td><td>Lock-holder preemption</td><td>Pin vCPUs; stop
+oversubscribing</td></tr>
+<tr><td>WFx with long durations</td><td>Guest is idle</td><td>Nothing — this is correct</td></tr>
+<tr><td>SYS64 on <code>CNTP_*</code></td><td>Guest on the physical timer</td><td>Fix the guest device tree
+(<a href="virt-12-timers.html">chapter 13</a>)</td></tr>
+<tr><td>SYS64 on ID registers</td><td>Guest probing features in a loop</td><td>Rare; usually a guest
+bug</td></tr>
+<tr><td>Guest faults (stage-2)</td><td>Memory being populated, or dirty logging active</td><td>Pre-fault with
+huge pages; expected during migration</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="step2">Step 2: is it steal time?</h2>
+
+<p>If the guest is not exiting excessively, the next question is whether it is being scheduled at all — which is a host problem wearing a guest disguise.</p>
+
+<pre><code># In the guest:
+$ vmstat 1 5
+procs -----------memory---------- ---system-- ------cpu-----
+ r  b   swpd   free  buff  cache   in   cs us sy id wa st
+ 4  0      0 512300  2200 120440 1210 3402 52  8  9  0 31
+                                                        ^^
+# st = 31%. Nearly a third of this guest's time does not exist.
+# No amount of guest-side tuning will recover it.
+
+$ mpstat -P ALL 1
+# per-vCPU steal - an uneven distribution points at pinning
+# problems rather than global oversubscription
+
+# On the host, confirm:
+$ vmstat 1
+$ cat /proc/pressure/cpu
+some avg10=42.11 avg60=38.90 avg300=31.02 total=...
+# PSI "some" above ~20 means real contention
+
+# How oversubscribed?
+$ echo "vCPUs: $(pgrep -c 'CPU .*KVM')  pCPUs: $(nproc)"
+
+# Fixes, in order of effectiveness:
+#  1. reduce vCPU count or VM count (yes, really)
+#  2. pin vCPUs to distinct pCPUs
+#       $ taskset -cp 4 $(pgrep -f 'CPU 0/KVM')
+#     or in libvirt:  &lt;vcpupin vcpu='0' cpuset='4'/&gt;
+#  3. isolate the cores the latency-sensitive VM uses
+#       isolcpus=4-7 nohz_full=4-7 rcu_nocbs=4-7
+#  4. give the vCPU threads a real-time policy - carefully;
+#     a runaway RT vCPU thread can wedge the host
+#       $ chrt -f -p 10 $(pgrep -f 'CPU 0/KVM')</code></pre>
+
+<h2 id="step3">Step 3: is it the page tables?</h2>
+
+<p>Nested translation costs are invisible to ordinary profiling, which is why they are usually the third thing checked and occasionally the answer.</p>
+
+<pre><code># A two-stage walk can be 24 memory accesses (chapter 05). Huge
+# pages at BOTH stages cut it dramatically.
+
+# Host: back guest RAM with huge pages
+$ echo 2048 | sudo tee /proc/sys/vm/nr_hugepages
+$ qemu-system-aarch64 \
+    -object memory-backend-file,id=mem,size=4G,\
+mem-path=/dev/hugepages,share=on,prealloc=on \
+    -M virt,memory-backend=mem ...
+
+# Or transparent huge pages, which KVM will happily use at
+# stage 2 if the host allocation is contiguous:
+$ cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+
+# Verify KVM actually built large stage-2 blocks:
+$ sudo grep -r . /sys/kernel/debug/kvm/*/  2>/dev/null | grep -i huge
+
+# Guest: measure the TLB pressure directly
+$ sudo perf stat -e \
+    dTLB-load-misses,iTLB-load-misses,instructions,cycles \
+    -- ./workload
+
+# A guest with a much worse dTLB-miss rate than the same
+# workload on the host is paying for two-stage walks. Huge
+# pages are the fix; there is no software workaround.
+
+# prealloc=on matters more than it looks: without it, the guest
+# faults every page in on first touch, and a 4 GB guest spends
+# its first seconds taking a million stage-2 faults.</code></pre>
+
+<h2 id="step4">Step 4: is it a neighbour?</h2>
+
+<p>When a VM's performance depends on what other VMs are doing, the cause is shared hardware that virtualisation does not partition.</p>
+
+<pre><code># Symptom: low exits, low steal, and still slow. Something
+# else on the machine is evicting your cache lines or
+# saturating memory bandwidth.
+
+# Measure the shared resources:
+$ sudo perf stat -e \
+    LLC-loads,LLC-load-misses,cache-misses,cache-references \
+    -a -- sleep 10
+
+# arm64 PMU events for memory traffic (names vary by part):
+$ sudo perf list | grep -i -E 'bus|l2d|ll_cache'
+$ sudo perf stat -e armv8_pmuv3/ll_cache_rd/,armv8_pmuv3/ll_cache_miss_rd/ \
+    -a -- sleep 5
+
+# Prove it by removing the neighbour:
+#   run your benchmark alone   -> baseline
+#   run it with the suspect VM -> the difference IS the
+#                                 interference
+# That difference is your worst case, and it is what belongs in
+# a capacity plan or a safety case (chapter 19).
+
+# If the silicon has MPAM, partition the cache properly:
+$ ls /sys/fs/resctrl/ 2>/dev/null
+$ cat /sys/fs/resctrl/info/L3/num_closids
+# then assign the latency-sensitive VM its own cache portion.
+
+# If it does not, your options are cache colouring (chapter 19)
+# or not co-locating those workloads.</code></pre>
+
+<div class="key">
+<b>The measurement discipline</b>
+<p>Always measure the same workload three ways: on bare metal, in the VM alone, and in the VM with realistic
+neighbours. The first two differences tell you the virtualisation cost; the third tells you the co-location
+cost. Reporting only "the VM is 20% slower" without saying which of those you measured makes the number
+useless.</p>
+</div>
+
+<h2 id="checklist">A tuning checklist that actually helps</h2>
+
+<p>Collected in one place: the changes that reliably help, ordered roughly by how much they return for the effort.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Change</th><th>Typical effect</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>-accel kvm</code> instead of TCG</td><td>10–100x</td><td>Always, if the host architecture
+matches</td></tr>
+<tr><td><code>-cpu host</code></td><td>Enables the guest to use every CPU feature</td><td>Always, unless you
+need migration compatibility</td></tr>
+<tr><td>virtio + vhost instead of emulated devices</td><td>5–50x on I/O</td><td>Always</td></tr>
+<tr><td><code>ioeventfd</code> on queue notifies</td><td>2–10x on I/O</td><td>Always (QEMU does it by
+default; check your own VMM)</td></tr>
+<tr><td>Huge pages, preallocated</td><td>5–30% on memory-heavy work; large boot-time win</td><td>Whenever the
+guest is big or TLB-sensitive</td></tr>
+<tr><td>vCPU pinning</td><td>Removes jitter; small mean improvement</td><td>Latency-sensitive
+guests</td></tr>
+<tr><td><code>isolcpus</code>/<code>nohz_full</code> on the host</td><td>Large tail-latency
+improvement</td><td>Real-time guests</td></tr>
+<tr><td>Multiqueue virtio-net</td><td>Scales with vCPUs</td><td>Network-heavy guests with several
+vCPUs</td></tr>
+<tr><td>Passthrough</td><td>Removes I/O cost entirely</td><td>When you can give up migration and
+sharing</td></tr>
+<tr><td>VHE (do not force nVHE)</td><td>~2x on exit cost</td><td>Never set <code>kvm-arm.mode=nvhe</code>
+without a reason</td></tr>
+<tr><td>Fewer vCPUs</td><td>Often the largest single win</td><td>Whenever steal time is
+non-trivial</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="bench">Benchmarks worth running</h2>
+
+<p>General-purpose benchmarks mislead under virtualisation. These are the ones that isolate the specific costs described above.</p>
+
+<pre><code># Exit cost, isolated. A guest loop that only traps:
+#    1: hvc #0
+#       b 1b
+# Time N iterations. This is your floor.
+
+# Memory, in the guest and on the host:
+$ sysbench memory --memory-block-size=1M --memory-total-size=20G run
+$ stream_c.exe            # if you have STREAM built
+
+# Block I/O - and use O_DIRECT or you measure the page cache:
+$ fio --name=r --rw=randread --bs=4k --iodepth=32 --direct=1 \
+      --ioengine=libaio --runtime=30 --filename=/dev/vdb
+
+# Network:
+$ iperf3 -c host -P 4 -t 30            # throughput
+$ netperf -H host -t TCP_RR            # latency, the harder one
+
+# Latency and jitter - the number that matters for embedded:
+$ cyclictest -S -p 90 -i 200 -d 0 -m -D 60
+T: 0 (  911) P:90 I:200 C: 300000 Min: 6 Act: 11 Avg: 12 Max: 89
+
+# Run cyclictest in the guest WHILE running a stressor in a
+# neighbouring guest. The Max column with interference is the
+# only latency figure worth quoting.
+$ stress-ng --cpu 4 --vm 2 --vm-bytes 1G --cache 4 --timeout 60s</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest 50–100x slower than the host at everything</td><td>TCG, not KVM. Check <code>/dev/kvm</code> and
+<code>-accel</code></td></tr>
+<tr><td>CPU work fast, I/O terrible</td><td>Emulated devices, or missing <code>ioeventfd</code>/vhost</td></tr>
+<tr><td>Everything fine except one driver</td><td>That driver polls a register; every read is an exit</td></tr>
+<tr><td>Steal time high, host looks idle</td><td>vCPU threads pinned to the same pCPU, or a cgroup CPU
+quota</td></tr>
+<tr><td>Big guest slow for the first minute, then fine</td><td>Memory faulted in on demand; use
+<code>prealloc=on</code></td></tr>
+<tr><td>Worse dTLB miss rate than bare metal</td><td>Two-stage walks without huge pages</td></tr>
+<tr><td>Latency spikes correlate with a neighbour's activity</td><td>Cache or memory-bandwidth interference,
+not a hypervisor problem</td></tr>
+<tr><td>Idle guest burning a core</td><td><code>WFI</code> not trapped, or a guest spinning</td></tr>
+<tr><td>Exit rate fine, cost per exit terrible</td><td>Exits reaching user space that should be handled in the
+kernel</td></tr>
+<tr><td>Performance regressed after a kernel update</td><td>Check for <code>kvm-arm.mode=</code> on the command
+line and for a mitigation that changed the exit path</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write the cost model and name the four terms that are not free.</li>
+  <li>Give the order in which you would test for each, and why that order.</li>
+  <li>Interpret a <code>perf kvm stat live</code> table dominated by MMIO, and by WFx.</li>
+  <li>Find which guest-physical addresses are causing the most exits.</li>
+  <li>Explain what steal time measures and name three fixes.</li>
+  <li>Explain why huge pages matter more under virtualisation than on bare metal.</li>
+  <li>Distinguish interference from steal time by measurement.</li>
+  <li>List the five highest-value tuning changes and say when each applies.</li>
+  <li>Describe the three-way measurement discipline and why a single number is not enough.</li>
+  <li>Design an experiment that produces a defensible worst-case latency figure for a guest.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

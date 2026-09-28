@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Box, Rc, RefCell and interior mutability | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1><code>Box</code>, <code>Rc</code>, <code>RefCell</code> and interior mutability</h1>
+<p class="lead">When the ownership rules from chapters 02 and 03 are too rigid for the design, these types
+relax them — some at compile time, some by moving the check to run time. Knowing which is which is the whole
+chapter.</p>
+
+<h2 id="box">Box</h2>
+
+<p>The simplest smart pointer, and the one that makes recursive types and trait objects possible. On embedded targets its requirement is the interesting part.</p>
+
+<pre><code>    let b = Box::new(42);       // one value, on the heap
+    let v = *b;                 // deref
+
+/* THE SAME THING AS std::unique_ptr (C++ chapter 10): one
+   owner, freed on drop, zero overhead beyond the allocation
+   itself. sizeof(Box&lt;T&gt;) == sizeof(&amp;T).
+
+/* THE THREE REASONS TO USE IT:
+
+/* 1. A RECURSIVE TYPE, which otherwise has infinite size: */
+    enum List { Cons(i32, Box&lt;List&gt;), Nil }
+    // without Box: "recursive type has infinite size"
+
+/* 2. A TRAIT OBJECT that must be owned: */
+    let sensors: Vec&lt;Box&lt;dyn Sensor&gt;&gt; = vec![
+        Box::new(Thermistor::new(0)),
+        Box::new(Photodiode::new(1)),
+    ];
+
+/* 3. MOVING A LARGE VALUE cheaply - moving a Box moves one
+      pointer, not the payload.
+
+/* AND THE CONVERSIONS that matter for FFI (chapter 15): */
+    let raw: *mut T = Box::into_raw(b);  // give up ownership
+    let b = unsafe { Box::from_raw(raw) };// take it back
+/* into_raw LEAKS unless something later calls from_raw. That
+   is exactly how you hand a Rust-allocated object to C and
+   get it back.                                            */</code></pre>
+
+<h2 id="interior">Interior mutability</h2>
+
+<p>This is how you mutate through a shared reference without breaking the borrow rule — by moving the check from compile time to run time, which is a trade with consequences worth understanding.</p>
+
+<pre class="diagram">   THE PROBLEM: sometimes you need to mutate through a shared
+   reference. A cache, a refcount, a peripheral behind a
+   global.
+
+   THE RULE (chapter 03) says &amp;T means no mutation. Interior
+   mutability types are the sanctioned exception: they
+   provide `fn set(&amp;self, ...)` and uphold the aliasing
+   guarantee some other way.
+
+     UnsafeCell&lt;T&gt;   the PRIMITIVE. The only legal way to get
+                     &amp;mut from &amp;. Everything below is built
+                     on it.
+     Cell&lt;T&gt;         get/set by VALUE for Copy types. No
+                     references handed out, so no aliasing
+                     question. Zero cost.
+     RefCell&lt;T&gt;      hands out &amp;T and &amp;mut T, with the
+                     borrow rule checked AT RUN TIME.
+                     PANICS on violation.
+     Mutex&lt;T&gt;        the same, across threads, by blocking.
+     RwLock&lt;T&gt;       many readers or one writer, across
+                     threads.
+     Atomic*         lock-free single values.
+
+   THE PATTERN: the compile-time check is moved to run time,
+   or to a lock. You pay either a panic risk or a
+   synchronisation cost, and you get flexibility.
+
+   THE CHOICE, in one line:
+     Copy value, single thread    -> Cell
+     needs references, single
+       thread                     -> RefCell
+     across threads               -> Mutex, RwLock or Atomic
+     performance-critical single
+       value                      -> Atomic</pre>
+
+<pre><code>/* --- Cell: no borrows, so no possible failure --- */
+    use core::cell::Cell;
+
+    struct Counter { count: Cell&lt;u32&gt; }
+
+    impl Counter {
+        fn increment(&amp;self) {           // note: &amp;self, not
+                                        // &amp;mut self
+            self.count.set(self.count.get() + 1);
+        }
+    }
+/* Cell::get COPIES the value out; set replaces it. No
+   reference to the interior ever exists, so there is nothing
+   to alias. Zero cost - it compiles to a plain load and
+   store.
+
+/* --- RefCell: borrows, checked at run time --- */
+    use core::cell::RefCell;
+
+    let c = RefCell::new(vec![1, 2, 3]);
+
+    {
+        let r = c.borrow();             // Ref&lt;Vec&lt;i32&gt;&gt;
+        println!("{}", r.len());
+    }                                   // released here
+
+    c.borrow_mut().push(4);             // RefMut
+
+    let a = c.borrow();
+    let b = c.borrow_mut();             // PANIC: already
+                                        // borrowed
+
+    // the non-panicking forms:
+    if let Ok(mut m) = c.try_borrow_mut() { m.push(5); }
+
+/* RefCell KEEPS A COUNTER of active borrows and panics if
+   the rule is violated. So the guarantee is preserved - you
+   just find out at run time instead of compile time.
+
+   COST: one usize per RefCell, and a check per borrow.
+
+   ON EMBEDDED: a panic in a RefCell is a bug that reaches
+   the field. Prefer designs where the compiler can check;
+   use try_borrow when a runtime failure is genuinely
+   possible.                                              */</code></pre>
+
+<div class="key">
+<b><code>UnsafeCell</code> is the only legal route</b>
+<p>Obtaining <code>&amp;mut T</code> from <code>&amp;T</code> by any other means — a pointer cast,
+<code>transmute</code> — is undefined behaviour, because the compiler emits <code>noalias</code> on shared
+references and will optimise on that assumption. <code>UnsafeCell</code> is the marker that tells it not to.
+Every safe interior-mutability type wraps one, and any <code>unsafe</code> code of your own that mutates
+through a shared reference must too.</p>
+</div>
+
+<h2 id="rc">Rc and Arc</h2>
+
+<p>Reference counting for when a single owner genuinely will not do. The two variants differ in one respect, and choosing wrongly is either a performance cost or a compile error.</p>
+
+<pre><code>    use std::rc::Rc;            // single-threaded
+    use std::sync::Arc;         // Atomic - across threads
+
+    let a = Rc::new(vec![1, 2, 3]);
+    let b = Rc::clone(&amp;a);      // refcount 2 - NOT a deep
+                                // copy
+    println!("{}", Rc::strong_count(&amp;a));   // 2
+
+/* SHARED OWNERSHIP: the value lives until the last Rc drops.
+   The same as std::shared_ptr (C++ chapter 10), with the
+   same caveats:
+
+     · Rc is NOT thread-safe (no atomics) - and the compiler
+       enforces that, because Rc is not Send (chapter 16).
+       Arc is, and pays for atomic refcounting.
+     · CYCLES LEAK. Two Rcs pointing at each other never
+       reach zero.
+     · Rc gives you &amp;T only. For mutation you need
+       Rc&lt;RefCell&lt;T&gt;&gt; - which is the shape most "I need
+       shared mutable state" designs end up in, and which
+       should prompt you to reconsider the design.
+
+/* BREAKING A CYCLE with Weak: */
+    use std::rc::{Rc, Weak};
+
+    struct Node {
+        children: RefCell&lt;Vec&lt;Rc&lt;Node&gt;&gt;&gt;,
+        parent: RefCell&lt;Weak&lt;Node&gt;&gt;,    // NOT Rc
+    }
+
+    if let Some(p) = node.parent.borrow().upgrade() {
+        // Weak::upgrade returns Option&lt;Rc&lt;T&gt;&gt; - None if the
+        // target is gone
+    }
+
+/* ON EMBEDDED: Rc and Arc need `alloc`, and the atomic
+   refcounting in Arc is a real cost. Ask first whether:
+     · one clear owner plus borrowed references works
+     · a static arena with indices works (chapter 04)
+     · the sharing is actually needed
+   Reaching for Rc&lt;RefCell&lt;T&gt;&gt; is usually a sign the
+   ownership design has not been decided.               */</code></pre>
+
+<h2 id="statics">Globals on embedded</h2>
+
+<p>Global mutable state is the normal way to write firmware and the thing Rust makes hardest. These are the patterns that resolve that tension safely.</p>
+
+<pre><code>/* THE PROBLEM: a peripheral is a global, and an interrupt
+   handler needs to reach it. `static mut` is unsafe to
+   touch, and as of Rust 2024 taking a reference to one is a
+   hard error.                                            */
+
+/* --- THE OLD WAY, now forbidden --- */
+    static mut UART: Option&lt;Uart&gt; = None;
+    unsafe { UART.as_mut().unwrap().write(b"x"); }
+                                // undefined behaviour if an
+                                // interrupt races
+
+/* --- 1. Mutex&lt;RefCell&lt;T&gt;&gt; with a critical section --- */
+    use cortex_m::interrupt::{self, Mutex};
+    use core::cell::RefCell;
+
+    static UART: Mutex&lt;RefCell&lt;Option&lt;Uart&gt;&gt;&gt; =
+        Mutex::new(RefCell::new(None));
+
+    fn init(uart: Uart) {
+        interrupt::free(|cs| {
+            UART.borrow(cs).replace(Some(uart));
+        });
+    }
+
+    #[interrupt]
+    fn USART1() {
+        interrupt::free(|cs| {
+            if let Some(u) = UART.borrow(cs).borrow_mut()
+                                 .as_mut() {
+                u.handle_irq();
+            }
+        });
+    }
+
+/* `cortex_m::interrupt::Mutex` is NOT a blocking mutex - it
+   requires a CriticalSection token, proving interrupts are
+   disabled. So access is sound by construction, and the
+   token costs nothing at run time. This is the standard
+   pattern in the embedded ecosystem.
+
+/* --- 2. StaticCell: initialise once, get &amp;'static mut --- */
+    use static_cell::StaticCell;
+
+    static BUFFER: StaticCell&lt;[u8; 1024]&gt; = StaticCell::new();
+
+    let buf: &amp;'static mut [u8; 1024] = BUFFER.init([0; 1024]);
+/* Panics if called twice. Gives you a 'static mutable
+   reference without a heap - which is exactly what a DMA
+   buffer or a network stack needs (chapter 20).
+
+/* --- 3. Atomics, for simple flags and counters --- */
+    use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    static READY: AtomicBool = AtomicBool::new(false);
+
+    #[interrupt]
+    fn TIMER() {
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        READY.store(true, Ordering::Release);
+    }
+
+    fn main_loop() {
+        if READY.load(Ordering::Acquire) {
+            // sees everything the ISR wrote before the store
+            // (chapter 16)
+        }
+    }
+/* No critical section, no panic risk, no allocation. For a
+   flag or a counter this is strictly the best option.
+
+/* --- 4. RTIC, which removes the question entirely --- */
+    #[app(device = stm32f4xx_hal::pac)]
+    mod app {
+        #[shared] struct Shared { uart: Uart }
+        #[task(binds = USART1, shared = [uart])]
+        fn on_uart(mut cx: on_uart::Context) {
+            cx.shared.uart.lock(|u| u.handle_irq());
+        }
+    }
+/* RTIC computes the required critical sections at COMPILE
+   time from the priority ceiling, so the lock is often free
+   (chapter 20).                                          */</code></pre>
+
+<h2 id="deref">Deref and custom smart pointers</h2>
+
+<p>The trait that makes smart pointers feel like the thing they point at, and the coercion rules that follow from it.</p>
+
+<pre><code>    use core::ops::{Deref, DerefMut};
+
+    struct Guard&lt;'a, T&gt; { inner: &amp;'a mut T }
+
+    impl&lt;T&gt; Deref for Guard&lt;'_, T&gt; {
+        type Target = T;
+        fn deref(&amp;self) -> &amp;T { self.inner }
+    }
+    impl&lt;T&gt; DerefMut for Guard&lt;'_, T&gt; {
+        fn deref_mut(&amp;mut self) -> &amp;mut T { self.inner }
+    }
+
+    impl&lt;T&gt; Drop for Guard&lt;'_, T&gt; {
+        fn drop(&amp;mut self) { release_hardware(); }
+    }
+
+    let g = acquire();          // returns a Guard
+    g.method();                 // DEREF COERCION - calls
+                                // T::method
+                                // released when g drops
+
+/* DEREF COERCION is why `&amp;String` works where `&amp;str` is
+   wanted, and `&amp;Vec&lt;T&gt;` where `&amp;[T]` is - and why you should
+   take the slice types in parameters (chapter 03).
+
+/* THE RULE FOR IMPLEMENTING Deref: only for types that ARE a
+   pointer or a guard. Using it to fake inheritance produces
+   confusing method resolution, exactly as in C++
+   (C++ chapter 06).
+
+/* THE GUARD PATTERN IS THE USEFUL ONE, and it is how Mutex
+   works: lock() returns a guard, the guard derefs to the
+   data, and dropping it unlocks. RAII plus Deref gives you
+   an API that cannot be used without holding the lock.  */</code></pre>
+
+<h2 id="choose">Choosing</h2>
+
+<p>Five types that overlap enough to be confusing and differ enough to matter. Working down from what you
+actually need is faster than reasoning about what each one offers.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>One owner, heap</td><td><code>Box&lt;T&gt;</code></td><td>The allocation</td></tr>
+<tr><td>Mutate a Copy value through <code>&amp;</code></td><td><code>Cell&lt;T&gt;</code></td><td>None</td></tr>
+<tr><td>Mutate anything through <code>&amp;</code>, one thread</td><td><code>RefCell&lt;T&gt;</code></td><td>A counter, and a panic risk</td></tr>
+<tr><td>Shared ownership, one thread</td><td><code>Rc&lt;T&gt;</code></td><td>Refcount, cycles leak</td></tr>
+<tr><td>Shared ownership, threads</td><td><code>Arc&lt;T&gt;</code></td><td>Atomic refcount</td></tr>
+<tr><td>Shared mutable, threads</td><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></td><td>Allocation + locking</td></tr>
+<tr><td>A flag or counter, ISR-shared</td><td><code>Atomic*</code></td><td>Near zero</td></tr>
+<tr><td>A peripheral, ISR-shared</td><td><code>Mutex&lt;RefCell&lt;T&gt;&gt;</code> + critical section</td><td>Interrupt latency</td></tr>
+<tr><td>A one-time <code>'static</code> buffer, no heap</td><td><code>StaticCell</code></td><td>None</td></tr>
+<tr><td>All of the above, managed</td><td>RTIC or Embassy</td><td>None — computed at compile time</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>Panic: "already borrowed: BorrowMutError"</td><td>Two <code>RefCell</code> borrows overlap — use <code>try_borrow_mut</code>, or restructure</td></tr>
+<tr><td>Panic: "already mutably borrowed"</td><td>Same, the other way round</td></tr>
+<tr><td>"recursive type has infinite size"</td><td>Add a <code>Box</code></td></tr>
+<tr><td>Memory grows steadily with <code>Rc</code></td><td>A cycle — make one direction <code>Weak</code></td></tr>
+<tr><td>"<code>Rc&lt;T&gt;</code> cannot be sent between threads"</td><td>Correct — use <code>Arc</code></td></tr>
+<tr><td>"cannot borrow as mutable behind a <code>&amp;</code>"</td><td>You need interior mutability, or <code>&amp;mut self</code></td></tr>
+<tr><td>"creating a mutable reference to a <code>static mut</code>"</td><td>Forbidden in Rust 2024 — use <code>Mutex&lt;RefCell&gt;</code> or an atomic</td></tr>
+<tr><td>Data corruption between an ISR and main</td><td>No critical section, or the wrong ordering on an atomic</td></tr>
+<tr><td><code>StaticCell::init</code> panics</td><td>Called twice — by design</td></tr>
+<tr><td>Everything is <code>Rc&lt;RefCell&lt;T&gt;&gt;</code></td><td>The ownership design needs revisiting</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the three reasons to use <code>Box</code> and its FFI conversions.</li>
+  <li>Explain interior mutability and name the five types that provide it.</li>
+  <li>Explain why <code>Cell</code> cannot fail and <code>RefCell</code> can.</li>
+  <li>Explain why <code>UnsafeCell</code> is the only legal route, in terms of <code>noalias</code>.</li>
+  <li>Contrast <code>Rc</code> with <code>Arc</code> and say how the compiler enforces the
+  difference.</li>
+  <li>Break a reference cycle with <code>Weak</code>.</li>
+  <li>Give four ways to share a peripheral with an interrupt handler on embedded.</li>
+  <li>Explain what the <code>CriticalSection</code> token proves and why it is free.</li>
+  <li>Explain <code>StaticCell</code> and what it replaces.</li>
+  <li>Implement a guard with <code>Deref</code> and <code>Drop</code>, and say what it guarantees.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

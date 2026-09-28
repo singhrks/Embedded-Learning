@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sequence models before transformers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Sequence models before transformers</h1>
+<p class="lead">Recurrent networks dominated sequence modelling for twenty-five years. Understanding what
+they did well and exactly why they were displaced is the clearest possible motivation for attention — and
+they are quietly coming back on embedded hardware.</p>
+
+<h2 id="rnn">The recurrent neural network</h2>
+
+<p>Understanding the recurrent approach is what makes the transformer's design look like a solution rather than an arbitrary choice, because every part of it is answering a specific problem here.</p>
+
+<pre class="diagram">   THE IDEA: carry a HIDDEN STATE from step to step.
+
+        h_t = tanh(W_hh @ h_{t-1} + W_xh @ x_t + b)
+        y_t = W_hy @ h_t
+
+   UNROLLED OVER TIME:
+
+     x1      x2      x3      x4
+      |       |       |       |
+      v       v       v       v
+    [RNN]->[RNN]->[RNN]->[RNN]->
+      |  h1   |  h2   |  h3   |  h4
+      v       v       v       v
+     y1      y2      y3      y4
+
+   THE SAME WEIGHTS AT EVERY STEP. That parameter sharing is
+   the sequential prior (chapter 14): the model assumes the
+   same computation applies at every position.
+
+   WHAT IS APPEALING ABOUT THIS:
+     · O(1) MEMORY PER STEP - the state is fixed size
+       regardless of how much text has been seen
+     · O(n) TOTAL COMPUTE for a sequence of length n
+     · handles ARBITRARY LENGTH input
+     · it is the obvious, natural model of a sequence
+
+   WHAT KILLS IT:
+
+   1. NO PARALLELISM. h_t depends on h_{t-1}. You cannot
+      compute step 5 before step 4. TRAINING IS INHERENTLY
+      SEQUENTIAL, which wastes almost all of a GPU. This,
+      more than accuracy, is why transformers won: a
+      transformer processes an entire sequence in parallel
+      during training.
+
+   2. VANISHING GRADIENTS. Backpropagation through time
+      multiplies by W_hh at every step (chapters 05, 07):
+
+         dL/dh_1 involves  (W_hh)^n
+
+      Largest eigenvalue below 1 -> the gradient vanishes
+      exponentially. Above 1 -> it explodes. IN PRACTICE A
+      PLAIN RNN CANNOT LEARN DEPENDENCIES BEYOND ABOUT 10
+      STEPS.
+
+   3. THE INFORMATION BOTTLENECK. Everything about the past
+      must fit in one fixed-size vector. For a 1,000-token
+      document compressed into 512 numbers, most of it is
+      simply gone.</pre>
+
+<h2 id="lstm">LSTM and GRU</h2>
+
+<p>Gating was the fix for the plain RNN's central failure, and it worked well enough to dominate the field for years. The mechanism is worth knowing because the idea recurs.</p>
+
+<pre><code>/* LONG SHORT-TERM MEMORY (Hochreiter and Schmidhuber,
+   1997). The fix that made recurrence work, and it held the
+   field for two decades.
+
+   THE KEY IDEA: A SEPARATE CELL STATE WITH AN ADDITIVE PATH,
+   controlled by learned GATES.                            */
+
+    f_t = sigmoid(W_f @ [h_{t-1}, x_t] + b_f)  /* FORGET  */
+    i_t = sigmoid(W_i @ [h_{t-1}, x_t] + b_i)  /* INPUT   */
+    o_t = sigmoid(W_o @ [h_{t-1}, x_t] + b_o)  /* OUTPUT  */
+    g_t = tanh(   W_g @ [h_{t-1}, x_t] + b_g)  /* CANDIDATE */
+
+    c_t = f_t * c_{t-1} + i_t * g_t     /* THE CELL STATE */
+    h_t = o_t * tanh(c_t)               /* the hidden state */
+
+/* WHY THIS SOLVES VANISHING GRADIENTS:
+
+   Look at the cell state update. The path from c_{t-1} to
+   c_t is MULTIPLICATION BY f_t AND AN ADDITION. If the
+   forget gate is near 1, the gradient flows back
+   essentially UNCHANGED - no repeated multiplication by a
+   weight matrix.
+
+   This is called the CONSTANT ERROR CARROUSEL, and it is
+   the same structural idea as a RESIDUAL CONNECTION
+   (chapter 22): give the gradient a path that does not go
+   through a transformation.
+
+   THE GATES ARE LEARNED, SOFT SWITCHES:
+     forget gate near 0 -> discard the past
+     input gate near 1  -> write the new candidate
+     output gate        -> decide what to expose
+
+   AND THE ONE PRACTICAL TRICK: INITIALISE THE FORGET GATE
+   BIAS TO 1 (or 2). It starts the network in
+   "remember everything" mode, and it measurably improves
+   training. A one-line change that was a small paper.
+
+/* --- GRU: the simplified version --- */
+    z_t = sigmoid(W_z @ [h_{t-1}, x_t])     /* UPDATE gate */
+    r_t = sigmoid(W_r @ [h_{t-1}, x_t])     /* RESET  gate */
+    h~  = tanh(W @ [r_t * h_{t-1}, x_t])
+    h_t = (1 - z_t) * h_{t-1} + z_t * h~
+
+    Two gates instead of three, no separate cell state,
+    ~25% fewer parameters. Usually comparable in accuracy
+    and faster. WHEN CHOOSING BETWEEN THEM ON A CONSTRAINED
+    DEVICE, START WITH GRU.
+
+/* --- IN CODE --- */
+import torch.nn as nn
+
+lstm = nn.LSTM(input_size=128, hidden_size=256,
+               num_layers=2, batch_first=True,
+               dropout=0.1, bidirectional=False)
+
+out, (h_n, c_n) = lstm(x)     # x: (batch, seq, 128)
+                              # out: (batch, seq, 256)
+
+/* BIDIRECTIONAL: run one LSTM forwards and one backwards,
+   concatenate. Every position then sees the whole sequence.
+   USE FOR CLASSIFICATION AND TAGGING; IMPOSSIBLE FOR
+   GENERATION, because you cannot look at the future you
+   have not generated yet.                               */</code></pre>
+
+<h2 id="attention">Where attention came from</h2>
+
+<p>Attention was not invented for the transformer. It arrived as a patch on an encoder-decoder bottleneck, and seeing that origin makes the mechanism much easier to motivate.</p>
+
+<pre><code>/* THE SETTING: SEQUENCE-TO-SEQUENCE TRANSLATION (2014).
+
+   ENCODER LSTM reads the source sentence -> a single
+   context vector
+   DECODER LSTM generates the target from that vector
+
+      "the cat sat on the mat"
+              |
+              v
+        [ONE VECTOR]        <-- EVERYTHING must fit here
+              |
+              v
+      "le chat s'est assis sur le tapis"
+
+   AND IT WORKED - until sentences got long. Translation
+   quality fell off a cliff past about 30 words, because the
+   whole source had to be compressed into one fixed vector.
+
+/* BAHDANAU ET AL., 2015: LET THE DECODER LOOK BACK.
+
+   Instead of one context vector, keep ALL the encoder
+   states, and at each decoding step compute a WEIGHTED SUM
+   of them:
+
+     score_i   = alignment(decoder_state, encoder_state_i)
+     alpha     = softmax(scores)          /* weights summing
+                                             to 1 */
+     context   = sum_i alpha_i * encoder_state_i
+
+   THE WEIGHTS ARE LEARNED AND DYNAMIC. When generating
+   "chat", the model attends to "cat". When generating
+   "tapis", it attends to "mat". You can PLOT the alignment
+   matrix and it looks like a translation dictionary -
+   which was the moment the field realised something
+   important had happened.
+
+/* THIS IS ATTENTION, and note what it fixed:
+     · no fixed-size bottleneck
+     · a DIRECT PATH from any output position to any input
+       position - so gradients do not have to travel through
+       n recurrent steps
+     · and it is INTERPRETABLE
+
+/* --- LUONG (2015) simplified the scoring to a dot
+       product --- */
+        score = decoder_state · encoder_state
+
+   Cheaper, and it is one step from the scaled dot-product
+   attention of chapter 19.
+
+/* --- AND THEN THE OBSERVATION THAT CHANGED EVERYTHING --- */
+
+   Vaswani et al., 2017: "ATTENTION IS ALL YOU NEED".
+
+   If attention gives every position direct access to every
+   other position, WHAT IS THE RECURRENCE FOR?
+
+   REMOVE IT. Keep only attention, plus a feed-forward
+   network and positional information.
+
+   THE PAYOFF WAS NOT PRIMARILY ACCURACY - IT WAS
+   PARALLELISM. Without the sequential dependency, an entire
+   sequence trains in ONE parallel pass. That turned
+   sequence modelling into a big matrix multiplication
+   (chapter 04), which is exactly what GPUs do, and it made
+   scaling to hundreds of billions of parameters an
+   engineering problem rather than an impossible one.     */</code></pre>
+
+<div class="key">
+<b>The comparison that explains the switch</b>
+<pre>                       RNN/LSTM      TRANSFORMER
+training parallelism   NONE          FULL
+path between two
+  positions            O(distance)   O(1)
+compute per layer      O(n·d²)       O(n²·d + n·d²)
+memory at inference    O(1)          O(n)   (the KV cache)
+max useful context     hundreds      hundreds of thousands</pre>
+<p>The transformer is <em>worse</em> asymptotically in sequence length and <em>worse</em> in inference
+memory. It won because training parallelism and the O(1) path length mattered far more — a reminder that
+the right complexity measure is the one that matches your hardware.</p>
+</div>
+
+<h2 id="today">Where recurrence stands now</h2>
+
+<p>Recurrence was declared obsolete and then partly returned, for reasons that have everything to do with the cost of long contexts. Worth knowing where the argument currently stands.</p>
+
+<pre><code>/* RNNs ARE NOT ONLY OF HISTORICAL INTEREST, and this is the
+   part that matters most for an embedded engineer.       */
+
+/* --- THE TRANSFORMER'S WEAKNESS IS INFERENCE MEMORY --- */
+    A transformer must keep a KV CACHE that GROWS WITH
+    SEQUENCE LENGTH (chapter 25). An RNN keeps a fixed-size
+    state, forever.
+
+    FOR STREAMING INFERENCE ON A DEVICE - continuous audio,
+    a sensor stream, always-on keyword spotting - a
+    fixed-size state is a decisive advantage. The memory
+    budget is known at compile time.
+
+/* --- THE MODERN RECURRENT MODELS --- */
+    STATE SPACE MODELS (S4, MAMBA)
+      A linear recurrence, formulated so that TRAINING can be
+      parallelised with a scan (or a convolution) while
+      INFERENCE remains a constant-memory recurrence.
+
+      THAT COMBINATION IS THE POINT: it recovers the
+      transformer's training parallelism WITHOUT the growing
+      inference state. Mamba's selective mechanism makes the
+      recurrence input-dependent, which was the missing
+      ingredient for language.
+
+    RWKV, RETNET, GRIFFIN, xLSTM
+      Various routes to the same goal - "transformer-quality
+      training, RNN-quality inference".
+
+    HYBRID ARCHITECTURES
+      Most recent efficient models interleave a few attention
+      layers among many recurrent or linear ones. Attention
+      where precise recall matters; recurrence for
+      everything else. This is currently the most practical
+      answer.
+
+/* --- AND THE CLASSIC RNN IS STILL DEPLOYED --- */
+    On microcontrollers, a small GRU or LSTM remains a
+    sensible choice for:
+      · keyword spotting ("hey device")
+      · sensor time-series classification and anomaly
+        detection
+      · gesture recognition from an IMU
+      · predictive maintenance from vibration data
+
+    WHY: a 2-layer GRU with 64 hidden units is a few tens of
+    kilobytes, runs in constant memory, has no attention
+    matrix to materialise, and every embedded inference
+    library supports it. CMSIS-NN and TFLite Micro both have
+    optimised LSTM/GRU kernels. Chapter 27 covers the
+    deployment.
+
+    THE ENGINEERING JUDGEMENT: FOR SHORT SEQUENCES AND TIGHT
+    MEMORY, RECURRENCE IS OFTEN STILL CORRECT. Do not reach
+    for a transformer because it is fashionable; reach for
+    it when you need long-range precise recall and you have
+    the memory for the cache.                            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>RNN cannot learn dependencies past ~10 steps</td><td>Vanishing gradients — use an LSTM or GRU</td></tr>
+<tr><td>Loss becomes <code>nan</code> during BPTT</td><td>Exploding gradients — clip the norm</td></tr>
+<tr><td>GPU utilisation is low when training an RNN</td><td>Inherently sequential — expected</td></tr>
+<tr><td>Translation quality collapses on long sentences</td><td>The fixed-size context bottleneck — add attention</td></tr>
+<tr><td>Bidirectional model cannot generate</td><td>It sees the future — use unidirectional for generation</td></tr>
+<tr><td>LSTM forgets everything early in training</td><td>Forget-gate bias not initialised to 1</td></tr>
+<tr><td>Transformer runs out of memory on long streams</td><td>KV cache grows with length — consider a recurrent model</td></tr>
+<tr><td>Transformer will not fit on an MCU</td><td>Attention working set — a GRU may be the right answer</td></tr>
+<tr><td>Padded steps corrupt the hidden state</td><td>No <code>pack_padded_sequence</code> or mask</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write the RNN recurrence and say what parameter sharing assumes.</li>
+  <li>Give the three reasons plain RNNs fail, and say which one mattered most commercially.</li>
+  <li>Write the LSTM equations and explain the constant error carrousel.</li>
+  <li>Connect the LSTM cell path to residual connections.</li>
+  <li>Say what the forget-gate bias initialisation does.</li>
+  <li>Contrast LSTM and GRU and pick one for a microcontroller.</li>
+  <li>Explain the seq2seq bottleneck and how Bahdanau attention removed it.</li>
+  <li>State what "attention is all you need" removed and what the real payoff was.</li>
+  <li>Fill in the RNN-versus-transformer comparison table from memory.</li>
+  <li>Explain what state space models recover and why it matters for streaming.</li>
+  <li>Give four embedded tasks where a small GRU is still the right choice.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

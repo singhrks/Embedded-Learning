@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance: measuring, and where Rust is not free | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Performance: measuring, and where Rust is not free</h1>
+<p class="lead">"Zero-cost abstractions" is true and routinely misquoted. It means you could not have written it
+faster by hand — not that everything is free. This chapter is about the abstractions that genuinely cost
+nothing, the ones that cost something, and how to tell which is which on your code rather than in the
+abstract.</p>
+
+<h2 id="claim">What the claim actually says</h2>
+
+<p>The phrase has a precise meaning and a common misreading, and the gap between them explains most
+disappointment about Rust performance.</p>
+
+<pre class="diagram">   THE CLAIM: "What you don't use, you don't pay for. What
+   you do use, you could not hand-code any better."
+
+   IT IS A CLAIM ABOUT THE ABSTRACTION, not about the
+   program. An iterator chain compiles to the loop you would
+   have written. It does NOT promise that the loop you would
+   have written was a good idea.
+
+   ---------------------------------------------------------
+
+   GENUINELY FREE, after optimisation:
+
+     · iterator chains          -> the equivalent loop
+     · generics                 -> monomorphised, inlined
+     · Option&lt;&amp;T&gt;               -> one pointer. The niche
+                                   optimisation uses the
+                                   null value as None, so
+                                   it is the same size as
+                                   &amp;T
+     · newtype wrappers         -> nothing at all
+     · Result in a hot path     -> a tag and a branch, the
+                                   same as a C error return
+     · bounds checks IN A LOOP  -> usually hoisted or
+                                   eliminated when the
+                                   compiler can prove the
+                                   range
+
+   NOT FREE, and each one is a real decision:
+
+     · dyn Trait                -> an indirect call that
+                                   cannot be inlined
+     · Box, Rc, Arc             -> allocation; Arc adds
+                                   atomic refcount traffic
+     · RefCell                  -> a runtime flag check, and
+                                   a panic path
+     · bounds checks the compiler CANNOT prove away
+     · .clone() and .to_string() -> exactly what they say
+     · Mutex                    -> a real lock
+     · format! / println!       -> allocation plus the
+                                   formatting machinery,
+                                   which is surprisingly
+                                   large on embedded
+
+   ---------------------------------------------------------
+
+   THE HONEST HEADLINE: idiomatic Rust and careful C land in
+   the same place for most systems work. Where Rust tends to
+   win is that the SAFE version is fast enough that nobody
+   reaches for the unsafe one - and where it tends to lose is
+   an interface that forced an allocation or a clone that C
+   would have handled with a pointer.</pre>
+
+<h2 id="measure">Measure first, and measure properly</h2>
+
+<p>Every instinct in this chapter is worth less than one measurement, and microbenchmarks are unusually easy to
+get wrong in a language that optimises this aggressively.</p>
+
+<pre><code>// The trap, in full:
+fn bench_bad() {
+    let start = Instant::now();
+    for _ in 0..1_000_000 {
+        checksum(&amp;data);          // result unused
+    }
+    println!("{:?}", start.elapsed());
+}
+// The compiler can see the result is never used, and delete
+// the call. You have measured an empty loop. The giveaway
+// is a suspiciously round, suspiciously small number.
+
+// The fix is to hide the value from the optimiser:
+use std::hint::black_box;
+
+for _ in 0..1_000_000 {
+    black_box(checksum(black_box(&amp;data)));
+}
+// black_box on the INPUT too, or constant folding may
+// compute the answer once at compile time.
+
+/* WHAT TO USE INSTEAD OF HAND-ROLLING THIS:
+
+     criterion    the standard benchmarking crate. Warms up,
+                  runs to a statistical confidence, and
+                  reports whether a change is a real
+                  regression or noise - which is the part
+                  you cannot eyeball.
+
+     cargo bench  built in, nightly only for the harness.
+
+   AND FOR FINDING WHAT TO OPTIMISE, rather than confirming
+   a guess:
+
+     perf / VTune         where the time goes
+     cargo-flamegraph     the same, readable in one picture
+     cargo-bloat          where the BINARY SIZE goes, which
+                          is the metric that matters on a
+                          microcontroller
+     cargo-llvm-lines     which generic got monomorphised
+                          three hundred times                */</code></pre>
+
+<div class="key">
+<b>Always measure a release build, and know what changes</b>
+<p>A debug build is routinely ten to fifty times slower than release, and the difference is not uniform — it
+falls hardest on exactly the abstractions this chapter is about, because none of them are inlined yet. Debug
+builds also insert integer-overflow checks that release builds omit. Timing a debug build tells you almost
+nothing, and the conclusions people draw from it ("iterators are slow", "Rust is slower than C") are artefacts
+of the profile rather than facts about the language.</p>
+</div>
+
+<h2 id="wins">Where the wins usually are</h2>
+
+<p>In practice the same handful of things account for most of the difference between slow and fast Rust, and
+none of them require <code>unsafe</code>.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Problem</th><th>Fix</th><th>Typical effect</th></tr></thead>
+<tbody>
+<tr><td>Allocating in a loop</td><td>Hoist the buffer out and <code>clear()</code> it, or use
+<code>with_capacity</code></td><td>Often the largest single win</td></tr>
+<tr><td><code>clone()</code> to silence the borrow checker</td><td>Restructure so a borrow works —
+<a href="rs-03-borrowing.html">chapter 03</a>'s techniques</td><td>Removes a copy per call</td></tr>
+<tr><td><code>collect()</code> into a temporary that is immediately iterated</td><td>Keep the iterator
+lazy</td><td>Removes an allocation and a pass</td></tr>
+<tr><td>Bounds checks in a hot loop</td><td>Iterate rather than index, or slice once up front so the compiler
+can prove the range</td><td>Real, but smaller than people assume</td></tr>
+<tr><td><code>dyn Trait</code> on a hot path</td><td>Generics, or an enum of the known
+implementations</td><td>Enables inlining, which is the actual win</td></tr>
+<tr><td><code>Arc</code> where <code>Rc</code> or a borrow would do</td><td>Use the cheapest that
+compiles</td><td>Removes atomic traffic between cores</td></tr>
+<tr><td>Hashing short keys with the default hasher</td><td>A faster hasher where DoS resistance is not
+needed</td><td>Noticeable in map-heavy code</td></tr>
+<tr><td>Generic code instantiated for many types</td><td>An inner non-generic function doing the
+work</td><td>Cuts compile time and binary size</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Notice the pattern: almost every row is about <em>memory traffic</em> rather than instruction count. That
+is the same lesson as the matmul chapter in the AI track and the cache chapters in the ARM track — on modern
+hardware, the interesting variable is usually what you moved, not what you computed.</p>
+
+<h2 id="size">Size, which is the embedded metric</h2>
+
+<p>On a microcontroller the binding constraint is flash and RAM rather than cycles, and Rust's defaults are not
+tuned for it. The settings below routinely move a firmware image by a large factor.</p>
+
+<pre><code># Cargo.toml - the release profile for firmware
+[profile.release]
+opt-level     = "z"     # optimise for size ("s" is milder)
+lto           = true    # link-time optimisation, across crates
+codegen-units = 1       # one unit: slower build, smaller output
+panic         = "abort" # no unwinding machinery at all
+strip         = true    # drop symbols from the final binary
+debug         = false
+
+# THE BIGGEST SINGLE WIN IS USUALLY panic = "abort". Unwinding
+# drags in the landing-pad tables and the whole panic
+# formatting path, and on a device with no operating system
+# there is nothing meaningful to unwind TO.
+
+# THE SECOND BIGGEST IS AVOIDING core::fmt. One println!-style
+# formatting call pulls in the formatting machinery, which can
+# be tens of kilobytes. Use defmt instead: it sends the format
+# STRING INDEX and the arguments over the wire and does the
+# formatting on the host. The strings never enter the binary.
+
+# FIND OUT WHERE IT WENT rather than guessing:
+#   cargo bloat --release -n 30        biggest functions
+#   cargo bloat --release --crates     biggest crates
+#   cargo size --release -- -A         section sizes</code></pre>
+
+<h2 id="unsafe">When reaching for unsafe is not the answer</h2>
+
+<p>The temptation, on finding a bounds check in a profile, is to remove it with <code>get_unchecked</code>.
+This is almost always a bad trade, and it is worth knowing why before you make it.</p>
+
+<pre class="diagram">   THE ARITHMETIC:
+
+     A BOUNDS CHECK is a compare and a predictable branch.
+     The branch predictor gets it right essentially every
+     time, because it never fires. On a superscalar core it
+     is frequently FREE - it fits in an issue slot that was
+     otherwise idle.
+
+     WHAT IT COSTS INSTEAD is that it can block
+     vectorisation, which IS significant - but the fix for
+     that is usually to give the compiler the information
+     it needs, not to remove the check.
+
+   ---------------------------------------------------------
+
+   THE ORDER TO TRY THINGS:
+
+     1. ITERATE INSTEAD OF INDEXING. An iterator has no
+        bounds check to eliminate, because it cannot go out
+        of bounds by construction.
+
+     2. SLICE ONCE, UP FRONT.
+          let a = &amp;a[..n];  let b = &amp;b[..n];
+          for i in 0..n { a[i] + b[i] }
+        The compiler now proves the range once and drops
+        the per-iteration checks.
+
+     3. USE zip, chunks_exact, windows. chunks_exact in
+        particular tells the optimiser the length is a
+        multiple of N, which is frequently what unlocks
+        vectorisation.
+
+     4. MEASURE AGAIN. Usually you are done.
+
+     5. ONLY THEN consider get_unchecked - and if you do,
+        write down the invariant that makes it sound, and
+        put the crate under Miri (chapter 12).
+
+   ---------------------------------------------------------
+
+   THE POINT: every step before 5 keeps the guarantee. Step 5
+   trades a permanent safety property for a performance gain
+   you have not yet demonstrated. Demonstrate it first.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Benchmark reports near-zero time</td><td>The optimiser deleted the work — <code>black_box</code> the
+result and the input</td></tr>
+<tr><td>Rust "is slower than C"</td><td>A debug build, almost always</td></tr>
+<tr><td>Benchmark results swing between runs</td><td>No warm-up and no statistics; use criterion rather than
+<code>Instant</code></td></tr>
+<tr><td>Hot loop allocates</td><td><code>collect()</code>, <code>to_string()</code>, or a <code>Vec</code>
+created inside the loop</td></tr>
+<tr><td>Profile dominated by <code>memcpy</code></td><td>Large values moved by value; box them or borrow
+them</td></tr>
+<tr><td>Unexpected atomic traffic</td><td><code>Arc</code> where <code>Rc</code> or a plain borrow would
+do</td></tr>
+<tr><td>Binary far larger than expected</td><td>Formatting machinery, unwinding tables, or a generic
+monomorphised many times — <code>cargo bloat</code> will say which</td></tr>
+<tr><td>Compile times ballooned</td><td>Heavy generics or a proc-macro dependency; check
+<code>cargo llvm-lines</code></td></tr>
+<tr><td>Firmware overflows flash after adding one
+<code>println!</code></td><td><code>core::fmt</code> — switch to defmt</td></tr>
+<tr><td><code>get_unchecked</code> gave no measurable gain</td><td>The bounds check was free; revert it and
+keep the guarantee</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State what "zero-cost abstraction" claims, and what it does not.</li>
+  <li>Give four abstractions that are free and four that are not.</li>
+  <li>Explain why <code>Option&lt;&amp;T&gt;</code> is the same size as <code>&amp;T</code>.</li>
+  <li>Say why a naive benchmark loop reports near-zero time, and the two places <code>black_box</code>
+  goes.</li>
+  <li>Give two reasons a debug build cannot be used for timing.</li>
+  <li>Name the fix that is most often the largest single win.</li>
+  <li>Say what <code>cargo bloat</code> answers that a profiler does not.</li>
+  <li>Explain why <code>panic = "abort"</code> shrinks firmware so much.</li>
+  <li>Explain why a bounds check is often free on a modern core.</li>
+  <li>Give the five steps before <code>get_unchecked</code>, and what step 5 trades away.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

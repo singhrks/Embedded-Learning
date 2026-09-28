@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARM architecture in depth | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 03</p>
+<h1>ARM architecture, in depth</h1>
+<p class="lead">This is the load-bearing chapter of the whole site. By the end you should be able to
+follow a single instruction from fetch, through address translation, through the cache hierarchy, out
+onto the interconnect — and explain what could go wrong at each step.</p>
+
+<h2 id="what-is-arm">What ARM is, and what it is not</h2>
+
+<p>Arm Ltd does not make chips. It designs and licenses two things:</p>
+<ul>
+  <li><strong>An architecture</strong> — a specification of what a processor must do: instructions,
+  registers, memory model, exception behaviour. This is the ARM Architecture Reference Manual (the "ARM ARM").
+  It is a contract, not an implementation.</li>
+  <li><strong>Micro-architectures</strong> — actual core designs implementing that contract (Cortex-A78,
+  Cortex-M4, Neoverse N2). Apple, Qualcomm and others take an architecture licence and build their own.</li>
+</ul>
+
+<div class="key">
+<b>Why this distinction matters</b>
+<p>Architecture defines <em>correctness</em>: if you write architecturally correct code it works on every
+implementation. Micro-architecture defines <em>performance</em>: cache sizes, pipeline depth, prefetchers.
+When you are debugging, ask yourself which one you are fighting. Architectural bugs are portable;
+micro-architectural surprises (timing, cache line effects, errata) are chip-specific.</p>
+</div>
+
+<h3>Profiles</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Profile</th><th>Target</th><th>Memory protection</th><th>Typical software</th></tr></thead>
+<tbody>
+<tr><td><strong>A</strong> — Application</td><td>Phones, servers, automotive infotainment</td><td>Full MMU, virtual memory</td><td>Linux, Android, Windows, hypervisors</td></tr>
+<tr><td><strong>R</strong> — Real-time</td><td>Storage controllers, safety islands, modems</td><td>MPU (region-based), sometimes MMU</td><td>RTOS, bare metal, deterministic</td></tr>
+<tr><td><strong>M</strong> — Microcontroller</td><td>Sensors, IoT, motor control</td><td>Optional MPU, no MMU</td><td>Bare metal, FreeRTOS, Zephyr</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Architecture versions</h3>
+<ul>
+  <li><strong>ARMv7-A</strong> — 32-bit only. Modes (User, FIQ, IRQ, Supervisor, Abort, Undefined, System, Monitor, Hyp), banked registers, CP15 coprocessor for system control.</li>
+  <li><strong>ARMv8-A</strong> — introduced <strong>AArch64</strong>: 64-bit registers, a clean new instruction
+  set (A64), 31 general-purpose registers, and the exception-level model (EL0–EL3) that replaced processor modes.
+  AArch32 is retained as a compatibility execution state.</li>
+  <li><strong>ARMv9-A</strong> — builds on v8: SVE2 vectors, Realm Management Extension (CCA — a fourth
+  security state), Branch Target Identification and Memory Tagging as mainline features.</li>
+</ul>
+<p>Everything below is AArch64 unless stated otherwise, because that is what modern application processors run.</p>
+
+<h2 id="risc">Load/store architecture — the core principle</h2>
+
+<p>ARM is a RISC design. The single most important consequence:</p>
+
+<div class="note">
+<b>The rule</b>
+<p>Only <code>LDR</code> and <code>STR</code> family instructions touch memory. Every arithmetic and logic
+instruction operates <em>only</em> on registers. There is no <code>ADD [addr], #1</code>.</p>
+</div>
+
+<p>So <code>counter++</code> on a global becomes three instructions, and that fact is the root of an entire
+class of concurrency bugs:</p>
+
+<pre><code>    adrp    x0, counter          // form page address of the symbol
+    add     x0, x0, :lo12:counter // add the low 12 bits -> full address
+    ldr     w1, [x0]             // LOAD  from memory into a register
+    add     w1, w1, #1           // MODIFY in the register
+    str     w1, [x0]             // STORE back to memory</code></pre>
+
+<p>Two cores executing that sequence at the same time can both read the same old value and both write
+back the same new value — one increment is lost. Fixing this needs the atomic instructions covered in
+<a href="#atomics">the atomics section</a>.</p>
+
+<h2 id="registers">The register file</h2>
+
+<pre class="diagram">General purpose (AArch64)
+
+  X0  .. X7    arguments and return values            (caller-saved)
+  X8           indirect result location / syscall number on Linux
+  X9  .. X15   temporaries                            (caller-saved)
+  X16, X17     IP0, IP1 - intra-procedure-call scratch, used by linker veneers
+  X18          platform register (reserved on some OSes; TLS on Windows)
+  X19 .. X28   callee-saved
+  X29          FP  - frame pointer
+  X30          LR  - link register (return address, written by BL)
+  SP           stack pointer   (separate per exception level: SP_EL0..SP_EL3)
+  PC           program counter (not directly writable; changed by branches)
+  XZR / WZR    zero register: reads as 0, writes are discarded
+
+  Wn = the low 32 bits of Xn. Writing Wn ZEROES the upper 32 bits of Xn.
+
+SIMD / floating point
+
+  V0 .. V31    128-bit vector registers
+               accessed as Bn (8), Hn (16), Sn (32), Dn (64), Qn (128)
+  SVE adds Z0..Z31 (scalable, 128-2048 bit) and predicate regs P0..P15
+</pre>
+
+<h3>PSTATE — processor state</h3>
+<p>In AArch64 there is no single CPSR register. Processor state lives in <strong>PSTATE</strong>, a set of
+fields accessed individually:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>N Z C V</code></td><td>Condition flags: Negative, Zero, Carry, oVerflow. Set by <code>CMP</code>, <code>ADDS</code> etc.</td></tr>
+<tr><td><code>D A I F</code></td><td>Exception masks: Debug, SError, IRQ, FIQ. <code>msr daifset, #2</code> disables IRQs.</td></tr>
+<tr><td><code>EL</code></td><td>Current exception level, 0–3</td></tr>
+<tr><td><code>SPSel</code></td><td>Which stack pointer is in use: <code>SP_EL0</code> or <code>SP_ELx</code></td></tr>
+<tr><td><code>nRW</code></td><td>Execution state: AArch64 or AArch32</td></tr>
+<tr><td><code>PAN</code>, <code>UAO</code>, <code>SSBS</code>, <code>BTYPE</code></td><td>Security/robustness features added in later revisions</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>System registers</h3>
+<p>Configuration lives in <strong>system registers</strong>, named <code>REG_ELx</code> where <code>x</code>
+is the lowest exception level that can access them. You read and write them only with <code>MRS</code> and <code>MSR</code>:</p>
+
+<pre><code>    mrs     x0, sctlr_el1        // MRS: system Register -> general register
+    orr     x0, x0, #(1 &lt;&lt; 0)    // set M bit: enable the MMU
+    msr     sctlr_el1, x0        // MSR: general register -> System register
+    isb                          // context-synchronising: make it take effect now</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>What it controls</th></tr></thead>
+<tbody>
+<tr><td><code>SCTLR_EL1</code></td><td>System Control: MMU enable (M), data cache (C), instruction cache (I), alignment check (A), WXN</td></tr>
+<tr><td><code>TTBR0_EL1</code> / <code>TTBR1_EL1</code></td><td>Translation Table Base Registers — the roots of the page tables</td></tr>
+<tr><td><code>TCR_EL1</code></td><td>Translation Control: VA size, granule size, cacheability of table walks</td></tr>
+<tr><td><code>MAIR_EL1</code></td><td>Memory Attribute Indirection: the 8 memory-type slots page-table entries refer to</td></tr>
+<tr><td><code>VBAR_EL1</code></td><td>Vector Base Address — where the exception vector table lives</td></tr>
+<tr><td><code>ESR_EL1</code></td><td>Exception Syndrome — <em>why</em> the last exception happened</td></tr>
+<tr><td><code>FAR_EL1</code></td><td>Fault Address — <em>which address</em> faulted</td></tr>
+<tr><td><code>ELR_EL1</code>, <code>SPSR_EL1</code></td><td>Saved return address and saved PSTATE</td></tr>
+<tr><td><code>MPIDR_EL1</code></td><td>Which core am I? (affinity levels) — used by SMP startup code</td></tr>
+<tr><td><code>CNTFRQ_EL0</code>, <code>CNTPCT_EL0</code></td><td>Generic timer frequency and count</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="instructions">The A64 instruction set</h2>
+
+<p>Fixed 32-bit instruction width, always 4-byte aligned. That regularity is why decode is cheap and
+why disassembly is trivially reliable.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>Examples</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Data processing</td><td><code>ADD X0,X1,X2</code> · <code>SUB</code> · <code>AND</code> · <code>ORR</code> · <code>EOR</code> · <code>LSL</code> · <code>MUL</code> · <code>UDIV</code></td><td>Suffix <code>S</code> (<code>ADDS</code>) sets the NZCV flags</td></tr>
+<tr><td>Move</td><td><code>MOV</code> · <code>MOVZ</code> · <code>MOVK</code> · <code>MOVN</code></td><td>A 64-bit constant is built from up to 4 <code>MOVK</code>s</td></tr>
+<tr><td>Load / store</td><td><code>LDR</code> · <code>STR</code> · <code>LDRB/H/SW</code> · <code>LDP/STP</code> (pair)</td><td><code>LDP</code>/<code>STP</code> move two registers at once — the standard prologue/epilogue</td></tr>
+<tr><td>Addressing</td><td><code>[X1]</code> · <code>[X1,#8]</code> · <code>[X1,X2,LSL #3]</code> · <code>[X1,#8]!</code> (pre-index) · <code>[X1],#8</code> (post-index)</td><td>Scaled register offset is how array indexing compiles</td></tr>
+<tr><td>Branch</td><td><code>B</code> · <code>BL</code> (sets LR) · <code>BR X0</code> · <code>BLR X0</code> · <code>RET</code> · <code>CBZ/CBNZ</code> · <code>TBZ/TBNZ</code> · <code>B.EQ</code></td><td><code>RET</code> is <code>BR X30</code> with a hint to the branch predictor</td></tr>
+<tr><td>Conditional</td><td><code>CSEL</code> · <code>CSET</code> · <code>CINC</code></td><td>A64 dropped ARMv7's fully predicated execution; these replace it and avoid branches</td></tr>
+<tr><td>Exclusives / atomics</td><td><code>LDXR/STXR</code> · <code>LDAXR/STLXR</code> · <code>LDADD</code> · <code>CAS</code> · <code>SWP</code></td><td>See <a href="#atomics">atomics</a></td></tr>
+<tr><td>Barriers</td><td><code>DMB</code> · <code>DSB</code> · <code>ISB</code></td><td>See <a href="#barriers">barriers</a></td></tr>
+<tr><td>System</td><td><code>MRS</code> · <code>MSR</code> · <code>SVC</code> · <code>HVC</code> · <code>SMC</code> · <code>ERET</code> · <code>WFI</code> · <code>WFE</code> · <code>TLBI</code> · <code>DC</code> · <code>IC</code></td><td>The system programmer's toolkit</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>The procedure call standard (AAPCS64)</h3>
+<p>You need this to read stack traces and to write assembly that C can call.</p>
+<ul>
+  <li>Integer arguments 1–8 in <code>X0</code>–<code>X7</code>; further arguments on the stack.</li>
+  <li>Return value in <code>X0</code> (and <code>X1</code> for 128-bit); large structs via a hidden pointer in <code>X8</code>.</li>
+  <li>Floating point / vector arguments in <code>V0</code>–<code>V7</code>.</li>
+  <li><code>X19</code>–<code>X28</code> are callee-saved: if you use them, save and restore them.</li>
+  <li>The stack pointer must be <strong>16-byte aligned</strong> at every public interface. Getting this wrong
+  produces alignment faults that look like random corruption.</li>
+</ul>
+
+<pre><code>// A typical function prologue / epilogue
+my_func:
+    stp     x29, x30, [sp, #-32]!   // push FP and LR, pre-decrement SP by 32
+    mov     x29, sp                 // establish the frame pointer
+    stp     x19, x20, [sp, #16]     // save the callee-saved regs we will use
+    ...
+    ldp     x19, x20, [sp, #16]     // restore
+    ldp     x29, x30, [sp], #32     // pop FP and LR, post-increment SP
+    ret                             // branch to X30</code></pre>
+
+<h2 id="pipeline">How an instruction actually executes</h2>
+
+<p>A classic in-order pipeline; modern cores are wider and out-of-order but the stages are the same names.</p>
+
+<figure>
+<svg viewBox="0 0 780 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Instruction pipeline from fetch through decode, issue, execute, memory and writeback with side interactions">
+  <rect class="svg-box-a" x="20" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="46" y="115">Fetch</text><text class="svg-tm" x="30" y="133">PC -&gt; I-cache</text>
+  <rect class="svg-box-a" x="146" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="172" y="115">Decode</text><text class="svg-tm" x="156" y="133">32-bit opcode</text>
+  <rect class="svg-box-a" x="272" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="300" y="115">Issue</text><text class="svg-tm" x="282" y="133">reg read/rename</text>
+  <rect class="svg-box-a" x="398" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="426" y="115">Execute</text><text class="svg-tm" x="410" y="133">ALU / FPU</text>
+  <rect class="svg-box-a" x="524" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="548" y="115">Memory</text><text class="svg-tm" x="534" y="133">MMU + D-cache</text>
+  <rect class="svg-box-a" x="650" y="90" width="106" height="56" rx="7"/><text class="svg-tb" x="668" y="115">Writeback</text><text class="svg-tm" x="668" y="133">reg file</text>
+
+  <path class="svg-line-a" d="M126 118 L146 118 M252 118 L272 118 M378 118 L398 118 M504 118 L524 118 M630 118 L650 118" marker-end="url(#a2)"/>
+  <defs><marker id="a2" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+
+  <rect class="svg-box-g" x="20" y="16" width="106" height="46" rx="7"/><text class="svg-tm" x="30" y="36">branch</text><text class="svg-tm" x="30" y="52">predictor</text>
+  <path class="svg-line" d="M73 62 L73 90"/>
+
+  <rect class="svg-box-w" x="524" y="16" width="106" height="46" rx="7"/><text class="svg-tm" x="534" y="36">TLB miss -&gt;</text><text class="svg-tm" x="534" y="52">table walk</text>
+  <path class="svg-line" d="M577 62 L577 90"/>
+
+  <rect class="svg-box-d" x="398" y="182" width="232" height="52" rx="7"/>
+  <text class="svg-tm" x="410" y="203">Any stage may raise an exception:</text>
+  <text class="svg-tm" x="410" y="221">undefined opcode, permission fault, abort</text>
+  <path class="svg-line" d="M451 146 L451 182 M577 146 L577 182"/>
+</svg>
+<figcaption>Pipeline stages. The Memory stage is where the MMU, the caches and eventually the interconnect all come into play.</figcaption>
+</figure>
+
+<ol class="steps">
+  <li><strong>Fetch.</strong> The PC is a virtual address. It goes through the instruction TLB, hits the L1
+  instruction cache, and returns up to several instructions. In parallel, the branch predictor guesses
+  where execution goes next so fetch never stalls.</li>
+  <li><strong>Decode.</strong> The fixed 32-bit encoding is split into operation, registers and immediates.
+  An unrecognised encoding raises an Undefined Instruction exception.</li>
+  <li><strong>Issue / register read.</strong> Operands are read; on out-of-order cores registers are renamed
+  and the instruction waits in a scheduler until its inputs are ready.</li>
+  <li><strong>Execute.</strong> The ALU, multiplier, FPU or vector unit does the work.</li>
+  <li><strong>Memory.</strong> Only for loads/stores. The virtual address goes to the data TLB; on a miss the
+  hardware walks the page tables. Permission and memory-type checks happen here. Then the data cache is
+  probed, and on a miss the request goes out to the interconnect.</li>
+  <li><strong>Writeback.</strong> The result is committed to the architectural register file. Only at this
+  point is the instruction architecturally "done" — everything before it can still be squashed by a
+  mispredicted branch or an exception.</li>
+</ol>
+
+<h2 id="memory-types">Memory types: Normal vs Device</h2>
+
+<p>Before translation, understand that ARM tags every region with a <strong>memory type</strong>, and this tag
+changes what the hardware is allowed to do with accesses to it. Choosing the wrong one is one of the most
+common driver bugs.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Normal memory</th><th>Device memory</th></tr></thead>
+<tbody>
+<tr><td>Used for</td><td>RAM, code, data, DMA buffers</td><td>Peripheral registers (MMIO)</td></tr>
+<tr><td>Reordering</td><td>Allowed freely by the CPU</td><td>Not reordered relative to other Device accesses</td></tr>
+<tr><td>Speculative access</td><td>Allowed — the CPU may read addresses you never asked for</td><td>Never speculated</td></tr>
+<tr><td>Merging / splitting writes</td><td>Allowed</td><td>Depends on sub-type (see below)</td></tr>
+<tr><td>Unaligned access</td><td>Allowed</td><td>Always faults</td></tr>
+<tr><td>Cacheable</td><td>Yes (write-back, write-through, or non-cacheable)</td><td>Never</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Device memory has sub-types, written <code>Device-nGnRnE</code> etc., where each letter is a permission:</p>
+<ul>
+  <li><strong>G / nG</strong> — Gathering: may separate accesses be merged into one bigger one?</li>
+  <li><strong>R / nR</strong> — Reordering: may accesses to different addresses in this region be reordered?</li>
+  <li><strong>E / nE</strong> — Early write acknowledgement: may a write be acknowledged before it reaches the endpoint?</li>
+</ul>
+<p><code>Device-nGnRnE</code> is the strictest — no gathering, no reordering, no early ack — and is what you use
+for control registers where every write must land in order. <code>Device-GRE</code> is the most relaxed and is
+used for things like framebuffers.</p>
+
+<div class="warn">
+<b>Classic bug</b>
+<p>Mapping a peripheral as Normal Cacheable "because it was faster". The CPU then speculatively reads a
+FIFO register — draining data that no one asked for — and caches control registers so your writes never reach
+the device. Symptom: works in a debugger, fails at speed. Always map MMIO as Device.</p>
+</div>
+
+<h2 id="mmu">The MMU and the translation walk</h2>
+
+<p>The MMU turns a <strong>virtual address</strong> into a <strong>physical address</strong>, while checking
+permissions and attaching memory attributes. It exists for four reasons: isolation between processes,
+giving each process the same layout, letting physically scattered pages look contiguous, and enforcing
+read/write/execute permissions.</p>
+
+<h3>The address space split</h3>
+<pre class="diagram">AArch64, 48-bit VA (bits [63:48] must be all 0s or all 1s)
+
+  0xFFFF_FFFF_FFFF_FFFF  +---------------------------+
+                         |  kernel space             |  TTBR1_EL1 translates these
+                         |  (top of the range)       |
+  0xFFFF_0000_0000_0000  +---------------------------+
+                         |     non-canonical hole    |  faults if accessed
+  0x0000_FFFF_FFFF_FFFF  +---------------------------+
+                         |  user space               |  TTBR0_EL1 translates these
+                         |  (bottom of the range)    |
+  0x0000_0000_0000_0000  +---------------------------+</pre>
+
+<p>Two translation table base registers is an elegant trick: the kernel mapping lives in
+<code>TTBR1_EL1</code> and never changes, while a context switch only has to swap <code>TTBR0_EL1</code>.
+The kernel stays mapped, so a syscall does not need a full table change.</p>
+
+<h3>Page table structure</h3>
+<p>With a 4 KB granule and a 48-bit VA, translation uses four levels. Each level's table is one page
+holding 512 entries of 8 bytes.</p>
+
+<pre class="diagram">Virtual address, 4 KB granule, 48-bit
+
+ 63       48 47    39 38    30 29    21 20    12 11         0
++-----------+--------+--------+--------+--------+------------+
+| sign ext. |  L0 ix |  L1 ix |  L2 ix |  L3 ix |   offset   |
++-----------+--------+--------+--------+--------+------------+
+              9 bits   9 bits   9 bits   9 bits    12 bits
+              (512)    (512)    (512)    (512)     (4 KB)
+
+Each level covers:   L0 -> 512 GB    L1 -> 1 GB    L2 -> 2 MB    L3 -> 4 KB</pre>
+
+<h3>The walk, step by step</h3>
+
+<figure>
+<svg viewBox="0 0 780 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flow of a four level page table walk from TTBR through L0 L1 L2 L3 to the physical page">
+  <rect class="svg-box-a" x="20" y="20" width="150" height="46" rx="7"/>
+  <text class="svg-tb" x="34" y="40">CPU issues VA</text><text class="svg-tm" x="34" y="57">0xFFFF0000C0DE1234</text>
+
+  <rect class="svg-box-g" x="210" y="20" width="150" height="46" rx="7"/>
+  <text class="svg-tb" x="224" y="40">TLB lookup</text><text class="svg-tm" x="224" y="57">hit? done in 1 cycle</text>
+
+  <rect class="svg-box-w" x="400" y="20" width="360" height="46" rx="7"/>
+  <text class="svg-tb" x="414" y="40">MISS -&gt; hardware table walker starts</text>
+  <text class="svg-tm" x="414" y="57">base = TTBR1_EL1 (VA[63]=1) or TTBR0_EL1 (VA[63]=0)</text>
+
+  <rect class="svg-box" x="60" y="100" width="200" height="52" rx="7"/>
+  <text class="svg-tb" x="74" y="122">L0 table</text><text class="svg-tm" x="74" y="140">entry[VA[47:39]] -&gt; L1 base PA</text>
+
+  <rect class="svg-box" x="60" y="170" width="200" height="52" rx="7"/>
+  <text class="svg-tb" x="74" y="192">L1 table</text><text class="svg-tm" x="74" y="210">entry[VA[38:30]] -&gt; L2 base PA</text>
+
+  <rect class="svg-box" x="60" y="240" width="200" height="52" rx="7"/>
+  <text class="svg-tb" x="74" y="262">L2 table</text><text class="svg-tm" x="74" y="280">entry[VA[29:21]] -&gt; L3 base PA</text>
+
+  <rect class="svg-box" x="60" y="310" width="200" height="52" rx="7"/>
+  <text class="svg-tb" x="74" y="332">L3 table</text><text class="svg-tm" x="74" y="350">entry[VA[20:12]] -&gt; page PA + attrs</text>
+
+  <path class="svg-line-a" d="M160 66 L160 100 M160 152 L160 170 M160 222 L160 240 M160 292 L160 310" marker-end="url(#a3)"/>
+  <defs><marker id="a3" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+
+  <rect class="svg-box-d" x="330" y="100" width="200" height="120" rx="7"/>
+  <text class="svg-tb" x="344" y="122">At every level, check:</text>
+  <text class="svg-tm" x="344" y="144">bit[0] valid? no -&gt; TRANSLATION</text>
+  <text class="svg-tm" x="344" y="160">              FAULT</text>
+  <text class="svg-tm" x="344" y="182">bit[1]=1 table, =0 block</text>
+  <text class="svg-tm" x="344" y="204">(block = large page, walk stops)</text>
+  <path class="svg-line" d="M260 126 L330 140"/>
+
+  <rect class="svg-box-d" x="330" y="240" width="200" height="122" rx="7"/>
+  <text class="svg-tb" x="344" y="262">Leaf entry checks:</text>
+  <text class="svg-tm" x="344" y="284">AP[2:1]  read/write, EL0 access</text>
+  <text class="svg-tm" x="344" y="302">UXN/PXN  execute never</text>
+  <text class="svg-tm" x="344" y="320">AttrIndx -&gt; MAIR_EL1 slot</text>
+  <text class="svg-tm" x="344" y="338">SH       shareability</text>
+  <text class="svg-tm" x="344" y="356">AF       access flag</text>
+  <path class="svg-line" d="M260 336 L330 320"/>
+
+  <rect class="svg-box-g" x="570" y="240" width="190" height="70" rx="7"/>
+  <text class="svg-tb" x="584" y="264">PA = page PA | VA[11:0]</text>
+  <text class="svg-tm" x="584" y="286">result cached in the TLB</text>
+  <text class="svg-tm" x="584" y="302">tagged with the ASID</text>
+  <path class="svg-line-a" d="M530 300 L570 288" marker-end="url(#a3)"/>
+</svg>
+<figcaption>A four-level walk. Note that a walk is up to four extra memory accesses — which is exactly why the TLB matters so much.</figcaption>
+</figure>
+
+<h3>A translation table entry, decoded</h3>
+
+<pre class="diagram">Level 3 (page) descriptor, 4 KB granule
+
+ 63  59 58    55 54  53 52 51    48 47                    12 11 10 9 8 7 6 5 4      2 1 0
++------+--------+---+---+--+-------+------------------------+--+--+---+--+---+------+-+-+
+| SW   | ignored|UXN|PXN|Ct| res0  |   output address[47:12] |nG|AF| SH|AP|NS |AttrIdx|1|1|
++------+--------+---+---+--+-------+------------------------+--+--+---+--+---+------+-+-+
+
+ bits[1:0]  11 = valid page (L3) / valid table (L0-L2)
+            01 = valid block (L1/L2 large page)
+            x0 = INVALID -> translation fault
+ AttrIndx   3-bit index into MAIR_EL1: selects Normal-WB, Normal-NC, Device-nGnRnE...
+ NS         non-secure bit - see the TrustZone chapter
+ AP[2:1]    00 RW at EL1 only  01 RW at EL1+EL0  10 RO at EL1 only  11 RO at EL1+EL0
+ SH         shareability: 00 non, 10 outer, 11 inner shareable
+ AF         access flag: hardware faults if 0, so the OS can track "was this page used?"
+ nG         not-Global: entry is tagged with the current ASID
+ PXN/UXN    privileged / unprivileged execute-never</pre>
+
+<h3>Building a mapping by hand</h3>
+<div class="codewrap"><div class="code-title">a minimal identity-map setup, the kind that lives in bare-metal boot code</div>
+<pre><code>#define PTE_VALID       (1UL &lt;&lt; 0)
+#define PTE_TABLE       (1UL &lt;&lt; 1)   /* at L0-L2: entry points to another table */
+#define PTE_PAGE        (1UL &lt;&lt; 1)   /* at L3:    entry is a 4 KB page          */
+#define PTE_AF          (1UL &lt;&lt; 10)  /* access flag - forget this and you fault  */
+#define PTE_SH_INNER    (3UL &lt;&lt; 8)
+#define PTE_AP_RW_EL1   (0UL &lt;&lt; 6)
+#define PTE_UXN         (1UL &lt;&lt; 54)
+#define PTE_ATTR(i)     ((unsigned long)(i) &lt;&lt; 2)
+
+#define MAIR_IDX_NORMAL 0
+#define MAIR_IDX_DEVICE 1
+
+static uint64_t l1[512] __attribute__((aligned(4096)));
+static uint64_t l2[512] __attribute__((aligned(4096)));
+
+void mmu_init(void)
+{
+    /* MAIR: slot 0 = Normal write-back, slot 1 = Device-nGnRnE */
+    uint64_t mair = (0xFFUL &lt;&lt; (8 * MAIR_IDX_NORMAL)) |
+                    (0x00UL &lt;&lt; (8 * MAIR_IDX_DEVICE));
+    asm volatile("msr mair_el1, %0" :: "r"(mair));
+
+    /* L1[0] points at our L2 table (covers VA 0 - 1 GB) */
+    l1[0] = (uint64_t)l2 | PTE_VALID | PTE_TABLE;
+
+    /* L2: map 512 x 2 MB blocks, identity mapped */
+    for (int i = 0; i &lt; 512; i++) {
+        uint64_t pa = (uint64_t)i &lt;&lt; 21;               /* 2 MB blocks */
+        int is_device = (pa &gt;= 0x40000000UL);          /* peripherals up here */
+        l2[i] = pa | PTE_VALID                         /* block: bit1 = 0 */
+                   | PTE_AF | PTE_AP_RW_EL1
+                   | (is_device ? PTE_ATTR(MAIR_IDX_DEVICE) | PTE_UXN
+                                : PTE_ATTR(MAIR_IDX_NORMAL) | PTE_SH_INNER);
+    }
+
+    asm volatile("msr ttbr0_el1, %0" :: "r"((uint64_t)l1));
+
+    /* TCR: 48-bit VA (T0SZ=16), 4 KB granule, inner-shareable walks */
+    uint64_t tcr = (16UL &lt;&lt; 0) | (1UL &lt;&lt; 8) | (1UL &lt;&lt; 10) | (3UL &lt;&lt; 12);
+    asm volatile("msr tcr_el1, %0" :: "r"(tcr));
+
+    asm volatile("dsb ish; isb");                      /* tables visible first */
+
+    uint64_t sctlr;
+    asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr |= (1UL &lt;&lt; 0) | (1UL &lt;&lt; 2) | (1UL &lt;&lt; 12);    /* M | C | I */
+    asm volatile("msr sctlr_el1, %0" :: "r"(sctlr));
+    asm volatile("isb");                               /* MMU is on from here */
+}</code></pre></div>
+
+<div class="tip">
+<b>Read that code twice</b>
+<p>If you understand every line above — MAIR, the block descriptor, TCR's T0SZ, and why the
+<code>dsb</code>/<code>isb</code> pair is there — you understand the ARM MMU. Everything else is detail.</p>
+</div>
+
+<h3>TLBs and ASIDs</h3>
+<p>The <strong>TLB</strong> caches completed translations. Because a full walk costs up to four memory
+accesses, a TLB miss is expensive and a TLB that must be flushed on every context switch is a disaster.
+Two mechanisms avoid that:</p>
+<ul>
+  <li><strong>ASID</strong> (Address Space ID) — an 8- or 16-bit tag stored in <code>TTBR0_EL1[63:48]</code>
+  and attached to every non-Global TLB entry. Two processes' entries can coexist in the TLB. A context
+  switch changes the ASID rather than invalidating everything.</li>
+  <li><strong>Global entries</strong> (<code>nG=0</code>) — kernel mappings match regardless of ASID.</li>
+  <li><strong>VMID</strong> — the same idea one level up, tagging entries per virtual machine.</li>
+</ul>
+
+<p>When you change a page table you must invalidate the stale TLB entry yourself. The hardware will not
+notice:</p>
+<pre><code>    dsb ishst              // make the table write visible to the walkers
+    tlbi vae1is, x0        // invalidate VA in x0, EL1, Inner Shareable (all cores)
+    dsb ish                // wait for the invalidate to complete everywhere
+    isb                    // flush the pipeline so nothing stale is in flight</code></pre>
+
+<div class="warn">
+<b>The number one MMU bug</b>
+<p>Updating a descriptor and forgetting the TLBI, or getting the barrier order wrong. Symptom: the change
+works on one core and not another, or works after an unrelated context switch. The sequence above is
+write-table &rarr; DSB &rarr; TLBI &rarr; DSB &rarr; ISB, and it is not optional.</p>
+</div>
+
+<h3>Two-stage translation</h3>
+<p>Under a hypervisor, translation happens twice:</p>
+<pre class="diagram">  Guest VA  --[ stage 1, guest owns it ]-->  IPA  --[ stage 2, hypervisor owns it ]-->  PA
+            TTBR0/1_EL1                            VTTBR_EL2
+
+  IPA = Intermediate Physical Address = "what the guest believes is physical"</pre>
+<p>A stage-1 walk that itself needs stage-2 translation for each of its table accesses can therefore cost
+many more memory accesses. This is why hypervisors care so much about TLB behaviour, and it is exactly
+the structure the SMMU reuses — see <a href="smmu.html">chapter 05</a>.</p>
+
+<h2 id="caches">Caches and coherency</h2>
+
+<p>DRAM is roughly 100&times; slower than a register. Caches hide that, and understanding them is the
+difference between a driver that works and a driver that works <em>sometimes</em>.</p>
+
+<pre class="diagram">   Core 0                  Core 1
+  +--------+              +--------+
+  | L1 I$  | | L1 D$ |    | L1 I$  | | L1 D$ |     ~32-64 KB, ~4 cycles
+  +--------+--+-------+   +--------+--+-------+
+        |                       |
+  +-----------+           +-----------+
+  |    L2     |           |    L2     |            ~256KB-1MB, ~15 cycles
+  +-----------+           +-----------+
+        |                       |
+        +-----------+-----------+
+                    |
+             +-------------+
+             | L3 / SLC    |                       shared, ~4-32 MB, ~40 cycles
+             +-------------+
+                    |
+             +-------------+
+             |    DRAM     |                       ~100-200 cycles
+             +-------------+</pre>
+
+<h3>Terms that matter</h3>
+<ul>
+  <li><strong>Cache line</strong> — the unit of transfer, almost always 64 bytes on ARM. You never fetch
+  4 bytes from DRAM; you fetch the whole line. This causes <em>false sharing</em>: two cores writing to
+  different variables in the same line ping-pong that line between them and destroy performance.</li>
+  <li><strong>Write-back</strong> — a store updates the cache and marks the line dirty; DRAM is updated later.
+  <strong>Write-through</strong> — every store also goes to the next level. Write-back is the default.</li>
+  <li><strong>PIPT / VIPT</strong> — how a cache is indexed and tagged. AArch64 data caches behave as
+  Physically Indexed, Physically Tagged from software's point of view, which means you do not have to worry
+  about virtual aliasing for data (instruction caches still need explicit maintenance).</li>
+  <li><strong>Shareability domain</strong> — Inner Shareable is typically "all the cores in this cluster/system
+  that are coherent"; Outer Shareable extends further. It determines how far a barrier or a TLBI propagates.</li>
+</ul>
+
+<h3>Hardware coherency</h3>
+<p>Between CPU cores, coherency is automatic: the interconnect implements a protocol (MESI/MOESI, carried
+over AMBA ACE or CHI) so that if core 0 writes a line, core 1's copy is invalidated before it can read stale
+data. You do not need cache maintenance between coherent cores.</p>
+
+<div class="danger">
+<b>But DMA may not be coherent</b>
+<p>Whether a DMA master participates in coherency is a property of the SoC. If it does not:</p>
+<ul>
+  <li><strong>Before a device reads your buffer</strong> you must <em>clean</em> (flush) the cache, or the device
+  reads stale DRAM while your data sits dirty in L1.</li>
+  <li><strong>Before you read a buffer the device wrote</strong> you must <em>invalidate</em> the cache, or you
+  read a stale cached copy and never see the new data.</li>
+</ul>
+<p>This is the single most common DMA bug in the field. In Linux the DMA API
+(<code>dma_map_single()</code>, <code>dma_sync_single_for_cpu()</code>) does this for you — which is exactly why
+you must never hand a device a raw <code>kmalloc</code> pointer.</p>
+</div>
+
+<h3>Cache maintenance instructions</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Instruction</th><th>Effect</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>DC CVAC, Xn</code></td><td>Clean by VA to Point of Coherency</td><td>Before a non-coherent device reads your buffer</td></tr>
+<tr><td><code>DC IVAC, Xn</code></td><td>Invalidate by VA to PoC</td><td>Before you read a buffer the device wrote</td></tr>
+<tr><td><code>DC CIVAC, Xn</code></td><td>Clean <em>and</em> invalidate</td><td>Bidirectional buffers; the safe default</td></tr>
+<tr><td><code>DC ZVA, Xn</code></td><td>Zero a cache line</td><td>Fast <code>memset(0)</code></td></tr>
+<tr><td><code>IC IALLU</code></td><td>Invalidate all instruction cache to Point of Unification</td><td>After writing code (JIT, module loading, self-modifying boot code)</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>// The mandatory sequence after writing instructions to memory:
+    dc      cvau, x0        // clean the data cache so the write reaches unified memory
+    dsb     ish             // wait for it
+    ic      ivau, x0        // invalidate the instruction cache for that address
+    dsb     ish             // wait for it
+    isb                     // flush the CPU pipeline of any prefetched stale instruction</code></pre>
+
+<h2 id="barriers">Memory ordering and barriers</h2>
+
+<p>ARM has a <strong>weakly ordered</strong> memory model. Unless you say otherwise, the CPU may execute
+your loads and stores to Normal memory in any order that preserves single-threaded correctness, and other
+observers may see them in a different order than you wrote them.</p>
+
+<p>The canonical failure:</p>
+<pre><code>// Producer (core 0)              // Consumer (core 1)
+buffer[0] = 42;                   while (flag == 0)
+flag      = 1;                        ;
+                                  use(buffer[0]);   // may read garbage!</code></pre>
+<p>The producer's two stores can become visible in the opposite order. The consumer sees <code>flag == 1</code>
+and reads a <code>buffer</code> that has not been written yet. This is not a compiler bug and not a race in the
+usual sense — it is the memory model working as specified.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Barrier</th><th>Guarantee</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>DMB</code> — Data Memory Barrier</td><td>Memory accesses before it are observed before accesses after it. Does not stall non-memory work.</td><td>Ordering two data accesses. The common case.</td></tr>
+<tr><td><code>DSB</code> — Data Synchronization Barrier</td><td>Stronger: execution stops until all prior memory accesses <em>and</em> cache/TLB maintenance have completed.</td><td>After <code>TLBI</code>/<code>DC</code>, before starting DMA, before WFI.</td></tr>
+<tr><td><code>ISB</code> — Instruction Synchronization Barrier</td><td>Flushes the pipeline; instructions after it are re-fetched. Makes system register changes take effect.</td><td>After enabling the MMU, changing <code>SCTLR</code>, or modifying code.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Each takes a domain and direction suffix: <code>ish</code> (Inner Shareable), <code>osh</code> (Outer),
+<code>sy</code> (full system), optionally <code>st</code> (stores only) or <code>ld</code> (loads only).
+<code>dmb ishst</code> is the cheap "make my prior stores visible to the other cores" barrier.</p>
+
+<pre><code>// Fixed producer
+buffer[0] = 42;
+dmb ishst;            // all prior stores visible before the next one
+flag = 1;
+
+// Fixed consumer
+while (flag == 0) ;
+dmb ishld;            // do not let the load of buffer float above the flag load
+use(buffer[0]);</code></pre>
+
+<h3>The modern way: acquire/release</h3>
+<p>ARMv8 added ordered load/store instructions that are cheaper than a standalone barrier because the
+ordering is attached to the access itself:</p>
+<ul>
+  <li><code>LDAR</code> — load-acquire: no later access may be reordered before it.</li>
+  <li><code>STLR</code> — store-release: no earlier access may be reordered after it.</li>
+</ul>
+<p>Together they give exactly the release/acquire pairing that C11 <code>&lt;stdatomic.h&gt;</code>,
+Linux's <code>smp_store_release()</code>/<code>smp_load_acquire()</code>, and Windows'
+<code>InterlockedExchangeRelease</code> compile down to. Prefer these over raw barriers in new code.</p>
+
+<h2 id="atomics">Atomic operations</h2>
+
+<p>Because ARM is load/store, atomicity needs dedicated instructions. Two generations exist:</p>
+
+<h3>Load-exclusive / store-exclusive (all of ARMv8)</h3>
+<pre><code>// atomic increment of the 32-bit word at [x0]
+1:  ldaxr   w1, [x0]        // load-acquire exclusive: marks the address as "monitored"
+    add     w1, w1, #1
+    stlxr   w2, w1, [x0]    // store-release exclusive: w2 = 0 on success, 1 on failure
+    cbnz    w2, 1b          // another core touched it -> retry the whole sequence</code></pre>
+<p>The <em>exclusive monitor</em> in hardware watches the address. If any other master writes it between the
+LDXR and the STXR, the store fails and you loop. Keep the loop body tiny — a memory access or an exception
+inside it can clear the monitor and cause livelock.</p>
+
+<h3>Large System Extensions (ARMv8.1+)</h3>
+<p>Single-instruction atomics that the interconnect can execute near memory, scaling far better under contention:</p>
+<pre><code>    ldadd   w1, w2, [x0]      // atomic add,  returns the old value in w2
+    ldeor   w1, w2, [x0]      // atomic XOR
+    ldset   w1, w2, [x0]      // atomic OR (set bits)
+    swp     w1, w2, [x0]      // atomic swap
+    cas     w1, w2, [x0]      // compare-and-swap</code></pre>
+<p>Linux and Windows both patch between the two forms at boot depending on what the CPU reports in
+<code>ID_AA64ISAR0_EL1</code>.</p>
+
+<h2 id="interrupts">Interrupts and the GIC</h2>
+
+<p>The <strong>Generic Interrupt Controller</strong> is a separate hardware block that collects interrupt
+signals from every peripheral, prioritises them, and delivers one to a specific core. Since GICv3 the CPU
+interface is accessed through system registers (<code>ICC_*_EL1</code>) rather than MMIO.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GIC structure showing distributor, redistributors and CPU interfaces with interrupt ID ranges">
+  <rect class="svg-box" x="20" y="20" width="120" height="40" rx="6"/><text class="svg-tm" x="34" y="45">UART irq</text>
+  <rect class="svg-box" x="20" y="70" width="120" height="40" rx="6"/><text class="svg-tm" x="34" y="95">Timer irq</text>
+  <rect class="svg-box" x="20" y="120" width="120" height="40" rx="6"/><text class="svg-tm" x="34" y="145">DMA irq</text>
+  <rect class="svg-box" x="20" y="170" width="120" height="40" rx="6"/><text class="svg-tm" x="34" y="195">PCIe MSI</text>
+
+  <rect class="svg-box-a" x="190" y="20" width="180" height="190" rx="7"/>
+  <text class="svg-tb" x="204" y="44">Distributor</text>
+  <text class="svg-tm" x="204" y="66">GICD_*</text>
+  <text class="svg-tm" x="204" y="88">enable / disable</text>
+  <text class="svg-tm" x="204" y="106">priority</text>
+  <text class="svg-tm" x="204" y="124">edge vs level</text>
+  <text class="svg-tm" x="204" y="142">target core routing</text>
+  <text class="svg-tm" x="204" y="164">security group</text>
+  <text class="svg-tm" x="204" y="186">(G0=secure FIQ,</text>
+  <text class="svg-tm" x="204" y="202"> G1=non-secure IRQ)</text>
+
+  <rect class="svg-box-g" x="420" y="20" width="150" height="86" rx="7"/>
+  <text class="svg-tb" x="434" y="44">Redistributor 0</text><text class="svg-tm" x="434" y="66">per-core SGI/PPI</text><text class="svg-tm" x="434" y="86">LPI tables</text>
+  <rect class="svg-box-g" x="420" y="124" width="150" height="86" rx="7"/>
+  <text class="svg-tb" x="434" y="148">Redistributor 1</text><text class="svg-tm" x="434" y="170">per-core SGI/PPI</text>
+
+  <rect class="svg-box-w" x="610" y="20" width="130" height="86" rx="7"/>
+  <text class="svg-tb" x="624" y="44">Core 0</text><text class="svg-tm" x="624" y="66">ICC_*_EL1</text><text class="svg-tm" x="624" y="86">IRQ / FIQ pin</text>
+  <rect class="svg-box-w" x="610" y="124" width="130" height="86" rx="7"/>
+  <text class="svg-tb" x="624" y="148">Core 1</text><text class="svg-tm" x="624" y="170">ICC_*_EL1</text>
+
+  <path class="svg-line" d="M140 40 L190 60 M140 90 L190 90 M140 140 L190 120 M140 190 L190 150
+                            M370 70 L420 63 M370 140 L420 167 M570 63 L610 63 M570 167 L610 167"/>
+
+  <text class="svg-tm" x="20" y="250">INTID 0-15 SGI (software generated, core-to-core)   16-31 PPI (private per core: timers)</text>
+  <text class="svg-tm" x="20" y="272">32-1019 SPI (shared peripheral)                     8192+ LPI (message-signalled, MSI)</text>
+</svg>
+<figcaption>GICv3 topology. The distributor is global; each core has a redistributor and a CPU interface.</figcaption>
+</figure>
+
+<h3>Interrupt delivery flow</h3>
+<ol class="steps">
+  <li>A peripheral asserts its interrupt line, or writes a doorbell register for an MSI.</li>
+  <li>The distributor marks the INTID <em>pending</em>, checks it is enabled, and compares its priority
+  against what the target core is currently running.</li>
+  <li>If it wins, the GIC asserts the IRQ (or FIQ) signal to that core.</li>
+  <li>The core takes the exception if <code>PSTATE.I</code> is clear — see
+  <a href="exception-levels.html">chapter 04</a> for the exact hardware sequence.</li>
+  <li>The handler reads <code>ICC_IAR1_EL1</code> to <em>acknowledge</em>. This returns the INTID and moves
+  the interrupt to <em>active</em>, so it will not be re-signalled.</li>
+  <li>The handler services the device — crucially, it must clear the interrupt condition <em>at the device</em>,
+  not just at the GIC, or a level-triggered interrupt fires again immediately.</li>
+  <li>The handler writes the INTID to <code>ICC_EOIR1_EL1</code> to signal End Of Interrupt, dropping the
+  running priority and allowing lower-priority interrupts through.</li>
+  <li><code>ERET</code> returns to the interrupted code.</li>
+</ol>
+
+<div class="warn">
+<b>Interrupt storm</b>
+<p>If you EOI without clearing the condition at the device, a level-triggered interrupt re-asserts
+immediately and the core does nothing but enter and exit the handler forever. The system appears hung with
+100% CPU in the handler. Always clear at the source first, then EOI.</p>
+</div>
+
+<h2 id="amba">The interconnect: AMBA</h2>
+
+<p>AMBA is Arm's family of on-chip bus specifications. Which one a block uses tells you a lot about it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Protocol</th><th>Character</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><strong>APB</strong></td><td>Simple, low bandwidth, no bursts, one transfer at a time</td><td>Slow peripheral registers: UART, I2C, GPIO</td></tr>
+<tr><td><strong>AHB</strong></td><td>Single shared bus, pipelined, bursts</td><td>Older/simpler SoCs, Cortex-M systems</td></tr>
+<tr><td><strong>AXI</strong></td><td>Five independent channels, out-of-order via transaction IDs, high throughput</td><td>The workhorse: memory controllers, DMA, GPU</td></tr>
+<tr><td><strong>ACE</strong></td><td>AXI plus cache coherency snooping</td><td>Coherent CPU clusters</td></tr>
+<tr><td><strong>CHI</strong></td><td>Packet-based, scalable mesh, credit-based flow control</td><td>Large multi-core / server-class SoCs</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>What travels with an AXI transaction</h3>
+<p>This list is the key to chapters 05, 06 and 07 — these sideband signals are what the isolation hardware
+inspects:</p>
+<ul>
+  <li><code>AxADDR</code> — the physical address.</li>
+  <li><code>AxID</code> — the master's transaction ID, from which the SoC derives a <strong>master ID</strong>
+  or <strong>StreamID</strong> identifying <em>who</em> is asking.</li>
+  <li><code>AxPROT[1]</code> — the <strong>NS bit</strong>: is this a Secure or Non-secure access? This one bit
+  is the entirety of TrustZone's bus-level enforcement.</li>
+  <li><code>AxPROT[0]</code> — privileged or unprivileged. <code>AxPROT[2]</code> — instruction or data.</li>
+  <li><code>AxCACHE</code> — cacheability and bufferability hints, derived from the page-table attributes.</li>
+  <li><code>AxLEN</code>, <code>AxSIZE</code>, <code>AxBURST</code> — burst shape.</li>
+</ul>
+
+<div class="key">
+<b>Tie it together</b>
+<p>A page table entry's <code>NS</code> and <code>AttrIndx</code> fields are not abstractions. They are
+literally converted into wires on the bus — <code>AxPROT[1]</code> and <code>AxCACHE</code> — and hardware
+downstream makes decisions based on them. When you set a bit in a descriptor you are setting a signal
+on the interconnect.</p>
+</div>
+
+<h2 id="full-flow">Putting it all together: one load instruction, end to end</h2>
+
+<pre class="diagram">        ldr  x1, [x0]        with x0 = 0xFFFF_0000_C0DE_1234
+
+  1. FETCH        PC -> I-TLB -> L1 I-cache -> instruction word
+                  (branch predictor already guessed the next PC)
+
+  2. DECODE       recognised as a 64-bit load, base x0, offset 0
+
+  3. EXECUTE      compute the effective address = x0 + 0
+
+  4. TRANSLATE    VA[63] == 1  -> use TTBR1_EL1
+                  D-TLB lookup, tagged by ASID
+                     hit  -> PA + attributes in ~1 cycle
+                     miss -> hardware walks L0->L1->L2->L3
+                             any invalid descriptor -> TRANSLATION FAULT
+                                 ESR_EL1 = fault code, FAR_EL1 = 0xFFFF...1234
+                                 -> exception to EL1, OS decides: fix or SIGSEGV
+
+  5. PERMISSION   AP bits vs current EL and access type
+                  UXN/PXN for instruction fetches
+                  PAN: is EL1 allowed to touch EL0 memory right now?
+                     fail -> PERMISSION FAULT (same reporting path)
+
+  6. STAGE 2      only if EL2 is active for this world:
+                  IPA -> PA via VTTBR_EL2, second set of permission checks
+                     fail -> exception to EL2, not EL1
+
+  7. CACHE        attributes from MAIR say Normal-WB-Inner-Shareable
+                  L1 D-cache probe -> miss -> L2 -> miss -> interconnect
+
+  8. INTERCONNECT AXI read: ADDR=PA, PROT[1]=NS bit, CACHE=attrs, ID=master id
+                  --> SMMU?      only for non-CPU masters (ch. 05)
+                  --> XPU check: is this master allowed at this PA in this
+                      security state?  no -> error response (ch. 07)
+                  --> memory controller -> DRAM
+
+  9. RETURN       64-byte line fills L2 and L1, x1 gets the requested 8 bytes
+
+ 10. WRITEBACK    x1 architecturally updated; the instruction retires</pre>
+
+<p>Every fault type in an OS crash log maps to one of those steps. When you learn to read a kernel oops or a
+bugcheck, you are really identifying which of these ten steps failed.</p>
+
+<h2 id="perf">Performance features worth knowing</h2>
+
+<ul>
+  <li><strong>Branch prediction</strong> — a mispredict costs 10–20 cycles of squashed work. Branchless code
+  via <code>CSEL</code> can win in hot loops.</li>
+  <li><strong>Out-of-order execution and speculation</strong> — the CPU runs ahead. This is also the root of
+  Spectre-class vulnerabilities, and why <code>CSDB</code>, <code>SB</code> and array-index masking exist.</li>
+  <li><strong>Prefetching</strong> — hardware detects strides and pulls lines in early. Sequential access
+  patterns can be several times faster than random ones for the same amount of data.</li>
+  <li><strong>NEON / SVE</strong> — SIMD. NEON is fixed 128-bit; SVE is vector-length agnostic, so the same
+  binary runs optimally on different vector widths.</li>
+  <li><strong>PMU</strong> — the Performance Monitor Unit counts cycles, cache misses, TLB misses, mispredicts.
+  This is what <code>perf stat</code> reads. Learn to use it before optimising anything.</li>
+  <li><strong>big.LITTLE / DynamIQ</strong> — heterogeneous cores with identical ISA but different
+  performance and power. The scheduler migrates threads between them; this occasionally surprises code that
+  assumed a fixed clock rate.</li>
+</ul>
+
+<h2 id="checklist">Chapter checklist</h2>
+<ul class="checklist">
+  <li>You can name the AArch64 registers and say which are callee-saved.</li>
+  <li>You can explain why <code>counter++</code> is not atomic and show the fix in assembly.</li>
+  <li>You can draw the four-level page walk and say what each descriptor bit does.</li>
+  <li>You can explain the difference between Normal and Device memory and give a bug caused by choosing wrong.</li>
+  <li>You can write the correct barrier sequence for a page table update and for a DMA buffer handoff.</li>
+  <li>You can trace an interrupt from the peripheral pin to the C handler and back.</li>
+  <li>You can list what an AXI transaction carries besides address and data, and why that matters for security.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

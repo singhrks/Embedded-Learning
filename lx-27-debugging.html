@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging the kernel | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging the kernel</h1>
+<p class="lead">Reading an oops, tracing with ftrace, attaching a debugger, and the config options that turn
+silent corruption into a loud message with a backtrace. The single highest-leverage skill in kernel work is
+extracting the maximum from one crash.</p>
+
+<h2 id="oops">Reading an oops</h2>
+
+<p>An oops is the kernel's crash report, and it looks intimidating until you know that only about five of its lines matter. Reading one properly usually identifies the faulting line and often the exact structure member involved.</p>
+
+<pre><code>Unable to handle kernel NULL pointer dereference at virtual
+        address 0000000000000018
+Mem abort info:
+  ESR = 0x0000000096000004
+  EC = 0x25: DABT (current EL), IL = 32 bits
+  SET = 0, FnV = 0
+  EA = 0, S1PTW = 0
+  FSC = 0x04: level 0 translation fault
+Data abort info:
+  ISV = 0, ISS = 0x00000004
+  CM = 0, WnR = 0
+CPU: 2 PID: 431 Comm: mytest Tainted: G           O
+                                     6.12.0 #1
+Hardware name: ARM Juno development board (DT)
+pstate: 60000005 (nZCv daif -PAN -UAO)
+pc : mydev_read+0x48/0x1c0 [mydev]
+lr : vfs_read+0xb4/0x1e0
+sp : ffff800012345678
+x29: ffff800012345678 x28: ffff0000c1234000
+x27: 0000000000000000 x26: 0000000000000004
+...
+Call trace:
+ mydev_read+0x48/0x1c0 [mydev]
+ vfs_read+0xb4/0x1e0
+ ksys_read+0x70/0x100
+ __arm64_sys_read+0x24/0x30
+ invoke_syscall+0x50/0x120
+ el0_svc_common+0x4c/0x100
+ do_el0_svc+0x30/0xa0
+ el0_svc+0x2c/0x90
+ el0t_64_sync_handler+0xb8/0xc0
+ el0t_64_sync+0x1a0/0x1a4
+Code: aa0003f3 f9400400 91006000 f9400c00 (f9400c01)
+---[ end trace 0000000000000000 ]---</code></pre>
+
+<pre class="diagram">READ IT IN THIS ORDER:
+
+  1. THE FIRST LINE says what happened.
+       "NULL pointer dereference at 0000000000000018"
+       -&gt; a pointer was NULL and something read offset 0x18
+          from it. Look for a struct whose member is at 0x18.
+
+  2. ESR/FSC decode the fault (ARM ch. 29):
+       EC 0x25 = data abort, same EL
+       FSC 0x04 = level 0 translation fault (nothing mapped)
+       WnR = 0  = it was a READ
+
+  3. pc : mydev_read+0x48/0x1c0 [mydev]
+              ^^^^^^^^^^ ^^^^ ^^^^^  ^^^^^
+              function   offset size  module
+     -&gt; THIS IS THE INSTRUCTION THAT FAULTED. Everything
+        else is context.
+
+  4. THE CALL TRACE, read bottom-up, is how you got there:
+     userspace read() -&gt; syscall -&gt; vfs_read -&gt; your function.
+
+  5. "Tainted: G O" - O means an out-of-tree module is
+     loaded. Other letters matter too (chapter 17).
+
+  6. Code: shows the instructions around the fault, with the
+     faulting one in (parentheses).
+
+  THE ONE NUMBER THAT MATTERS: +0x48 in mydev_read. Turn it
+  into a source line:</pre>
+
+<pre><code># Function + offset to file and line:
+    aarch64-linux-gnu-addr2line -e mydev.ko -f -i 0x48
+      mydev_read
+      /home/you/mydev/mydev.c:142
+
+# For a built-in function, use vmlinux and the absolute
+# address (with nokaslr, or after adjusting for the offset):
+    aarch64-linux-gnu-addr2line -e vmlinux -f -i ffff800008123456
+
+# THE BEST TOOL - decodes a whole oops at once:
+    ./scripts/decode_stacktrace.sh vmlinux . < oops.txt
+# It annotates every frame with file:line. Paste an oops in,
+# get a readable trace out. Learn this one command.
+
+# Or disassemble around the offset:
+    aarch64-linux-gnu-objdump -dS --start-address=0x30 \
+        --stop-address=0x60 mydev.ko
+
+# KEEP vmlinux AND THE UNSTRIPPED .ko from the exact build
+# that is running. Without them an oops is just numbers.</code></pre>
+
+<div class="key">
+<b>NULL-plus-offset tells you which member</b>
+<p>A fault at <code>0x18</code> means the code did <code>ptr-&gt;something</code> where
+<code>something</code> is 24 bytes into the struct and <code>ptr</code> was NULL. Use
+<code>pahole -C mydev mydev.ko</code> to print the struct layout with offsets, and the member is named
+directly. That usually identifies the bug faster than reading the source.</p>
+</div>
+
+<h2 id="messages">The other crash messages</h2>
+
+<p>An oops is only one of several distinct ways the kernel reports that something went wrong, and each has its
+own signature phrase in <code>dmesg</code> that points to a different class of bug — recognising the phrase
+before reading a single line of the backtrace already narrows down where the problem lives.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Message</th><th>Means</th><th>First thing to check</th></tr></thead>
+<tbody>
+<tr><td><code>NULL pointer dereference</code></td><td>Unchecked return, or use-after-free that poisoned the pointer</td><td>The offset, via <code>pahole</code></td></tr>
+<tr><td><code>Unable to handle paging request</code></td><td>A wild pointer</td><td>Whether the address looks like a poison pattern</td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code></td><td>Slept while atomic</td><td>The backtrace's caller (<a href="lx-06-gfp-flags.html">ch. 07</a>)</td></tr>
+<tr><td><code>BUG: scheduling while atomic</code></td><td>Same class</td><td>Locks held at the time</td></tr>
+<tr><td><code>WARNING: at ...</code></td><td>A <code>WARN_ON</code> fired — a bug the kernel survived</td><td>The condition at that line</td></tr>
+<tr><td><code>soft lockup - CPU stuck for 22s</code></td><td>A loop with preemption off</td><td>The looping function in the trace</td></tr>
+<tr><td><code>hard LOCKUP</code></td><td>Interrupts disabled too long</td><td>Same</td></tr>
+<tr><td><code>INFO: task blocked for more than 120 seconds</code></td><td>D state (<a href="lx-09-task-struct.html">ch. 10</a>)</td><td><code>/proc/PID/stack</code></td></tr>
+<tr><td><code>rcu_sched self-detected stall</code></td><td>No quiescent state</td><td>A loop or deadlock (<a href="lx-12-rcu-atomics.html">ch. 14</a>)</td></tr>
+<tr><td><code>possible circular locking dependency</code></td><td>Lockdep found an AB-BA</td><td>Both lock sites it prints</td></tr>
+<tr><td><code>Kernel panic - not syncing</code></td><td>Unrecoverable</td><td>The line above the panic</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* POISON PATTERNS - a faulting address that is one of these
+   tells you immediately what kind of bug it is: */
+
+   0x6b6b6b6b6b6b6b6b   SLAB_POISON: freed memory, reused
+   0xa5a5a5a5a5a5a5a5   uninitialised slab memory
+   0x5a5a5a5a5a5a5a5a   uninitialised
+   0xdead000000000100   LIST_POISON1 - a list_head that was
+                        deleted, then used
+   0xdead000000000122   LIST_POISON2
+   0xffffffffffffffff   often an ERR_PTR treated as a pointer
+
+/* "Unable to handle kernel paging request at dead000000000100"
+   means: you used a list entry after list_del(). That is a
+   complete diagnosis from the address alone.              */</code></pre>
+
+<h2 id="options">The config options that do the work</h2>
+
+<p>Most kernel bugs can be made to announce themselves at the moment they occur rather than crashing later somewhere unrelated. That is what these configuration options do, and turning them on during development is the highest-value habit in this chapter.</p>
+
+<pre><code># A bug that KASAN catches at the moment it happens is a
+# ten-minute fix. The same bug found by its downstream crash
+# is a week. Enable these in every development build.
+
+CONFIG_KASAN=y                  # use-after-free, OOB access
+CONFIG_KASAN_INLINE=y           # faster instrumentation
+CONFIG_KFENCE=y                 # cheap sampling version,
+                                # usable in production
+CONFIG_UBSAN=y                  # shifts, overflow, alignment
+CONFIG_DEBUG_KMEMLEAK=y         # unreferenced allocations
+CONFIG_PROVE_LOCKING=y          # lockdep
+CONFIG_DEBUG_ATOMIC_SLEEP=y     # sleeping in atomic
+CONFIG_DEBUG_LIST=y             # corrupted list_head
+CONFIG_DEBUG_OBJECTS=y          # misused timers, work items
+CONFIG_DEBUG_OBJECTS_TIMERS=y
+CONFIG_DMA_API_DEBUG=y          # DMA misuse (chapter 30)
+CONFIG_DEBUG_SG=y               # scatterlist misuse
+CONFIG_DETECT_HUNG_TASK=y
+CONFIG_PANIC_ON_OOPS=y          # fail loudly, do not limp on
+CONFIG_DEBUG_INFO_DWARF5=y      # symbols for gdb/addr2line
+CONFIG_GDB_SCRIPTS=y
+CONFIG_MAGIC_SYSRQ=y
+CONFIG_FTRACE=y
+CONFIG_FUNCTION_GRAPH_TRACER=y
+CONFIG_DYNAMIC_DEBUG=y
+
+# A KASAN report is the best diagnostic in the kernel: it
+# gives you the bad access, the allocation site, AND the free
+# site, each with a full backtrace.
+
+  BUG: KASAN: use-after-free in mydev_read+0x120/0x2a0 [mydev]
+  Read of size 4 at addr ffff0000c1234018 by task mytest/431
+  Allocated by task 430:
+   mydev_probe+0x88/0x400 [mydev]
+  Freed by task 431:
+   mydev_release+0x40/0x80 [mydev]
+   ^^^ there is your bug, in three lines</code></pre>
+
+<h2 id="ftrace">ftrace</h2>
+
+<p>ftrace is the kernel's built-in tracer, and it is remarkably powerful for something that needs no extra tooling: it can show every function called, how long each took, and who called whom, on a running system.</p>
+
+<pre><code># Mounted at /sys/kernel/tracing (or debug/tracing).
+
+# --- WHICH FUNCTIONS RUN, and how long ---
+    cd /sys/kernel/tracing
+    echo function_graph > current_tracer
+    echo 'mydev_*'      > set_ftrace_filter
+    echo 1 > tracing_on
+    ... run the thing ...
+    echo 0 > tracing_on
+    cat trace
+
+  2)               |  mydev_read() {
+  2)   0.520 us    |    mydev_rd();
+  2) + 15.240 us   |    wait_event_interruptible();
+  2)   1.100 us    |    copy_to_user();
+  2) + 18.140 us   |  }
+
+# The durations are real. This is a profiler you did not have
+# to instrument.
+
+# --- WHO CALLS THIS FUNCTION ---
+    echo 1 > options/func_stack_trace
+    echo mydev_reset > set_ftrace_filter
+    echo function > current_tracer
+    cat trace         # every call, with a full backtrace
+
+# --- EVENTS, cheaper and structured ---
+    echo 1 > events/irq/enable
+    echo 1 > events/sched/sched_switch/enable
+    echo 1 > events/regmap/enable
+    cat trace_pipe                     # live stream
+
+# --- LATENCY: find the longest critical section ---
+    echo preemptirqsoff > current_tracer
+    echo 0 > tracing_max_latency
+    ... run the load ...
+    cat trace     # a backtrace of the WORST offender
+
+# --- KPROBES: trace a function without recompiling ---
+    echo 'p:myprobe mydev_read dev=%x0 count=%x2' \
+         > kprobe_events
+    echo 1 > events/kprobes/myprobe/enable
+    cat trace_pipe
+
+# --- trace-cmd, which is much nicer than the raw files ---
+    trace-cmd record -p function_graph -l 'mydev_*' -- sleep 5
+    trace-cmd report
+    kernelshark                        # graphical
+
+# --- A ONE-SHOT SNAPSHOT from inside your driver ---
+    trace_printk("state=%d count=%d\n", state, count);
+# Writes into the ftrace ring buffer, orders of magnitude
+# faster than printk, and never blocks. Ideal in a hot path or
+# an interrupt handler. Remove them before submitting - the
+# kernel prints a banner warning if any remain.</code></pre>
+
+<h2 id="gdb">A real debugger</h2>
+
+<p>You can attach a real source-level debugger to a running kernel — set breakpoints, inspect structures, step through code — provided you are running under an emulator or have hardware debug access. It is far easier than most people expect.</p>
+
+<pre><code># --- QEMU: the easy case (chapter 18) ---
+    qemu-system-aarch64 ... -s -S
+    # in another terminal:
+    aarch64-linux-gnu-gdb vmlinux
+    (gdb) target remote :1234
+    (gdb) hbreak start_kernel
+    (gdb) continue
+
+# --- Debugging a MODULE: gdb needs to know where it landed ---
+    # on the target:
+    cat /sys/module/mydev/sections/.text
+      0xffff800008a00000
+    # in gdb:
+    (gdb) add-symbol-file mydev.ko 0xffff800008a00000
+    (gdb) break mydev_read
+    (gdb) continue
+
+# --- The kernel's own gdb helpers (CONFIG_GDB_SCRIPTS) ---
+    (gdb) lx-dmesg              # the kernel log
+    (gdb) lx-lsmod              # loaded modules
+    (gdb) lx-ps                 # every task
+    (gdb) lx-symbols            # AUTO-loads module symbols
+    (gdb) lx-device-tree        # the DT
+    (gdb) lx-iomem
+# lx-symbols alone justifies enabling the option.
+
+# --- KGDB on real hardware, over serial ---
+    # kernel cmdline:
+    kgdboc=ttyS0,115200 kgdbwait
+    # the kernel waits for a debugger at boot
+    (gdb) target remote /dev/ttyUSB0
+    # or break in at any time:
+    echo g > /proc/sysrq-trigger
+
+# --- crash, for post-mortem on a dump ---
+    crash vmlinux vmcore
+    crash> bt                   # backtrace
+    crash> ps
+    crash> log
+    crash> struct mydev ffff0000c1234000
+
+# CAPTURING a dump needs kdump/kexec configured in advance -
+# set it up before you need it, not after.</code></pre>
+
+<h2 id="sysrq">SysRq: when the system is nearly dead</h2>
+
+<p>When a machine is too far gone to run commands but has not fully stopped, there is a back door directly into the kernel that still works. It can print what every task is stuck on, which frequently identifies a hang that nothing else could.</p>
+
+<pre><code># Over serial: send a BREAK, then the letter.
+# From a shell: echo &lt;letter&gt; > /proc/sysrq-trigger
+
+    l   backtrace of ALL CPUs         &lt;-- for a hang
+    w   backtrace of all BLOCKED tasks &lt;-- for D states
+    t   backtrace of every task
+    m   memory statistics
+    d   show all locks held            &lt;-- for a deadlock
+    p   registers
+    c   crash deliberately (to trigger kdump)
+    g   enter kgdb
+    9   set loglevel to maximum
+    s   sync disks
+    u   remount read-only
+    b   reboot immediately
+
+# THE SEQUENCE FOR A HANG YOU CANNOT LOG INTO:
+    &lt;break&gt;l      # what is every CPU doing?
+    &lt;break&gt;w      # what is blocked?
+    &lt;break&gt;d      # who holds what?
+# Those three usually identify the culprit without any other
+# tooling, and they work when nothing else does.
+
+# Enable it: CONFIG_MAGIC_SYSRQ=y and
+    echo 1 > /proc/sys/kernel/sysrq</code></pre>
+
+<h2 id="method">A method</h2>
+
+<p>Tools matter less than order. Debugging a kernel problem efficiently is mostly a matter of asking the cheapest question that eliminates the most possibilities, rather than reaching for a debugger first.</p>
+
+<pre class="diagram">   1. MAKE IT REPRODUCE. A bug you can trigger on demand is
+      most of the way solved. Script it.
+
+   2. TURN ON THE DEBUG OPTIONS and reproduce again. KASAN,
+      lockdep and DMA_API_DEBUG frequently name the bug
+      outright, and you have just skipped steps 3-6.
+
+   3. READ THE WHOLE MESSAGE. The first line, the ESR, the
+      offset, the taint flags, the poison pattern. Most oopses
+      contain more diagnosis than people extract.
+
+   4. LOCALISE IN TIME. Was it always broken, or did it start?
+      git bisect on the kernel, or on your driver.
+
+   5. LOCALISE IN CODE. ftrace function_graph on your module
+      shows exactly which function last ran.
+
+   6. INSTRUMENT. trace_printk or a trace event around the
+      suspect region. Cheap, fast, and safe in atomic context.
+
+   7. CHANGE ONE THING. Then check. Never two.
+
+   8. UNDERSTAND WHY IT WORKED. A fix you cannot explain is a
+      timing change that moved the bug somewhere else - which
+      is the most expensive kind of "fix" there is.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Approach</th></tr></thead>
+<tbody>
+<tr><td>Reproducible oops</td><td><code>decode_stacktrace.sh</code>, then read the offset</td></tr>
+<tr><td>Crash far from the cause</td><td>KASAN — it reports at the moment of the bad access</td></tr>
+<tr><td>Memory grows over time</td><td>kmemleak, <code>slabtop</code></td></tr>
+<tr><td>Intermittent corruption</td><td>KASAN plus <code>slub_debug=FZPU</code></td></tr>
+<tr><td>Hang with no output</td><td>SysRq <code>l</code>, <code>w</code>, <code>d</code></td></tr>
+<tr><td>Process stuck in D</td><td><code>/proc/PID/stack</code></td></tr>
+<tr><td>Deadlock</td><td>lockdep — it usually reports before the deadlock happens</td></tr>
+<tr><td>Latency spike</td><td><code>preemptirqsoff</code> tracer</td></tr>
+<tr><td>Works, but slowly</td><td><code>function_graph</code> with durations, or <code>perf</code></td></tr>
+<tr><td>Boot hang</td><td><code>initcall_debug</code>, <code>earlycon</code> (<a href="lx-03-boot-flow.html">ch. 04</a>)</td></tr>
+<tr><td>Regression after an upgrade</td><td><code>git bisect</code> on the kernel</td></tr>
+<tr><td>Only on production hardware</td><td>kdump, or serial logging with <code>keep_bootcon</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Read an oops and name the faulting function, offset and call path.</li>
+  <li>Turn a function+offset into a source line, three different ways.</li>
+  <li>Use a NULL-plus-offset fault and <code>pahole</code> to name the struct member.</li>
+  <li>Recognise five poison patterns and say what each implies.</li>
+  <li>List ten debug config options and what each catches.</li>
+  <li>Read a KASAN report and identify the allocation and free sites.</li>
+  <li>Use <code>function_graph</code> to profile your driver's entry points.</li>
+  <li>Add a kprobe to a function you did not compile in.</li>
+  <li>Attach gdb to a module and set a breakpoint in it.</li>
+  <li>Diagnose a hang using only SysRq.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel concurrency: choosing a lock | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Kernel concurrency: choosing a lock</h1>
+<p class="lead">The kernel gives you a dozen synchronisation primitives. Choosing correctly is nearly
+mechanical once you can answer two questions — <em>can this context sleep?</em> and <em>who else touches
+this data?</em> — and getting it wrong produces the hardest bugs you will ever chase.</p>
+
+<h2 id="decide">The decision, as a flowchart</h2>
+
+<p>Choosing a lock in the kernel is not a matter of preference; the wrong choice is a deadlock or a crash, not merely slower code. Fortunately the decision reduces to a small number of questions with definite answers, which is what this flowchart captures.</p>
+
+<pre class="diagram">  What am I protecting?
+      |
+      +-- a single integer or flag, no other invariant
+      |      -&gt; ATOMIC operations. No lock at all.
+      |
+      +-- data read constantly, written rarely, and readers
+      |   can tolerate seeing the old version briefly
+      |      -&gt; RCU (chapter 14)
+      |
+      +-- anything else: I need a lock.
+             |
+             v
+      Is the data ever touched from an INTERRUPT handler?
+             |
+      +------+------+
+      |             |
+     YES           NO
+      |             |
+      |             +-- Can every accessor SLEEP?
+      |             |      (process context, no atomic ctx)
+      |             |         |
+      |             |    +----+----+
+      |             |   YES       NO
+      |             |    |         |
+      |             |  MUTEX    SPINLOCK
+      |             |    |
+      |             |    +-- and if readers vastly outnumber
+      |             |        writers: rw_semaphore
+      |             |
+      v
+   spin_lock_irqsave() in process context
+   spin_lock()        inside the handler itself
+
+  A MUTEX MAY NEVER BE TAKEN IN INTERRUPT CONTEXT. Not
+  "should not" - the machine will deadlock or oops.</pre>
+
+<h2 id="mutex">Mutexes</h2>
+
+<p>Start here. A mutex is the right answer for the large majority of driver code, and the reason is simple: if the holder needs to wait for anything at all — memory, hardware, a bus transaction — a mutex is the only option that permits it.</p>
+
+<pre><code>#include &lt;linux/mutex.h&gt;
+
+        DEFINE_MUTEX(my_mutex);            /* static */
+        mutex_init(&amp;d-&gt;lock);              /* dynamic */
+
+        mutex_lock(&amp;d-&gt;lock);
+        ... critical section ...
+        mutex_unlock(&amp;d-&gt;lock);
+
+        /* interruptible - the caller can be Ctrl-C'd while
+           waiting. Use this in syscall paths.              */
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;
+
+        /* try, do not wait */
+        if (!mutex_trylock(&amp;d-&gt;lock))
+                return -EBUSY;
+
+/* PROPERTIES:
+     · the waiter SLEEPS - so the CPU does other work
+     · only in process context
+     · you MAY sleep while holding one (kmalloc(GFP_KERNEL),
+       copy_to_user, another mutex) - which is the main reason
+       to prefer it
+     · strictly one owner; must be released by the same task
+       that took it
+     · optimistically spins briefly if the owner is running on
+       another CPU, so short holds are not as expensive as
+       "it sleeps" suggests
+
+   USE A MUTEX BY DEFAULT in process-context driver code. It is
+   the right answer far more often than a spinlock, and code
+   under it is far easier to write correctly.               */
+
+/* THE SCOPED FORM, newer and worth adopting - it releases
+   automatically on every exit path, including returns and
+   gotos:                                                    */
+        scoped_guard(mutex, &amp;d-&gt;lock) {
+                ...
+        }
+        /* or for a whole function: */
+        guard(mutex)(&amp;d-&gt;lock);</code></pre>
+
+<h2 id="spin">Spinlocks</h2>
+
+<p>A spinlock does not sleep; it spins, burning CPU until the lock is free. That sounds strictly worse, and usually is — but it is the only kind of lock usable in the places where sleeping is forbidden, which is exactly where interrupt handlers live.</p>
+
+<pre><code>#include &lt;linux/spinlock.h&gt;
+
+        DEFINE_SPINLOCK(my_lock);
+        spin_lock_init(&amp;d-&gt;lock);
+
+/* THE THREE FORMS, and choosing between them is the whole
+   difficulty:                                              */
+
+/* 1. Data touched ONLY in process context (but in an atomic
+      section, so a mutex is not allowed):                  */
+        spin_lock(&amp;d-&gt;lock);
+        ...
+        spin_unlock(&amp;d-&gt;lock);
+
+/* 2. Data ALSO touched by a SOFTIRQ/tasklet: */
+        spin_lock_bh(&amp;d-&gt;lock);
+        ...
+        spin_unlock_bh(&amp;d-&gt;lock);
+
+/* 3. Data ALSO touched by a HARDWARE INTERRUPT handler: */
+        unsigned long flags;
+
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        ...
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+/* WHY THE _irqsave VARIANT EXISTS - the classic self-deadlock:
+
+     process context:  spin_lock(&d->lock);
+                       ... interrupt arrives on THIS CPU ...
+     handler:          spin_lock(&d->lock);   /* spins    */
+                       /* waiting for a lock held by the
+                          code it interrupted, which cannot
+                          continue until the handler returns */
+                       DEADLOCK, this CPU, forever.
+
+   Disabling local interrupts while holding the lock makes it
+   impossible. Note it only needs to disable them LOCALLY -
+   another CPU's handler spinning is fine, because the holder
+   is still making progress.
+
+/* INSIDE the interrupt handler itself, plain spin_lock() is
+   correct - interrupts are already off for that line.      */
+
+/* THE RULES while holding a spinlock:
+     · MAY NOT SLEEP. Not kmalloc(GFP_KERNEL), not
+       copy_to_user, not mutex_lock, not msleep.
+     · keep it SHORT - microseconds. Every other CPU wanting
+       it is burning cycles, and on PREEMPT_RT your section is
+       a latency bound (chapter 11).
+     · no unbounded loops, no MMIO polling.
+
+   `flags` MUST be a local variable. Sharing one between
+   CPUs is a subtle, devastating bug.                       */</code></pre>
+
+<div class="key">
+<b>The rule that prevents most spinlock bugs</b>
+<p>Ask: <em>what is the highest-priority context that touches this data?</em> Then use the form that
+protects against it, in <strong>every</strong> place the data is touched. Protecting a structure with
+<code>spin_lock_irqsave</code> in one function and plain <code>spin_lock</code> in another gives you no
+protection at all — and it will work perfectly until the interrupt happens to land at the wrong
+microsecond, in the field, months later.</p>
+</div>
+
+<h2 id="atomic">Atomics: no lock at all</h2>
+
+<p>If all you are protecting is a single counter or flag, a lock is more machinery than the job needs. Atomic operations give you an indivisible read-modify-write with no lock at all, and the hardware guarantees nobody can observe a half-finished update.</p>
+
+<pre><code>#include &lt;linux/atomic.h&gt;
+
+        atomic_t counter = ATOMIC_INIT(0);
+
+        atomic_inc(&amp;counter);
+        atomic_dec(&amp;counter);
+        atomic_add(5, &amp;counter);
+        val = atomic_read(&amp;counter);
+        atomic_set(&amp;counter, 0);
+
+        /* the ones that RETURN, and are the useful ones: */
+        if (atomic_dec_and_test(&amp;refcount))
+                free_it();                  /* hit zero */
+        old = atomic_cmpxchg(&amp;v, expected, new);
+        old = atomic_xchg(&amp;v, new);
+        if (atomic_add_unless(&amp;v, 1, 0))    /* unless it is 0 */
+                ...
+
+        atomic64_t for 64-bit.
+
+/* BIT OPERATIONS, also atomic: */
+        set_bit(FLAG_BUSY, &amp;d-&gt;flags);
+        clear_bit(FLAG_BUSY, &amp;d-&gt;flags);
+        if (test_and_set_bit(FLAG_BUSY, &amp;d-&gt;flags))
+                return -EBUSY;              /* was already set */
+        if (test_bit(FLAG_BUSY, &amp;d-&gt;flags))
+                ...
+        /* __set_bit etc. are the NON-atomic versions - faster,
+           and only safe under an existing lock                */
+
+/* REFERENCE COUNTS - use the dedicated type, not atomic_t: */
+        refcount_t ref;
+        refcount_set(&amp;ref, 1);
+        refcount_inc(&amp;ref);
+        if (refcount_dec_and_test(&amp;ref))
+                free_it();
+/* refcount_t detects overflow and use-after-free (increment
+   from zero) and WARNs, where atomic_t silently wraps. That
+   difference has closed real CVEs.                          */
+
+/* THE LIMIT OF ATOMICS: they protect ONE variable. If your
+   invariant spans two - "count matches the number of list
+   entries" - atomics give you nothing. You need a lock.   */</code></pre>
+
+<h2 id="rw">Reader/writer locks</h2>
+
+<p>When a structure is read constantly and written rarely, an ordinary lock forces readers to queue behind each other for no benefit. These variants let readers proceed together — though as the section notes, they are less often the right answer than they first appear.</p>
+
+<pre><code>/* rw_semaphore - sleeping, many readers or one writer: */
+        DECLARE_RWSEM(my_rwsem);
+
+        down_read(&amp;my_rwsem);   ... up_read(&amp;my_rwsem);
+        down_write(&amp;my_rwsem);  ... up_write(&amp;my_rwsem);
+
+/* rwlock_t - the spinning version: */
+        read_lock(&amp;lock);   ... read_unlock(&amp;lock);
+        write_lock(&amp;lock);  ... write_unlock(&amp;lock);
+
+/* USE THESE SPARINGLY. They are slower than a plain lock in
+   the uncontended case, the cacheline still bounces between
+   readers, and writers can starve.
+
+   The kernel's general advice: if you think you want a
+   reader/writer lock, you probably want RCU (chapter 14) or
+   just a plain mutex. rwlock_t in particular is discouraged in
+   new code and is being removed from many subsystems.
+
+   THE EXCEPTION where rw_semaphore genuinely fits: readers
+   that hold the lock for a LONG time (walking a large
+   structure, doing I/O), where the parallelism is real.   */
+
+/* seqlock - writers never block, readers retry: */
+        unsigned seq;
+        do {
+                seq = read_seqbegin(&amp;d-&gt;sl);
+                a = d-&gt;value_a;
+                b = d-&gt;value_b;
+        } while (read_seqretry(&amp;d-&gt;sl, seq));
+
+        write_seqlock(&amp;d-&gt;sl);
+        d-&gt;value_a = x;  d-&gt;value_b = y;
+        write_sequnlock(&amp;d-&gt;sl);
+
+/* Perfect for a few values updated by a writer that must not
+   be delayed - timekeeping uses it. READERS MUST BE PURE:
+   they may run several times and see torn intermediate state,
+   so they must not have side effects or dereference pointers
+   read inside the section without care.                    */</code></pre>
+
+<h2 id="deadlock">Deadlock, and how the kernel finds it for you</h2>
+
+<p>Deadlocks are notoriously hard to reproduce: the machine simply stops, usually only under load, and only sometimes. The kernel therefore ships a checker that watches every lock acquisition and reports a dangerous ordering the <em>first</em> time it sees it, long before it ever deadlocks in practice.</p>
+
+<pre><code>/* THE FOUR CLASSIC WAYS:
+
+   1. AB-BA. Thread 1 takes A then B; thread 2 takes B then A.
+   2. Self-deadlock. Taking a non-recursive lock twice.
+   3. Interrupt inversion. The spin_lock case above.
+   4. Sleeping while holding a spinlock, then something else
+      needs that lock to make progress.
+
+   THE FIX FOR (1) IS ALWAYS THE SAME: define a global LOCK
+   ORDER and document it at the top of the file.            */
+
+/*
+ * Locking order:
+ *      dev->config_mutex
+ *        -> dev->queue_lock
+ *          -> chan->lock
+ * Never acquire in the reverse direction.
+ */
+
+/* AND THEN LET LOCKDEP CHECK IT: */
+        CONFIG_PROVE_LOCKING=y
+        CONFIG_DEBUG_ATOMIC_SLEEP=y
+        CONFIG_DEBUG_SPINLOCK=y
+        CONFIG_DEBUG_MUTEXES=y
+
+/* Lockdep builds a graph of every lock ordering it has ever
+   observed, and reports a POTENTIAL deadlock the first time it
+   sees an inconsistent order - even if the deadlock did not
+   actually happen. It also catches:
+        · sleeping in atomic context
+        · taking an IRQ-unsafe lock from IRQ context
+        · a lock taken and never released
+        · recursive acquisition
+
+   The report looks like:
+
+     ======================================================
+     WARNING: possible circular locking dependency detected
+     ------------------------------------------------------
+     kworker/0:1/23 is trying to acquire lock:
+      (&d->queue_lock){+.+.} at: my_queue_work+0x40
+     but task is already holding lock:
+      (&chan->lock){+.+.} at: my_chan_start+0x28
+     which lock already depends on the new lock.
+
+   It names both locks, both call sites, and the order it
+   expected. It is the single most valuable debugging feature
+   in the kernel for concurrency, and it finds bugs your
+   testing never will. ENABLE IT IN DEVELOPMENT, ALWAYS.  */</code></pre>
+
+<h2 id="less">Not needing a lock</h2>
+
+<p>The best-performing lock is the one you never take. Several common patterns remove the need for locking entirely by changing how the data is arranged rather than by protecting it better.</p>
+
+<pre><code>/* The best lock is the one you removed. In order of
+   preference: */
+
+/* 1. DON'T SHARE. Per-CPU data needs no lock against other
+      CPUs - only against interrupts on the same one:      */
+        DEFINE_PER_CPU(struct my_stats, my_stats);
+
+        struct my_stats *s = get_cpu_ptr(&amp;my_stats);
+        s-&gt;count++;
+        put_cpu_ptr(&amp;my_stats);         /* re-enables
+                                           preemption      */
+        /* or, if only ever from one context: */
+        this_cpu_inc(my_stats.count);
+
+/* 2. IMMUTABLE DATA needs no lock. Set it up in probe, never
+      change it, and readers are free.
+
+/* 3. OWNERSHIP TRANSFER. A single-producer, single-consumer
+      ring needs no lock, only barriers - and kfifo does it
+      for you:                                             */
+        DECLARE_KFIFO(fifo, struct event, 128);
+        kfifo_put(&amp;fifo, ev);           /* producer */
+        kfifo_get(&amp;fifo, &amp;ev);          /* consumer */
+
+/* 4. A SMALLER CRITICAL SECTION. Compute outside, mutate
+      inside:                                              */
+        val = expensive_computation(input);     /* no lock */
+        spin_lock(&amp;d-&gt;lock);
+        d-&gt;result = val;                        /* tiny    */
+        spin_unlock(&amp;d-&gt;lock);
+
+/* 5. RCU, for read-mostly data (chapter 14).             */</code></pre>
+
+<h2 id="table">The reference table</h2>
+
+<p>This is the chapter compressed to the two questions that actually decide which primitive is correct: can
+the code holding this lock ever sleep, and can this same data be touched from interrupt context — get either
+answer wrong and the choice below is not just suboptimal, it is a deadlock or a corruption bug waiting for the
+right timing.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Primitive</th><th>Sleeps</th><th>IRQ context</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>mutex</code></td><td>Yes</td><td>No</td><td><strong>The default</strong> in process context</td></tr>
+<tr><td><code>spinlock_t</code></td><td>No</td><td>Yes</td><td>Short sections; data shared with interrupts</td></tr>
+<tr><td><code>atomic_t</code></td><td>No</td><td>Yes</td><td>A single counter or flag</td></tr>
+<tr><td><code>refcount_t</code></td><td>No</td><td>Yes</td><td>Object lifetimes</td></tr>
+<tr><td><code>rw_semaphore</code></td><td>Yes</td><td>No</td><td>Long reads, rare writes</td></tr>
+<tr><td><code>seqlock_t</code></td><td>No (readers)</td><td>Careful</td><td>A few values, writer must not block</td></tr>
+<tr><td><code>completion</code></td><td>Yes</td><td>Signal from IRQ</td><td>"Wait until this finishes"</td></tr>
+<tr><td><code>semaphore</code></td><td>Yes</td><td>No</td><td>Counting resources. Rare — usually a mutex is meant</td></tr>
+<tr><td>RCU</td><td>No (readers)</td><td>Yes</td><td>Read-mostly pointers and lists</td></tr>
+<tr><td>per-CPU</td><td>—</td><td>—</td><td>Statistics, caches</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* COMPLETION - the "wait for the hardware" primitive, and the
+   one drivers use constantly: */
+
+        struct completion done;
+        init_completion(&amp;done);
+
+        /* start the operation, then: */
+        if (!wait_for_completion_timeout(&amp;done,
+                                         msecs_to_jiffies(100)))
+                return -ETIMEDOUT;
+
+        /* in the interrupt handler: */
+        complete(&amp;done);
+
+/* Always use the _timeout or _interruptible_timeout form.
+   wait_for_completion() with no bound is how a driver hangs a
+   process in D state forever when the hardware misbehaves
+   (chapter 10).                                            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>One CPU hangs, others fine</td><td>Spinlock self-deadlock — a handler took a lock the interrupted code holds</td></tr>
+<tr><td>Whole system freezes</td><td>AB-BA deadlock, or a spinlock held while sleeping</td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code></td><td>Slept while holding a spinlock</td></tr>
+<tr><td>Lockdep "possible circular locking dependency"</td><td>Inconsistent lock order — a real bug even if it never triggered</td></tr>
+<tr><td>Rare corruption under load</td><td>Missing lock, or inconsistent variants of the same lock</td></tr>
+<tr><td>Counter drifts from reality</td><td>Non-atomic read-modify-write</td></tr>
+<tr><td>Works on one CPU, fails on SMP</td><td>It was always racy; single-CPU just hid it</td></tr>
+<tr><td>Use-after-free on an object</td><td>Refcount race — use <code>refcount_t</code>, which would have warned</td></tr>
+<tr><td>Soft lockup, "CPU stuck for 22s"</td><td>Spinning too long, or a spinlock never released</td></tr>
+<tr><td>Latency spikes on PREEMPT_RT</td><td>Long spinlock sections that were merely rude before</td></tr>
+<tr><td>Process in D state forever</td><td>Unbounded <code>wait_for_completion()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Walk the decision flowchart for four different data structures.</li>
+  <li>Explain why a mutex may never be taken in interrupt context.</li>
+  <li>Explain the spinlock self-deadlock and why <code>irqsave</code> only disables local interrupts.</li>
+  <li>Say why using different spinlock variants on the same data gives no protection.</li>
+  <li>Explain when atomics are enough and when they are not.</li>
+  <li>Say why <code>refcount_t</code> is preferred over <code>atomic_t</code> for lifetimes.</li>
+  <li>Explain what a seqlock requires of its readers.</li>
+  <li>Name the four classic deadlocks and the universal fix for AB-BA.</li>
+  <li>Enable lockdep and read one of its reports.</li>
+  <li>Give five ways to avoid needing a lock at all.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

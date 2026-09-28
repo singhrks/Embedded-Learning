@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asynchronous models: events, coroutines, async/await | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Asynchronous models: events, coroutines, async/await</h1>
+<p class="lead">A thread blocked on a socket costs a megabyte of stack and a scheduler slot to do nothing.
+Asynchronous models remove that cost by making waiting explicit — and charge you in a different currency:
+your code turns inside out, and the function colour problem arrives.</p>
+
+<h2 id="why">The problem with a thread per connection</h2>
+
+<p>Threads are an expensive way to wait. When a program's concurrency is dominated by waiting for I/O rather than by computation, a different model handles far more concurrent operations with far fewer threads.</p>
+
+<pre class="diagram">   10,000 concurrent connections, one thread each:
+
+     10,000 x 8 MB reserved stack   = 80 GB of address space
+     10,000 kernel task structures
+     a run queue the scheduler must reason about
+     context switches whenever any of them wakes
+
+   Most of those threads are doing NOTHING - waiting for a
+   packet. The work is tiny; the waiting is everything.
+
+   THE ASYNC ALTERNATIVE
+
+     one thread (or a few), and a readiness list:
+
+       for (;;) {
+               events = wait_for_readiness(all_fds);
+               for (e : events)
+                       handle(e);      /* never blocks */
+       }
+
+     10,000 connections =  ~10,000 small state objects,
+     a few hundred bytes each, and one thread.
+
+   THE TRADE
+
+     you may NEVER BLOCK inside a handler. One blocking call -
+     a DNS lookup, a disk read, a mutex - stalls every other
+     connection on that thread. In a threaded model it stalls
+     only itself.
+
+     That single rule is what makes async both fast and
+     hostile to write.</pre>
+
+<h2 id="readiness">Readiness versus completion</h2>
+
+<p>Two fundamentally different models for asynchronous I/O, and the distinction determines the shape of your whole program. One tells you when you <em>may</em> act; the other tells you when the work is already done.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Readiness (<code>epoll</code>, <code>kqueue</code>)</th><th>Completion (<code>io_uring</code>,
+IOCP)</th></tr></thead>
+<tbody>
+<tr><td>Kernel tells you</td><td>"you can read now"</td><td>"your read is done, here is the data"</td></tr>
+<tr><td>You then</td><td>Call <code>read()</code>, which returns immediately</td><td>Nothing — the buffer is
+already filled</td></tr>
+<tr><td>Syscalls per operation</td><td>Two: wait, then read</td><td>Can be zero — submit and reap in
+batches</td></tr>
+<tr><td>Buffers</td><td>Allocated when the data arrives</td><td>Must be committed <em>before</em>, and pinned
+until completion</td></tr>
+<tr><td>Regular files</td><td><strong>Does not work</strong> — a file is always "ready", so
+<code>read()</code> blocks anyway</td><td>Works properly</td></tr>
+<tr><td>Where</td><td>Linux, BSD, macOS</td><td>Windows (IOCP) since the 1990s, Linux
+(<code>io_uring</code>) since 5.1</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The readiness loop, which is what most async runtimes wrap. */
+
+int ep = epoll_create1(0);
+
+struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLET,     /* edge-triggered     */
+        .data.ptr = conn,
+};
+epoll_ctl(ep, EPOLL_CTL_ADD, conn-&gt;fd, &amp;ev);
+
+for (;;) {
+        struct epoll_event out[64];
+        int n = epoll_wait(ep, out, 64, -1);
+        for (int i = 0; i &lt; n; i++)
+                handle(out[i].data.ptr);
+}
+
+/* LEVEL vs EDGE triggered - the classic epoll bug:
+
+     LEVEL (default): reports while data remains. Forgiving.
+     EDGE  (EPOLLET): reports only on a CHANGE. Fewer wake-ups,
+                      and you MUST read until EAGAIN or you
+                      will never be told again - the connection
+                      simply goes silent and stays silent.
+
+   With EPOLLET the loop is:
+        while ((n = read(fd, buf, sizeof buf)) &gt; 0) consume();
+        if (n &lt; 0 &amp;&amp; errno != EAGAIN) error();
+
+   Forget the loop and you get a hang that appears only when a
+   message spans two reads.                                  */</code></pre>
+
+<h2 id="callbacks">Callbacks, and why they became coroutines</h2>
+
+<p>The traditional way to express "do this when that finishes" nests badly and scatters related logic. Knowing why is what motivates the alternatives that followed.</p>
+
+<pre><code>/* CALLBACK STYLE - the control flow is inside out. */
+
+read_async(sock, buf, [](int n) {
+        parse_async(buf, n, [](Request r) {
+                db_query_async(r, [](Row row) {
+                        render_async(row, [](string html) {
+                                write_async(sock, html, [](int) {
+                                        /* five levels deep, and
+                                           now try adding error
+                                           handling to each   */
+                                });
+                        });
+                });
+        });
+});
+
+/* PROBLEMS
+     * error handling at every level, or errors vanish
+     * no try/catch, no RAII scope - the stack is gone by the
+       time the callback runs
+     * lifetimes are manual: who owns `buf` across five
+       callbacks? Use-after-free is the default outcome
+     * a loop becomes a recursive callback chain
+     * debugging: the stack trace shows the event loop, not
+       how you got there                                     */
+
+
+/* ASYNC/AWAIT - the same machine, written as straight code. */
+
+async Task&lt;void&gt; serve(Socket sock) {
+        try {
+                auto n    = co_await read_async(sock, buf);
+                auto req  = parse(buf, n);
+                auto row  = co_await db_query_async(req);
+                auto html = render(row);
+                co_await write_async(sock, html);
+        } catch (const IoError &amp;e) {          /* works again    */
+                log(e);
+        }
+}   /* destructors run. RAII works. Loops are loops. */
+
+/* WHAT THE COMPILER DOES: splits the function at every await
+   into a state machine, and heap-allocates the locals that
+   live across a suspension point. `co_await` is "return to
+   the caller, and resume here when the awaited thing
+   completes".                                              */</code></pre>
+
+<div class="key">
+<b>Stackless versus stackful</b>
+<p><strong>Stackless</strong> coroutines (C++20, Rust, C#, JavaScript) store only the variables that survive
+a suspension — tens of bytes, and the compiler computes the size. You can only suspend inside a coroutine,
+which is why <code>await</code> is contagious. <strong>Stackful</strong> coroutines and goroutines get a real
+(growable) stack, so any function can yield — no colouring — at the cost of kilobytes each and a runtime that
+manages stacks. Go chose stackful; almost everyone else chose stackless.</p>
+</div>
+
+<h2 id="colour">The function colour problem</h2>
+
+<p>Asynchronous functions tend to infect their callers, so that one async call at the bottom forces every function above it to become async too. That property has real design consequences and is worth naming explicitly.</p>
+
+<pre><code>/* An async function can only be awaited from an async
+   function. So async spreads up the call graph until it
+   reaches main.                                            */
+
+        int compute(int x);                    /* "red"  - sync */
+        async Task&lt;int&gt; fetch(int x);          /* "blue" - async */
+
+        /* calling fetch from compute: impossible without
+           blocking, which defeats the purpose             */
+
+/* CONSEQUENCES
+
+   1. TWO ECOSYSTEMS. Rust has `Read` and `AsyncRead`,
+      `Mutex` and `tokio::Mutex`. Python has requests and
+      aiohttp. Libraries get written twice.
+
+   2. THE BRIDGE IS DANGEROUS. block_on() from inside an async
+      context deadlocks the executor - the thread that would
+      run the future is the one blocked waiting for it.
+
+   3. sleep() IS A BUG. std::thread::sleep in an async task
+      blocks the whole executor thread and every other task on
+      it. Every runtime ships its own: tokio::time::sleep.
+
+   4. A LOCK HELD ACROSS AN AWAIT is held for an unbounded
+      time, and in a work-stealing executor may be released
+      on a different thread than took it - which is undefined
+      for many mutex implementations.
+
+   THE RULE: never hold a std mutex across an await. Either
+   scope it so it is released first, or use the runtime's
+   async-aware mutex.                                       */
+
+        /* WRONG */
+        let g = mutex.lock().unwrap();
+        let v = fetch().await;              /* held across await */
+
+        /* RIGHT */
+        let v = fetch().await;
+        { let mut g = mutex.lock().unwrap(); *g = v; }
+
+        /* OR, when you genuinely must hold it: */
+        let mut g = async_mutex.lock().await;
+        let v = fetch().await;              /* fine: this mutex
+                                               yields properly  */</code></pre>
+
+<h2 id="choose">Choosing a model</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Concurrency ceiling</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><strong>Thread per task</strong></td><td>Thousands</td><td>Simple, CPU-bound, or moderate
+concurrency. Still the right default for most programs</td></tr>
+<tr><td><strong>Thread pool</strong></td><td>Thousands of tasks, N threads</td><td>Bounded CPU work
+(<a href="mt-17-thread-pools.html">chapter 17</a>)</td></tr>
+<tr><td><strong>Event loop + callbacks</strong></td><td>Hundreds of thousands</td><td>You have no coroutine
+support. Expect the pyramid</td></tr>
+<tr><td><strong>async/await</strong></td><td>Hundreds of thousands</td><td>High-concurrency I/O in a language
+that supports it well</td></tr>
+<tr><td><strong>Goroutines / green threads</strong></td><td>Millions</td><td>You can choose the language.
+No colouring, blocking calls are handled by the runtime</td></tr>
+<tr><td><strong>Virtual threads (Java 21)</strong></td><td>Millions</td><td>Existing blocking code, made
+scalable without rewriting it — the most interesting recent development here</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Async is for I/O concurrency, not for speed</b>
+<p>An async runtime does not make anything compute faster; it removes the cost of <em>waiting</em>. If your
+bottleneck is CPU, async adds state-machine overhead and buys nothing — you want a thread pool. If your
+bottleneck is ten thousand idle sockets, async is transformative. Diagnosing which you have, before
+rewriting, saves a great deal of regret.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>One slow request stalls every other connection</td><td>A blocking call inside a handler</td></tr>
+<tr><td>A connection goes silent and never recovers</td><td>Edge-triggered epoll without reading to
+<code>EAGAIN</code></td></tr>
+<tr><td>Deadlock calling <code>block_on</code> inside a task</td><td>Blocking the executor thread that would
+run the future</td></tr>
+<tr><td>Everything stops for exactly one second</td><td><code>thread::sleep</code> instead of the runtime's
+sleep</td></tr>
+<tr><td>Panic or UB unlocking a mutex</td><td>Held across an <code>await</code>, released on a different
+thread</td></tr>
+<tr><td>Use-after-free in a callback</td><td>A buffer whose owner returned before the callback ran</td></tr>
+<tr><td>Memory grows with connection count faster than expected</td><td>Large futures — a big local held
+across an await is stored in the state machine</td></tr>
+<tr><td>Stack traces show only the event loop</td><td>Inherent to callbacks; async/await restores useful
+traces</td></tr>
+<tr><td>Async rewrite made it slower</td><td>The workload was CPU-bound</td></tr>
+<tr><td>Works on Linux, poor on Windows</td><td>A readiness design ported to a completion-based OS</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute the address space cost of 10,000 threads and explain why async avoids it.</li>
+  <li>State the one rule an event-loop handler must never break.</li>
+  <li>Distinguish readiness from completion notification and give an OS for each.</li>
+  <li>Explain why <code>epoll</code> does not work for regular files.</li>
+  <li>Describe the edge-triggered bug and the loop that prevents it.</li>
+  <li>Give four problems with callback style that async/await fixes.</li>
+  <li>Explain stackless versus stackful coroutines and which languages chose which.</li>
+  <li>Define the function colour problem and give three consequences.</li>
+  <li>Explain why holding a standard mutex across an <code>await</code> is wrong.</li>
+  <li>Say when async is the wrong tool, and what to use instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

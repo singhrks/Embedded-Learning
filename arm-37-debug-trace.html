@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The debug and trace architecture | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The debug and trace architecture</h1>
+<p class="lead">Breakpoints appear in <a href="arm-29-esr.html">chapter 29</a> only as an exception class, and
+that undersells them considerably. Debug is a full architectural feature with its own registers, its own
+authentication rules and its own exception routing — and alongside it sits a completely separate mechanism
+that records what the processor did without stopping it at all.</p>
+
+<h2 id="two">Two kinds of debug, and the difference matters</h2>
+
+<p>Before any register, there is a distinction that determines which tools can be used and what state you can
+see. The architecture supports two debug models that are not variations on a theme — they stop the processor
+in fundamentally different ways.</p>
+
+<pre class="diagram">   SELF-HOSTED DEBUG
+        The debug event becomes an EXCEPTION, taken to an
+        exception level on the same processor, and handled by
+        software running there - a kernel, typically.
+
+        The processor never stops. The debugger is a program
+        on the machine being debugged.
+
+        THIS IS WHAT ptrace, gdbserver AND perf USE.
+        It needs a working kernel, so it cannot debug the
+        kernel's own early boot.
+
+   EXTERNAL (HALTING) DEBUG
+        The debug event puts the processor into DEBUG STATE:
+        it stops fetching instructions entirely and is driven
+        from outside, through a debug port - JTAG or SWD.
+
+        Nothing on the target executes. The debugger is
+        another machine.
+
+        THIS IS WHAT A JTAG PROBE USES (ref-03), and it is
+        the only option when there is no kernel yet, when the
+        kernel has died, or when you need to inspect a core
+        that is wedged with interrupts disabled.
+
+   THE SAME BREAKPOINT REGISTERS SERVE BOTH. What differs is
+   where the event is routed, which is configured separately -
+   and that routing is the thing people get wrong when a
+   breakpoint "does nothing".</pre>
+
+<h2 id="breakpoints">Hardware breakpoints and watchpoints</h2>
+
+<p>A software breakpoint works by overwriting an instruction, which requires the memory to be writable and
+changes the code. Hardware breakpoints do neither: the processor compares addresses as it executes, so they
+work on read-only memory, on flash, and on code you must not modify.</p>
+
+<pre><code>/* BREAKPOINTS - fire on INSTRUCTION execution.
+   Implemented as register pairs, typically 2 to 16 of them: */
+
+     DBGBVR&lt;n&gt;_EL1    Breakpoint Value Register - the address
+     DBGBCR&lt;n&gt;_EL1    Breakpoint Control Register
+                        · E     enable
+                        · PMC   which exception levels it
+                                applies to
+                        · BAS   byte address select
+                        · BT    breakpoint type - address
+                                match, address mismatch, or
+                                linked to a context match
+
+/* WATCHPOINTS - fire on DATA access. The single most useful
+   debugging feature in the architecture, because they answer
+   "who is corrupting this variable" directly rather than by
+   bisection:                                                */
+
+     DBGWVR&lt;n&gt;_EL1    Watchpoint Value Register - the address
+     DBGWCR&lt;n&gt;_EL1    Watchpoint Control Register
+                        · E     enable
+                        · PAC   which exception levels
+                        · LSC   load / store / both
+                        · BAS   which bytes within the
+                                doubleword
+
+/* HOW MANY YOU ACTUALLY HAVE is implementation-defined and
+   discoverable rather than assumed:                        */
+        MRS  x0, ID_AA64DFR0_EL1
+        /* BRPs  field: number of breakpoints  minus 1
+           WRPs  field: number of watchpoints  minus 1
+           CTX_CMPs:    context-aware breakpoints           */
+
+/* FROM LINUX, you do not touch these registers - the kernel
+   multiplexes them between users:                          */
+        (gdb) watch my_global
+        (gdb) rwatch my_global          /* on read          */
+        $ perf record -e mem:0xffff0000c0001234:w
+
+/* A CONTEXT-AWARE breakpoint fires only when a particular
+   ASID or VMID is active - which is how a debugger sets a
+   breakpoint that hits in ONE process rather than in every
+   process that happens to execute that address (chapter 15
+   covers the ASID).                                         */</code></pre>
+
+<div class="key">
+<b>Watchpoints report the instruction <em>after</em> the access, and that is not a bug</b>
+<p>A watchpoint exception is taken once the access has completed, so the address in <code>ELR_ELx</code> is
+generally the following instruction rather than the store you are hunting. The faulting address itself comes
+from <code>FAR_ELx</code>, and the responsible instruction is normally the one immediately before the return
+address. Debuggers hide this, which is exactly why it confuses people the first time they read the raw
+registers instead — and why <a href="arm-29-esr.html">chapter 29</a>'s note that <code>FAR</code> is valid for
+watchpoints matters here.</p>
+</div>
+
+<h2 id="singlestep">Software step, and the other debug events</h2>
+
+<p>Stepping one instruction at a time is its own architectural feature rather than something a debugger fakes
+by setting a breakpoint on the next instruction — which would be unreliable for branches and impossible for
+instructions that fault.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Debug event</th><th>Triggered by</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td>Hardware breakpoint</td><td>Executing a matching address</td><td>Stopping in read-only or flash
+code</td></tr>
+<tr><td>Watchpoint</td><td>Reading or writing a matching address</td><td>Finding what corrupts a
+variable</td></tr>
+<tr><td>Software step</td><td><code>MDSCR_EL1.SS</code> — step exactly one instruction</td><td>Single-stepping
+in a debugger</td></tr>
+<tr><td><code>BRK #imm</code></td><td>Executing the instruction itself</td><td>Software breakpoints;
+<code>BUG()</code> in Linux</td></tr>
+<tr><td><code>HLT #imm</code></td><td>Executing the instruction</td><td>Halting debug — enters debug state
+directly</td></tr>
+<tr><td>Vector catch</td><td>Taking a particular exception</td><td>Catching a fault at the moment it is
+delivered</td></tr>
+<tr><td>External debug request</td><td>A signal from the debug port</td><td>A probe halting a running
+core</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* WHERE A DEBUG EXCEPTION IS ROUTED is configurable, and it
+   is the usual reason a correctly programmed breakpoint
+   appears to do nothing at all:
+
+     MDSCR_EL1.MDE     enable debug exceptions
+     MDCR_EL2.TDE      route them to EL2 instead of EL1
+     MDCR_EL3.TDA      trap debug register ACCESS to EL3
+
+   A hypervisor sets TDE so that a guest's breakpoints are
+   delivered to the hypervisor rather than to the guest -
+   which is what lets a host debug a guest, and what stops a
+   guest from interfering with the host's own debug state.
+   (Chapter 31 covers trapping generally.)                  */</code></pre>
+
+<h2 id="auth">Debug authentication: why the probe sees nothing</h2>
+
+<p>Debug is a complete bypass of every protection in the architecture — anyone who can halt the processor can
+read the keys out of it. It is therefore gated by authentication signals that a production device deliberately
+deasserts, and this is the single most common reason a debugger connects successfully and then shows nothing
+useful.</p>
+
+<pre class="diagram">   FOUR SIGNALS, set by the SoC - usually from fuses blown at
+   manufacture, sometimes from a secure boot decision:
+
+     DBGEN     invasive debug, non-secure
+                 halt and step non-secure code
+     NIDEN     NON-invasive debug, non-secure
+                 trace and the PMU (chapter 34), but no
+                 halting
+     SPIDEN    invasive debug, SECURE
+                 halt secure world code (chapter 26's EL3
+                 and the secure side)
+     SPNIDEN   non-invasive debug, secure
+                 trace secure world execution
+
+   THE TYPICAL PRODUCTION CONFIGURATION is DBGEN and NIDEN
+   asserted, SPIDEN and SPNIDEN deasserted: you may debug the
+   normal world, and the secure world is invisible. A fully
+   locked device deasserts all four.
+
+   READ THE CURRENT STATE rather than guessing:
+        MRS  x0, DBGAUTHSTATUS_EL1
+
+   THE SYMPTOMS OF DEBUG BEING DISABLED ARE NOT ERRORS. A
+   breakpoint in secure code simply never fires; the PMU
+   returns zeros; trace produces an empty buffer. Nothing
+   reports a permission failure, because reporting one would
+   itself leak information.</pre>
+
+<h2 id="trace">Trace: recording without stopping</h2>
+
+<p>Breakpoints answer "what is the state here", which requires stopping — and stopping destroys the timing you
+may be trying to investigate. Trace answers a different question entirely: what did the processor
+<em>actually do</em>, recorded at full speed, with no effect on execution.</p>
+
+<pre class="diagram">   THE TRACE PATH, and every SoC assembles these differently:
+
+   ┌──────────┐   ┌──────────┐
+   │ core 0   │   │ core 1   │        each core has its own
+   │  ETM     │   │  ETM     │        Embedded Trace Macrocell
+   └────┬─────┘   └────┬─────┘        generating a compressed
+        │              │              stream of what it
+        └──────┬───────┘              executed
+               v
+        ┌─────────────┐
+        │   FUNNEL    │   merges several streams, tagging
+        └──────┬──────┘   each with its source ID
+               v
+        ┌─────────────┐
+        │  REPLICATOR │   optionally sends the same stream to
+        └──┬───────┬──┘   two destinations
+           v       v
+     ┌─────────┐ ┌──────────────┐
+     │   ETB   │ │     TPIU     │  ON-CHIP BUFFER, small
+     │ or ETR  │ │              │  (a few KB) - or ETR, which
+     └─────────┘ └──────┬───────┘  writes to SYSTEM DRAM and
+                        v          is therefore much larger
+                  off-chip pins
+                  to the probe
+
+   THE COMPRESSION IS EXTREME AND IT IS WHY THIS WORKS AT
+   ALL. The ETM does not record every instruction - it
+   records only what a reconstruction tool cannot infer for
+   itself: which way each conditional branch went, and the
+   target of each indirect branch. Straight-line code costs
+   nothing to trace. Combined with the binary, that is enough
+   to reproduce the exact instruction sequence afterwards.
+
+   BANDWIDTH IS STILL THE LIMIT. A few kilobytes of on-chip
+   buffer holds only milliseconds of execution, which is why
+   trace is normally armed with a TRIGGER - record
+   continuously, and stop on an event so the buffer holds the
+   period LEADING UP TO the problem.</pre>
+
+<pre><code># FROM LINUX, CoreSight is driven through perf rather than
+# through a JTAG probe - the kernel owns the topology and
+# configures the path for you:
+
+$ ls /sys/bus/coresight/devices/
+etm0  etm1  funnel0  replicator0  tmc_etf0  tmc_etr0
+
+$ perf record -e cs_etm/@tmc_etr0/ --per-thread ./myprogram
+$ perf report --stdio
+
+# AND THE DECODED RESULT IS AN EXACT INSTRUCTION TRACE -
+# every branch taken, in order, with timestamps. That is
+# something no sampling profiler (chapter 34) can give you,
+# because sampling shows you WHERE time went statistically
+# and trace shows you WHAT HAPPENED exactly.
+
+# THE TWO ARE COMPLEMENTARY, and the choice is usually:
+#   "which function is hot?"        -> PMU sampling, ch. 34
+#   "why did it take that branch?"  -> trace
+#   "what ran just before the crash?" -> trace with a trigger</code></pre>
+
+<div class="note">
+<b>Trace is non-invasive debug, so it is gated separately</b>
+<p>Because trace does not stop the processor, it is governed by <code>NIDEN</code> and <code>SPNIDEN</code>
+rather than by the invasive-debug signals. A device can therefore be configured to permit profiling and trace
+while forbidding anyone to halt a core and inspect its registers — which is a common production setting, and
+it explains the otherwise puzzling situation where <code>perf</code> works perfectly but a JTAG probe cannot
+halt anything.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A hardware breakpoint never fires</td><td>Debug exceptions not enabled
+(<code>MDSCR_EL1.MDE</code>), or routed elsewhere by <code>MDCR_EL2.TDE</code></td></tr>
+<tr><td>A breakpoint in secure-world code never fires</td><td><code>SPIDEN</code> deasserted — secure debug is
+disabled in hardware</td></tr>
+<tr><td>The debugger attaches but everything reads as zero</td><td>Debug authentication disabled — check
+<code>DBGAUTHSTATUS_EL1</code></td></tr>
+<tr><td>A watchpoint reports the wrong instruction</td><td>Expected — the exception is taken after the access;
+use <code>FAR_ELx</code> and look one instruction back</td></tr>
+<tr><td>A breakpoint fires in every process, not just yours</td><td>It is an address match without a context
+match — link it to an ASID</td></tr>
+<tr><td>Software breakpoints fail in flash or read-only code</td><td>They work by overwriting the instruction —
+use a hardware breakpoint instead</td></tr>
+<tr><td>Trace buffer is empty</td><td><code>NIDEN</code> deasserted, or the CoreSight path was never
+enabled</td></tr>
+<tr><td>Trace captures only microseconds</td><td>Expected with an on-chip buffer — use a trigger, or route to
+DRAM via the ETR</td></tr>
+<tr><td>The bug disappears when the debugger is attached</td><td>Halting changes timing — switch to trace,
+which does not</td></tr>
+<tr><td>perf works but JTAG cannot halt the core</td><td>Non-invasive debug permitted, invasive debug
+disabled — a deliberate production configuration</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the difference between self-hosted and external debug, and when each is the only option.</li>
+  <li>Explain why a hardware breakpoint works where a software breakpoint cannot.</li>
+  <li>Name the register pairs behind breakpoints and watchpoints, and how you discover how many exist.</li>
+  <li>Explain why a watchpoint appears to report the wrong instruction.</li>
+  <li>Explain what a context-aware breakpoint adds, and what it uses to do it.</li>
+  <li>Name the four debug authentication signals and what each permits.</li>
+  <li>Explain why debug being disabled produces silence rather than an error.</li>
+  <li>Explain what an ETM records and why straight-line code is nearly free to trace.</li>
+  <li>Explain when trace answers a question that sampling cannot.</li>
+  <li>Explain why <code>perf</code> can work on a device where a JTAG probe cannot halt a core.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

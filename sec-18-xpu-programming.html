@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access control: programming and locking | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Access control: programming and locking</h1>
+<p class="lead">Now configure one. The register model, the ordering rules that decide whether your policy is
+ever actually in force, and the locking that stops later code from undoing it.</p>
+
+<h2 id="regs">The register model</h2>
+
+<p>Access control units are programmed through registers like any other peripheral, with one crucial difference: getting the sequence wrong can lock you out of the very registers you were configuring.</p>
+
+<pre><code>/* Vendor names differ; the shape does not. A representative
+   XPU region block:                                         */
+
+   +0x000  XPU_CTRL          global enable, default action
+   +0x004  XPU_STATUS        enabled, locked, error pending
+   +0x008  XPU_ERR_STATUS    valid, direction, security, type
+   +0x00C  XPU_ERR_ADDR_LO   the address that faulted
+   +0x010  XPU_ERR_ADDR_HI
+   +0x014  XPU_ERR_MASTER    which master ID
+   +0x018  XPU_ERR_CLEAR     write 1 to clear and re-arm
+   +0x01C  XPU_IRQ_ENABLE
+
+   /* then N region blocks, 0x20 bytes apart: */
+   +0x100  XPU_R0_BASE_LO    region base address
+   +0x104  XPU_R0_BASE_HI
+   +0x108  XPU_R0_LIMIT_LO   inclusive end, or a size encoding
+   +0x10C  XPU_R0_LIMIT_HI
+   +0x110  XPU_R0_RD_ALLOW   bitmap: which masters may read
+   +0x114  XPU_R0_WR_ALLOW   bitmap: which masters may write
+   +0x118  XPU_R0_CONFIG     enable, security, subregion mask
+   +0x11C  XPU_R0_LOCK       write 1: frozen until reset
+
+/* THE VARIATIONS you will meet:
+
+   base+limit vs base+size          - and if size, usually a
+                                      power of two, naturally
+                                      aligned
+   master BITMAP vs ID+MASK pairs   - bitmaps are simpler;
+                                      ID+mask scales further
+   one permission field vs separate secure/non-secure ones
+   subregion disable masks          - split a region into 8
+   region PRIORITY                  - overlapping regions:
+                                      highest index wins, or
+                                      lowest, or it is
+                                      UNPREDICTABLE. READ THE
+                                      TRM. This one bites.  */</code></pre>
+
+<h2 id="order">The ordering that matters</h2>
+
+<p>The ordering of configuration steps is not a style question. Enabling enforcement before the policy is complete blocks legitimate traffic; doing it in the other order leaves a window where nothing is enforced.</p>
+
+<pre class="diagram">Getting the sequence wrong leaves a WINDOW in which the system
+is unprotected, or bricks the boot because you locked yourself
+out. The safe order:
+
+  1. Program the DEFAULT to DENY, but do NOT enable yet.
+  2. Program every specific region: base, limit, permissions.
+  3. Verify by reading back every register you wrote.
+  4. Add the region containing YOUR OWN code and stack, with
+     permission for the master you are running on.
+     &lt;-- forget this and step 5 halts the CPU
+  5. Enable the XPU.
+  6. Test the policy: negative cases, not just positive.
+  7. LOCK it.
+
+  AND THE INVERSE ORDER for reconfiguration, which is why you
+  should avoid needing it: an XPU cannot usually be "paused",
+  so changing a region while masters are active means either
+  a brief window of wrong policy, or quiescing everything
+  first.
+
+  A DIFFERENT WINDOW to think about: between reset and step 5,
+  NOTHING is enforced. Masters that are released from reset
+  before the XPU is configured can do anything. So:
+
+     configure the XPU BEFORE releasing other masters from
+     reset, or hold them in reset until it is done.
+
+  That single sentence is the most commonly violated rule in
+  this whole chapter.</pre>
+
+<h2 id="code">Configuring one</h2>
+
+<p>What the configuration actually looks like in firmware, with the barriers that make each step take effect before the next depends on it.</p>
+
+<pre><code>/* Firmware, running at EL3 during BL2/BL31 (chapter 14).    */
+
+struct xpu_region {
+        uint64_t base;
+        uint64_t limit;         /* inclusive */
+        uint32_t rd_masters;    /* bitmap */
+        uint32_t wr_masters;
+        uint32_t flags;         /* SECURE_ONLY, NS_ONLY, BOTH */
+        bool     lock;
+};
+
+static const struct xpu_region policy[] = {
+        /* secure firmware DRAM - only the secure domain */
+        { .base = 0x0E000000, .limit = 0x0E3FFFFF,
+          .rd_masters = M_CPU,
+          .wr_masters = M_CPU,
+          .flags = XPU_SECURE_ONLY, .lock = true },
+
+        /* the trusted OS carve-out */
+        { .base = 0x0E400000, .limit = 0x0EFFFFFF,
+          .rd_masters = M_CPU | M_CRYPTO,
+          .wr_masters = M_CPU | M_CRYPTO,
+          .flags = XPU_SECURE_ONLY, .lock = true },
+
+        /* the normal world's DRAM */
+        { .base = 0x80000000, .limit = 0xBFFFFFFF,
+          .rd_masters = M_CPU | M_GPU | M_DISPLAY | M_VIDEO | M_DMA,
+          .wr_masters = M_CPU | M_GPU | M_VIDEO | M_DMA,
+          .flags = XPU_NS_ONLY, .lock = true },
+          /* note: DISPLAY reads only. A display controller has
+             no business writing DRAM, and a compromised one
+             then cannot corrupt the kernel.                 */
+
+        /* modem's private memory - the AP cannot see it */
+        { .base = 0xC0000000, .limit = 0xC7FFFFFF,
+          .rd_masters = M_MODEM,
+          .wr_masters = M_MODEM,
+          .flags = XPU_NS_ONLY, .lock = true },
+
+        /* the AP/modem shared buffer - the ONLY overlap */
+        { .base = 0xC8000000, .limit = 0xC80FFFFF,
+          .rd_masters = M_CPU | M_MODEM,
+          .wr_masters = M_CPU | M_MODEM,
+          .flags = XPU_NS_ONLY, .lock = true },
+
+        /* fuse controller - secure reads only, no writes at
+           runtime by anyone                                 */
+        { .base = 0x01790000, .limit = 0x01790FFF,
+          .rd_masters = M_CPU,
+          .wr_masters = 0,
+          .flags = XPU_SECURE_ONLY, .lock = true },
+};
+
+int xpu_apply(uintptr_t xpu, const struct xpu_region *r, size_t n)
+{
+        size_t i;
+
+        if (n &gt; XPU_NR_REGIONS)
+                return -EINVAL;          /* fail, do not truncate */
+
+        /* 1. default DENY, error responses on */
+        mmio_write32(xpu + XPU_CTRL,
+                     XPU_CTRL_DEFAULT_DENY | XPU_CTRL_ERR_RESP);
+
+        /* 2. program regions */
+        for (i = 0; i &lt; n; i++) {
+                uintptr_t reg = xpu + XPU_REGION(i);
+
+                mmio_write32(reg + XPU_R_BASE_LO,  (uint32_t)r[i].base);
+                mmio_write32(reg + XPU_R_BASE_HI,  r[i].base &gt;&gt; 32);
+                mmio_write32(reg + XPU_R_LIMIT_LO, (uint32_t)r[i].limit);
+                mmio_write32(reg + XPU_R_LIMIT_HI, r[i].limit &gt;&gt; 32);
+                mmio_write32(reg + XPU_R_RD_ALLOW, r[i].rd_masters);
+                mmio_write32(reg + XPU_R_WR_ALLOW, r[i].wr_masters);
+                mmio_write32(reg + XPU_R_CONFIG,
+                             r[i].flags | XPU_R_ENABLE);
+        }
+
+        /* disable every region we did NOT program - stale
+           entries from a previous boot stage are a real
+           hazard                                            */
+        for (; i &lt; XPU_NR_REGIONS; i++)
+                mmio_write32(xpu + XPU_REGION(i) + XPU_R_CONFIG, 0);
+
+        /* 3. read back and verify (see below) */
+        if (xpu_verify(xpu, r, n))
+                return -EIO;
+
+        /* 4. enable */
+        mmio_write32(xpu + XPU_CTRL,
+                     XPU_CTRL_DEFAULT_DENY | XPU_CTRL_ERR_RESP |
+                     XPU_CTRL_IRQ_EN | XPU_CTRL_ENABLE);
+
+        dsb(sy);                 /* make it visible before we
+                                    depend on it (ARM ch. 21) */
+        return 0;
+}</code></pre>
+
+<div class="warn">
+<b>Always disable the regions you did not program</b>
+<p>An earlier boot stage — the ROM, or a previous firmware version, or a warm reset path — may have left
+regions enabled. They persist. A region you never wrote about is not "absent"; it is whatever the last
+writer left there, and it may be a wide-open range someone added temporarily for bring-up.</p>
+</div>
+
+<h2 id="verify">Read back, always</h2>
+
+<p>A policy that was written is not necessarily a policy that took effect. Reading the configuration back — and testing a denial deliberately — is what distinguishes a working boundary from an assumed one.</p>
+
+<pre><code>/* Write-then-verify is not paranoia here. Real reasons a write
+   does not take:
+
+     · the region is already LOCKED from an earlier stage
+     · the address is not aligned to the granularity, and the
+       low bits were silently dropped - so your region is not
+       where you think
+     · the size is below the minimum and was rounded up
+     · you are not allowed to program this XPU from this
+       master or this security state
+     · the block is not clocked or not out of reset yet
+     · a reserved bit rejected the whole write               */
+
+static int xpu_verify(uintptr_t xpu, const struct xpu_region *r,
+                      size_t n)
+{
+        for (size_t i = 0; i &lt; n; i++) {
+                uintptr_t reg = xpu + XPU_REGION(i);
+                uint64_t base, limit;
+
+                base  = (uint64_t)mmio_read32(reg + XPU_R_BASE_HI) &lt;&lt; 32;
+                base |= mmio_read32(reg + XPU_R_BASE_LO);
+                limit = (uint64_t)mmio_read32(reg + XPU_R_LIMIT_HI) &lt;&lt; 32;
+                limit |= mmio_read32(reg + XPU_R_LIMIT_LO);
+
+                if (base != r[i].base || limit != r[i].limit) {
+                        ERROR("xpu: region %zu base/limit mismatch: "
+                              "wanted %llx-%llx got %llx-%llx\n",
+                              i, r[i].base, r[i].limit, base, limit);
+                        return -1;
+                }
+                if (mmio_read32(reg + XPU_R_RD_ALLOW) != r[i].rd_masters ||
+                    mmio_read32(reg + XPU_R_WR_ALLOW) != r[i].wr_masters) {
+                        ERROR("xpu: region %zu permissions mismatch\n", i);
+                        return -1;
+                }
+        }
+        return 0;
+}
+
+/* And FAIL THE BOOT if verification fails. A system whose
+   access-control policy did not apply is not a system that
+   should continue booting. "Warn and carry on" here is how
+   devices ship unprotected.                                 */</code></pre>
+
+<h2 id="lock">Locking</h2>
+
+<p>Most units can be locked so that their configuration cannot be changed until reset. That is what stops later-running, less-trusted software from simply reconfiguring the protection away.</p>
+
+<pre class="diagram">A policy that can be changed by later code is not a policy - it
+is a suggestion. Three mechanisms, usually combined:
+
+  1. PER-REGION LOCK BITS
+        write 1 to XPU_Rn_LOCK. Sticky until reset.
+        Now that region cannot be moved, resized, or widened.
+
+  2. GLOBAL LOCK
+        locks the whole block, including the enable bit and the
+        default action. Some blocks also make the lock bit
+        itself sticky, so it cannot be cleared.
+
+  3. THE XPU'S OWN REGISTERS PROTECTED BY AN XPU
+        the configuration interface is itself a slave. Make it
+        reachable only from the secure domain, so even before
+        locking, only EL3 firmware could change it.
+
+  ORDER: lock LAST, after verification and after testing. Once
+  locked, your only way out is a reset.
+
+  WHAT LOCKING BUYS: an attacker who compromises the normal
+  world - or even the trusted OS - cannot widen the policy. The
+  configuration window closed in early firmware, in code that
+  is much smaller and much more reviewed.
+
+  WHAT TO LEAVE UNLOCKED, deliberately and with a written
+  reason: regions that genuinely must change at runtime, such
+  as a framebuffer switched to secure for a trusted UI. Those
+  become the attack surface, so make the code that changes them
+  as small as the SMC handler it lives behind (chapter 11).</pre>
+
+<h2 id="dynamic">Dynamic reassignment, when you must</h2>
+
+<p>Some policies must change at run time — a buffer handed to a coprocessor, then taken back. Doing that safely requires care about the window in between.</p>
+
+<pre><code>/* Use case: a trusted UI. The display buffer must become
+   SECURE while a PIN is entered, then return.
+
+   This is a state machine, and every transition is a place to
+   get it wrong.                                             */
+
+TEE_Result secure_display_acquire(void)
+{
+        int ret;
+
+        if (state != DISPLAY_NORMAL)
+                return TEE_ERROR_BUSY;      /* no re-entry */
+
+        /* 1. stop the normal world's access FIRST. Order
+              matters: if we made it secure while NS DMA was in
+              flight, we would get faults, not safety.       */
+        ret = display_quiesce_ns();
+        if (ret)
+                return TEE_ERROR_BUSY;
+
+        /* 2. WIPE the buffer. Whatever the normal world left
+              there must not be shown as if it were ours, and
+              our content must not leak back later.          */
+        memset_secure(fb_va, 0, fb_size);
+        cache_clean_range(fb_va, fb_size);
+
+        /* 3. reassign: secure only, CPU and display only */
+        ret = xpu_set_region(FB_REGION,
+                             M_CPU | M_DISPLAY,   /* read  */
+                             M_CPU,               /* write */
+                             XPU_SECURE_ONLY);
+        if (ret)
+                goto out_resume;
+
+        /* 4. verify it took */
+        if (xpu_verify_region(FB_REGION, XPU_SECURE_ONLY))
+                goto out_resume;
+
+        state = DISPLAY_SECURE;
+        return TEE_SUCCESS;
+
+out_resume:
+        display_resume_ns();
+        return TEE_ERROR_GENERIC;
+}
+
+TEE_Result secure_display_release(void)
+{
+        if (state != DISPLAY_SECURE)
+                return TEE_ERROR_BAD_STATE;
+
+        /* WIPE BEFORE HANDING BACK - the PIN pad is still on
+           screen. This is the step people forget, and it
+           hands the attacker exactly what the trusted UI was
+           protecting.                                       */
+        memset_secure(fb_va, 0, fb_size);
+        cache_clean_range(fb_va, fb_size);
+
+        xpu_set_region(FB_REGION,
+                       M_CPU | M_DISPLAY | M_GPU,
+                       M_CPU | M_GPU,
+                       XPU_NS_ONLY);
+
+        state = DISPLAY_NORMAL;
+        display_resume_ns();
+        return TEE_SUCCESS;
+}
+
+/* THE RULES for any dynamic reassignment:
+     · only secure code may request it
+     · quiesce the losing side before the switch
+     · WIPE on both transitions
+     · verify the change applied
+     · make it re-entrant-safe: two CPUs, or a crash mid-way
+     · bound how long the resource can be held, so a hung TA
+       does not permanently take the display                */</code></pre>
+
+<h2 id="linux">What Linux sees</h2>
+
+<p>Linux generally does not program these units; firmware does, before Linux exists. Knowing that is what tells you where to look when an access is denied.</p>
+
+<pre><code>/* Linux is usually a SUBJECT of the policy, not its author -
+   the XPU was configured and locked before the kernel started.
+   But it must know the shape of it.                         */
+
+/* 1. Memory the kernel must not touch is removed from the
+      memory map, in the device tree: */
+
+        reserved-memory {
+                #address-cells = &lt;2&gt;;
+                #size-cells = &lt;2&gt;;
+                ranges;
+
+                optee@e400000 {
+                        reg = &lt;0x00 0x0e400000 0x00 0x00c00000&gt;;
+                        no-map;          /* do not even MAP it */
+                };
+
+                modem_mem: modem@c0000000 {
+                        reg = &lt;0x00 0xc0000000 0x00 0x08000000&gt;;
+                        no-map;
+                };
+
+                shared_mem: shared@c8000000 {
+                        reg = &lt;0x00 0xc8000000 0x00 0x00100000&gt;;
+                        /* no no-map: the kernel MAY map this,
+                           it is the shared window            */
+                };
+        };
+
+/* "no-map" matters: without it the kernel creates a linear
+   mapping, and a speculative access through that mapping can
+   fault - producing an SError at a completely unrelated
+   moment (ARM chapter 29). With no-map, the memory is never
+   mapped and never touched.                                */
+
+/* 2. A driver claims its share: */
+
+        my_device: dma-thing@1a000000 {
+                compatible = "vendor,dma-thing";
+                reg = &lt;0x00 0x1a000000 0x00 0x1000&gt;;
+                memory-region = &lt;&amp;shared_mem&gt;;
+        };
+
+        /* and in probe: */
+        ret = of_reserved_mem_device_init(dev);
+        /* now dma_alloc_coherent() on this device allocates
+           from that region - which is the region the XPU
+           policy allows this master to touch. The two
+           descriptions must agree, and nothing checks that
+           they do except your testing.                     */</code></pre>
+
+<div class="danger">
+<b>Two descriptions of the same truth</b>
+<p>The XPU policy lives in firmware. The reserved-memory nodes live in the device tree. If they disagree,
+you get either a security hole (the kernel can touch what it should not) or a bug that appears late and far
+from its cause (the kernel gets memory the hardware will refuse). Generate both from one source, or at
+minimum test that they agree. <a href="sec-19-xpu-policy.html">Chapter 19</a> is about making that
+systematic.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Register writes have no effect</td><td>Region already locked, or the block is not clocked/out of reset</td></tr>
+<tr><td>Region is not where you programmed it</td><td>Base not aligned to the granularity; low bits dropped</td></tr>
+<tr><td>System halts the moment you enable the XPU</td><td>You did not allow your own code's region</td></tr>
+<tr><td>Policy applies but an old, wide region is still active</td><td>Unused regions not explicitly disabled</td></tr>
+<tr><td>Behaviour differs between cold and warm boot</td><td>Warm reset does not clear the block; stale configuration</td></tr>
+<tr><td>Overlapping regions behave unpredictably</td><td>Priority rules differ per block — check the TRM</td></tr>
+<tr><td>A master misbehaves before firmware finishes</td><td>Released from reset before the XPU was configured</td></tr>
+<tr><td>Trusted UI leaks the previous screen</td><td>Buffer not wiped on acquire</td></tr>
+<tr><td>PIN pad visible to the normal world afterwards</td><td>Buffer not wiped on release</td></tr>
+<tr><td>SError at a random later instruction</td><td>Kernel speculatively touched a carve-out — add <code>no-map</code></td></tr>
+<tr><td><code>dma_alloc_coherent</code> memory rejected by hardware</td><td>DT reserved-memory and the XPU policy disagree</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Sketch an XPU's register map and name what each group does.</li>
+  <li>Give the safe configuration order and say what each step prevents.</li>
+  <li>Explain why other masters must be held in reset until the policy is applied.</li>
+  <li>Write a region table for a device with secure, AP and modem domains.</li>
+  <li>List five reasons a register write silently does not take, and write the read-back check.</li>
+  <li>Explain the three locking mechanisms and when to apply them.</li>
+  <li>Write a safe dynamic reassignment, including both wipes.</li>
+  <li>Explain what <code>no-map</code> does and the failure it prevents.</li>
+  <li>Explain why the DT and the firmware policy must be generated from one source.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

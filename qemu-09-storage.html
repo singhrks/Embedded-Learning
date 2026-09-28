@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage and block devices | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Storage and block devices</h1>
+<p class="lead">QEMU's block layer is a stack of filters — format drivers, protocol drivers, caches,
+throttling, snapshots — that you compose. The command line hides this behind <code>-drive</code>, which is
+convenient until you need a snapshot chain or an overlay, at which point knowing the real structure saves
+you.</p>
+
+<h2 id="stack">The block stack</h2>
+
+<pre class="diagram">   guest driver  (virtio-blk, nvme, ahci ...)
+        |
+        v
+   +---------------------------------------------+
+   |  FRONTEND     -device virtio-blk-device     |
+   +---------------------------------------------+
+        |
+        v
+   +---------------------------------------------+
+   |  FILTERS (optional, stackable)              |
+   |    throttle    - IOPS/bandwidth limits      |
+   |    copy-on-read                             |
+   |    blkverify, blkdebug - fault injection    |
+   +---------------------------------------------+
+        |
+        v
+   +---------------------------------------------+
+   |  FORMAT driver                              |
+   |    raw    - nothing, byte for byte          |
+   |    qcow2  - snapshots, compression, backing |
+   |             files, sparse allocation        |
+   |    vmdk / vhdx / vdi / vpc - other people's |
+   |    luks   - encryption                      |
+   +---------------------------------------------+
+        |
+        v
+   +---------------------------------------------+
+   |  PROTOCOL driver                            |
+   |    file   - a local file or block device    |
+   |    nbd    - network block device            |
+   |    iscsi / rbd / ssh / http                 |
+   +---------------------------------------------+
+        |
+        v
+   host storage
+
+   -drive collapses all of this into one option. -blockdev
+   exposes each layer as a named node you can wire together,
+   which is what libvirt and any serious automation uses.</pre>
+
+<h2 id="formats">raw versus qcow2</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>raw</th><th>qcow2</th></tr></thead>
+<tbody>
+<tr><td>Overhead</td><td>None</td><td>~5–10% on random writes</td></tr>
+<tr><td>Sparse</td><td>Only if the host filesystem is</td><td>Always</td></tr>
+<tr><td>Snapshots</td><td>No</td><td>Internal and external</td></tr>
+<tr><td>Backing files</td><td>No</td><td>Yes — the basis of overlays</td></tr>
+<tr><td>Compression</td><td>No</td><td>Yes, read-only after write</td></tr>
+<tr><td>Encryption</td><td>Via the <code>luks</code> layer</td><td>Built in (LUKS)</td></tr>
+<tr><td>Mount on the host</td><td><code>mount -o loop</code></td><td>Needs <code>qemu-nbd</code></td></tr>
+<tr><td>Use it for</td><td>Rootfs images you rebuild often; anything you want to inspect with ordinary
+tools</td><td>Golden images, overlays, snapshot workflows</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>$ qemu-img create -f qcow2 disk.qcow2 20G
+Formatting 'disk.qcow2', fmt=qcow2 size=21474836480 ...
+
+$ qemu-img create -f raw disk.raw 20G
+$ ls -lh disk.raw          # 20G apparent
+$ du -h  disk.raw          # 0 actual - sparse, on ext4/xfs/btrfs
+
+$ qemu-img info disk.qcow2
+image: disk.qcow2
+file format: qcow2
+virtual size: 20 GiB (21474836480 bytes)
+disk size: 196 KiB
+cluster_size: 65536
+
+$ qemu-img convert -p -O raw disk.qcow2 disk.raw
+$ qemu-img convert -p -O qcow2 -c disk.raw compressed.qcow2
+
+$ qemu-img resize disk.qcow2 +10G
+# then, in the guest: growpart /dev/vda 1 &amp;&amp; resize2fs /dev/vda1
+
+$ qemu-img check disk.qcow2
+$ qemu-img map disk.qcow2         # which ranges are allocated</code></pre>
+
+<h2 id="overlay">Overlays: the workflow that saves the most time</h2>
+
+<pre><code># Build a golden image once. Never boot it directly again.
+# Every experiment gets a disposable overlay on top.
+
+$ qemu-img create -f qcow2 -b golden.qcow2 -F qcow2 work.qcow2
+Formatting 'work.qcow2', fmt=qcow2 backing_file=golden.qcow2 ...
+
+$ ls -lh
+-rw-r--r-- 2.1G golden.qcow2
+-rw-r--r--  196K work.qcow2        # writes go here only
+
+$ qemu-system-aarch64 ... -drive file=work.qcow2,if=none,id=hd0 \
+    -device virtio-blk-device,drive=hd0
+
+# Broke it? Throw the overlay away, make a new one. Two seconds.
+$ rm work.qcow2 &amp;&amp; qemu-img create -f qcow2 -b golden.qcow2 \
+    -F qcow2 work.qcow2
+
+# Even quicker, for a single throwaway run - no overlay file at
+# all, all writes go to a temporary file QEMU deletes on exit:
+$ qemu-system-aarch64 ... -snapshot -drive file=golden.qcow2,...
+
+# Commit an overlay back into its backing file, when the change
+# was one you wanted to keep:
+$ qemu-img commit work.qcow2
+
+# Chains are allowed, and useful:
+#   base.qcow2  &lt;- installed.qcow2  &lt;- configured.qcow2  &lt;- run.qcow2
+$ qemu-img info --backing-chain run.qcow2
+
+# Flatten a chain into one image:
+$ qemu-img convert -O qcow2 run.qcow2 flattened.qcow2</code></pre>
+
+<div class="key">
+<b>The single habit worth forming</b>
+<p>Keep one read-only golden image per project and always boot an overlay. Experiments become free, "it
+worked yesterday" becomes recoverable, and you stop being afraid of <code>rm -rf</code> inside a guest. The
+whole trick is one <code>qemu-img create -b</code> command.</p>
+</div>
+
+<h2 id="cache">Cache modes: a correctness setting</h2>
+
+<pre class="diagram">   Three caches sit between the guest and the platter:
+
+     guest page cache -- guest's own, always present
+     HOST page cache  -- controlled by cache=
+     disk write cache -- controlled by whether flushes reach it
+
+   cache=writeback   (default)
+       host page cache USED. Guest flushes are honoured
+       (fdatasync). Fast, and SAFE - provided the guest issues
+       flushes and your device model implements them.
+
+   cache=none
+       O_DIRECT: bypass the host page cache. The guest's own
+       cache is the only one. Predictable, avoids double
+       caching, required for some migration setups. Needs
+       aligned I/O, so it fails on some filesystems (tmpfs).
+
+   cache=writethrough
+       every write goes to stable storage before completing.
+       Very slow. Safe even for a guest that never flushes.
+
+   cache=unsafe
+       FLUSHES ARE IGNORED. Fastest by far. A host crash loses
+       arbitrary amounts of guest data, including data the
+       guest was told was durable.
+
+   cache=directsync
+       O_DIRECT plus writethrough.
+
+   Choose:
+     building/throwaway images, CI        -> unsafe   (10x on
+                                             installs)
+     day-to-day development               -> writeback
+     anything holding work you care about -> writeback, and
+                                             verify flushes
+     production, shared storage           -> none</pre>
+
+<pre><code># The full modern form. aio=native needs cache=none or
+# directsync; aio=io_uring is better where available.
+-drive file=disk.qcow2,if=none,id=hd0,format=qcow2,\
+cache=none,aio=io_uring,discard=unmap,detect-zeroes=unmap \
+-device virtio-blk-device,drive=hd0
+
+#   discard=unmap        guest TRIM shrinks the host image
+#   detect-zeroes=unmap  writes of zeroes become holes
+#   Together these keep a long-lived image from growing without
+#   bound. Add them to every qcow2 you keep.
+
+# Throttling, to simulate slow storage - genuinely useful for
+# finding timeout bugs in a driver:
+-drive file=disk.img,if=none,id=hd0,\
+throttling.iops-total=100,throttling.bps-total=1048576
+
+# Fault injection, to test error paths:
+-drive file=blkdebug::disk.img,if=none,id=hd0
+# with a config file that fails the Nth read, or corrupts a
+# write, or returns EIO after a delay.</code></pre>
+
+<h2 id="mount">Reading and writing images from the host</h2>
+
+<pre><code># raw, single filesystem - simplest:
+$ sudo mount -o loop rootfs.ext4 /mnt
+
+# raw, partitioned:
+$ LOOP=$(sudo losetup -Pf --show sd.img)
+$ sudo mount ${LOOP}p2 /mnt
+$ ... ; sudo umount /mnt ; sudo losetup -d $LOOP
+
+# qcow2 - via NBD:
+$ sudo modprobe nbd max_part=8
+$ sudo qemu-nbd --connect=/dev/nbd0 disk.qcow2
+$ sudo fdisk -l /dev/nbd0
+$ sudo mount /dev/nbd0p1 /mnt
+$ ... ; sudo umount /mnt ; sudo qemu-nbd --disconnect /dev/nbd0
+
+# WITHOUT ROOT, and without mounting - libguestfs. This is the
+# right tool for scripting:
+$ sudo apt install libguestfs-tools
+$ virt-ls -a disk.qcow2 /etc
+$ virt-cat -a disk.qcow2 /etc/hostname
+$ virt-copy-out -a disk.qcow2 /var/log/messages ./
+$ virt-copy-in -a disk.qcow2 mydriver.ko /lib/modules/
+$ virt-customize -a disk.qcow2 \
+      --root-password password:secret \
+      --install openssh-server \
+      --run-command 'systemctl enable serial-getty@ttyAMA0'
+$ guestfish -a disk.qcow2 -i        # an interactive shell
+
+# NEVER mount an image read-write while a guest is using it.
+# Two writers on one filesystem corrupts it immediately and
+# the corruption may not show for hours.</code></pre>
+
+<h2 id="snapshots">Snapshots</h2>
+
+<pre><code># INTERNAL snapshots - stored inside a qcow2, include RAM if
+# taken from the monitor. This is save-state/load-state.
+
+(qemu) savevm before-experiment
+(qemu) info snapshots
+ID   TAG                 VM SIZE  DATE               VM CLOCK
+1    before-experiment     512MiB 2026-08-22 10:14   00:02:31
+(qemu) loadvm before-experiment      # instant time travel
+(qemu) delvm before-experiment
+
+# Offline:
+$ qemu-img snapshot -l disk.qcow2
+$ qemu-img snapshot -c mytag disk.qcow2
+$ qemu-img snapshot -a mytag disk.qcow2
+$ qemu-img snapshot -d mytag disk.qcow2
+
+# EXTERNAL snapshots - a new overlay, taken live via QMP. This
+# is how backups are done without pausing the guest:
+{"execute":"blockdev-snapshot-sync",
+ "arguments":{"device":"hd0","snapshot-file":"snap1.qcow2",
+              "format":"qcow2"}}
+
+# savevm/loadvm is the most underused debugging tool in QEMU.
+# Reproducing a bug that takes ten minutes of setup? Snapshot
+# just before it, then loadvm as many times as you need. It
+# turns a ten-minute iteration into a one-second one.
+# (It requires all devices to support migration state; a
+# passed-through device will refuse.)</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest filesystem corrupt after a host crash</td><td><code>cache=unsafe</code>, or a device model that
+ignores <code>FLUSH</code></td></tr>
+<tr><td>Image grows until the host disk fills</td><td>No <code>discard=unmap</code>; deleted guest data still
+occupies clusters</td></tr>
+<tr><td><code>Could not open backing file</code></td><td>Overlay moved away from its backing file — the path is
+stored inside the overlay. Use <code>qemu-img rebase</code></td></tr>
+<tr><td>Guest sees a smaller disk than the file</td><td>Image resized but the guest partition and filesystem
+were not</td></tr>
+<tr><td><code>cache=none</code> fails to open</td><td>Filesystem does not support O_DIRECT (tmpfs, some network
+filesystems)</td></tr>
+<tr><td><code>aio=native</code> rejected</td><td>Requires <code>cache=none</code> or
+<code>cache=directsync</code></td></tr>
+<tr><td>Both host and guest wrote to an image; it is wrecked</td><td>Two writers. There is no recovery; restore
+from the golden image</td></tr>
+<tr><td><code>savevm</code> refuses</td><td>A device without migration support — commonly a passed-through
+device or a non-migratable model</td></tr>
+<tr><td>Guest boots from the wrong disk</td><td>Ordering; set <code>bootindex=</code> on the device</td></tr>
+<tr><td>Terrible install performance</td><td>Use <code>cache=unsafe</code> for the install, then switch
+back</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four layers of the block stack and give an example driver at each.</li>
+  <li>Give three things qcow2 does that raw cannot, and one thing raw does better.</li>
+  <li>Create an overlay on a golden image and explain why this should be your default workflow.</li>
+  <li>Explain what <code>-snapshot</code> does without creating a file.</li>
+  <li>Describe each cache mode and say which is a correctness hazard.</li>
+  <li>Explain what <code>discard=unmap</code> and <code>detect-zeroes=unmap</code> prevent.</li>
+  <li>Mount a qcow2 image on the host, and give a way to read one without mounting.</li>
+  <li>State the rule about writing to an image a guest is using.</li>
+  <li>Use <code>savevm</code>/<code>loadvm</code> to shorten a debugging loop, and name one thing that blocks
+  it.</li>
+  <li>Explain what <code>qemu-img rebase</code> fixes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

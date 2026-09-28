@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading compiler output like a professional | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Reading compiler output like a professional</h1>
+<p class="lead">The practical skill this whole track exists to give you: look at generated AArch64 assembly
+and understand what the compiler did and why. It is the only way to settle a performance argument, and it is
+faster than you expect once you know the patterns.</p>
+
+<h2 id="workflow">The workflow</h2>
+
+<pre><code># --- godbolt.org, for anything small ---
+# Source left, assembly right, colour-matched by line. Set the
+# compiler to "ARM64 gcc" or "armv8-a clang", flags to -O2.
+# Nothing else comes close for exploring a question.
+
+# --- Locally, for real code ---
+    gcc -S -O2 -fverbose-asm prog.c -o prog.s
+    ; -fverbose-asm annotates each instruction with the
+    ; variable names involved
+
+    objdump -dS --demangle prog.o | less
+    ; disassembly INTERLEAVED with source (needs -g)
+
+    objdump -d --no-show-raw-insn --demangle prog.o
+
+# --- One function only ---
+    objdump -d prog | awk '/&lt;myfunc&gt;:/,/^$/'
+    gdb -batch -ex 'disassemble /s myfunc' prog
+
+# --- With performance data attached ---
+    perf record ./prog
+    perf annotate myfunc
+    ; shows the percentage of samples on each instruction -
+    ; which turns "this function is slow" into "this load is
+    ; slow"
+
+# --- Cycle-level analysis ---
+    llvm-mca -mcpu=cortex-a53 -timeline prog.s
+    ; a pipeline simulation with the bottleneck named
+
+# --- ALWAYS COMPILE WITH THE FLAGS YOU SHIP. Reading -O0
+# output tells you nothing about your release build, and
+# reading -O2 output while shipping -Os tells you almost as
+# little.</code></pre>
+
+<h2 id="skeleton">Recognising the skeleton</h2>
+
+<pre><code>; int add(int a, int b) { return a + b; }
+add:
+        add     w0, w0, w1              ; args in w0,w1;
+        ret                             ; result in w0
+
+; A LEAF FUNCTION: no prologue, no stack, no calls. If you see
+; this shape, the function is as cheap as it can be.
+
+; ---------------------------------------------------------
+; int call_it(int x) { return helper(x) + 1; }
+call_it:
+        stp     x29, x30, [sp, #-16]!   ; PROLOGUE: save FP,LR
+        mov     x29, sp
+        bl      helper                  ; the call
+        add     w0, w0, #1
+        ldp     x29, x30, [sp], #16     ; EPILOGUE
+        ret
+
+; A NON-LEAF FUNCTION. The stp/ldp pair is the giveaway.
+; ---------------------------------------------------------
+; A function needing callee-saved registers:
+big:
+        stp     x29, x30, [sp, #-64]!
+        mov     x29, sp
+        stp     x19, x20, [sp, #16]     ; more saves ->
+        stp     x21, x22, [sp, #32]     ; more simultaneous
+        str     x23, [sp, #48]          ; live state
+        ...
+; THE PROLOGUE SIZE IS A PRESSURE GAUGE (chapter 09). Five
+; saved registers and a 64-byte frame means the function is
+; carrying a lot at once - a candidate for splitting.</code></pre>
+
+<h2 id="patterns">The patterns worth knowing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>You see</th><th>It means</th></tr></thead>
+<tbody>
+<tr><td><code>ldr w0, [x1, x2, lsl #2]</code></td><td>Array index, scaling folded in — free</td></tr>
+<tr><td><code>adrp x0, sym</code> + <code>add x0, x0, :lo12:sym</code></td><td>Forming a global's address — PC-relative</td></tr>
+<tr><td><code>madd</code>, <code>msub</code></td><td>Multiply-accumulate fused into one instruction</td></tr>
+<tr><td><code>csel</code>, <code>csinc</code>, <code>cinc</code></td><td>A branch was if-converted — no misprediction</td></tr>
+<tr><td><code>ubfx</code>, <code>sbfx</code>, <code>bfi</code></td><td>Bitfield extract/insert in one instruction</td></tr>
+<tr><td><code>ldp</code>/<code>stp</code></td><td>Paired access — two loads for the price of one</td></tr>
+<tr><td><code>cbz</code>, <code>tbz</code></td><td>Compare-with-zero or test-bit and branch</td></tr>
+<tr><td><code>wzr</code>, <code>xzr</code></td><td>The zero register — no register needed to store 0</td></tr>
+<tr><td><code>v0.4s</code>, <code>q0</code>, <code>faddp</code></td><td><strong>Vectorised</strong> (<a href="cmp-07-loops-vectorisation.html">ch. 07</a>)</td></tr>
+<tr><td><code>bl memcpy</code> where you wrote a loop</td><td>Idiom recognition</td></tr>
+<tr><td><code>str</code>/<code>ldr</code> to <code>[sp, #n]</code> in a loop</td><td><strong>Spilling</strong> (<a href="cmp-09-register-allocation.html">ch. 09</a>)</td></tr>
+<tr><td><code>dmb ish</code>, <code>dsb</code>, <code>isb</code></td><td>A memory barrier (<a href="arm-21-barriers.html">ARM ch. 21</a>)</td></tr>
+<tr><td><code>ldaxr</code>/<code>stlxr</code> loop</td><td>An atomic read-modify-write (<a href="arm-22-atomics.html">ARM ch. 22</a>)</td></tr>
+<tr><td><code>paciasp</code>/<code>autiasp</code></td><td>Pointer authentication — return-address signing</td></tr>
+<tr><td><code>bti c</code></td><td>Branch target identification — an indirect-branch landing pad</td></tr>
+<tr><td><code>brk #0x3e8</code> / <code>udf</code></td><td>A trap the compiler inserted — UBSan, or unreachable code</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="worked">A worked example</h2>
+
+<pre><code>/* SOURCE: */
+int count_set_bits(const uint32_t *data, int n)
+{
+        int count = 0;
+
+        for (int i = 0; i &lt; n; i++)
+                count += __builtin_popcount(data[i]);
+
+        return count;
+}
+
+; aarch64 gcc -O2 -mcpu=cortex-a72
+count_set_bits:
+        cmp     w1, #0
+        b.le    .Lreturn_zero           ; guard: n &lt;= 0
+        mov     x2, #0                  ; i
+        mov     w3, #0                  ; count
+.Lloop:
+        ldr     w4, [x0, x2, lsl #2]    ; data[i] - scaled
+        fmov    s0, w4                  ; move to a SIMD reg
+        cnt     v0.8b, v0.8b            ; popcount per BYTE
+        addv    b0, v0.8b               ; sum the bytes
+        fmov    w4, s0                  ; back to a GP reg
+        add     x2, x2, #1
+        add     w3, w3, w4
+        cmp     x2, x1, sxtw
+        b.lt    .Lloop
+        mov     w0, w3
+        ret
+.Lreturn_zero:
+        mov     w0, #0
+        ret
+
+/* WHAT THIS TELLS YOU:
+
+   1. __builtin_popcount became `cnt` + `addv` on the SIMD
+      unit, because AArch64 has no scalar population count.
+      Four instructions including the register moves.
+
+   2. THE fmov PAIR IS THE COST. Moving between general and
+      SIMD registers has real latency (typically 3-5 cycles
+      each way on an A72), and it happens EVERY iteration.
+
+   3. IT DID NOT VECTORISE. Processing four words at once
+      would amortise the moves, and it did not - because the
+      reduction plus the per-element move confused the
+      vectoriser.
+
+   4. THE FIX, and this is the point of reading the output:
+      restructure so the popcount stays in the vector domain: */
+
+int count_set_bits_v2(const uint32_t *data, int n)
+{
+        uint32x4_t acc = vdupq_n_u32(0);
+        int i;
+
+        for (i = 0; i &lt;= n - 4; i += 4) {
+                uint8x16_t v = vreinterpretq_u8_u32(
+                                    vld1q_u32(data + i));
+                uint8x16_t c = vcntq_u8(v);
+                acc = vaddq_u32(acc,
+                        vpaddlq_u16(vpaddlq_u8(c)));
+        }
+
+        int count = vaddvq_u32(acc);
+
+        for (; i &lt; n; i++)              /* the tail */
+                count += __builtin_popcount(data[i]);
+
+        return count;
+}
+/* Four words per iteration, no domain crossing in the loop,
+   one horizontal reduction at the end. Typically 3-4x faster.
+
+   YOU WOULD NOT HAVE KNOWN TO DO THIS without reading the
+   assembly. The source looked fine.                      */</code></pre>
+
+<div class="key">
+<b>What reading assembly is actually for</b>
+<p>Not to hand-optimise — the compiler usually wins at that. It is to answer three questions no other tool
+answers: <em>did the optimisation I expected happen?</em>, <em>what is this loop actually doing per
+iteration?</em>, and <em>is the cost where I think it is?</em> Every performance investigation that gets
+past guesswork goes through this step.</p>
+</div>
+
+<h2 id="questions">The questions to ask</h2>
+
+<pre><code>/* Work down this list on any hot function: */
+
+1. IS IT A LEAF? No stp/ldp prologue means no calls, no
+   frame. Good.
+
+2. HOW BIG IS THE FRAME? `sub sp, sp, #N` or the stp
+   immediate. Large frames mean spilling or large locals.
+
+3. WHAT IS IN THE LOOP BODY? Count the instructions between
+   the label and the backward branch. That is your per-
+   iteration cost, roughly.
+
+4. ANY STACK TRAFFIC IN THE LOOP? str/ldr to [sp, #n] means
+   spilling. Reduce pressure (chapter 09).
+
+5. ANY CALLS IN THE LOOP? `bl` prevents most optimisation
+   across it and clobbers the caller-saved registers.
+
+6. DID IT VECTORISE? Look for v registers and q loads. If not,
+   ask why with -fopt-info-vec-missed (chapter 07).
+
+7. ARE THE ADDRESSING MODES BEING USED? `[x0, x1, lsl #2]`
+   good; a separate lsl then add means something prevented
+   folding.
+
+8. ARE THERE REDUNDANT MOVES? A `mov` between two registers
+   that could have been the same one suggests a coalescing
+   failure or a domain crossing.
+
+9. ANY BARRIERS OR ATOMICS? dmb/ldaxr are expensive and often
+   unintended - a stray volatile or an atomic where a plain
+   variable would do.
+
+10. IS THE HOT PATH THE FALL-THROUGH? A taken branch on the
+    common path costs more than a not-taken one. PGO fixes
+    this (chapter 06); __builtin_expect hints it.
+
+11. WHAT DOES perf annotate SAY? The instruction with the
+    samples on it is often a load - i.e. the problem is
+    memory, not code (CA chapter 14), and no amount of
+    instruction tuning will help.</code></pre>
+
+<h2 id="differences">Comparing two versions</h2>
+
+<pre><code># The most productive use of all: does my change help?
+
+    gcc -O2 -S before.c -o before.s
+    gcc -O2 -S after.c  -o after.s
+    diff -u before.s after.s
+
+# Or count instructions in the hot loop:
+    objdump -d prog | awk '/\.Lloop/,/b\.lt/' | wc -l
+
+# Or measure sizes:
+    size -A before.o after.o
+    nm --size-sort -S prog | tail
+
+# AND THEN MEASURE THE ACTUAL PROGRAM, because instruction
+# count is a proxy, not the answer:
+    perf stat -r 10 ./prog
+      cycles, instructions, IPC, branch-misses,
+      cache-misses, stalled-cycles
+
+# THE THREE NUMBERS THAT DIAGNOSE MOST THINGS:
+#   IPC low + high cache-misses    -&gt; memory bound
+#   IPC low + high branch-misses   -&gt; branchy code
+#   IPC high but slow              -&gt; genuinely doing too much
+#                                     work; look at the
+#                                     algorithm
+
+# A CHANGE THAT REMOVES INSTRUCTIONS AND DOES NOT REMOVE TIME
+# means the bottleneck is elsewhere. That is worth
+# discovering before spending a day on it.</code></pre>
+
+<h2 id="traps">Traps when reading</h2>
+
+<pre><code>/* --- 1. THE FUNCTION IS NOT THERE --- */
+/* It was inlined. Look at the caller, or build with
+   -fno-inline to see it in isolation - accepting that you are
+   now looking at different code.
+
+/* --- 2. THE LOOP IS NOT THERE --- */
+/* Constant-folded, deleted as dead, or turned into a closed
+   form. If you wrote a benchmark whose result is unused, the
+   compiler deleted the whole thing. Defeat it: */
+        __asm__ volatile("" : : "r"(result) : "memory");
+        /* or use a benchmark framework's DoNotOptimize() */
+
+/* --- 3. THE CODE IS DUPLICATED --- */
+/* Loop unswitching, vectorisation with a scalar epilogue,
+   runtime alias checks (chapter 07) - all produce several
+   copies. Find the one that runs.
+
+/* --- 4. YOU ARE READING -O0 --- */
+/* Every variable in memory, every expression separate. It
+   tells you nothing about your release build.
+
+/* --- 5. LINE ATTRIBUTION IS APPROXIMATE --- */
+/* After scheduling, an instruction's source line is where it
+   CAME FROM, not where it runs. objdump -S interleaving looks
+   scrambled for this reason (chapter 14).
+
+/* --- 6. THE STATIC FUNCTION VANISHED --- */
+/* If a `static` function has one caller it is usually inlined
+   and the out-of-line copy deleted. Add
+   __attribute__((noinline)) temporarily to study it.
+
+/* --- 7. YOU ARE ON THE WRONG TARGET --- */
+/* godbolt defaults to x86-64. Check the compiler selection.
+   Half of all "the compiler did something strange" reports
+   are this.                                              */</code></pre>
+
+<h2 id="learn">A practice routine</h2>
+
+<pre><code># Twenty minutes, and it teaches more than reading about it.
+
+# 1. Open godbolt.org, set ARM64 gcc, -O2.
+
+# 2. Type each of these and read the output:
+    int f(int x) { return x * 2; }          ; lsl
+    int f(int x) { return x / 2; }          ; the signed
+                                            ; correction
+    unsigned f(unsigned x) { return x / 2; } ; one lsr
+    int f(int x) { return x % 7; }          ; magic-number
+                                            ; division
+    int f(int a, int b) { return a &gt; b ? a : b; }  ; csel
+    int f(int *p) { return p ? *p : 0; }
+    int f(void) { int a[4] = {1,2,3,4};
+                  return a[0]+a[1]+a[2]+a[3]; }    ; folded?
+
+# 3. Then a loop, and check whether it vectorises:
+    void f(float *a, float *b, int n) {
+            for (int i = 0; i &lt; n; i++) a[i] += b[i];
+    }
+    ; add `restrict` and watch the alias check disappear
+
+# 4. Then something from your own codebase.
+
+# THE HABIT TO BUILD: whenever you wonder "is this fast?" or
+# "did that help?", spend two minutes looking rather than
+# reasoning. It is almost always faster than the argument,
+# and it is always more reliable.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>What to look for</th></tr></thead>
+<tbody>
+<tr><td>Function slower than expected</td><td>Stack traffic in the loop; calls; missing vectorisation</td></tr>
+<tr><td>Your optimisation changed nothing</td><td>The compiler was already doing it — diff the assembly</td></tr>
+<tr><td>Benchmark shows zero time</td><td>The loop was deleted; the result is unused</td></tr>
+<tr><td>Cannot find the function</td><td>Inlined</td></tr>
+<tr><td>Several copies of the loop</td><td>Unswitching, vectorisation epilogue, or alias-check versioning</td></tr>
+<tr><td>Unexpected <code>bl</code> to a libc function</td><td>Idiom recognition, or a division/modulo helper</td></tr>
+<tr><td>Unexpected barriers</td><td>A stray <code>volatile</code>, or an atomic type</td></tr>
+<tr><td>Register moves everywhere</td><td>Domain crossing (GP↔SIMD), or coalescing failure</td></tr>
+<tr><td>Assembly looks fine but it is still slow</td><td>Memory bound — check <code>perf stat</code> cache misses</td></tr>
+<tr><td>x86 instructions in the output</td><td>Wrong target selected</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Get from a source file to annotated assembly three different ways.</li>
+  <li>Recognise a leaf function, a non-leaf, and a register-pressured one at a glance.</li>
+  <li>Identify fifteen AArch64 patterns and say what each implies.</li>
+  <li>Work the eleven diagnostic questions on a real hot function.</li>
+  <li>Spot spilling, vectorisation and idiom recognition in output.</li>
+  <li>Diff two versions of a function and quantify the change.</li>
+  <li>Use <code>perf stat</code> to decide whether you are memory or compute bound.</li>
+  <li>Name seven traps that make assembly misleading, and how to avoid each.</li>
+  <li>Find a real optimisation opportunity in your own code by reading its output.</li>
+  <li>Explain what reading assembly is for, and what it is not for.</li>
+</ul>
+
+<div class="tip">
+<b>End of the compilers track</b>
+<p>Sixteen chapters, from preprocessing to reading the result. You now know what happens to your source,
+which phase to blame for a given behaviour, and how to check rather than guess. Next:
+<a href="track.html?t=cpp">C++</a>, where the same machinery has to cope with a far larger language.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

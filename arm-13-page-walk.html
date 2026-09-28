@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Translation tables and the page walk | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Translation tables and the page walk</h1>
+<p class="lead">The single most important mechanism in system software. Trace it by hand once and address
+translation stops being mysterious — page faults, TLB maintenance, hypervisors and the SMMU all become
+variations on this one walk.</p>
+
+<h2 id="decompose">Decomposing the address</h2>
+
+<p>A virtual address is not one number; it is a set of indices packed together. Splitting it correctly is the first step of every translation, and doing it by hand once makes the rest of the chapter obvious.</p>
+
+<pre class="diagram">48-bit VA, 4 KB granule — the configuration you will meet most
+
+ 63       48 47    39 38    30 29    21 20    12 11         0
+┌───────────┬────────┬────────┬────────┬────────┬────────────┐
+│ sign ext. │ L0 idx │ L1 idx │ L2 idx │ L3 idx │   offset   │
+└───────────┴────────┴────────┴────────┴────────┴────────────┘
+              9 bits   9 bits   9 bits   9 bits    12 bits
+
+  9 bits = 512 entries per table.
+  Each table is 512 × 8 bytes = 4096 bytes = exactly one page.
+  That is not a coincidence: the table size is chosen to equal
+  the granule so tables can be allocated from the page allocator.
+
+  Coverage per entry:
+     L0 entry → 512 GB      L2 entry →   2 MB
+     L1 entry →   1 GB      L3 entry →   4 KB
+
+  So one L1 entry can be a 1 GB BLOCK, one L2 entry a 2 MB block,
+  or either can point to the next table. That choice is what
+  makes huge pages possible.</pre>
+
+<h2 id="walk">The walk, step by step</h2>
+
+<p>The walk itself is a loop: use an index to find an entry, check whether it points to another table or to the final page, repeat. Everything else — permissions, attributes, faults — is detail hung off those steps.</p>
+
+<pre class="diagram">   CPU issues VA = 0xFFFF_0000_C0DE_1234
+        │
+        ▼
+   VA[55] == 1  →  use TTBR1_EL1 (chapter 12)
+        │
+        ▼
+   base = TTBR1_EL1 & ~0xFFF                    (physical address)
+        │
+   ┌────▼──────────────────────────────────────────────────────┐
+   │ L0:  index = VA[47:39] = 0x1FE                             │
+   │      read 8 bytes at  base + 0x1FE*8                       │
+   │      descriptor[0]  == 0 ?  → TRANSLATION FAULT, level 0   │
+   │      descriptor[1:0] == 0b11 → table: next base = desc[47:12]│
+   └────┬──────────────────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────────────────┐
+   │ L1:  index = VA[38:30] = 0x003                             │
+   │      descriptor[1:0] == 0b01 → BLOCK (1 GB) → walk STOPS   │
+   │      descriptor[1:0] == 0b11 → table → continue            │
+   └────┬──────────────────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────────────────┐
+   │ L2:  index = VA[29:21] = 0x006                             │
+   │      0b01 → BLOCK (2 MB) → walk STOPS                      │
+   │      0b11 → table → continue                               │
+   └────┬──────────────────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────────────────┐
+   │ L3:  index = VA[20:12] = 0x0DE                             │
+   │      0b11 → PAGE (4 KB)     ← note: at L3, 0b11 means PAGE │
+   │      0b01 → INVALID at L3   ← and 0b01 is a FAULT here     │
+   └────┬──────────────────────────────────────────────────────┘
+        ▼
+   PA = descriptor[47:12] | VA[11:0]
+   permissions and attributes checked (chapter 14)
+   result cached in the TLB, tagged with the ASID (chapter 15)
+
+  Up to FOUR memory accesses for one translation. Each of those
+  accesses can itself hit or miss in the data cache — which is
+  why TCR's walk-cacheability setting matters so much.</pre>
+
+<div class="warn">
+<b>The 0b01 / 0b11 inversion at L3</b>
+<p>At levels 0–2, <code>0b11</code> means "table" and <code>0b01</code> means "block". At level 3 there is no
+next level, so <code>0b11</code> means "page" and <code>0b01</code> is <strong>invalid</strong>. Hand-written
+table code that uses a single "valid leaf" constant across levels produces a translation fault only at L3 —
+which looks like a random subset of addresses failing. It is one of the two or three most common bugs in
+bare-metal MMU setup.</p>
+</div>
+
+<h2 id="worked">A worked example</h2>
+
+<p>Nothing makes this concrete like doing it with real numbers. Work through this example with a pen before trusting that you have understood the mechanism.</p>
+
+<pre><code>/* Translate VA = 0x0000_0000_4020_1000, 4 KB granule, 48-bit.
+
+   Binary of the relevant bits:
+     0x40201000 = 0100 0000 0010 0000 0001 0000 0000 0000
+
+   Extract the indices:
+     VA[47:39] = 0            → L0 index 0
+     VA[38:30] = 1            → L1 index 1     (0x40000000 / 1 GB)
+     VA[29:21] = 1            → L2 index 1     (0x00200000 / 2 MB)
+     VA[20:12] = 1            → L3 index 1     (0x00001000 / 4 KB)
+     VA[11:0]  = 0            → offset 0
+
+   Walk, with TTBR0 = 0x80000000:
+
+     L0: read  0x80000000 + 0*8  = 0x80000000
+         value 0x0000000080001003
+               ↑ next table at 0x80001000, bits[1:0]=11 = table
+
+     L1: read  0x80001000 + 1*8  = 0x80001008
+         value 0x0000000080002003   → table at 0x80002000
+
+     L2: read  0x80002000 + 1*8  = 0x80002008
+         value 0x0000000080003003   → table at 0x80003000
+
+     L3: read  0x80003000 + 1*8  = 0x80003008
+         value 0x00600000_9A00_0743
+               bits[1:0] = 11 = valid page
+               output address bits[47:12] = 0x9A000
+               → PA = 0x9A000000 | 0x000 = 0x9A000000
+
+   Do this once with a real dump from your own system. It converts
+   the whole subject from abstract to obvious.                 */</code></pre>
+
+<h2 id="blocks">Blocks: huge pages</h2>
+
+<p>A table entry can describe a large region directly instead of pointing at another table. That saves both memory and, more importantly, TLB entries — which is why huge pages matter for performance.</p>
+
+<pre class="diagram">A BLOCK descriptor terminates the walk early, mapping a large
+contiguous region with ONE entry.
+
+   L1 block   1 GB    used for the kernel linear map, and for
+                      hugetlbfs 1 GB pages
+   L2 block   2 MB    transparent huge pages, most large mappings
+   L3 page    4 KB    the normal case
+
+  Requirements: both the VA and the PA must be aligned to the
+  block size, and the whole region must have identical
+  permissions and attributes.
+
+  BENEFIT — TLB reach. One entry covers 2 MB instead of 4 KB, so
+  1024 TLB entries cover 2 GB rather than 4 MB (CA chapter 16).
+  Also a shorter walk: 3 levels instead of 4.
+
+  COST — internal fragmentation, and splitting a block later
+  (to change permissions on part of it) requires break-before-make
+  (below).
+
+  CONTIGUOUS HINT: a descriptor bit saying "this entry and its
+  15 neighbours form one contiguous, aligned region with identical
+  attributes". The TLB may then use ONE entry for all 16 — a
+  64 KB mapping from 4 KB pages, without needing a real block.
+  Setting it when the claim is FALSE is a serious error: the TLB
+  will happily use one entry for regions that differ.</pre>
+
+<h2 id="building">Building tables in code</h2>
+
+<p>Reading tables is one thing; constructing them is what a kernel or bootloader actually does. The code is short, and the ordering requirements around it are what make it difficult.</p>
+
+<div class="codewrap"><div class="code-title">a minimal but correct table builder</div>
+<pre><code>#define PTE_VALID       (1UL &lt;&lt; 0)
+#define PTE_TABLE       (1UL &lt;&lt; 1)   /* L0-L2: points to next table */
+#define PTE_PAGE        (1UL &lt;&lt; 1)   /* L3:    a 4 KB page          */
+#define PTE_BLOCK       (0UL &lt;&lt; 1)   /* L1-L2: a block              */
+#define PTE_AF          (1UL &lt;&lt; 10)  /* access flag — MANDATORY     */
+#define PTE_SH_INNER    (3UL &lt;&lt; 8)
+#define PTE_AP_RW_EL1   (0UL &lt;&lt; 6)
+#define PTE_AP_RW_ALL   (1UL &lt;&lt; 6)
+#define PTE_AP_RO_EL1   (2UL &lt;&lt; 6)
+#define PTE_UXN         (1UL &lt;&lt; 54)
+#define PTE_PXN         (1UL &lt;&lt; 53)
+#define PTE_ATTR(i)     ((uint64_t)(i) &lt;&lt; 2)
+
+#define IDX(va, level)  (((va) &gt;&gt; (39 - 9 * (level))) &amp; 0x1FF)
+
+static uint64_t *alloc_table(void);   /* returns a zeroed 4 KB page */
+
+static void map_page(uint64_t *l0, uint64_t va, uint64_t pa,
+                     uint64_t attrs)
+{
+        uint64_t *tbl = l0;
+
+        /* walk levels 0..2, creating tables as needed */
+        for (int level = 0; level &lt; 3; level++) {
+                uint64_t *e = &amp;tbl[IDX(va, level)];
+
+                if (!(*e &amp; PTE_VALID)) {
+                        uint64_t *next = alloc_table();
+                        /* the ZEROED table must be visible before
+                           the descriptor that points at it        */
+                        __asm__ volatile("dsb ishst" ::: "memory");
+                        *e = (uint64_t)next | PTE_VALID | PTE_TABLE;
+                } else if (!(*e &amp; PTE_TABLE)) {
+                        return;         /* a block is already here */
+                }
+                tbl = (uint64_t *)(*e &amp; 0x0000FFFFFFFFF000UL);
+        }
+
+        /* level 3: the leaf */
+        tbl[IDX(va, 3)] = (pa &amp; 0x0000FFFFFFFFF000UL)
+                        | PTE_VALID | PTE_PAGE | PTE_AF | attrs;
+
+        __asm__ volatile("dsb ishst" ::: "memory");
+}
+
+/* Note the two DSBs. The table walker is a separate hardware
+   observer that reads memory directly; your stores must be
+   visible to it before the descriptor referencing them is
+   written. Omitting these gives faults that appear only under
+   load or only on certain cores.                            */</code></pre></div>
+
+<h2 id="bbm">Break-before-make</h2>
+
+<div class="danger">
+<b>You may not change a live mapping in place</b>
+<p>If a TLB holds an entry for a VA and you overwrite the descriptor with a different output address, size or
+attributes, the architecture permits the TLB to hold <em>both</em> old and new translations simultaneously.
+The result is UNPREDICTABLE — including a possible TLB conflict abort, or accesses going to either address
+non-deterministically.</p>
+<p>The required sequence is <strong>break-before-make</strong>:</p>
+<pre><code>        /* 1. BREAK: make the entry invalid */
+        *pte = 0;
+        dsb     ishst
+
+        /* 2. invalidate the TLB entry, everywhere */
+        tlbi    vaae1is, x_va
+        dsb     ish
+        isb
+
+        /* 3. MAKE: write the new descriptor */
+        *pte = new_descriptor;
+        dsb     ishst
+        isb</code></pre>
+<p>This applies when changing the output address, the block size (splitting a 2 MB block into 4 KB pages), or
+the memory type. It is <em>not</em> required for a permission-only change from more permissive to less, or for
+setting the access/dirty bits — the architecture permits those to be atomic.</p>
+</div>
+
+<h2 id="hardware">Hardware access and dirty bit management</h2>
+
+<p>Modern cores can update the access and dirty bits in the tables themselves, without software involvement. Whether that feature is present changes how an operating system must handle page aging.</p>
+
+<pre><code>/* Without hardware management (ARMv8.0):
+     · AF starts clear; the first access takes an ACCESS FLAG FAULT
+       and software sets it — this is how the OS tracks page usage
+     · the dirty state is emulated by mapping the page read-only,
+       taking a permission fault on the first write, and recording
+       "dirty" in software before making it writable
+
+   Both cost a fault per page. With HA/HD (ARMv8.1), the hardware
+   sets AF and clears the DBM-controlled read-only bit itself, and
+   the faults disappear.                                       */
+
+        TCR_EL1.HA  = 1        /* hardware Access flag update */
+        TCR_EL1.HD  = 1        /* hardware Dirty bit  update  */
+        descriptor DBM bit     /* marks a page as dirty-managed */
+
+/* Query support: ID_AA64MMFR1_EL1.HAFDBS
+   Linux enables it when present — worth knowing because it
+   changes the fault pattern you will see when profiling.    */</code></pre>
+
+<h2 id="faults">What can go wrong during a walk</h2>
+
+<p>These are the values you actually decode out of <code>ESR_EL1</code> after a data or instruction abort
+(<a href="arm-29-esr.html">chapter 29</a> covers the register layout), and the <code>LL</code> suffix on
+several of them is the page-table level the walk had reached when it failed — level 1 versus level 3 tells you
+whether the whole region is unmapped or just this specific page. The first four rows are the walk finding a
+descriptor and deciding it cannot be used, for increasingly specific reasons: absent entirely, present but the
+access-flag housekeeping was not done, or present but permissions forbid the access you attempted. The last
+three are different in kind — the walk itself could not complete because of a hardware or software problem
+external to the page table's own contents, and those are the ones worth suspecting first when the fault makes
+no sense given what you believe the mapping to be.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Fault</th><th>DFSC</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Address size fault</td><td><code>0b0000LL</code></td><td>Output address exceeds the configured PA size</td></tr>
+<tr><td>Translation fault</td><td><code>0b0001LL</code></td><td>Descriptor invalid at level LL — <strong>not mapped</strong></td></tr>
+<tr><td>Access flag fault</td><td><code>0b0010LL</code></td><td>AF was clear</td></tr>
+<tr><td>Permission fault</td><td><code>0b0011LL</code></td><td>Mapped, but AP/XN forbids this access</td></tr>
+<tr><td>Synchronous external abort</td><td><code>0b010000</code></td><td>The bus refused it — power, clock, or a firewall</td></tr>
+<tr><td>External abort on a table walk</td><td><code>0b0101LL</code></td><td>The table memory itself was unreadable</td></tr>
+<tr><td>TLB conflict abort</td><td><code>0b110000</code></td><td>Overlapping TLB entries — a break-before-make violation</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The <code>LL</code> field gives the level, which is the most useful diagnostic in the whole set: a level-0
+translation fault means the top-level table is wrong or <code>TTBR</code> is garbage; a level-3 fault means
+only the final page is missing. Chapter 29 covers decoding these in full.</p>
+
+<h2 id="inspect">Walking tables from a live system</h2>
+
+<p>You can follow a real translation on a live machine, entry by entry. This is the most direct way to answer "why did that address fault" when the answer is not obvious.</p>
+
+<pre><code># Linux: dump every mapping the kernel installed
+mount -t debugfs none /sys/kernel/debug
+cat /sys/kernel/debug/kernel_page_tables
+#   ---[ Linear Mapping start ]---
+#   0xffff000000000000-0xffff000040000000  1G PMD  RW NX SHD AF UXN MEM/NORMAL
+#   ---[ vmalloc() area ]---
+#   0xffff800008000000-0xffff800008001000  4K PTE  ro x  SHD AF UXN MEM/NORMAL
+#         ^ size ^ level ^ perms ^ attrs
+
+# per-process
+cat /sys/kernel/debug/page_tables/current   # some configurations
+
+# ask the hardware instead (chapter 12)
+        at   s1e1r, x0
+        mrs  x1, par_el1
+
+# in a JTAG debugger, most tools have a built-in walker:
+#   OpenOCD:  aarch64 mmu / mem2array
+#   Trace32:  MMU.List, MMU.DUMP PageTable
+#   gdb:      write a small python walker — worth doing once</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Some addresses translate, others fault at level 3</td><td>Used <code>0b01</code> for L3 leaves instead of <code>0b11</code></td></tr>
+<tr><td>Every access faults at level 0</td><td><code>TTBR</code> wrong, or the table is not physically where you think</td></tr>
+<tr><td>Access flag faults on every first touch</td><td>Normal without HA; set AF yourself in static tables</td></tr>
+<tr><td>Mapping works, then fails after a change</td><td>Missing TLB invalidate, or missing break-before-make</td></tr>
+<tr><td>TLB conflict abort</td><td>Overlapping entries from an in-place block split</td></tr>
+<tr><td>Faults only under load or only on some cores</td><td>Missing <code>DSB</code> before the descriptor became visible</td></tr>
+<tr><td>External abort during a walk</td><td>Table memory itself unmapped, or in a denied region</td></tr>
+<tr><td>Huge page mapping silently ignored</td><td>VA or PA not aligned to the block size</td></tr>
+<tr><td>Random accesses go to the wrong page</td><td>Contiguous hint set on a region that is not actually contiguous</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Split a 48-bit VA into its four indices and offset, and say how much each level covers.</li>
+  <li>Explain why a table is exactly one page in size.</li>
+  <li>State what <code>0b01</code> and <code>0b11</code> mean at L2 and at L3, and the bug the difference causes.</li>
+  <li>Walk a real address by hand from a <code>TTBR</code> value and four descriptors.</li>
+  <li>Explain what a block descriptor buys and what it costs.</li>
+  <li>State the break-before-make sequence and when it is required.</li>
+  <li>Explain why building tables needs <code>DSB</code> instructions.</li>
+  <li>Given a fault with DFSC <code>0b000101</code>, say exactly what happened.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

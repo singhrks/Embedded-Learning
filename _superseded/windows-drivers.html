@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windows driver development | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 12</p>
+<h1>Windows driver development</h1>
+<p class="lead">WDM taught a generation of engineers to write PnP and power code by hand, and most of them
+got it wrong. WDF exists so you never have to. This chapter covers the WDF object model, request queues,
+I/O, INF packaging, signing, and how to debug what you build.</p>
+
+<h2 id="models">Choosing a driver model</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Runs in</th><th>Use when</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td><strong>UMDF</strong> (User-Mode Driver Framework)</td><td>User mode</td><td>USB, HID, sensors, anything not needing high IRQL or direct DMA</td><td><strong>Prefer this.</strong> A crash kills a service, not the machine.</td></tr>
+<tr><td><strong>KMDF</strong> (Kernel-Mode Driver Framework)</td><td>Kernel mode</td><td>Hardware needing interrupts, DMA, or high IRQL access</td><td>The default for real hardware. What this chapter covers.</td></tr>
+<tr><td><strong>WDM</strong></td><td>Kernel mode</td><td>Filter drivers in stacks that require it, or maintaining legacy code</td><td>Only when WDF genuinely cannot express what you need.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>What WDF actually does for you</b>
+<p>It implements the PnP and power state machines — roughly 3,000 lines of extremely subtle code that
+every WDM driver had to get right and most did not. It manages IRP queuing, cancellation, and
+synchronisation scopes. You write callbacks for the events you care about and WDF handles the rest,
+including all the transitions you did not think about.</p>
+</div>
+
+<h2 id="objects">The WDF object model</h2>
+
+<p>Everything is a handle to a framework object. Objects have a parent, so freeing a parent frees its
+children — the same idea as Linux's <code>devm_</code>.</p>
+
+<pre class="diagram">WDFDRIVER                     one per driver, created in DriverEntry
+   │
+   └── WDFDEVICE              one per device instance
+         ├── WDFQUEUE         holds pending requests; you can have several
+         │     └── WDFREQUEST one I/O request (wraps an IRP)
+         │           └── WDFMEMORY  the buffers
+         ├── WDFINTERRUPT     ISR + DPC pair
+         ├── WDFDMAENABLER    DMA capability
+         │     └── WDFCOMMONBUFFER / WDFDMATRANSACTION
+         ├── WDFTIMER, WDFWORKITEM, WDFSPINLOCK, WDFWAITLOCK
+         ├── WDFFILEOBJECT    per open handle
+         └── WDFCHILDLIST     for bus drivers enumerating children
+
+Every object can carry a "context" — your own struct, allocated with the object
+and retrieved with a generated accessor. This is where your state lives.</pre>
+
+<pre><code>// Declare your per-device state and generate a typed accessor
+typedef struct _DEVICE_CONTEXT {
+        ULONG   Value;
+        WDFQUEUE ManualQueue;
+        PVOID   Registers;
+} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
+
+// ...then anywhere you have the WDFDEVICE handle:
+PDEVICE_CONTEXT ctx = DeviceGetContext(device);</code></pre>
+
+<h2 id="lifecycle">Driver lifecycle and callbacks</h2>
+
+<figure>
+<svg viewBox="0 0 780 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KMDF driver lifecycle from DriverEntry through device add, prepare hardware, entry into D0 and back out">
+  <rect class="svg-box-a" x="30" y="16" width="250" height="46" rx="7"/>
+  <text class="svg-tb" x="44" y="38">DriverEntry()</text>
+  <text class="svg-tm" x="44" y="54">once per driver load</text>
+
+  <rect class="svg-box-a" x="30" y="76" width="250" height="46" rx="7"/>
+  <text class="svg-tb" x="44" y="98">EvtDriverDeviceAdd()</text>
+  <text class="svg-tm" x="44" y="114">once per device found — create WDFDEVICE, queues</text>
+
+  <rect class="svg-box-g" x="30" y="136" width="250" height="46" rx="7"/>
+  <text class="svg-tb" x="44" y="158">EvtDevicePrepareHardware()</text>
+  <text class="svg-tm" x="44" y="174">resources assigned: map MMIO, claim IRQ</text>
+
+  <rect class="svg-box-g" x="30" y="196" width="250" height="46" rx="7"/>
+  <text class="svg-tb" x="44" y="218">EvtDeviceD0Entry()</text>
+  <text class="svg-tm" x="44" y="234">powering up: start the hardware</text>
+
+  <rect class="svg-box-w" x="30" y="256" width="250" height="52" rx="7"/>
+  <text class="svg-tb" x="44" y="278">RUNNING</text>
+  <text class="svg-tm" x="44" y="298">EvtIoRead / EvtIoWrite / EvtIoDeviceControl · ISR · DPC</text>
+
+  <rect class="svg-box-d" x="30" y="322" width="250" height="66" rx="7"/>
+  <text class="svg-tb" x="44" y="344">Teardown, exact reverse:</text>
+  <text class="svg-tm" x="44" y="364">D0Exit -&gt; ReleaseHardware -&gt; EvtCleanupCallback</text>
+  <text class="svg-tm" x="44" y="380">-&gt; EvtDestroyCallback -&gt; DriverUnload</text>
+
+  <path class="svg-line-a" d="M155 62 L155 76 M155 122 L155 136 M155 182 L155 196 M155 242 L155 256 M155 308 L155 322" marker-end="url(#d1)"/>
+  <defs><marker id="d1" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+
+  <rect class="svg-box" x="320" y="16" width="440" height="170" rx="7"/>
+  <text class="svg-tb" x="334" y="38">What goes where — this is the part people get wrong</text>
+  <text class="svg-tm" x="334" y="62">DeviceAdd:        create objects. NO hardware access — resources</text>
+  <text class="svg-tm" x="334" y="78">                  have not been assigned yet.</text>
+  <text class="svg-tm" x="334" y="100">PrepareHardware:  resources ARE assigned. Map registers here.</text>
+  <text class="svg-tm" x="334" y="116">                  Called again after a resource rebalance.</text>
+  <text class="svg-tm" x="334" y="138">D0Entry:          the device now has power. Program it, enable</text>
+  <text class="svg-tm" x="334" y="154">                  interrupts. Called on every resume from Dx.</text>
+  <text class="svg-tm" x="334" y="176">D0Exit:           quiesce. Save state if the power will be removed.</text>
+
+  <rect class="svg-box-d" x="320" y="200" width="440" height="110" rx="7"/>
+  <text class="svg-tb" x="334" y="222">Common mistake</text>
+  <text class="svg-tm" x="334" y="246">Touching hardware in EvtDriverDeviceAdd. It compiles, and on a</text>
+  <text class="svg-tm" x="334" y="264">machine where the BIOS happened to leave the device configured it</text>
+  <text class="svg-tm" x="334" y="282">even works — until a machine where it does not, and you fault on</text>
+  <text class="svg-tm" x="334" y="300">an unmapped register. Map in PrepareHardware, always.</text>
+
+  <rect class="svg-box" x="320" y="324" width="440" height="64" rx="7"/>
+  <text class="svg-tb" x="334" y="346">Surprise-removal</text>
+  <text class="svg-tm" x="334" y="368">A USB device can vanish mid-transfer. WDF cancels outstanding</text>
+  <text class="svg-tm" x="334" y="384">requests and calls your teardown path. Test it by yanking the cable.</text>
+</svg>
+<figcaption>KMDF lifecycle. Each callback has a defined IRQL and a defined set of things that are legal in it — check the docs for each.</figcaption>
+</figure>
+
+<h2 id="queues">Request queues</h2>
+
+<p>WDF does not hand you IRPs as they arrive. It puts them in a <strong>queue</strong> whose configuration
+you choose, and calls your handler according to that configuration. This is where WDF's concurrency model
+lives.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Dispatch type</th><th>Behaviour</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>WdfIoQueueDispatchSequential</code></td><td>One request delivered at a time; the next arrives only after the current one completes</td><td>Hardware that can do one operation at a time. <strong>Simplest and safest — start here.</strong></td></tr>
+<tr><td><code>WdfIoQueueDispatchParallel</code></td><td>Requests delivered as they arrive, possibly concurrently on several CPUs</td><td>Hardware with deep queues; you handle your own synchronisation</td></tr>
+<tr><td><code>WdfIoQueueDispatchManual</code></td><td>Nothing is delivered; you pull requests with <code>WdfIoQueueRetrieveNextRequest()</code></td><td>Pending requests that complete later — the classic "wait for data" pattern</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>WDF_IO_QUEUE_CONFIG queueConfig;
+WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                                       WdfIoQueueDispatchSequential);
+queueConfig.EvtIoRead          = MyEvtIoRead;
+queueConfig.EvtIoWrite         = MyEvtIoWrite;
+queueConfig.EvtIoDeviceControl = MyEvtIoDeviceControl;
+queueConfig.EvtIoStop          = MyEvtIoStop;   // called on power-down
+
+status = WdfIoQueueCreate(device, &amp;queueConfig,
+                          WDF_NO_OBJECT_ATTRIBUTES, &amp;queue);</code></pre>
+
+<h3>The manual queue pattern</h3>
+<p>The Windows answer to a blocking read: park the request, complete it when data arrives.</p>
+
+<pre><code>// In EvtIoRead — no data yet, so park the request instead of completing it
+status = WdfRequestForwardToIoQueue(Request, ctx-&gt;ManualQueue);
+if (!NT_SUCCESS(status))
+        WdfRequestComplete(Request, status);
+return;   // note: NOT completed. The caller is still waiting.
+
+// Later, from a DPC when the hardware has data
+WDFREQUEST pending;
+status = WdfIoQueueRetrieveNextRequest(ctx-&gt;ManualQueue, &amp;pending);
+if (NT_SUCCESS(status)) {
+        PVOID buf; size_t len;
+        WdfRequestRetrieveOutputBuffer(pending, 1, &amp;buf, &amp;len);
+        RtlCopyMemory(buf, data, min(len, dataLen));
+        WdfRequestCompleteWithInformation(pending, STATUS_SUCCESS,
+                                          min(len, dataLen));
+}</code></pre>
+
+<div class="warn">
+<b>Cancellation is not optional</b>
+<p>A request sitting in a manual queue can be cancelled at any moment — the application pressed Ctrl+C, or
+called <code>CancelIo</code>, or exited. WDF handles the mechanics if the request is in a queue, which is
+exactly why you should park requests in a queue rather than in your own list. If you must hold a request
+outside a queue, you have to implement <code>EvtRequestCancel</code> correctly, and getting that race right
+is genuinely hard.</p>
+</div>
+
+<h2 id="io">Accessing I/O buffers</h2>
+
+<pre><code>NTSTATUS status;
+PVOID    buffer;
+size_t   length;
+
+// input buffer (what the caller sent you)
+status = WdfRequestRetrieveInputBuffer(Request,
+                                       sizeof(MY_INPUT),  // minimum required
+                                       &amp;buffer, &amp;length);
+if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);   // too small -> STATUS_BUFFER_TOO_SMALL
+        return;
+}
+
+// output buffer (what you fill in for the caller)
+status = WdfRequestRetrieveOutputBuffer(Request, sizeof(MY_OUTPUT),
+                                        &amp;buffer, &amp;length);
+
+// completing: the second value becomes the caller's bytes-transferred
+WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, bytesWritten);</code></pre>
+
+<div class="tip">
+<b>WDF validates lengths for you</b>
+<p>Passing a minimum size to <code>WdfRequestRetrieve*Buffer</code> makes the framework return
+<code>STATUS_BUFFER_TOO_SMALL</code> rather than handing you a short buffer. Always pass the real minimum —
+this one habit eliminates an entire class of kernel buffer-overflow vulnerabilities.</p>
+</div>
+
+<h2 id="ioctl">IOCTL codes</h2>
+
+<pre><code>#define FILE_DEVICE_MYDEV  0x8000u    // 0x8000+ is reserved for third parties
+
+#define IOCTL_MYDEV_GET_VERSION \
+        CTL_CODE(FILE_DEVICE_MYDEV, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define IOCTL_MYDEV_SET_CONFIG \
+        CTL_CODE(FILE_DEVICE_MYDEV, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_MYDEV_XFER \
+        CTL_CODE(FILE_DEVICE_MYDEV, 0x802, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)</code></pre>
+
+<pre class="diagram">CTL_CODE(DeviceType, Function, Method, Access) packs into 32 bits:
+
+ 31    16 15   14 13         2 1  0
++--------+------+-------------+----+
+|DeviceType|Access| Function   |Meth|
++--------+------+-------------+----+
+
+  Function  0x000-0x7FF reserved by Microsoft, 0x800-0xFFF yours
+  Method    how buffers are passed: BUFFERED / IN_DIRECT / OUT_DIRECT / NEITHER
+  Access    FILE_READ_ACCESS / FILE_WRITE_ACCESS / FILE_ANY_ACCESS
+            — checked against how the handle was opened. Use it.</pre>
+
+<h2 id="hardware">Hardware resources</h2>
+
+<pre><code>NTSTATUS MyEvtDevicePrepareHardware(WDFDEVICE Device,
+                                    WDFCMRESLIST Raw, WDFCMRESLIST Translated)
+{
+        PDEVICE_CONTEXT ctx = DeviceGetContext(Device);
+        ULONG count = WdfCmResourceListGetCount(Translated);
+
+        for (ULONG i = 0; i &lt; count; i++) {
+                PCM_PARTIAL_RESOURCE_DESCRIPTOR d =
+                        WdfCmResourceListGetDescriptor(Translated, i);
+
+                switch (d-&gt;Type) {
+                case CmResourceTypeMemory:
+                        ctx-&gt;Registers = MmMapIoSpaceEx(d-&gt;u.Memory.Start,
+                                                        d-&gt;u.Memory.Length,
+                                                        PAGE_READWRITE | PAGE_NOCACHE);
+                        ctx-&gt;RegLength = d-&gt;u.Memory.Length;
+                        break;
+
+                case CmResourceTypeInterrupt:
+                        /* WDF claims this automatically if you created a
+                         * WDFINTERRUPT in EvtDeviceAdd */
+                        break;
+
+                case CmResourceTypePort:
+                        /* legacy x86 I/O ports */
+                        break;
+                }
+        }
+        return ctx-&gt;Registers ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+}
+
+// register access - note PAGE_NOCACHE above; this is the Device memory type
+// from chapter 03, and getting it wrong causes exactly the bugs described there
+ULONG v = READ_REGISTER_ULONG((PULONG)((PUCHAR)ctx-&gt;Registers + REG_STATUS));
+WRITE_REGISTER_ULONG((PULONG)((PUCHAR)ctx-&gt;Registers + REG_CTRL), v | ENABLE);
+
+// in EvtDeviceReleaseHardware
+MmUnmapIoSpace(ctx-&gt;Registers, ctx-&gt;RegLength);</code></pre>
+
+<h2 id="interrupts">Interrupts</h2>
+
+<pre><code>WDF_INTERRUPT_CONFIG intConfig;
+WDF_INTERRUPT_CONFIG_INIT(&amp;intConfig, MyEvtInterruptIsr, MyEvtInterruptDpc);
+intConfig.EvtInterruptEnable  = MyEvtInterruptEnable;   // called at D0Entry
+intConfig.EvtInterruptDisable = MyEvtInterruptDisable;  // called at D0Exit
+
+status = WdfInterruptCreate(device, &amp;intConfig,
+                            WDF_NO_OBJECT_ATTRIBUTES, &amp;ctx-&gt;Interrupt);
+
+// --- ISR: runs at DIRQL. Do the minimum. ---
+BOOLEAN MyEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
+{
+        PDEVICE_CONTEXT ctx = DeviceGetContext(WdfInterruptGetDevice(Interrupt));
+        ULONG status = READ_REGISTER_ULONG(REG(ctx, REG_STATUS));
+
+        if (!(status &amp; ST_IRQ))
+                return FALSE;          // not ours - essential for shared lines
+
+        WRITE_REGISTER_ULONG(REG(ctx, REG_STATUS), ST_IRQ);   // clear at source
+        ctx-&gt;LastStatus = status;                             // capture volatile state
+        WdfInterruptQueueDpcForIsr(Interrupt);
+        return TRUE;
+}
+
+// --- DPC: runs at DISPATCH_LEVEL. Still no paging, still no waiting. ---
+VOID MyEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT Device)
+{
+        PDEVICE_CONTEXT ctx = DeviceGetContext((WDFDEVICE)Device);
+        WDFREQUEST request;
+
+        if (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx-&gt;ManualQueue, &amp;request))) {
+                /* fill the buffer and complete the parked request */
+                WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, len);
+        }
+}
+
+// To synchronise your normal code against the ISR, use the interrupt lock:
+WdfInterruptAcquireLock(ctx-&gt;Interrupt);      // raises to DIRQL
+ctx-&gt;SharedWithIsr = value;
+WdfInterruptReleaseLock(ctx-&gt;Interrupt);
+
+// ...or run a whole function at DIRQL with the lock held:
+WdfInterruptSynchronize(ctx-&gt;Interrupt, MySyncedRoutine, ctx);</code></pre>
+
+<h2 id="dma">DMA</h2>
+
+<pre><code>// 1. Declare DMA capability in EvtDeviceAdd or PrepareHardware
+WDF_DMA_ENABLER_CONFIG dmaConfig;
+WDF_DMA_ENABLER_CONFIG_INIT(&amp;dmaConfig, WdfDmaProfileScatterGather64,
+                            MAX_TRANSFER_LENGTH);
+status = WdfDmaEnablerCreate(device, &amp;dmaConfig,
+                             WDF_NO_OBJECT_ATTRIBUTES, &amp;ctx-&gt;DmaEnabler);
+
+// 2. Per transfer: create a transaction, initialise it from the request,
+//    and let WDF call you back with the scatter-gather list
+status = WdfDmaTransactionCreate(ctx-&gt;DmaEnabler, WDF_NO_OBJECT_ATTRIBUTES,
+                                 &amp;dmaTransaction);
+status = WdfDmaTransactionInitializeUsingRequest(dmaTransaction, Request,
+                                                 MyEvtProgramDma,
+                                                 WdfDmaDirectionWriteToDevice);
+status = WdfDmaTransactionExecute(dmaTransaction, WDF_NO_CONTEXT);
+
+// 3. Your callback receives the SG list — program the hardware here
+BOOLEAN MyEvtProgramDma(WDFDMATRANSACTION Transaction, WDFDEVICE Device,
+                        PVOID Context, WDF_DMA_DIRECTION Direction,
+                        PSCATTER_GATHER_LIST SgList)
+{
+        for (ULONG i = 0; i &lt; SgList-&gt;NumberOfElements; i++) {
+                program_descriptor(SgList-&gt;Elements[i].Address.QuadPart,
+                                   SgList-&gt;Elements[i].Length);
+        }
+        start_dma();
+        return TRUE;
+}
+
+// 4. On completion (from your DPC)
+if (WdfDmaTransactionDmaCompleted(dmaTransaction, &amp;status)) {
+        /* the whole transfer is done */
+        WdfDmaTransactionRelease(dmaTransaction);
+        WdfRequestComplete(request, status);
+}</code></pre>
+
+<div class="note">
+<b>The same physics as chapter 05</b>
+<p><code>SgList-&gt;Elements[i].Address</code> is a <em>logical</em> address — Windows' name for what Linux
+calls a <code>dma_addr_t</code>. If an IOMMU is present it is an IOVA; if not it is a physical address.
+Never program the device with a virtual address, and never DMA to a buffer you have not described with an
+MDL. The reasoning in <a href="smmu.html">chapter 05</a> applies unchanged.</p>
+</div>
+
+<h2 id="inf">INF files — installation and matching</h2>
+
+<p>An INF is both the driver's "device tree" (what hardware it matches) and its installer.</p>
+
+<div class="codewrap"><div class="code-title">mydriver.inf</div>
+<pre><code>[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = mydriver.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1                       ; required on modern Windows
+
+[DestinationDirs]
+DefaultDestDir = 13                   ; the driver store
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+[SourceDisksFiles]
+mydriver.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceDesc% = MyDevice_Install, Root\MyDevice          ; software-only device
+;%DeviceDesc% = MyDevice_Install, PCI\VEN_8086&amp;DEV_1234 ; a real PCI device
+
+[MyDevice_Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+mydriver.sys
+
+[MyDevice_Install.NT.Services]
+AddService = mydriver,%SPSVCINST_ASSOCSERVICE%,MyDriver_Service
+
+[MyDriver_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1                     ; SERVICE_KERNEL_DRIVER
+StartType     = 3                     ; SERVICE_DEMAND_START
+ErrorControl  = 1                     ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\mydriver.sys
+
+[MyDevice_Install.NT.Wdf]
+KmdfService = mydriver, MyDriver_wdfsect
+[MyDriver_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "Embedded Learning Hub"
+DiskName         = "MyDriver Installation Disk"
+DeviceDesc       = "My Example Device"
+ServiceName      = "MyDriver Service"</code></pre></div>
+
+<pre><code>:: validate the INF before you ever try to install it
+infverif /v mydriver.inf
+
+:: build the driver package (creates the .cat)
+:: — Visual Studio does this, or:
+inf2cat /driver:. /os:10_X64
+
+:: install / manage a root-enumerated device from the command line
+devcon install mydriver.inf Root\MyDevice
+devcon status Root\MyDevice
+devcon remove Root\MyDevice
+
+:: or with the in-box tool
+pnputil /add-driver mydriver.inf /install
+pnputil /enum-drivers
+pnputil /delete-driver oem42.inf /uninstall</code></pre>
+
+<h2 id="signing">Signing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Stage</th><th>What you need</th><th>Works on</th></tr></thead>
+<tbody>
+<tr><td><strong>Test signing</strong></td><td>A self-made certificate; <code>bcdedit /set testsigning on</code> on the target</td><td>Your test VM only</td></tr>
+<tr><td><strong>Attestation signing</strong></td><td>An EV code-signing certificate + a Microsoft Partner Center account; submit the package, get it signed back</td><td>Windows 10/11 desktop. No hardware lab tests required.</td></tr>
+<tr><td><strong>WHQL / HLK</strong></td><td>All of the above plus passing the Hardware Lab Kit test suite</td><td>Everything, and eligible for Windows Update distribution</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="codewrap"><div class="code-title">creating and using a test certificate</div>
+<pre><code>:: 1. make a self-signed test certificate
+makecert -r -pe -ss PrivateCertStore -n "CN=MyTestCert" mytest.cer
+
+:: 2. sign the driver
+signtool sign /v /s PrivateCertStore /n "MyTestCert" ^
+              /t http://timestamp.digicert.com mydriver.sys
+
+:: 3. sign the catalog too - Windows checks the .cat, not just the .sys
+signtool sign /v /s PrivateCertStore /n "MyTestCert" mydriver.cat
+
+:: 4. on the TEST machine, trust the certificate
+certmgr /add mytest.cer /s /r localMachine root
+certmgr /add mytest.cer /s /r localMachine trustedpublisher
+
+:: 5. verify
+signtool verify /v /kp mydriver.sys</code></pre></div>
+
+<div class="warn">
+<b>Why the certificate must be in two stores</b>
+<p><code>root</code> makes Windows trust the chain; <code>trustedpublisher</code> suppresses the installation
+prompt. Missing either one gives "the third-party INF does not contain digital signature information"
+even though the file is signed correctly.</p>
+</div>
+
+<h2 id="analysis">Static analysis — non-negotiable</h2>
+
+<p>Windows has the best static analysis of any driver ecosystem. Use all of it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Finds</th><th>Run with</th></tr></thead>
+<tbody>
+<tr><td><strong>Code Analysis</strong></td><td>Buffer overruns, uninitialised memory, wrong annotations</td><td>Build &rarr; Run Code Analysis, or <code>msbuild /p:RunCodeAnalysis=true</code></td></tr>
+<tr><td><strong>SDV</strong> (Static Driver Verifier)</td><td>Proves or disproves rules about the WDF/WDM API: IRQL correctness, lock pairing, correct IRP completion</td><td>Driver &rarr; Launch Static Driver Verifier</td></tr>
+<tr><td><strong>SAL annotations</strong></td><td>Contract violations at compile time</td><td>Annotate your own functions</td></tr>
+<tr><td><strong>Driver Verifier</strong></td><td>Runtime: pool corruption, IRQL violations, leaks</td><td><code>verifier /standard /driver mydriver.sys</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>// SAL annotations describe the contract to the analyser
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Requires_lock_held_(ctx-&gt;Lock)
+VOID MyHelper(
+        _In_ PDEVICE_CONTEXT ctx,
+        _Out_writes_bytes_(Length) PVOID Buffer,
+        _In_ ULONG Length
+);
+
+// PAGED_CODE() asserts you are at PASSIVE_LEVEL — put it at the top of
+// every function marked #pragma alloc_text(PAGE, ...)
+VOID MyPageableFunction(VOID)
+{
+        PAGED_CODE();
+        ...
+}</code></pre>
+
+<h2 id="tracing">Tracing and logging</h2>
+
+<pre><code>// simple, always available
+KdPrint(("mydriver: value=%d status=0x%08x\n", value, status));  // debug builds
+DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "mydriver: ...\n");
+
+// WPP tracing — the production mechanism: near-zero cost when disabled,
+// messages compiled out into a trace format file
+DoTraceMessage(TRACE_DEVICE, "Device %p entered D0", device);</code></pre>
+
+<pre><code>:: capture a WPP trace live
+tracelog -start MyTrace -guid #GUID -f mytrace.etl -flag 0xF -level 5
+:: ...reproduce the problem...
+tracelog -stop MyTrace
+traceview -process mytrace.etl -pdb mydriver.pdb
+
+:: see DbgPrint output without a debugger: DebugView from Sysinternals
+:: (enable kernel capture + "capture events")</code></pre>
+
+<h2 id="debug">WinDbg essentials for drivers</h2>
+
+<pre><code>:: setup
+.sympath srv*C:\symbols*https://msdl.microsoft.com/download/symbols;C:\proj\x64\Debug
+.reload /f
+
+:: breakpoints
+bu mydriver!MyEvtIoDeviceControl        :: deferred: survives module reload
+bp mydriver!MyEvtInterruptDpc
+bl                                      :: list      bc *  :: clear all
+
+:: WDF-specific extensions - load once
+.load wdfkd.dll
+!wdfkd.wdfldr                           :: which WDF version is loaded
+!wdfkd.wdfdriverinfo mydriver           :: your driver's WDF objects
+!wdfkd.wdfdevicequeues &lt;WDFDEVICE&gt;      :: what is sitting in your queues
+!wdfkd.wdfrequest &lt;WDFREQUEST&gt;
+!wdfkd.wdfhandle &lt;handle&gt;               :: what kind of object is this?
+!wdfkd.wdflogdump mydriver              :: the WDF internal log - extremely useful
+
+:: general
+!analyze -v          k          !irql          !running
+!devnode 0 1         !devobj \Device\MyDevice  !drvobj mydriver 7
+!poolused 2          !pool &lt;addr&gt;              dt nt!_IRP &lt;addr&gt;
+dx -r2 @$curprocess.Threads                    :: modern data model queries</code></pre>
+
+<h2 id="pitfalls">Common pitfalls</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Touching hardware in <code>EvtDeviceAdd</code></td><td>Crash or garbage reads on some machines</td><td>Map and touch in <code>EvtDevicePrepareHardware</code>/<code>D0Entry</code></td></tr>
+<tr><td>Paged memory at DISPATCH_LEVEL</td><td>Bug check 0xA or 0xD1, intermittently</td><td><code>NonPagedPoolNx</code>; enable Verifier's force-IRQL check</td></tr>
+<tr><td>Completing a request twice</td><td>Bug check 0x44 <code>MULTIPLE_IRP_COMPLETE_REQUESTS</code></td><td>Exactly one completion on every path, including error paths</td></tr>
+<tr><td>Forgetting to complete a request</td><td>The application hangs forever</td><td>Every path either completes or forwards the request</td></tr>
+<tr><td>No cancellation handling</td><td>Hang on Ctrl+C or process exit</td><td>Use a manual queue; WDF handles cancellation</td></tr>
+<tr><td>Not returning <code>FALSE</code> from a shared ISR</td><td>Interrupt storm, system hangs</td><td>Check your status bit first</td></tr>
+<tr><td>Ignoring <code>NTSTATUS</code> returns</td><td>Cascading failures far from the cause</td><td>Check every one; use <code>NT_SUCCESS()</code></td></tr>
+<tr><td>Assuming a fixed IRQL</td><td>Works in testing, fails under load</td><td><code>KeGetCurrentIrql()</code>, SAL annotations, SDV</td></tr>
+<tr><td>Mapping MMIO cacheable</td><td>Writes lost, phantom reads — see <a href="arm-architecture.html#memory-types">chapter 03</a></td><td><code>PAGE_NOCACHE</code> and <code>READ/WRITE_REGISTER_*</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="checklist">Chapter checklist</h2>
+<ul class="checklist">
+  <li>You can explain why WDF exists and what it takes off your hands.</li>
+  <li>You can name the WDF object hierarchy and say what a context is for.</li>
+  <li>You can choose a queue dispatch type and justify it.</li>
+  <li>You can describe the manual-queue pattern for a request that completes later.</li>
+  <li>You know which callback maps registers and why it is not <code>EvtDeviceAdd</code>.</li>
+  <li>You can write a minimal INF and explain what each service field does.</li>
+  <li>You can test-sign a driver and get it to load on a test VM.</li>
+</ul>
+
+<p>Next: build all of it — <a href="windows-project.html">Chapter 13, the Windows driver project</a>.</p>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

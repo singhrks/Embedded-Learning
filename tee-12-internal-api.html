@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The TA Internal Core API in depth | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The TA Internal Core API in depth</h1>
+<p class="lead">Inside a trusted application there is no libc, no filesystem, no sockets and no
+<code>printf</code> — there is one specified API covering memory, cryptography, storage, time and arithmetic.
+It is deliberately small and deliberately awkward in places; this chapter is the whole of it, organised by
+what you actually reach for.</p>
+
+<h2 id="entry">The five entry points</h2>
+
+<p>A trusted application is defined by the entry points it exports. The framework calls them at defined moments, and their signatures are fixed by the standard rather than by you.</p>
+
+<pre><code>/* Every TA implements exactly these. They are the TA's whole
+   interface to the world.                                    */
+
+TEE_Result TA_CreateEntryPoint(void)
+{
+        /* Called ONCE, when the TA is loaded into memory,
+           before any session exists. Initialise global state.
+           Returning an error prevents the TA loading at all. */
+        DMSG("has been called");
+        return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void)
+{
+        /* Called once, when the last session closes and the TA
+           is unloaded. Free global state. Cannot fail.       */
+}
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
+                                    TEE_Param params[4],
+                                    void **sess_ctx)
+{
+        /* Once per client session. Allocate per-session state
+           and store the pointer in *sess_ctx - it comes back
+           on every later call for this session.
+
+           params[] are whatever the client passed to
+           TEEC_OpenSession. Check param_types here too.      */
+        struct my_session *s = TEE_Malloc(sizeof *s, 0);
+        if (!s)
+                return TEE_ERROR_OUT_OF_MEMORY;
+        *sess_ctx = s;
+        return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess_ctx)
+{
+        TEE_Free(sess_ctx);
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx,
+                                      uint32_t cmd_id,
+                                      uint32_t param_types,
+                                      TEE_Param params[4])
+{
+        /* THE REAL WORK. One switch on cmd_id.              */
+        switch (cmd_id) {
+        case CMD_SIGN:   return do_sign(sess_ctx, param_types, params);
+        case CMD_VERIFY: return do_verify(sess_ctx, param_types, params);
+        default:         return TEE_ERROR_NOT_SUPPORTED;
+        }
+}</code></pre>
+
+<h2 id="memory">Memory</h2>
+
+<p>Memory inside a trusted application comes with the obligation to check every buffer that arrived from outside — and the API provides the function that performs exactly that check.</p>
+
+<pre><code>void *TEE_Malloc(size_t size, uint32_t hint);
+void *TEE_Realloc(void *buffer, uint32_t newSize);
+void  TEE_Free(void *buffer);
+
+/* hint:
+     TEE_MALLOC_FILL_ZERO   (0)  zeroed. The default, and what
+                                 you almost always want.
+     TEE_USER_MEM_HINT_NO_FILL_ZERO   uninitialised, faster   */
+
+void TEE_MemMove(void *dest, const void *src, uint32_t size);
+int32_t TEE_MemCompare(const void *b1, const void *b2, uint32_t size);
+void TEE_MemFill(void *buf, uint32_t x, uint32_t size);
+
+/* TEE_MemCompare is NOT constant time. For comparing a MAC or
+   a password against a stored value, that is a timing oracle.
+   Write your own:                                            */
+
+static bool ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
+{
+        uint8_t diff = 0;
+        for (size_t i = 0; i &lt; n; i++)
+                diff |= a[i] ^ b[i];
+        return diff == 0;
+}
+
+/* Validating a pointer the client gave you: */
+TEE_Result TEE_CheckMemoryAccessRights(uint32_t accessFlags,
+                                       void *buffer, uint32_t size);
+    TEE_MEMORY_ACCESS_READ
+    TEE_MEMORY_ACCESS_WRITE
+    TEE_MEMORY_ACCESS_ANY_OWNER    /* it may be shared memory  */
+    TEE_MEMORY_ACCESS_SECURE       /* it must be secure memory */
+
+/* Giving up: */
+void TEE_Panic(TEE_Result panicCode);   /* never returns. The
+                                           session dies, the
+                                           client gets
+                                           TEEC_ERROR_TARGET_DEAD,
+                                           and a stack dump
+                                           appears on the secure
+                                           console.            */</code></pre>
+
+<h2 id="crypto">Cryptography</h2>
+
+<p>The cryptographic API is deliberately object-based: allocate, initialise, use, free. That shape is what allows an implementation to back it with hardware transparently.</p>
+
+<pre><code>/* The pattern is always the same: allocate an OPERATION,
+   allocate and populate an OBJECT for the key, attach one to
+   the other, then init/update/final.                        */
+
+/* ----- 1. an operation ----- */
+TEE_Result TEE_AllocateOperation(TEE_OperationHandle *op,
+                                 uint32_t algorithm,
+                                 uint32_t mode,
+                                 uint32_t maxKeySize);
+void TEE_FreeOperation(TEE_OperationHandle op);
+void TEE_ResetOperation(TEE_OperationHandle op);
+
+/* mode: TEE_MODE_ENCRYPT DECRYPT SIGN VERIFY MAC DIGEST DERIVE */
+
+/* ----- 2. a key object ----- */
+TEE_Result TEE_AllocateTransientObject(uint32_t objectType,
+                                       uint32_t maxKeySize,
+                                       TEE_ObjectHandle *object);
+TEE_Result TEE_PopulateTransientObject(TEE_ObjectHandle object,
+                                       const TEE_Attribute *attrs,
+                                       uint32_t attrCount);
+TEE_Result TEE_GenerateKey(TEE_ObjectHandle object,
+                           uint32_t keySize,
+                           const TEE_Attribute *params,
+                           uint32_t paramCount);
+void TEE_FreeTransientObject(TEE_ObjectHandle object);
+
+TEE_Result TEE_SetOperationKey(TEE_OperationHandle op,
+                               TEE_ObjectHandle key);
+
+/* ----- 3. use it ----- */
+void TEE_CipherInit(TEE_OperationHandle op, const void *IV,
+                    uint32_t IVLen);
+TEE_Result TEE_CipherUpdate(TEE_OperationHandle op,
+                            const void *src, uint32_t srcLen,
+                            void *dest, uint32_t *destLen);
+TEE_Result TEE_CipherDoFinal(...);
+
+TEE_Result TEE_DigestUpdate(...);
+TEE_Result TEE_DigestDoFinal(...);
+
+TEE_Result TEE_MACInit(...);   TEE_MACUpdate(...);
+TEE_Result TEE_MACComputeFinal(...);
+TEE_Result TEE_MACCompareFinal(...);   /* constant time - USE
+                                          THIS rather than
+                                          comparing yourself  */
+
+TEE_Result TEE_AEInit(...);    TEE_AEUpdateAAD(...);
+TEE_Result TEE_AEEncryptFinal(...);  TEE_AEDecryptFinal(...);
+
+TEE_Result TEE_AsymmetricSignDigest(TEE_OperationHandle op,
+                                    const TEE_Attribute *params,
+                                    uint32_t paramCount,
+                                    const void *digest, uint32_t digestLen,
+                                    void *signature, uint32_t *signatureLen);
+TEE_Result TEE_AsymmetricVerifyDigest(...);
+TEE_Result TEE_AsymmetricEncrypt(...);  TEE_AsymmetricDecrypt(...);
+
+TEE_Result TEE_DeriveKey(TEE_OperationHandle op,
+                         const TEE_Attribute *params,
+                         uint32_t paramCount,
+                         TEE_ObjectHandle derivedKey);
+
+void TEE_GenerateRandom(void *randomBuffer, uint32_t randomBufferLen);</code></pre>
+
+<pre><code>/* A complete AES-GCM encrypt, showing the shape end to end. */
+
+static TEE_Result encrypt(const uint8_t *key, size_t keylen,
+                          const uint8_t *nonce, size_t noncelen,
+                          const uint8_t *pt, size_t ptlen,
+                          uint8_t *ct, size_t *ctlen,
+                          uint8_t *tag, size_t *taglen)
+{
+        TEE_OperationHandle op = TEE_HANDLE_NULL;
+        TEE_ObjectHandle    ko = TEE_HANDLE_NULL;
+        TEE_Attribute       attr;
+        TEE_Result          res;
+
+        res = TEE_AllocateOperation(&amp;op, TEE_ALG_AES_GCM,
+                                    TEE_MODE_ENCRYPT, keylen * 8);
+        if (res) goto out;
+
+        res = TEE_AllocateTransientObject(TEE_TYPE_AES,
+                                          keylen * 8, &amp;ko);
+        if (res) goto out;
+
+        TEE_InitRefAttribute(&amp;attr, TEE_ATTR_SECRET_VALUE,
+                             key, keylen);
+        res = TEE_PopulateTransientObject(ko, &amp;attr, 1);
+        if (res) goto out;
+
+        res = TEE_SetOperationKey(op, ko);
+        if (res) goto out;
+
+        res = TEE_AEInit(op, nonce, noncelen, *taglen * 8, 0, ptlen);
+        if (res) goto out;
+
+        res = TEE_AEEncryptFinal(op, pt, ptlen, ct, ctlen,
+                                 tag, taglen);
+out:
+        /* Both are safe to call on TEE_HANDLE_NULL. */
+        TEE_FreeOperation(op);
+        TEE_FreeTransientObject(ko);
+        return res;
+}
+
+/* Note TEE_FreeTransientObject on the key: the key material is
+   wiped when the object is freed. Never keep raw key bytes in
+   a local array longer than necessary, and TEE_MemFill(0) any
+   you do keep.                                              */</code></pre>
+
+<div class="key">
+<b>Handles are opaque and must be freed on every path</b>
+<p><code>TEE_OperationHandle</code> and <code>TEE_ObjectHandle</code> are allocations inside OP-TEE. A TA that
+leaks them exhausts its own heap and eventually fails with
+<code>TEE_ERROR_OUT_OF_MEMORY</code> — after running correctly for hours. Initialise every handle to
+<code>TEE_HANDLE_NULL</code> and use a single <code>goto out</code> cleanup path, as above; the free
+functions accept NULL precisely so this pattern works.</p>
+</div>
+
+<h2 id="storage">Persistent storage</h2>
+
+<p>Persistent storage from inside a trusted application looks like a simple object store, with the confidentiality and integrity handled beneath the interface.</p>
+
+<pre><code>TEE_Result TEE_CreatePersistentObject(uint32_t storageID,
+                                      const void *objectID,
+                                      uint32_t objectIDLen,
+                                      uint32_t flags,
+                                      TEE_ObjectHandle attributes,
+                                      const void *initialData,
+                                      uint32_t initialDataLen,
+                                      TEE_ObjectHandle *object);
+TEE_Result TEE_OpenPersistentObject(...);
+void       TEE_CloseObject(TEE_ObjectHandle object);
+TEE_Result TEE_CloseAndDeletePersistentObject1(TEE_ObjectHandle object);
+
+TEE_Result TEE_ReadObjectData(TEE_ObjectHandle object, void *buffer,
+                              uint32_t size, uint32_t *count);
+TEE_Result TEE_WriteObjectData(TEE_ObjectHandle object,
+                               const void *buffer, uint32_t size);
+TEE_Result TEE_SeekObjectData(TEE_ObjectHandle object,
+                              int32_t offset, TEE_Whence whence);
+TEE_Result TEE_TruncateObjectData(TEE_ObjectHandle object,
+                                  uint32_t size);
+TEE_Result TEE_GetObjectInfo1(TEE_ObjectHandle object,
+                              TEE_ObjectInfo *objectInfo);
+
+/* storageID:
+     TEE_STORAGE_PRIVATE        the default; REE FS or RPMB
+                                depending on build config
+     TEE_STORAGE_PRIVATE_REE    explicitly the normal-world FS
+     TEE_STORAGE_PRIVATE_RPMB   explicitly RPMB
+
+   flags:
+     TEE_DATA_FLAG_ACCESS_READ
+     TEE_DATA_FLAG_ACCESS_WRITE
+     TEE_DATA_FLAG_ACCESS_WRITE_META    needed to delete/rename
+     TEE_DATA_FLAG_SHARE_READ / SHARE_WRITE
+     TEE_DATA_FLAG_OVERWRITE            create even if it exists
+
+   The object ID is an arbitrary byte string YOU choose - it is
+   not a filename. Storage is per-TA and, with LOGIN_USER, per
+   caller (chapter 15).                                       */</code></pre>
+
+<h2 id="misc">Time, properties and arithmetic</h2>
+
+<p>The remaining services — time, random, properties — are small but each has a detail that matters, particularly around what can be trusted.</p>
+
+<pre><code>/* TIME - three sources, three trust levels. */
+
+void TEE_GetSystemTime(TEE_Time *time);
+    /* monotonic since boot, from the secure world. TRUSTED
+       for measuring intervals. Not wall-clock.              */
+
+TEE_Result TEE_GetREETime(TEE_Time *time);
+    /* wall-clock, FROM THE NORMAL WORLD. An attacker can set
+       it to anything. NEVER use for expiry or replay
+       protection (chapter 17).                              */
+
+TEE_Result TEE_GetTAPersistentTime(TEE_Time *time);
+TEE_Result TEE_SetTAPersistentTime(const TEE_Time *time);
+    /* a per-TA time that survives reboot, stored securely.
+       Returns TEE_ERROR_TIME_NOT_SET / TIME_NEEDS_RESET so
+       you can tell whether to trust it.                     */
+
+TEE_Result TEE_Wait(uint32_t timeout);   /* an RPC - holds a
+                                            thread! (ch. 9)   */
+
+/* PROPERTIES - configuration, declared in the TA's header or
+   provided by the implementation.                           */
+
+TEE_Result TEE_GetPropertyAsString(TEE_PropSetHandle propsetOrEnum,
+                                   const char *name,
+                                   char *valueBuffer,
+                                   uint32_t *valueBufferLen);
+TEE_Result TEE_GetPropertyAsBool(...);
+TEE_Result TEE_GetPropertyAsU32(...);
+TEE_Result TEE_GetPropertyAsBinaryBlock(...);
+TEE_Result TEE_GetPropertyAsUUID(...);
+TEE_Result TEE_GetPropertyAsIdentity(...);
+
+    TEE_PROPSET_TEE_IMPLEMENTATION   about the TEE
+    TEE_PROPSET_CURRENT_TA           about this TA
+    TEE_PROPSET_CURRENT_CLIENT       about the caller -
+                                     including its identity,
+                                     which is how a TA
+                                     authorises a client
+
+/* Reading the client's identity: */
+    TEE_Identity id;
+    TEE_GetPropertyAsIdentity(TEE_PROPSET_CURRENT_CLIENT,
+                              "gpd.client.identity", &amp;id);
+    /* id.login is the login type; id.uuid is derived from the
+       uid/gid, and the client cannot forge it.              */
+
+/* BIG NUMBERS - because a TA may need arithmetic the crypto
+   API does not cover. Rarely needed, and slow.              */
+
+void TEE_BigIntInit(TEE_BigInt *bigInt, uint32_t len);
+void TEE_BigIntAdd/Sub/Mul/Div(...);
+void TEE_BigIntExpMod(...);
+TEE_Result TEE_BigIntConvertFromOctetString(...);</code></pre>
+
+<h2 id="trace">Tracing from inside a TA</h2>
+
+<p>Printing from a trusted application is possible and has to route through the normal world, which has both practical and security consequences.</p>
+
+<pre><code>/* There is no printf. There are these, from
+   lib/libutee/include/trace.h - they go to the SECURE console. */
+
+    EMSG("error: %d", x);      /* always shown                 */
+    IMSG("info: %s", s);       /* CFG_TEE_TA_LOG_LEVEL &gt;= 2    */
+    DMSG("debug: %p", p);      /* &gt;= 3                          */
+    FMSG("flow");              /* &gt;= 4                          */
+
+    EMSG_RAW("no prefix\n");
+    DHEXDUMP(buf, len);        /* a hex dump - very useful     */
+
+/* Output:
+     E/TA: do_sign:112 error: -1
+     I/TA: something happened
+   with the function name and line number added for you.
+
+   NEVER log key material. DHEXDUMP of a buffer that might be a
+   key is a habit that ships. If you need it during
+   development, guard it:
+     #ifdef DEBUG_SECRETS
+     DHEXDUMP(key, keylen);
+     #endif
+   and make sure DEBUG_SECRETS cannot be defined in a release
+   build.                                                     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>TA works for hours then fails with out-of-memory</td><td>Leaked operation or object handles on an error
+path</td></tr>
+<tr><td><code>TEEC_ERROR_TARGET_DEAD</code></td><td><code>TEE_Panic</code>, a bad pointer, or an assertion.
+Read the secure console</td></tr>
+<tr><td><code>TEE_ERROR_BAD_PARAMETERS</code> from a crypto call</td><td>Algorithm and key type mismatch, or
+key size outside the operation's <code>maxKeySize</code></td></tr>
+<tr><td><code>TEE_ERROR_NOT_SUPPORTED</code></td><td>That algorithm is not compiled in — check the
+<code>CFG_CRYPTO_*</code> flags</td></tr>
+<tr><td>MAC verification is a timing oracle</td><td>Used <code>TEE_MemCompare</code> instead of
+<code>TEE_MACCompareFinal</code></td></tr>
+<tr><td>Expiry check defeated trivially</td><td>Used <code>TEE_GetREETime</code>, which the attacker
+controls</td></tr>
+<tr><td>Storage works for one user, collides for another</td><td>Login type and storage scoping — see
+<a href="tee-15-secure-storage.html">chapter 15</a></td></tr>
+<tr><td>Key material found in a memory dump</td><td>Raw key bytes left in a local buffer; wipe with
+<code>TEE_MemFill</code></td></tr>
+<tr><td>A TA hangs the system</td><td><code>TEE_Wait</code> or a long loop holding a thread</td></tr>
+<tr><td>Secrets in the log</td><td><code>DHEXDUMP</code> of key material left in a release build</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five entry points and say exactly when each is called.</li>
+  <li>Explain what <code>sess_ctx</code> is for and where it is allocated and freed.</li>
+  <li>Write the allocate-populate-attach-use pattern for a symmetric cipher.</li>
+  <li>Explain why every handle must be freed on every path, and give the pattern that ensures it.</li>
+  <li>Say why <code>TEE_MemCompare</code> is unsafe for MAC verification and what to use instead.</li>
+  <li>Name the three time sources and rank them by trustworthiness.</li>
+  <li>Explain how a TA discovers who its client is, and why that identity cannot be forged.</li>
+  <li>Give the four trace macros and the log level each needs.</li>
+  <li>Explain what <code>TEE_Panic</code> does to the session and what the client sees.</li>
+  <li>List the persistent-storage flags and say which one is needed to delete an object.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

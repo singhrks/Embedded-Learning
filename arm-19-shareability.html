@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coherency and shareability domains | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Coherency and shareability domains</h1>
+<p class="lead">Shareability decides which observers hardware keeps coherent, and how far a barrier or a
+maintenance operation propagates. It is set per page, costs nothing to get right, and produces
+impossible-looking multi-core bugs when got wrong.</p>
+
+<h2 id="domains">The domains</h2>
+
+<p>Shareability declares which other observers must see a memory access coherently. It is a property of the mapping rather than of the memory, which means two mappings of the same page can disagree — with predictable consequences.</p>
+
+<pre class="diagram">   ┌───────────────────────────────────────────────────────────┐
+   │  SYSTEM                                                    │
+   │  ┌──────────────────────────────────────────────────────┐ │
+   │  │  OUTER SHAREABLE                                      │ │
+   │  │  ┌────────────────────┐   ┌────────────────────┐     │ │
+   │  │  │ INNER SHAREABLE    │   │ INNER SHAREABLE    │     │ │
+   │  │  │  ┌────┐ ┌────┐     │   │  ┌────┐ ┌────┐     │     │ │
+   │  │  │  │CPU0│ │CPU1│     │   │  │CPU4│ │CPU5│     │     │ │
+   │  │  │  └────┘ └────┘     │   │  └────┘ └────┘     │     │ │
+   │  │  │   cluster 0 + L2   │   │   cluster 1 + L2   │     │ │
+   │  │  └────────────────────┘   └────────────────────┘     │ │
+   │  │            GPU, coherent DMA masters                  │ │
+   │  └──────────────────────────────────────────────────────┘ │
+   │            non-coherent DMA, other subsystems              │
+   └───────────────────────────────────────────────────────────┘
+
+  The BOUNDARIES are IMPLEMENTATION DEFINED. On a typical SoC:
+     Inner Shareable  = one CPU cluster, kept coherent by the
+                        cluster interconnect
+     Outer Shareable  = all clusters plus coherent DMA masters,
+                        via the system interconnect (CHI/ACE)
+     Non-shareable    = this core only; NO coherency maintained
+
+  Software cannot query the boundaries directly. It relies on the
+  SoC's documentation and, in Linux, on the device tree telling it
+  which masters are coherent.</pre>
+
+<div class="key">
+<b>What shareability actually controls</b>
+<p>Two things, and they are the same mechanism seen from two sides:</p>
+<ol>
+<li><strong>Which observers hardware keeps coherent</strong> for this page. Inside the domain, a write by one
+observer is automatically visible to the others — no cache maintenance needed.</li>
+<li><strong>How far a barrier or maintenance operation propagates.</strong> <code>DMB ISH</code> orders
+accesses within the inner domain; <code>TLBI ...IS</code> broadcasts to the inner domain. Going wider costs
+more.</li>
+</ol>
+<p>Shareability applies only to <strong>Normal cacheable</strong> memory. It is ignored for Device memory and
+for Normal Non-cacheable, both of which are coherent by construction because nothing caches them.</p>
+</div>
+
+<h2 id="setting">Setting it</h2>
+
+<p>In practice the attribute comes from the page descriptor, and an operating system sets it based on what the memory is for. Knowing the defaults tells you what you already have before you consider changing anything.</p>
+
+<pre><code>/* In a page table descriptor, SH[9:8] (chapter 14): */
+   00   Non-shareable
+   10   Outer Shareable
+   11   Inner Shareable
+   01   reserved
+
+/* Linux: */
+#define PTE_SHARED  (_AT(pteval_t, 3) &lt;&lt; 8)     /* Inner Shareable */
+/* — and PROT_NORMAL always includes it. Every normal Linux
+   mapping is Inner Shareable, because SMP requires it.       */
+
+/* In barriers and maintenance, the domain is a suffix: */
+        dmb     ish          /* inner shareable  — the usual   */
+        dmb     osh          /* outer shareable                */
+        dmb     sy           /* full system — widest, slowest  */
+        dmb     nsh          /* non-shareable — this core only */
+
+        tlbi    vae1is       /* IS = broadcast to inner domain */
+        tlbi    vae1os       /* OS = outer                     */
+        tlbi    vae1         /* no suffix = this core only     */</code></pre>
+
+<h2 id="rule">The rule that matters</h2>
+
+<div class="danger">
+<b>Non-shareable memory is not kept coherent — at all</b>
+<p>Marking SMP-shared memory Non-shareable takes it <em>out</em> of the coherency domain. Hardware then does
+not snoop it, and two cores can hold different values indefinitely. No barrier fixes this, because it is not
+an ordering problem: the cores genuinely disagree about the contents of memory.</p>
+<p>The symptom is a variable that "does not update" on one core, or a lock that both cores appear to hold. It
+is easy to misdiagnose as a missing barrier and spend days adding <code>DMB</code>s that cannot help.</p>
+<pre><code>/* WRONG for anything SMP */
+pte = pa | PTE_VALID | PTE_AF | PTE_ATTR(NORMAL_WB);   /* SH = 00 */
+
+/* RIGHT */
+pte = pa | PTE_VALID | PTE_AF | PTE_ATTR(NORMAL_WB) | PTE_SH_INNER;</code></pre>
+</div>
+
+<h2 id="mismatched">Mismatched attributes</h2>
+
+<p>Mapping the same physical memory with different shareability from two places is architecturally dangerous rather than merely inadvisable. This is the trap behind a class of extremely hard-to-reproduce bugs.</p>
+
+<pre class="diagram">If two observers map the SAME physical memory with DIFFERENT
+memory types or shareability, the architecture says the result is
+UNPREDICTABLE. Real consequences:
+
+  · one observer's writes may sit in a cache the other does not
+    snoop
+  · a Non-cacheable read may bypass a cache holding dirty data
+  · loss of atomicity — exclusives may not work
+
+COMMON WAYS THIS HAPPENS ACCIDENTALLY:
+
+  1. The kernel's LINEAR MAP covers all of RAM as Normal
+     Write-Back Inner-Shareable. If a driver then ioremaps some
+     of that same RAM as Device or Non-cacheable, the SAME
+     PHYSICAL PAGES now have two conflicting mappings.
+     → this is why Linux refuses to ioremap normal RAM, and why
+       reserved DMA regions are marked `no-map` in the device
+       tree so the linear map excludes them.
+
+  2. A guest and a hypervisor mapping the same page with
+     different stage-1 and stage-2 attributes. The combining
+     rule (chapter 16) makes the stricter one win, which is
+     safe — but a guest expecting cacheable access to something
+     the hypervisor forced Non-cacheable will be very slow.
+
+  3. Firmware and OS disagreeing about a shared region across a
+     handover — one running with the MMU off (everything is
+     Device) and one with it on.
+
+The fix is always the same: exactly ONE mapping per physical
+page, or identical attributes on every mapping of it.</pre>
+
+<h2 id="dma-coherent">Coherent and non-coherent masters</h2>
+
+<p>Whether a device participates in coherency changes everything about how a driver must handle its buffers. On modern SoCs some masters are coherent and others are not, often in the same system.</p>
+
+<pre><code>/* Whether a DMA master participates in coherency is a property of
+   how the SoC integrator wired it up:                        */
+
+   ACE / CHI      fully coherent: the master can snoop CPU caches
+                  AND be snooped
+   ACE-Lite       I/O coherent: the master can snoop CPU caches,
+                  but has no cache of its own to be snooped.
+                  This is the common case for DMA engines.
+   AXI            not coherent at all: software must do cache
+                  maintenance
+
+/* Software learns which from the device tree: */
+        dma_engine@2c000000 {
+                compatible = "vendor,dma";
+                reg = &lt;...&gt;;
+                dma-coherent;          /* ← this property */
+        };
+
+/* And the DMA API acts on it: */
+        dev-&gt;dma_coherent = of_dma_is_coherent(node);
+/* dma_map_single() then emits cache maintenance, or does not.
+
+   The single most important consequence: the SAME driver source
+   is correct on both kinds of SoC, PROVIDED it uses the DMA API.
+   Hand-rolled cache maintenance is either wasted work or a
+   correctness bug, depending on the platform.               */</code></pre>
+
+<h2 id="barriers">Choosing the barrier domain</h2>
+
+<p>Every barrier instruction takes a domain suffix that answers "ordered with respect to <em>whom</em>", and
+picking a wider domain than you need is not free — it makes the barrier wait for more of the system to catch
+up, which on a large SoC can mean hundreds of extra cycles for no correctness benefit. The four domains nest
+inside one another, from a single core outward to literally everything including non-coherent devices, and the
+practical rule is to pick the narrowest one that actually covers every observer you need to synchronise with:
+ordinary SMP synchronisation between cores never needs to reach further than the inner shareable domain, and
+reaching for <code>sy</code> everywhere "to be safe" is how a hot path silently accumulates hundreds of cycles
+of unnecessary waiting.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Domain</th><th>Orders accesses visible to</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>nsh</code></td><td>This PE only</td><td>Local TLB and cache maintenance in boot code</td></tr>
+<tr><td><code>ish</code></td><td>The inner shareable domain</td><td><strong>Almost everything in SMP kernel code</strong></td></tr>
+<tr><td><code>osh</code></td><td>The outer shareable domain</td><td>Synchronising with a coherent DMA master outside the cluster</td></tr>
+<tr><td><code>sy</code></td><td>Everything, including Device memory and non-coherent masters</td><td>MMIO ordering, DMA handoff, the conservative choice</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Cost increases with width. `dsb sy` may have to wait for
+   transactions to reach the far side of the interconnect, which
+   on a large SoC is hundreds of cycles.
+
+   Use the narrowest correct domain. In practice:
+     · CPU-to-CPU synchronisation        → ish
+     · after TLBI ...IS                  → ish
+     · before starting DMA on a
+       non-coherent device               → sy
+     · MMIO write that must land         → sy
+     · single-core boot code             → nsh                */
+
+/* Linux's naming maps directly:
+        smp_mb()   → dmb ish
+        mb()       → dsb sy         (used for MMIO / DMA)
+        dma_wmb()  → dmb oshst
+        __iowmb()  → dsb st, before an MMIO write             */</code></pre>
+
+<h2 id="exclusives">Exclusives and the shareability domain</h2>
+
+<p>Atomic operations depend on a hardware reservation, and that reservation only works within a shareability domain. A lock shared across a boundary where exclusives do not work will silently fail to be a lock.</p>
+
+<pre><code>/* LDXR/STXR rely on an EXCLUSIVE MONITOR. There are two:
+
+     LOCAL monitor    per-PE, tracks one address
+     GLOBAL monitor   in the interconnect, tracks addresses for
+                      the coherency domain
+
+   For Non-shareable memory, only the local monitor is used —
+   which means exclusives between two cores DO NOT WORK. A
+   spinlock in Non-shareable memory will let both cores in.
+
+   For Inner Shareable memory, the global monitor participates
+   and exclusives are correct across the domain.
+
+   This is another reason the shareability attribute is not
+   optional for shared data — and it is why a lock that
+   "sometimes lets two threads in" is often a page-attribute
+   bug rather than a logic bug.                             */
+
+/* The reservation granule (CTR_EL0.ERG) is the size the monitor
+   tracks — often 64 or 128 bytes. Two locks within one granule
+   cause FALSE SHARING of the reservation: each STXR clears the
+   other's, producing livelock-like retry storms. Pad locks to
+   the granule, exactly as you pad against cache-line false
+   sharing (CA chapter 15).                                 */</code></pre>
+
+<h2 id="debug">Diagnosing shareability problems</h2>
+
+<p>Shareability problems look like memory corruption or lost updates rather than like configuration errors. These are the signatures worth recognising.</p>
+
+<pre><code># what did the kernel actually map?
+cat /sys/kernel/debug/kernel_page_tables | head -40
+#   ...  RW NX SHD AF UXN MEM/NORMAL
+#              ^^^ SHD = shareable. Its ABSENCE on SMP memory is
+#                  the thing to look for.
+
+# ask the hardware for one address (chapter 12)
+        at   s1e1r, x0
+        mrs  x1, par_el1
+        /* PAR_EL1[9:8] = shareability actually applied
+           PAR_EL1[63:56] = memory attributes            */
+
+# is this device coherent?
+grep -l dma-coherent /proc/device-tree/*/*/
+cat /sys/bus/platform/devices/*/of_node/dma-coherent 2&gt;/dev/null
+
+# in the kernel
+pr_info("coherent=%d\n", dev_is_dma_coherent(dev));</code></pre>
+
+<div class="tip">
+<b>Distinguishing the three failure modes</b>
+<p>When shared data misbehaves on multi-core, decide which of these you have before touching anything:</p>
+<ul>
+<li><strong>Ordering</strong> — both cores eventually agree, but saw the writes in the wrong sequence. Fix
+with barriers or acquire/release (<a href="arm-21-barriers.html">chapter 21</a>).</li>
+<li><strong>Coherency</strong> — the cores durably disagree about a value. Check shareability, and check for
+mismatched mappings.</li>
+<li><strong>Atomicity</strong> — an update was lost. Check exclusives, and check that the memory is
+shareable so the global monitor applies.</li>
+</ul>
+<p>Adding barriers to a coherency problem is the most common wasted debugging effort in multi-core work.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A variable never updates on the other core</td><td>Memory marked Non-shareable</td></tr>
+<tr><td>Adding barriers does not help</td><td>It is a coherency problem, not an ordering one</td></tr>
+<tr><td>A spinlock lets two cores in</td><td>Exclusives on Non-shareable memory — no global monitor</td></tr>
+<tr><td>Two locks in one structure cause retry storms</td><td>Both inside one exclusives reservation granule</td></tr>
+<tr><td>Works single-core, fails on SMP</td><td>Shareability, or a genuinely missing barrier</td></tr>
+<tr><td>Corruption after <code>ioremap</code> of normal RAM</td><td>Mismatched attributes with the linear map</td></tr>
+<tr><td>Reserved DMA region behaves erratically</td><td>Not marked <code>no-map</code>; the linear map also covers it</td></tr>
+<tr><td>Driver correct on one SoC, corrupts on another</td><td>One master is coherent and the other is not</td></tr>
+<tr><td><code>dsb sy</code> in a hot path is slow</td><td>Widest domain; use <code>ish</code> where it suffices</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the shareability domains and say what determines their boundaries.</li>
+  <li>State the two things shareability controls.</li>
+  <li>Explain why shareability is ignored for Device memory.</li>
+  <li>Say what happens to SMP data marked Non-shareable, and why barriers do not fix it.</li>
+  <li>Give two ways mismatched attributes arise accidentally, and the fix.</li>
+  <li>Explain the difference between ACE, ACE-Lite and plain AXI for a DMA master.</li>
+  <li>Choose the right barrier domain for four different situations.</li>
+  <li>Explain why exclusives fail on Non-shareable memory.</li>
+  <li>Distinguish ordering, coherency and atomicity failures by symptom.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

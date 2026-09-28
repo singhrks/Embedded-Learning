@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Example: a complete character driver, annotated | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Example: a complete character driver, annotated</h1>
+<p class="lead"><a href="lx-20-char-devices.html">Chapter 22</a> explained the character device interface
+piece by piece. This chapter is one complete, compiling, working driver — every line of it — that you can
+build, load and talk to in about five minutes, and then keep as the skeleton you start every future character
+driver from.</p>
+
+<h2 id="what">What this driver does</h2>
+
+<p>Before reading any code, it helps to know exactly what the finished driver does and — just as usefully — what it deliberately leaves out. This one is small enough to hold in your head entirely, which is the point.</p>
+
+<pre class="diagram">   A FIXED-SIZE IN-KERNEL BUFFER EXPOSED AS /dev/echodev.
+
+     echo "hello" &gt; /dev/echodev      stores "hello"
+     cat /dev/echodev                  returns "hello"
+
+   DELIBERATELY SMALL, BUT NOT A TOY - it exercises every
+   mechanism a real character driver needs:
+
+     · a device node created automatically (no mknod)
+     · open / read / write / release / llseek
+     · SAFE copying across the user-kernel boundary (ch. 09)
+     · a mutex, because two processes CAN open it at once
+       and the kernel will not serialise them for you (ch. 12)
+     · correct partial-read and end-of-file semantics
+     · an ioctl to clear the buffer, with proper numbering
+     · a clean teardown path that leaks nothing
+
+   WHAT IT DELIBERATELY OMITS, and where to find it:
+     · blocking reads and poll()        chapter 22
+     · a ring buffer with a wait queue  chapter 36
+     · hardware of any kind             chapters 27 · 28</pre>
+
+<h2 id="driver">The complete driver</h2>
+
+<p>Here is the whole driver, in one file, with nothing omitted. Every mechanism in it was covered in an earlier chapter; the value of seeing them assembled is that you can now copy this shape rather than reconstructing it.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/* echodev.c - a complete, minimal character driver. */
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/fs.h&gt;           /* file_operations              */
+#include &lt;linux/miscdevice.h&gt;   /* misc_register                */
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;      /* copy_to_user, copy_from_user */
+
+#define ECHO_BUF_SIZE 4096
+
+struct echo_dev {
+        char       *buf;
+        size_t      len;        /* bytes currently stored */
+        struct mutex lock;      /* protects buf and len   */
+};
+
+static struct echo_dev *echo;
+
+/* ---------------------------------------------------------------
+   open / release
+
+   With a misc device there is exactly ONE instance, so open()
+   has almost nothing to do. Storing our device pointer in
+   file-&gt;private_data is still the right habit: every other
+   callback then reaches its state through the struct file it
+   was given, rather than through a global - which is what
+   lets the same code support many instances later.
+   --------------------------------------------------------------- */
+static int echo_open(struct inode *inode, struct file *file)
+{
+        file-&gt;private_data = echo;
+        return 0;
+}
+
+static int echo_release(struct inode *inode, struct file *file)
+{
+        return 0;               /* nothing acquired in open()  */
+}
+
+/* ---------------------------------------------------------------
+   read
+
+   THE THREE THINGS EVERY read() MUST GET RIGHT:
+     1. respect *ppos - the caller's file offset, not a global
+     2. return 0 at end of file, or `cat` never terminates
+     3. return the number of bytes ACTUALLY copied, which may
+        be fewer than requested
+   --------------------------------------------------------------- */
+static ssize_t echo_read(struct file *file, char __user *ubuf,
+                         size_t count, loff_t *ppos)
+{
+        struct echo_dev *d = file-&gt;private_data;
+        ssize_t ret;
+
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;   /* a signal arrived while
+                                          waiting for the lock   */
+
+        if (*ppos &gt;= d-&gt;len) {
+                ret = 0;               /* EOF - this is what
+                                          terminates `cat`       */
+                goto out;
+        }
+
+        /* Clamp the request to what actually exists. */
+        if (count &gt; d-&gt;len - *ppos)
+                count = d-&gt;len - *ppos;
+
+        if (copy_to_user(ubuf, d-&gt;buf + *ppos, count)) {
+                ret = -EFAULT;         /* NEVER dereference ubuf
+                                          directly - chapter 09  */
+                goto out;
+        }
+
+        *ppos += count;
+        ret = count;
+out:
+        mutex_unlock(&amp;d-&gt;lock);
+        return ret;
+}
+
+/* ---------------------------------------------------------------
+   write
+   --------------------------------------------------------------- */
+static ssize_t echo_write(struct file *file, const char __user *ubuf,
+                          size_t count, loff_t *ppos)
+{
+        struct echo_dev *d = file-&gt;private_data;
+        ssize_t ret;
+
+        if (*ppos &gt;= ECHO_BUF_SIZE)
+                return -ENOSPC;
+
+        if (count &gt; ECHO_BUF_SIZE - *ppos)
+                count = ECHO_BUF_SIZE - *ppos;
+
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;
+
+        if (copy_from_user(d-&gt;buf + *ppos, ubuf, count)) {
+                ret = -EFAULT;
+                goto out;
+        }
+
+        *ppos += count;
+        if (*ppos &gt; d-&gt;len)
+                d-&gt;len = *ppos;        /* the buffer grew        */
+        ret = count;
+out:
+        mutex_unlock(&amp;d-&gt;lock);
+        return ret;
+}
+
+/* ---------------------------------------------------------------
+   llseek
+
+   generic_file_llseek needs a size; the simplest correct
+   approach for a fixed-size buffer is fixed_size_llseek,
+   which handles SEEK_SET / SEEK_CUR / SEEK_END and all the
+   overflow and negative-offset checks for you. Writing this
+   by hand is a classic source of subtle bugs.
+   --------------------------------------------------------------- */
+static loff_t echo_llseek(struct file *file, loff_t off, int whence)
+{
+        return fixed_size_llseek(file, off, whence, ECHO_BUF_SIZE);
+}
+
+/* ---------------------------------------------------------------
+   ioctl - one command, numbered properly (chapter 23)
+   --------------------------------------------------------------- */
+#define ECHO_IOC_MAGIC  'E'
+#define ECHO_IOC_CLEAR  _IO(ECHO_IOC_MAGIC, 1)
+
+static long echo_ioctl(struct file *file, unsigned int cmd,
+                       unsigned long arg)
+{
+        struct echo_dev *d = file-&gt;private_data;
+
+        switch (cmd) {
+        case ECHO_IOC_CLEAR:
+                mutex_lock(&amp;d-&gt;lock);
+                memset(d-&gt;buf, 0, ECHO_BUF_SIZE);
+                d-&gt;len = 0;
+                mutex_unlock(&amp;d-&gt;lock);
+                return 0;
+        default:
+                return -ENOTTY;        /* the CORRECT error for an
+                                          unknown ioctl - not
+                                          -EINVAL                */
+        }
+}
+
+static const struct file_operations echo_fops = {
+        .owner          = THIS_MODULE,  /* stops rmmod while a
+                                           file is open          */
+        .open           = echo_open,
+        .release        = echo_release,
+        .read           = echo_read,
+        .write          = echo_write,
+        .llseek         = echo_llseek,
+        .unlocked_ioctl = echo_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,
+};
+
+static struct miscdevice echo_misc = {
+        .minor = MISC_DYNAMIC_MINOR,
+        .name  = "echodev",             /* becomes /dev/echodev  */
+        .fops  = &amp;echo_fops,
+        .mode  = 0666,                  /* world-writable, for a
+                                           demo only - see the
+                                           permissions note below */
+};
+
+static int __init echo_init(void)
+{
+        int ret;
+
+        echo = kzalloc(sizeof(*echo), GFP_KERNEL);
+        if (!echo)
+                return -ENOMEM;
+
+        echo-&gt;buf = kzalloc(ECHO_BUF_SIZE, GFP_KERNEL);
+        if (!echo-&gt;buf) {
+                ret = -ENOMEM;
+                goto err_free_dev;
+        }
+
+        mutex_init(&amp;echo-&gt;lock);
+
+        ret = misc_register(&amp;echo_misc);
+        if (ret)
+                goto err_free_buf;      /* UNWIND IN REVERSE -
+                                           chapter 33            */
+
+        pr_info("echodev: ready at /dev/echodev\n");
+        return 0;
+
+err_free_buf:
+        kfree(echo-&gt;buf);
+err_free_dev:
+        kfree(echo);
+        return ret;
+}
+
+static void __exit echo_exit(void)
+{
+        misc_deregister(&amp;echo_misc);    /* no new opens after this */
+        kfree(echo-&gt;buf);
+        kfree(echo);
+        pr_info("echodev: gone\n");
+}
+
+module_init(echo_init);
+module_exit(echo_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("you");
+MODULE_DESCRIPTION("A complete minimal character driver");</code></pre>
+
+<div class="key">
+<b>Why <code>misc_register</code> rather than <code>alloc_chrdev_region</code> + <code>cdev_add</code></b>
+<p>The misc device framework does three things for you that the raw <code>cdev</code> path makes you do by
+hand: it allocates a minor number, it registers the <code>file_operations</code>, and — most usefully — it
+asks the driver core to create the <code>/dev</code> node, so udev makes <code>/dev/echodev</code> appear the
+instant the module loads and removes it on unload. The raw path is worth knowing (<a
+href="lx-20-char-devices.html">chapter 22</a> covers it) and is necessary when you need many minor numbers
+under one major, but for a driver exposing a single device node, misc is less code and fewer things to get
+wrong.</p>
+</div>
+
+<h2 id="build">Building and loading it</h2>
+
+<p>Two commands build it and one loads it. If you have the source tree from chapter 01 and a running Linux machine, you can have this driver working in about five minutes.</p>
+
+<pre><code># Makefile - three lines, and the same shape for every
+# out-of-tree module.
+obj-m += echodev.o
+
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean</code></pre>
+
+<pre><code>$ make
+$ sudo insmod echodev.ko
+$ dmesg | tail -1
+[12345.678] echodev: ready at /dev/echodev
+
+$ ls -l /dev/echodev
+crw-rw-rw- 1 root root 10, 122 Sep 10 12:00 /dev/echodev
+#  ^ 'c' = character device, created automatically by udev
+
+$ echo "hello kernel" &gt; /dev/echodev
+$ cat /dev/echodev
+hello kernel
+
+$ dd if=/dev/echodev bs=1 count=5 2&gt;/dev/null
+hello                     # partial reads work: *ppos is honoured
+
+$ sudo rmmod echodev</code></pre>
+
+<h2 id="ioctltest">Exercising the ioctl from user space</h2>
+
+<p>An ioctl cannot be exercised from the shell, so it needs a small program. This is also where the point about shared headers becomes concrete: the numbers below must match the driver exactly.</p>
+
+<pre><code>/* echoctl.c - the user-space side. The _IO() numbering must
+   match the driver EXACTLY, which is why a real driver ships
+   these definitions in a uapi header both sides include
+   rather than duplicating them (chapter 23).               */
+
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;unistd.h&gt;
+
+#define ECHO_IOC_MAGIC  'E'
+#define ECHO_IOC_CLEAR  _IO(ECHO_IOC_MAGIC, 1)
+
+int main(void)
+{
+        int fd = open("/dev/echodev", O_RDWR);
+        if (fd &lt; 0) {
+                perror("open");
+                return 1;
+        }
+
+        if (ioctl(fd, ECHO_IOC_CLEAR) &lt; 0) {
+                perror("ioctl");
+                close(fd);
+                return 1;
+        }
+
+        printf("buffer cleared\n");
+        close(fd);
+        return 0;
+}</code></pre>
+
+<div class="warn">
+<b>The <code>.mode = 0666</code> in this example is a demonstration shortcut</b>
+<p>A world-writable device node means any user on the system can write to your device. That is fine for a
+buffer you are testing on your own machine and wrong for anything else. Real drivers leave the default
+(root-only) mode and let a udev rule grant access to a specific group — for example a rule placing the node in
+the <code>dialout</code> or a project-specific group, which is how serial ports and GPIO character devices are
+normally made usable without giving every process on the machine access.
+<a href="lx-20-char-devices.html">Chapter 22</a>'s permissions section covers the rule syntax.</p>
+</div>
+
+<h2 id="mistakes">The five mistakes this skeleton is built to avoid</h2>
+
+<p>Every choice in the driver above was made to avoid a specific, common bug. Here they are named explicitly — read this list once now, and again the first time one of your own drivers misbehaves.</p>
+
+<pre class="diagram">   1. DEREFERENCING THE USER POINTER DIRECTLY
+        *ubuf = 'x';                      /* CATASTROPHIC */
+      The address is valid only in the caller's address space,
+      may be unmapped, and may be deliberately hostile. Always
+      copy_to_user / copy_from_user, and always check the
+      return (chapter 09).
+
+   2. IGNORING *ppos
+      A read() that always returns the whole buffer makes
+      `cat` loop forever, because it never sees the zero-byte
+      return that means end of file.
+
+   3. RETURNING count INSTEAD OF WHAT WAS COPIED
+      copy_to_user returns the number of bytes it could NOT
+      copy. Reporting a full transfer when it partially failed
+      silently corrupts the caller's data.
+
+   4. NO LOCKING
+      Two processes can hold the device open simultaneously.
+      Without the mutex, one write() can interleave with
+      another and leave len inconsistent with buf.
+
+   5. UNWINDING INIT IN THE WRONG ORDER
+      Every error path must undo exactly what succeeded, in
+      reverse - the goto-ladder above, not a copy-pasted
+      cleanup block per branch (chapter 33).
+
+   6. FORGETTING .owner = THIS_MODULE
+      Without it, rmmod can unload the module while a process
+      still holds the device open, and the next read() jumps
+      into freed memory.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>cat /dev/echodev</code> never terminates</td><td><code>read()</code> is not returning 0 at end of
+file — check the <code>*ppos &gt;= len</code> test</td></tr>
+<tr><td>Oops with a fault on a user-looking address</td><td>The user pointer was dereferenced directly instead
+of via <code>copy_to_user</code></td></tr>
+<tr><td><code>/dev/echodev</code> does not appear after <code>insmod</code></td><td><code>misc_register</code>
+failed, or returned an error the init path ignored — check <code>dmesg</code></td></tr>
+<tr><td>Permission denied writing as a normal user</td><td>Expected without the <code>.mode</code> override —
+add a udev rule rather than making it world-writable</td></tr>
+<tr><td><code>ioctl</code> returns <code>ENOTTY</code></td><td>The command number does not match — the
+<code>_IO()</code> definitions differ between driver and user program</td></tr>
+<tr><td>Crash shortly after <code>rmmod</code></td><td>A file was still open — <code>.owner =
+THIS_MODULE</code> is missing</td></tr>
+<tr><td>Data corrupts when two programs write at once</td><td>The mutex is missing or not covering both
+<code>buf</code> and <code>len</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Build, load, write to, read from and unload this driver on a real machine or in QEMU.</li>
+  <li>Explain what <code>*ppos</code> is for and what breaks if you ignore it.</li>
+  <li>Explain why <code>copy_to_user</code> is mandatory and what its return value means.</li>
+  <li>Explain what <code>.owner = THIS_MODULE</code> prevents.</li>
+  <li>Explain why an unknown ioctl must return <code>-ENOTTY</code> rather than <code>-EINVAL</code>.</li>
+  <li>Add a second ioctl that reports the current length, and a user-space program that calls it.</li>
+  <li>Convert this driver from misc to the raw <code>cdev</code> interface, and say what you had to add.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

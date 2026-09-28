@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WMI and ETW: instrumentation and tracing | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>WMI and ETW: instrumentation and tracing</h1>
+<p class="lead">Windows carries two separate, general-purpose instrumentation frameworks that most driver
+authors touch only occasionally but that everything from Task Manager to Process Monitor to your own event
+log entries ultimately runs through. WMI answers "what is the current state of this system, and let me query
+and change it." ETW answers "what just happened, at high volume, with acceptable overhead." This chapter is
+both, and where <a href="win-34-alpc.html">chapter 33</a>'s ALPC tracing gap and Process Monitor's own
+internals fit into the picture.</p>
+
+<h2 id="wmi">WMI: a management framework built on a database analogy</h2>
+
+<p>WMI is how management tools ask a machine about itself, and the quickest way to understand it is to notice that it is organised exactly like a database — which is also why it is queried with something that looks very like SQL.</p>
+
+<pre class="diagram">   WINDOWS MANAGEMENT INSTRUMENTATION organises everything
+   it manages the way a DATABASE organises data: NAMESPACES
+   (like schemas), CLASSES (like tables) with PROPERTIES and
+   METHODS, and INSTANCES (like rows) representing actual
+   objects on the running system.
+
+   root\cimv2                        the most common namespace
+     Win32_Process                   a CLASS - one instance
+                                     per running process
+       Name, ProcessId, ExecutablePath, WorkingSetSize  (properties)
+       Terminate(), Create()                            (methods)
+
+     Win32_LogicalDisk               a CLASS - one instance
+                                     per drive letter
+     Win32_PnPEntity                 a CLASS - one instance
+                                     per Plug-and-Play device,
+                                     the WMI view onto exactly
+                                     the device stack chapter
+                                     06 introduced
+
+   A DRIVER CAN EXPOSE ITS OWN WMI CLASS: WDF's
+   WdfDeviceWmiRegistration and the older WMI_INFORMATION
+   IRP-based mechanism let a driver publish custom
+   properties (a device's temperature, an error counter, a
+   firmware version) that management tools and scripts can
+   query through the SAME uniform WMI interface used for
+   built-in classes, rather than inventing a bespoke IOCTL
+   protocol for every piece of diagnostic data.</pre>
+
+<pre><code>PS&gt; Get-CimInstance -ClassName Win32_Process |
+      Where-Object Name -eq 'notepad.exe'
+
+PS&gt; Get-CimInstance -Query `
+      "SELECT * FROM Win32_Process WHERE Name='notepad.exe'"
+# WQL - the WMI Query Language, deliberately SQL-shaped so
+# the database analogy above is not just pedagogical; you
+# genuinely query WMI the way you would query a table.
+
+PS&gt; Register-CimIndicationEvent -Query `
+      "SELECT * FROM Win32_ProcessStartTrace"
+# WMI EVENTS: rather than polling, a consumer can subscribe
+# to a query and be called back whenever a matching event
+# occurs - process creation, a device arriving, a service
+# state change - all through the same query mechanism.
+</code></pre>
+
+<div class="note">
+<b>WMI is a management interface, not a high-frequency tracing tool</b>
+<p>WMI's request/response and event-subscription model is well suited to "what is the state of X" and
+"tell me when Y changes" — configuration, inventory, occasional notifications. It was never designed for the
+volume of events ETW routinely handles: thousands of trace events per second with sub-microsecond overhead
+per event. Reaching for WMI eventing to capture something like every disk I/O or every ALPC message would
+be the wrong tool for the job — that is exactly what ETW, below, exists for.</p>
+</div>
+
+<h2 id="etw">ETW: providers, sessions, and consumers</h2>
+
+<p>ETW is a different tool for a different job: not asking about current state, but recording what happened, at very high volume, cheaply enough to leave enabled in shipping code. It separates three roles that are easy to confuse.</p>
+
+<pre class="diagram">   EVENT TRACING FOR WINDOWS separates three roles that are
+   easy to conflate but genuinely independent:
+
+   PROVIDER                 the component that KNOWS how to
+                             emit events about itself - a
+                             driver, a kernel subsystem, a
+                             user-mode service. A provider
+                             does nothing on its own; it only
+                             emits events when a session has
+                             actually enabled it.
+
+   SESSION                  a kernel-managed, named recording
+                             configuration: which provider(s)
+                             are enabled, at what verbosity
+                             (keywords/levels), and where the
+                             events go (a .etl file, or
+                             directly to a real-time consumer).
+                             Multiple sessions can independently
+                             enable the SAME provider at once.
+
+   CONSUMER                 reads events back out - either
+                             live, from a real-time session, or
+                             after the fact from a .etl file.
+                             Event Viewer, Performance Monitor,
+                             WPA (Windows Performance Analyzer)
+                             and Process Monitor are all,
+                             ultimately, ETW consumers.
+
+   THE KEY PERFORMANCE PROPERTY: a provider with NO enabled
+   session costs almost nothing to leave compiled into
+   shipping code - each trace call is a cheap "is anyone
+   listening" check that returns instantly when the answer is
+   no. This is why production Windows systems ship with
+   thousands of ETW trace points permanently present in code
+   that never runs a debugger-attached build.</pre>
+
+<pre><code>PS&gt; logman query providers | findstr ALPC
+Microsoft-Windows-Kernel-ALPC    {45d8cccd-539f-4b72-a8b7-...}
+
+PS&gt; logman create trace AlpcTrace -p "Microsoft-Windows-Kernel-ALPC" -o alpc.etl
+PS&gt; logman start AlpcTrace
+# ... reproduce the ALPC activity you want to observe ...
+PS&gt; logman stop AlpcTrace
+# alpc.etl can now be opened in WPA, exactly the provider
+# chapter 33 named as the practical way to see ALPC traffic
+# that Process Monitor's own UI cannot decode.
+
+/* A driver becomes its own ETW provider with a handful of
+   WPP or manifest-based macros - conceptually: */
+EventWriteMYDRIVER_REQUEST_START(requestId, deviceName);
+/* which costs a few instructions when no session has
+   enabled this provider, and writes a structured, typed
+   event to every session that has, with no code change
+   needed at either end when a new consumer starts
+   listening.                                              */
+</code></pre>
+
+<h2 id="pmon">Why Process Monitor's own reliance on ETW matters</h2>
+
+<p>Sysinternals' Process Monitor is, under the hood, itself a collection of ETW consumers reading from kernel
+providers for file, registry, process, and network activity — which is exactly why it can show those categories
+of activity with such low overhead and such rich detail: it is not polling or hooking, it is subscribing to
+events the kernel was already going to emit. The gap chapter 33 pointed out — that Process Monitor shows
+nothing for ALPC — is not a limitation of ETW itself, since the <code>Microsoft-Windows-Kernel-ALPC</code>
+provider exists and works exactly like every provider Process Monitor <em>does</em> consume. It is a choice
+Process Monitor's own UI has not made: nothing stops a session from enabling that provider directly, as the
+<code>logman</code> example above does, and reading the result in WPA instead.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A WQL query against a driver's custom class returns nothing</td><td>The driver never registered a WMI
+class, or registered it under a different namespace</td></tr>
+<tr><td>A WMI event subscription misses high-frequency events</td><td>WMI eventing is not built for high
+volume — use ETW for that workload instead</td></tr>
+<tr><td>A shipping build with thousands of trace points shows no measurable slowdown</td><td>Expected — an ETW
+provider with no enabled session costs almost nothing per call</td></tr>
+<tr><td>The same provider appears to be traced by two tools at once with no conflict</td><td>Normal — multiple
+independent sessions can enable the same provider simultaneously</td></tr>
+<tr><td>Process Monitor shows nothing for known ALPC activity</td><td>A Process Monitor UI limitation, not an
+ETW limitation — enable <code>Microsoft-Windows-Kernel-ALPC</code> directly instead</td></tr>
+<tr><td>An .etl file cannot be opened by a live consumer</td><td>Expected — real-time sessions and file-based
+post-hoc analysis are different consumption modes</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the WMI namespace/class/instance model using the database analogy.</li>
+  <li>Say how a driver exposes its own data through WMI, and why that is preferable to a bespoke IOCTL.</li>
+  <li>Explain why WMI eventing is the wrong tool for high-frequency tracing.</li>
+  <li>Name the three ETW roles and what each one does.</li>
+  <li>Explain why a provider with no enabled session is nearly free to leave in shipping code.</li>
+  <li>Explain how you would observe ALPC traffic that Process Monitor cannot show, using this chapter's
+  tools.</li>
+  <li>Explain why Process Monitor's reliance on ETW explains both its low overhead and its ALPC gap.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

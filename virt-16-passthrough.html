@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device passthrough, the SMMU and VFIO | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Device passthrough, the SMMU and VFIO</h1>
+<p class="lead">Giving a guest a real device removes every emulation cost at once — and hands an untrusted
+kernel a DMA engine. The SMMU is what makes that survivable, and VFIO is the interface through which Linux
+lets user space own a device safely. This chapter is where the isolation track and the virtualisation track
+meet.</p>
+
+<h2 id="why">Why passthrough, and what it costs you</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Emulated</th><th>virtio</th><th>Passthrough</th></tr></thead>
+<tbody>
+<tr><td>MMIO cost</td><td>One exit per register</td><td>One exit per batch</td><td><strong>Zero</strong> — the
+guest maps the real registers</td></tr>
+<tr><td>Interrupt cost</td><td>Exit to inject</td><td>Exit to inject</td><td>One exit, or zero with
+GICv4</td></tr>
+<tr><td>Guest driver</td><td>Any</td><td>Must have a virtio driver</td><td>The real vendor driver,
+unmodified</td></tr>
+<tr><td>Live migration</td><td>Easy</td><td>Easy</td><td><strong>Very hard</strong> — device state is opaque
+(unless it supports the VFIO migration protocol)</td></tr>
+<tr><td>Sharing between guests</td><td>Trivial</td><td>Trivial</td><td>Impossible without SR-IOV</td></tr>
+<tr><td>Host visibility</td><td>Full</td><td>Full</td><td>None — the host cannot inspect the traffic</td></tr>
+<tr><td>Blast radius of a guest bug</td><td>Contained</td><td>Contained</td><td>The device is
+compromised</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Passthrough is the right answer for a GPU, a 100GbE NIC, an accelerator, or an automotive CAN controller
+that a partition must own outright. It is the wrong answer whenever you need to migrate, oversubscribe, or
+inspect. Most real systems mix: virtio for the boot disk and management network, passthrough for the one
+device whose performance actually matters.</p>
+
+<h2 id="dma">The problem passthrough creates</h2>
+
+<p>Giving a guest a real device creates a problem the CPU's page tables cannot solve, because the device does not use them. This is the core of why passthrough needs an IOMMU.</p>
+
+<pre class="diagram">   The guest programs the real device:
+
+       "DMA 4 KB from your FIFO to address 0x4200_0000"
+
+   The guest means its own IPA 0x4200_0000. But the device does
+   not go through the CPU's MMU - it issues a bus transaction
+   with that address directly.
+
+   WITHOUT an SMMU:
+
+       device writes PHYSICAL 0x4200_0000
+            |
+            v
+       whatever is there. The host kernel. Another guest.
+       Firmware. The guest just wrote to it.
+
+   A guest with a passed-through device and no SMMU owns the
+   entire machine. Not "can crash it" - OWNS it. This is not a
+   subtle bug; it is the reason IOMMUs exist.
+
+   WITH an SMMU:
+
+       device writes IPA 0x4200_0000
+            |
+            |  SMMU looks up the StreamID of this device,
+            |  finds the translation tables the hypervisor
+            |  installed for it - THE SAME STAGE-2 TABLES the
+            |  guest's CPU accesses use
+            v
+       real physical address, inside the guest's memory. Or a
+       fault, if the guest lied.
+
+   The elegance: the device and the vCPU now share one notion
+   of "guest physical". A guest driver written for bare metal
+   works unmodified, because its DMA addresses mean the same
+   thing to the device that they mean to its own CPU.</pre>
+
+<div class="key">
+<b>Stage 2 does double duty</b>
+<p>The same translation tables that constrain the guest's CPU also constrain its devices. That is why
+<a href="sec-03-smmu-streamid.html">StreamID</a> and <code>VTTBR_EL2</code> appear together in every
+passthrough setup: the hypervisor points the device's SMMU context descriptor at the VM's stage-2 tables and
+its VMID, and isolation follows automatically.</p>
+</div>
+
+<h2 id="vfio">VFIO: owning a device from user space</h2>
+
+<p>VFIO is the framework that makes safe device assignment possible from user space, and its grouping rules are the part that surprises people.</p>
+
+<pre class="diagram">   VFIO is how Linux hands a device to a non-kernel owner
+   safely. QEMU uses it; so does DPDK; so can you.
+
+   /dev/vfio/vfio          the container - an address space
+   /dev/vfio/&lt;group&gt;       an IOMMU group - the unit of
+                           assignment
+
+   +-------------------------------------------------------+
+   |  CONTAINER  (one IOMMU address space)                  |
+   |                                                        |
+   |   +----------------+     +----------------+            |
+   |   | GROUP 12       |     | GROUP 13       |            |
+   |   |  device 0000:  |     |  device 0000:  |            |
+   |   |   03:00.0      |     |   04:00.0      |            |
+   |   |  device 0000:  |     |                |            |
+   |   |   03:00.1      |     |                |            |
+   |   +----------------+     +----------------+            |
+   +-------------------------------------------------------+
+
+   THE GROUP IS THE UNIT, AND YOU DO NOT CHOOSE IT.
+
+   Two devices share a group when the hardware cannot tell them
+   apart - they sit behind a PCIe bridge that does not do ACS
+   (Access Control Services), or they share a StreamID, or they
+   are functions of one multifunction device that alias.
+
+   If they cannot be told apart, they cannot be isolated from
+   each other, so they must be assigned together. A group
+   containing your NIC and your disk controller means you
+   cannot pass through the NIC alone. That is a HARDWARE
+   limitation and no kernel flag legitimately works around it.
+   (There is an "ACS override" patch. Using it on a machine you
+   care about is choosing to believe a device that has told you
+   it cannot be trusted.)</pre>
+
+<pre><code># The whole workflow, on a PCIe NIC.
+
+# 1. What group is it in, and who else is in there?
+$ lspci -nn | grep -i ethernet
+03:00.0 Ethernet controller [0200]: Intel X710 [8086:1572]
+
+$ readlink -f /sys/bus/pci/devices/0000:03:00.0/iommu_group
+/sys/kernel/iommu_groups/12
+
+$ ls /sys/kernel/iommu_groups/12/devices/
+0000:03:00.0  0000:03:00.1        # both ports - both must go
+
+# 2. Unbind from the host driver, bind to vfio-pci
+$ echo 0000:03:00.0 | sudo tee /sys/bus/pci/devices/0000:03:00.0/driver/unbind
+$ echo 8086 1572 | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
+# (repeat for 03:00.1)
+
+$ ls -l /dev/vfio/
+crw------- 1 root root 241, 0 vfio
+crw------- 1 root root 511, 0 12          # the group is now ours
+
+# 3. Hand it to QEMU
+$ qemu-system-aarch64 -M virt,iommu=smmuv3 -accel kvm \
+    -device vfio-pci,host=0000:03:00.0 \
+    -device vfio-pci,host=0000:03:00.1 \
+    ...
+
+# 4. In the guest, it is simply the real device:
+$ lspci
+00:01.0 Ethernet controller: Intel X710
+$ dmesg | grep i40e
+i40e 0000:00:01.0: fw 6.1.42... </code></pre>
+
+<h2 id="pinning">Why the guest's memory gets pinned</h2>
+
+<p>Passthrough forces the guest's memory to be resident, which removes several host features you may have been relying on.</p>
+
+<pre><code>/* The moment a device can DMA into guest memory, that memory
+   can no longer be swapped, migrated, or reclaimed - because
+   the device holds a translation the kernel cannot revoke
+   without the device noticing.
+
+   So VFIO PINS it. All of it.                              */
+
+    ioctl(container, VFIO_IOMMU_MAP_DMA, &amp;(struct vfio_iommu_type1_dma_map){
+            .vaddr = host_virtual_address_of_guest_ram,
+            .iova  = guest_physical_address,
+            .size  = whole_guest_ram,
+            .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+    });
+
+/* Consequences you must plan for:
+
+   * A 16 GB guest with passthrough consumes 16 GB of host RAM,
+     immediately and permanently. No ballooning, no overcommit,
+     no KSM.
+
+   * You will hit RLIMIT_MEMLOCK. The error is
+     "VFIO_MAP_DMA failed: Cannot allocate memory" and it is
+     nothing to do with free memory.
+         $ ulimit -l
+         64            # kilobytes. Nowhere near enough.
+     Fix in /etc/security/limits.conf or the systemd unit:
+         LimitMEMLOCK=infinity
+
+   * Huge pages help a lot: fewer SMMU table levels, fewer
+     entries, better TLB reach on the device side too.
+
+   * Live migration of a pinned, passed-through device requires
+     the device itself to implement the VFIO migration region
+     so its internal state can be saved. Most do not.        */</code></pre>
+
+<h2 id="msi">Interrupts for a passed-through device</h2>
+
+<p>Interrupt delivery for an assigned device has to reach the guest without the host handling every one, and there are several mechanisms depending on the hardware.</p>
+
+<pre class="diagram">   The device's real interrupt must become the guest's virtual
+   interrupt, and the guest's EOI must deactivate the real one.
+
+     device raises MSI / SPI
+        |
+        v
+     physical interrupt -> host (HCR_EL2.IMO routes to EL2)
+        |
+        v
+     VFIO's handler signals an EVENTFD
+        |
+        v
+     KVM has that eventfd bound as an IRQFD to a vINTID:
+        ioctl(vmfd, KVM_IRQFD, {fd, gsi})
+        |
+        v
+     KVM writes a list register with
+        HW = 1, pINTID = the real one, vINTID = the guest's
+        |
+        v
+     guest reads ICV_IAR1_EL1, services the device through its
+     passed-through MMIO, writes ICV_EOIR1_EL1
+        |
+        v
+     hardware deactivates the PHYSICAL interrupt too, because
+     HW = 1. (chapter 11)
+
+   Exits: one, for the physical interrupt. GICv4 removes even
+   that by delivering the virtual LPI directly (chapter 12).
+
+   The MSI address problem: a device programmed by the guest
+   writes its MSI to an address the GUEST chose - an IPA. The
+   SMMU must translate that to the real ITS doorbell, so the
+   ITS window has to be mapped in the device's stage-2 tables.
+   Linux handles this with "reserved regions"; a mismatch
+   produces a device that works for MMIO and never interrupts. */</pre>
+
+<pre><code># The reserved regions the IOMMU insists you avoid or map:
+$ cat /sys/kernel/iommu_groups/12/reserved_regions
+0x0000000008080000 0x000000000809ffff msi
+0x00000000fee00000 0x00000000feefffff msi
+
+# QEMU refuses to place guest RAM over these, and maps the MSI
+# window so the device's doorbell writes land on the real ITS.
+
+# Check the SMMU is actually in the path:
+$ dmesg | grep -i smmu
+[    1.234567] arm-smmu-v3 arm-smmu-v3.0.auto: ias 44-bit, oas 48-bit
+[    1.234599] arm-smmu-v3 arm-smmu-v3.0.auto: allocated 65536 entry CMDQ
+[    1.234610] arm-smmu-v3 arm-smmu-v3.0.auto: 2-level strtab only
+
+# And that the group is genuinely isolated, not a passthrough
+# fallback:
+$ cat /sys/kernel/iommu_groups/12/type
+DMA          # good.  "identity" means NO TRANSLATION - the
+             # device sees physical addresses. Never pass a
+             # device through from an identity-mapped group.</code></pre>
+
+<div class="danger">
+<b><code>iommu.passthrough=1</code> and identity domains</b>
+<p>Some distributions boot with the IOMMU in identity (bypass) mode for performance. A device in an identity
+domain sees real physical addresses. Passing such a device to a guest gives that guest full write access to
+host memory, silently — everything appears to work. Always check
+<code>/sys/kernel/iommu_groups/N/type</code> before trusting an assignment.</p>
+</div>
+
+<h2 id="platform">Platform devices, not just PCIe</h2>
+
+<p>On embedded systems the devices are not PCIe, which changes almost every practical detail of assignment.</p>
+
+<pre><code>/* Embedded SoCs have few PCIe devices and many platform
+   devices described by device tree. VFIO handles those too,
+   with more manual work.                                   */
+
+  vfio-platform      generic platform device passthrough
+  vfio-amba          for AMBA/PrimeCell devices
+
+# Bind:
+$ echo vfio-platform | sudo tee \
+    /sys/bus/platform/devices/ff170000.i2c/driver_override
+$ echo ff170000.i2c | sudo tee /sys/bus/platform/drivers/vfio-platform/bind
+
+# QEMU:
+$ qemu-system-aarch64 -M virt -accel kvm \
+    -device vfio-platform,host=ff170000.i2c
+
+/* Extra work platform passthrough demands and PCIe does not:
+
+   1. YOU must write the guest's device tree node for it -
+      there is no enumeration. QEMU can generate one for
+      simple cases; anything with clocks, resets, regulators
+      or pinmux you do yourself.
+
+   2. RESET. PCIe has FLR (function level reset) as a standard.
+      A platform device has whatever the vendor invented. VFIO
+      requires a reset driver in the host kernel
+      (vfio_platform_reset) or it refuses to bind, because
+      handing a guest a device you cannot reset means the next
+      guest inherits whatever the last one left running -
+      including in-flight DMA.
+
+   3. Shared resources. A clock or power domain shared between
+      a passed-through device and a host device means the guest
+      can switch off something the host is using. Device tree
+      will not stop you; only your partitioning discipline
+      will.                                                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>VFIO_MAP_DMA failed: Cannot allocate memory</code></td><td><code>RLIMIT_MEMLOCK</code> too low —
+not a shortage of RAM</td></tr>
+<tr><td>Cannot bind: "group is not viable"</td><td>Another device in the same IOMMU group is still bound to a
+host driver</td></tr>
+<tr><td>Guest sees the device, MMIO works, no interrupts ever</td><td>MSI doorbell window not mapped, or
+<code>irqfd</code> not bound to the right vINTID</td></tr>
+<tr><td>Device works once, then not after guest reboot</td><td>No reset path — the device kept running with
+stale DMA</td></tr>
+<tr><td>Host memory corruption when the guest starts</td><td>IOMMU in identity/passthrough mode, or no SMMU in
+the path at all</td></tr>
+<tr><td>Guest boots, device faults on every DMA</td><td>Stage-2 tables not shared with the SMMU context, or the
+guest's DMA addresses are not IPAs it owns</td></tr>
+<tr><td>SMMU fault flood in host <code>dmesg</code></td><td>Guest driver programming addresses outside its
+memory — usually a guest bug the SMMU is correctly catching</td></tr>
+<tr><td>Cannot migrate the VM</td><td>Passed-through device without VFIO migration support. Expected, not a
+bug</td></tr>
+<tr><td>Guest gets far less memory than requested</td><td>Pinning failed partway; check for
+<code>hugetlb</code> availability and memlock limits</td></tr>
+<tr><td>Two guests both crash when one uses its device</td><td>Devices share a StreamID, so the SMMU cannot
+tell them apart</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three costs of passthrough and three benefits, and name a workload for each side.</li>
+  <li>Explain precisely what a passed-through device can do to a system with no SMMU.</li>
+  <li>Explain how the SMMU and the vCPU come to agree on what a guest-physical address means.</li>
+  <li>Define an IOMMU group and say why you cannot choose its membership.</li>
+  <li>Walk through binding a PCIe device to <code>vfio-pci</code> and handing it to QEMU.</li>
+  <li>Explain why guest memory is pinned and list three consequences.</li>
+  <li>Diagnose <code>VFIO_MAP_DMA failed: Cannot allocate memory</code>.</li>
+  <li>Trace a passed-through device's interrupt to the guest handler and back, naming the
+  <code>HW</code> bit's role.</li>
+  <li>Explain the MSI doorbell translation problem and how reserved regions solve it.</li>
+  <li>Give three things platform passthrough requires that PCIe passthrough does not.</li>
+  <li>Explain why an identity-domain IOMMU group must never be passed through.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

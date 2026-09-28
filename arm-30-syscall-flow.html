@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A system call, end to end | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>A system call, end to end</h1>
+<p class="lead">Everything in this track converging on one path. Follow <code>write(fd, buf, len)</code> from
+a C call to the return value, naming every register, every check and every layer — and the whole architecture
+stops being a collection of separate topics.</p>
+
+<h2 id="flow">The complete path</h2>
+
+<p>This chapter follows one system call through every mechanism the track has covered so far. If you can narrate this path from memory, you understand how user space and the kernel actually connect.</p>
+
+<pre class="diagram">USER (EL0)                            KERNEL (EL1)
+──────────                            ────────────
+ ssize_t n = write(1, "hi\n", 3);
+
+ ① libc marshals the arguments per the SYSCALL ABI —
+    which is NOT the C ABI (chapter 09):
+        x0 = 1        fd
+        x1 = &buf     pointer
+        x2 = 3        count
+        x8 = 64       __NR_write
+        │
+ ② svc #0
+        │
+        ├══► HARDWARE, atomically (chapter 28):
+        │      ELR_EL1  ← pc + 4
+        │      SPSR_EL1 ← PSTATE
+        │      ESR_EL1  ← EC=0x15, ISS=0
+        │      PSTATE: EL→1, SPSel→1, DAIF masked, PAN set
+        │      PC       ← VBAR_EL1 + 0x400   (lower EL, sync)
+        │
+        └──────────────────────────► ③ el0_sync vector entry
+                                        · SP is now SP_EL1
+                                        · save x0-x30 to pt_regs
+                                        · save SP_EL0, ELR, SPSR
+                                        · unmask IRQ
+                                        · read ESR, EC == 0x15
+                                             │
+                                             ▼
+                                     ④ el0_svc_common()
+                                        · x8 &lt; __NR_syscalls?
+                                        · audit / seccomp / ptrace
+                                        · sys_call_table[x8]
+                                             │
+                                             ▼
+                                     ⑤ sys_write(fd, buf, count)
+                                        fdget_pos(fd)
+                                          → struct fd, or -EBADF
+                                        vfs_write()
+                                          → security_file_permission()
+                                            (LSM: SELinux, AppArmor)
+                                          → file->f_op->write_iter()
+                                             │
+                                             ▼
+                                     ⑥ the filesystem or driver
+                                        copy_from_user(kbuf, buf, n)
+                                          · is the address really
+                                            in user space?
+                                          · PAN lifted, LDTR used
+                                          · exception fixup installed
+                                            so a fault returns
+                                            -EFAULT rather than
+                                            oopsing
+                                             │
+                                             ▼
+                                     ⑦ return the byte count in x0
+                                             │
+                                     ⑧ ret_to_user
+                                        · pending signals?
+                                        · need_resched?
+                                        · restore x0-x30, SP_EL0,
+                                          ELR_EL1, SPSR_EL1
+                                             │
+        ┌◄────────────────────────── ⑨ eret
+        │
+        ▼
+ ⑩ libc: is x0 negative and &gt;= -4095?
+        yes → errno = -x0; return -1
+        no  → return x0
+        │
+        ▼
+ your code continues</pre>
+
+<h2 id="abi">Step 1: the syscall ABI</h2>
+
+<p>The agreement about which register holds the call number and which hold the arguments is a contract between libc and the kernel. It is fixed per architecture, which is why binaries are not portable between them.</p>
+
+<pre><code>/* The syscall ABI differs from the C ABI in two ways that matter: */
+
+   C ABI:       arguments in x0-x7, return in x0
+   syscall ABI: arguments in x0-x5 ONLY, syscall number in x8,
+                return in x0
+
+/* Why x8 rather than x7? Because it keeps the argument registers
+   contiguous and leaves x8 — the indirect result register, which
+   a syscall never needs — free for the number.
+
+   Why only six arguments? Because no Linux syscall needs more.
+   Those that would (mmap, clone3) pass a POINTER TO A STRUCT
+   instead, which is also how they stay extensible (OS ch. 03). */
+
+/* A raw syscall in assembly: */
+        mov     x0, #1                  /* fd = stdout */
+        adr     x1, msg
+        mov     x2, #3
+        mov     x8, #64                 /* __NR_write  */
+        svc     #0
+        /* x0 now holds the result, or a negative errno */
+
+/* From C, without libc: */
+static inline long syscall3(long n, long a, long b, long c)
+{
+        register long x8 asm("x8") = n;
+        register long x0 asm("x0") = a;
+        register long x1 asm("x1") = b;
+        register long x2 asm("x2") = c;
+        asm volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2)
+                     : "memory", "cc");
+        return x0;
+}
+/* Note "memory": the kernel may modify anything the pointers
+   reach, so the compiler must not cache values across it
+   (C chapter 18).                                          */</code></pre>
+
+<h2 id="dispatch">Step 4: dispatch</h2>
+
+<p>Once inside, the kernel has to turn a number into a function. The mechanism is deliberately simple, and its simplicity is part of why the boundary is defensible.</p>
+
+<pre><code>/* The syscall table is an array of function pointers — exactly
+   the dispatch table pattern from C chapter 12.            */
+
+const syscall_fn_t sys_call_table[__NR_syscalls] = {
+        [0 ... __NR_syscalls - 1] = __arm64_sys_ni_syscall,
+#include &lt;asm/unistd.h&gt;
+};
+
+/* The bounds check is not optional, and on a speculating core it
+   must survive speculation (CA chapter 12):                */
+
+        if (scno &lt; __NR_syscalls) {
+                scno = array_index_nospec(scno, __NR_syscalls);
+                /* → CMP + CSEL + CSDB: a MASK, not a branch, so
+                     speculation cannot bypass it            */
+                syscall_fn = sys_call_table[scno];
+                ret = syscall_fn(regs);
+        } else {
+                ret = do_ni_syscall(regs, scno);
+        }
+
+/* Before dispatch, several hooks may intervene:
+     ptrace       a debugger can inspect or change the arguments,
+                  or skip the call entirely
+     seccomp      a BPF filter can allow, deny, kill or trap
+     audit        logging
+   Each costs cycles, which is why a heavily-sandboxed process
+   has measurably slower syscalls.                          */</code></pre>
+
+<h2 id="usercopy">Step 6: crossing the boundary</h2>
+
+<div class="danger">
+<b>Every byte from user space is hostile</b>
+<p>A system call argument is attacker-controlled input arriving at the highest privilege level. The kernel must
+assume the caller is malicious, not merely buggy — a local user exploiting a validation gap gets kernel code
+execution.</p>
+</div>
+
+<pre><code>/* NEVER dereference a __user pointer directly. */
+
+long sys_example(void __user *ubuf, size_t len)
+{
+        char kbuf[256];
+
+        if (len &gt; sizeof kbuf)
+                return -EINVAL;                  /* bound FIRST */
+        if (copy_from_user(kbuf, ubuf, len))
+                return -EFAULT;                  /* bytes NOT copied */
+        ...
+}
+
+/* copy_from_user does three things you cannot skip:
+
+   1. RANGE CHECK — is the address really below the user/kernel
+      boundary? On arm64 this is a single comparison against
+      TASK_SIZE, made speculation-safe.
+
+   2. EXCEPTION FIXUP — an entry in __ex_table maps the faulting
+      instruction to a recovery address. If the user page is
+      unmapped, the data abort handler finds the fixup and
+      returns -EFAULT instead of oopsing. This is what makes
+      passing a bad pointer an ERROR rather than a crash.
+
+   3. PAN / LDTR — with PAN enabled (chapter 05), ordinary kernel
+      loads from user pages FAULT. The copy routines either lift
+      PAN briefly or use the unprivileged LDTR/STTR instructions
+      (chapter 08), which behave as EL0 accesses. Either way, a
+      pointer aimed at KERNEL memory fails the permission check
+      rather than succeeding.                                */
+
+/* The five validation rules (OS chapter 03):
+     1. bound every length BEFORE using it
+     2. COPY before validating — never validate in place (TOCTOU)
+     3. check every index and enum against its range
+     4. zero output structures fully — padding leaks stack data
+     5. reject unknown flags rather than ignoring them        */</code></pre>
+
+<h2 id="return">Steps 8–10: returning</h2>
+
+<p>Returning is more than reversing the entry: there are things the kernel must check before handing control back, which is where signal delivery and rescheduling actually happen.</p>
+
+<pre><code>/* ret_to_user is not just a restore. Two things must be checked
+   at the boundary, because this is the only safe point to do
+   them:                                                     */
+
+   TIF_SIGPENDING     a signal is queued → build a signal frame
+                      on the USER stack, and return into the
+                      handler instead of the original code
+   TIF_NEED_RESCHED   a higher-priority task became runnable →
+                      call schedule() before returning
+
+/* This is why signals are delivered "on return to userspace" and
+   not at arbitrary points — the kernel needs a known-good state
+   to rewrite the return context.                          */
+
+/* The errno convention, at step 10: */
+        if ((unsigned long)ret &gt;= (unsigned long)-4095) {
+                errno = -ret;
+                return -1;
+        }
+        return ret;
+
+/* The kernel returns a NEGATIVE ERRNO directly (-EINVAL = -22),
+   never sets a global. libc translates. This is strictly better
+   than errno (C chapter 16): the error travels in the return
+   value, so it cannot be clobbered or forgotten.
+
+   The -4095 boundary is why no syscall may return a legitimate
+   value in the range -1 to -4095 — mmap returning a high
+   address is why it is checked this way rather than just
+   testing for negative.                                    */</code></pre>
+
+<h2 id="vdso">Avoiding the syscall entirely</h2>
+
+<p>Some calls are frequent enough and simple enough that trapping for them is wasteful. The kernel maps a small piece of its own code into every process to answer them without crossing the boundary at all.</p>
+
+<pre><code>/* Some "syscalls" need no privilege at all. The vDSO is a small
+   shared object the kernel maps into every process, containing
+   implementations that run in USER MODE.                   */
+
+clock_gettime(CLOCK_MONOTONIC, &amp;ts);
+/*  · reads a kernel-maintained page of timekeeping data
+    · reads CNTVCT_EL0 — the counter, readable from EL0
+      (chapter 32)
+    · does the arithmetic
+    · returns. NO exception, no privilege change.
+    ~25 ns instead of ~300 ns.                              */
+
+cat /proc/self/maps | grep vdso
+LD_SHOW_AUXV=1 /bin/true | grep VDSO
+
+/* Also served by the vDSO: gettimeofday, clock_getres, time,
+   getcpu, and on some architectures rt_sigreturn.
+
+/* The general principle: the fastest system call is the one you
+   do not make. Hence io_uring (shared rings, often zero
+   syscalls in steady state), mmap instead of read, and eBPF
+   (run the logic kernel-side). OS chapter 03.             */</code></pre>
+
+<h2 id="cost">Where the time goes</h2>
+
+<p>Knowing where the cycles go explains which optimisations are worth making — and why mitigations for speculative-execution vulnerabilities made this path measurably more expensive.</p>
+
+<pre class="diagram">   svc → first kernel instruction        ~15-30 cycles
+   save 31 registers + 3 sysregs         ~20-40 cycles
+   seccomp / audit / ptrace checks       0 to hundreds
+   table lookup + indirect call          ~10 cycles
+   ── the actual work ──
+   signal / resched checks               ~10 cycles
+   restore + eret                        ~30-50 cycles
+
+   Plus, on affected systems:
+     KPTI                                two address-space
+                                         switches, +100-300 cycles
+     Spectre-BHB mitigation              a flush sequence in the
+                                         vector, +tens of cycles
+
+   A "null" syscall (getppid) measures roughly:
+      no mitigations       ~60-100 ns
+      with KPTI + BHB      ~150-400 ns
+
+   Measure your own:
+      perf bench syscall basic
+      strace -c ./program           ← count them first</pre>
+
+<h2 id="variants">HVC and SMC follow the same shape</h2>
+
+<p>Once you understand <code>SVC</code> as "a deliberate, synchronous request to the level above me", the
+other two instructions are the same idea reused at each successive privilege boundary: <code>HVC</code> is how
+a kernel deliberately asks its hypervisor for something, and <code>SMC</code> is how a kernel or hypervisor
+deliberately asks the secure monitor for something. All three land in the same exception class, differ only in
+which vector table receives them and which register the request landed in, and each has an explicit off switch
+that the level above can flip — a hypervisor without KVM enabled sets <code>HCR_EL2.HCD</code> to reject
+guests attempting hypercalls, and a system with no secure-world services set <code>SCR_EL3.SMD</code> the same
+way. Recognising this common shape means learning one mechanism rather than three.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>SVC</code></th><th><code>HVC</code></th><th><code>SMC</code></th></tr></thead>
+<tbody>
+<tr><td>Target</td><td>EL1</td><td>EL2</td><td>EL3</td></tr>
+<tr><td>ESR EC</td><td>0x15</td><td>0x16</td><td>0x17</td></tr>
+<tr><td>Vector</td><td><code>VBAR_EL1</code> + 0x400</td><td><code>VBAR_EL2</code> + 0x400</td><td><code>VBAR_EL3</code> + 0x400</td></tr>
+<tr><td>Number in</td><td><code>x8</code></td><td>The immediate, or <code>x0</code></td><td><code>x0</code> (SMCCC)</td></tr>
+<tr><td>Used for</td><td>System calls</td><td>Hypercalls, KVM</td><td>PSCI, TEE, SiP services</td></tr>
+<tr><td>Disabled by</td><td>—</td><td><code>HCR_EL2.HCD</code></td><td><code>SCR_EL3.SMD</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The structure is identical: a deliberate synchronous exception
+   to a higher level, arguments in registers, a number selecting
+   the service, and ERET to return. Once you understand SVC, you
+   understand all three.
+
+   The differences are in what the handler does — and for SMC,
+   the monitor must also save and restore the ENTIRE state of one
+   world before switching (security track).               */
+
+/* A PSCI call, for example — this is how a kernel starts a
+   secondary CPU (chapter 33):                             */
+        ldr     x0, =0xC4000003         /* PSCI_CPU_ON, SMC64 */
+        mov     x1, target_mpidr
+        ldr     x2, =secondary_entry
+        mov     x3, #0
+        smc     #0
+        /* x0 = 0 on success, or a negative PSCI error */</code></pre>
+
+<h2 id="observing">Watching it happen</h2>
+
+<p>The whole path is traceable on a live system, which turns the preceding description from something you believe into something you can watch.</p>
+
+<pre><code># count and time every syscall — ALWAYS do this first
+strace -c ./program
+#   % time     seconds  usecs/call     calls    errors syscall
+#   ------ ----------- ----------- --------- --------- --------
+#    89.12    0.451203           0   1204811           read
+#     → 1.2 MILLION reads. That is the bug, whatever else is true.
+
+strace -f -e trace=openat,read,write ./program
+strace -p 1234                   # attach
+
+# lower overhead, system-wide
+perf trace ./program
+sudo bpftrace -e 'tracepoint:raw_syscalls:sys_enter {
+        @[comm, args-&gt;id] = count(); }'
+
+# the entry path itself
+echo 1 &gt; /sys/kernel/debug/tracing/events/raw_syscalls/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# the table
+ausyscall --dump | head -20
+cat /usr/include/asm-generic/unistd.h | grep __NR_write
+
+# see the vDSO in action — no syscall for clock_gettime
+strace -e trace=clock_gettime ./prog     # produces nothing</code></pre>
+
+<div class="tip">
+<b><code>strace -c</code> before anything else</b>
+<p>When a program is slow with low CPU usage, this one command usually finds it: a million one-byte reads,
+thousands of failed <code>stat()</code> calls probing for a file, or a <code>poll()</code> loop with a zero
+timeout. All three are extremely common and all three are obvious in the summary. Reach for a profiler only
+after this comes back clean.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Slow program, low CPU</td><td>Syscall-bound — check <code>strace -c</code></td></tr>
+<tr><td>Byte-at-a-time I/O 100× slower</td><td>One syscall per byte; buffer it</td></tr>
+<tr><td>Performance dropped after a kernel update</td><td>KPTI or Spectre mitigations on the entry path</td></tr>
+<tr><td>Kernel oops on a pointer from userspace</td><td>Direct dereference instead of <code>copy_from_user</code></td></tr>
+<tr><td>Vulnerability from a caller-supplied length</td><td>Length used before being bounded</td></tr>
+<tr><td>Exploit changes a value after validation</td><td>TOCTOU — validated in place instead of after copying</td></tr>
+<tr><td>Kernel stack bytes appear in user output</td><td>Struct padding not zeroed</td></tr>
+<tr><td>Syscall returns a huge positive number instead of an error</td><td>Return value not checked against the -4095 boundary</td></tr>
+<tr><td>Sandboxed process is measurably slower</td><td>seccomp filter evaluated on every call</td></tr>
+<tr><td><code>clock_gettime</code> is suspiciously cheap</td><td>Served by the vDSO — no exception at all</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the syscall ABI registers and two ways it differs from the C ABI.</li>
+  <li>List the six things hardware does at <code>svc #0</code>.</li>
+  <li>Explain why the syscall number bounds check must be speculation-safe.</li>
+  <li>Give the three things <code>copy_from_user</code> does that a <code>memcpy</code> does not.</li>
+  <li>Explain how PAN and <code>LDTR</code> enforce the boundary in hardware.</li>
+  <li>Say why signals are delivered on return to userspace rather than at arbitrary points.</li>
+  <li>Explain the negative-errno convention and the -4095 boundary.</li>
+  <li>Explain what the vDSO is and why <code>clock_gettime</code> needs no exception.</li>
+  <li>Give the three deliberate-exception instructions and what distinguishes them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

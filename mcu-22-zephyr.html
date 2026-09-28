@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zephyr in practice | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Zephyr in practice</h1>
+<p class="lead">Zephyr is not FreeRTOS with more features — it is a different proposition. FreeRTOS gives you a
+scheduler and leaves the system to you; Zephyr gives you a whole operating system with device drivers, a
+device tree, a build system and a networking stack, and asks you to work its way.</p>
+
+<h2 id="difference">The essential difference</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>FreeRTOS</th><th>Zephyr</th></tr></thead>
+<tbody>
+<tr><td>What it is</td><td>A scheduler and IPC primitives</td><td>A complete RTOS with drivers, subsystems and
+a build system</td></tr>
+<tr><td>Hardware description</td><td>Your code, vendor HAL</td><td>Device tree, as in Linux</td></tr>
+<tr><td>Configuration</td><td>One header</td><td>Kconfig, as in Linux</td></tr>
+<tr><td>Build</td><td>Your Makefile or IDE</td><td><code>west</code> plus CMake</td></tr>
+<tr><td>Drivers</td><td>Vendor HAL, per-chip</td><td>Portable driver API across all supported chips</td></tr>
+<tr><td>Footprint</td><td>~6 kB flash minimum</td><td>~20 kB minimum, realistically much more</td></tr>
+<tr><td>Learning curve</td><td>An afternoon</td><td>Genuinely a week or two</td></tr>
+<tr><td>Board support</td><td>You write it</td><td>750+ boards supported upstream</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The trade is legibility against leverage. FreeRTOS is small enough to read in a day; you will never wonder
+what it is doing. Zephyr abstracts the hardware so completely that the same application source builds for an
+nRF52, an STM32 and a RISC-V part — but understanding why something does not work means learning device tree,
+Kconfig and the driver model first.</p>
+
+<h2 id="devicetree">Device tree: hardware as data</h2>
+
+<pre><code>/* Zephyr borrows the device tree wholesale from Linux (see
+   the Linux track, chapter 18). Hardware is DESCRIBED, not
+   coded.                                                   */
+
+/* boards/arm/my_board/my_board.dts */
+/ {
+    aliases {
+        status-led = &amp;led0;
+        sensor-bus = &amp;i2c1;
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        led0: led_0 {
+            gpios = &lt;&amp;gpioa 5 GPIO_ACTIVE_HIGH&gt;;
+            label = "Status LED";
+        };
+    };
+};
+
+&amp;i2c1 {
+    status = "okay";
+    clock-frequency = &lt;I2C_BITRATE_FAST&gt;;
+
+    bme280@76 {
+        compatible = "bosch,bme280";
+        reg = &lt;0x76&gt;;
+    };
+};
+
+/* The application never names a pin, a port or a register: */
+
+#include &lt;zephyr/drivers/gpio.h&gt;
+
+static const struct gpio_dt_spec led =
+    GPIO_DT_SPEC_GET(DT_ALIAS(status_led), gpios);
+
+int main(void)
+{
+    if (!gpio_is_ready_dt(&amp;led)) {
+        return -ENODEV;
+    }
+    gpio_pin_configure_dt(&amp;led, GPIO_OUTPUT_ACTIVE);
+
+    for (;;) {
+        gpio_pin_toggle_dt(&amp;led);
+        k_msleep(500);
+    }
+}
+
+/* This source is portable across every supported board. Move
+   to different silicon and you change the .dts, not the
+   application. That is the leverage Zephyr is selling, and
+   on a product line with several hardware variants it is a
+   very large saving.
+
+   The macros are resolved at COMPILE time - devicetree.h is
+   generated from the .dts during the build - so there is no
+   runtime parsing cost, unlike Linux.                       */
+</code></pre>
+
+<div class="note">
+<b>Device tree errors are compile-time and cryptic</b>
+<p>A missing node or a typo'd alias produces an error inside a generated header, pointing at a macro
+expansion rather than your <code>.dts</code>. The habit that saves hours: after any device tree change, read
+<code>build/zephyr/zephyr.dts</code> — the fully merged and resolved tree — rather than your fragment. It
+shows what the build actually concluded, including everything the SoC's own <code>.dtsi</code> files
+contributed.</p>
+</div>
+
+<h2 id="kernel">The kernel API</h2>
+
+<pre><code>/* Same concepts as chapter 19, different spelling, and
+   static definition is idiomatic rather than exceptional.  */
+
+#include &lt;zephyr/kernel.h&gt;
+
+/* Threads. Note K_THREAD_DEFINE creates it at BOOT with no
+   runtime allocation - the Zephyr default style.           */
+K_THREAD_DEFINE(sensor_tid, 1024, sensor_thread,
+                NULL, NULL, NULL,
+                5,        /* priority: LOWER = more urgent,
+                             the OPPOSITE of FreeRTOS and the
+                             same as the NVIC. Cooperative
+                             priorities are negative.        */
+                0, 0);
+
+/* Message queue - the queue of chapter 19. */
+K_MSGQ_DEFINE(sensor_q, sizeof(struct reading), 10, 4);
+
+void sensor_thread(void *a, void *b, void *c)
+{
+    struct reading r;
+    while (1) {
+        if (k_msgq_get(&amp;sensor_q, &amp;r, K_MSEC(100)) == 0) {
+            process(&amp;r);
+        }
+    }
+}
+
+/* From an ISR - note there is no separate FromISR API.
+   Zephyr's calls detect ISR context themselves and require
+   only that you pass K_NO_WAIT.                            */
+void my_isr(const void *arg)
+{
+    struct reading r = read_hw();
+    k_msgq_put(&amp;sensor_q, &amp;r, K_NO_WAIT);   /* must not block */
+}
+
+/* Other primitives, mapping onto chapter 19:
+     k_mutex      mutex, with priority inheritance
+     k_sem        counting semaphore
+     k_event      event flags
+     k_fifo/lifo  linked-list queues, no copy
+     k_work       deferred work to a system workqueue -
+                  the standard "get it out of the ISR"
+                  mechanism, equivalent to a Linux workqueue
+
+   K_FOREVER, K_NO_WAIT and K_MSEC(n) replace FreeRTOS's
+   portMAX_DELAY and tick arithmetic, and are type-safe.    */
+</code></pre>
+
+<h2 id="build">Kconfig and west</h2>
+
+<pre><code># prj.conf - application configuration, Kconfig syntax
+CONFIG_GPIO=y
+CONFIG_I2C=y
+CONFIG_SENSOR=y
+CONFIG_BME280=y
+CONFIG_LOG=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_MAIN_STACK_SIZE=2048
+CONFIG_THREAD_ANALYZER=y          # stack watermarks, ch 20
+CONFIG_THREAD_ANALYZER_AUTO=y
+
+# Build and flash
+$ west build -b nucleo_f429zi app/
+$ west flash
+$ west debug
+
+# Inspect what Kconfig actually resolved to - symbols have
+# dependencies, and one you set may be silently disabled
+# because its prerequisite is off. This file is the truth:
+$ less build/zephyr/.config
+
+# Change configuration interactively, which also SHOWS the
+# dependency that is blocking a symbol:
+$ west build -t menuconfig
+
+/* The most common Zephyr frustration by far: "I set
+   CONFIG_FOO=y and it had no effect." Almost always FOO
+   depends on BAR which is not enabled, and Kconfig silently
+   dropped it. menuconfig's search (press /) tells you the
+   dependency chain immediately.                            */
+</code></pre>
+
+<h2 id="choosing">Choosing between them</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>Choice</th></tr></thead>
+<tbody>
+<tr><td>32 kB flash, one board, fixed scope</td><td>FreeRTOS, or no RTOS at all</td></tr>
+<tr><td>You need BLE, Wi-Fi, USB or TCP/IP</td><td>Zephyr — the stacks are integrated and maintained</td></tr>
+<tr><td>Several hardware variants of one product</td><td>Zephyr — the device tree pays for itself
+quickly</td></tr>
+<tr><td>Vendor supplies a FreeRTOS BSP and examples</td><td>FreeRTOS — swimming with the current</td></tr>
+<tr><td>You must read and justify every line for certification</td><td>FreeRTOS, or a certified kernel like
+SAFERTOS</td></tr>
+<tr><td>Long-lived product needing upstream security fixes</td><td>Zephyr — an active foundation and a real
+release cadence</td></tr>
+<tr><td>Team already knows Linux device tree and Kconfig</td><td>Zephyr — the concepts transfer
+directly</td></tr>
+<tr><td>You need it working this week</td><td>FreeRTOS</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>CONFIG_FOO=y</code> has no effect</td><td>An unmet Kconfig dependency; check
+<code>build/zephyr/.config</code></td></tr>
+<tr><td>Cryptic error inside a generated header</td><td>Device tree node or alias missing — read the merged
+<code>zephyr.dts</code></td></tr>
+<tr><td><code>gpio_is_ready_dt</code> returns false</td><td>The controller's node has
+<code>status = "disabled"</code></td></tr>
+<tr><td>Device not found at runtime</td><td>Driver not enabled in Kconfig even though the node
+exists</td></tr>
+<tr><td>Priorities behave backwards versus FreeRTOS</td><td>Zephyr uses lower = more urgent, and negative for
+cooperative</td></tr>
+<tr><td>Kernel call hangs the system from an ISR</td><td>A timeout other than <code>K_NO_WAIT</code> passed in
+interrupt context</td></tr>
+<tr><td>Build succeeds, board does nothing</td><td>Wrong board target — the binary is for different
+silicon</td></tr>
+<tr><td>Binary far larger than expected</td><td>Logging, shell or asserts left enabled in a release
+build</td></tr>
+<tr><td>Stack overflow in the system workqueue</td><td>Long work items — raise
+<code>CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE</code></td></tr>
+<tr><td>Cannot find where a pin is configured</td><td>It is in the pinctrl node of the board's
+<code>.dts</code>, not in code</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the essential difference in what FreeRTOS and Zephyr each provide.</li>
+  <li>Explain what the device tree buys you and what it costs.</li>
+  <li>Say why Zephyr's device tree has no runtime parsing cost, unlike Linux's.</li>
+  <li>Give the file to read when a device tree change does not behave as expected.</li>
+  <li>State Zephyr's priority direction and contrast it with FreeRTOS.</li>
+  <li>Explain why Zephyr has no separate <code>FromISR</code> API.</li>
+  <li>Name the Zephyr equivalent of deferring work out of an ISR.</li>
+  <li>Describe the most common Kconfig frustration and how to diagnose it.</li>
+  <li>Give three situations that clearly favour Zephyr.</li>
+  <li>Give three situations that clearly favour FreeRTOS.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

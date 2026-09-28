@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parallelism: ILP, SIMD, SMT and multicore | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Parallelism: ILP, SIMD, SMT and multicore</h1>
+<p class="lead">Clock speeds stopped rising around 2005. Everything since has come from doing more things at
+once. This chapter covers the four kinds of parallelism, which ones are free, which ones you must ask for,
+and why "add more cores" stops working.</p>
+
+<h2 id="why">Why parallelism became the only option</h2>
+
+<p>Processors stopped getting faster in the way they had for decades, and the reason was physics rather than engineering fashion. Understanding what stopped explains why every machine you buy now has many cores instead of one fast one.</p>
+
+<pre class="diagram">Dynamic power in CMOS:      P ≈ C × V² × f
+
+  Raising frequency f raises power linearly — and requires raising
+  voltage V to keep switching fast enough, which raises power by the
+  SQUARE. So a 20% clock increase can cost ~70% more power.
+
+  ~2005: the "power wall". Air cooling caps a chip around 100-150 W.
+  Frequencies flattened at 3-4 GHz and have stayed there for 20 years.
+
+  Meanwhile transistor counts kept doubling. The only way to spend
+  them was on MORE UNITS rather than FASTER ones:
+
+     more execution units per core        -> ILP
+     wider registers                      -> SIMD
+     more thread contexts per core        -> SMT
+     more cores                           -> multicore
+     specialised units                    -> accelerators, NPUs
+
+This is the entire shape of modern computing, and it is a
+consequence of one equation.</pre>
+
+<h2 id="taxonomy">Flynn's taxonomy</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Single data</th><th>Multiple data</th></tr></thead>
+<tbody>
+<tr><td><strong>Single instruction</strong></td><td><strong>SISD</strong> — a classic scalar core</td><td><strong>SIMD</strong> — one instruction, many elements: NEON, SVE, AVX, GPUs</td></tr>
+<tr><td><strong>Multiple instruction</strong></td><td><strong>MISD</strong> — essentially unused, except for redundant lockstep cores in safety systems</td><td><strong>MIMD</strong> — multicore, multiprocessor, clusters</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="ilp">Instruction-level parallelism</h2>
+
+<p>Independent instructions in a single stream, executed simultaneously. <strong>You do not ask for this —
+the hardware finds it.</strong></p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Technique</th><th>What it does</th><th>Covered in</th></tr></thead>
+<tbody>
+<tr><td>Pipelining</td><td>Overlaps stages of consecutive instructions</td><td><a href="ca-11-pipelining.html">ch. 11</a></td></tr>
+<tr><td>Superscalar issue</td><td>Issues 2–8 instructions per cycle to different units</td><td>here</td></tr>
+<tr><td>Out-of-order execution</td><td>Runs instructions as operands become ready, not in program order</td><td><a href="ca-11-pipelining.html">ch. 11</a></td></tr>
+<tr><td>Register renaming</td><td>Removes false (write-after-read/write) dependencies</td><td><a href="ca-11-pipelining.html">ch. 11</a></td></tr>
+<tr><td>Speculation</td><td>Executes past unresolved branches</td><td><a href="ca-12-speculation.html">ch. 12</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">What limits ILP, and what you can do about it
+
+  TRUE DEPENDENCIES. A dependent chain cannot be parallelised at all.
+
+     s = 0;
+     for (i = 0; i < n; i++)
+             s += a[i];        <- every add waits for the previous one
+                                  4-cycle FP add latency = 4 cycles/element
+                                  no matter how wide the core is
+
+  Break the chain with accumulators — the single highest-value ILP
+  optimisation available to a programmer:
+
+     s0 = s1 = s2 = s3 = 0;
+     for (i = 0; i < n; i += 4) {
+             s0 += a[i];   s1 += a[i+1];      <- four INDEPENDENT chains
+             s2 += a[i+2]; s3 += a[i+3];         now the 4-cycle latencies
+     }                                           overlap
+     s = (s0 + s1) + (s2 + s3);
+
+  Typical result: ~4x faster, from an unchanged instruction count.
+
+  Note the reassociation: this changes floating-point results
+  (chapter 03), which is exactly why the compiler will NOT do it for
+  you unless you pass -ffast-math. On integers it does it freely.</pre>
+
+<p>Beyond ~4-wide issue, ILP hits diminishing returns: real code simply does not contain enough independent
+work, and the hardware to find more grows quadratically. That is why cores stopped getting wider and started
+getting more numerous.</p>
+
+<h2 id="simd">Data-level parallelism: SIMD</h2>
+
+<p>One instruction, several data elements. Cheap in hardware — one instruction fetch and decode drives many
+ALUs — but you or your compiler must express it.</p>
+
+<pre class="diagram">   scalar                          SIMD (128-bit, 4 x float32)
+
+   c[0] = a[0] + b[0];             ┌────┬────┬────┬────┐  a
+   c[1] = a[1] + b[1];             ├────┼────┼────┼────┤
+   c[2] = a[2] + b[2];             │ +  │ +  │ +  │ +  │  b
+   c[3] = a[3] + b[3];             ├────┼────┼────┼────┤
+                                   └────┴────┴────┴────┘  c
+   4 instructions                  1 instruction
+
+  ARM NEON      128-bit fixed        V0-V31
+  ARM SVE/SVE2  128-2048, scalable   Z0-Z31 + predicates P0-P15
+  x86 AVX2      256-bit
+  x86 AVX-512   512-bit
+
+SVE's key idea is VECTOR LENGTH AGNOSTIC code: the same binary runs
+optimally on 128-bit and 512-bit implementations, because the loop is
+written against a runtime length with predication for the tail.
+No recompilation, no dispatch table.</pre>
+
+<pre><code>/* Four ways to get SIMD, in order of preference */
+
+/* 1. Let the compiler do it. Write clean, obviously independent loops. */
+void add(float *restrict c, const float *a, const float *b, int n) {
+        for (int i = 0; i &lt; n; i++)
+                c[i] = a[i] + b[i];
+}
+/* -O3 -march=armv8-a+simd emits NEON automatically.
+   `restrict` is what makes it legal: it promises the arrays do not
+   overlap, so the compiler may reorder the accesses. Without it the
+   compiler must assume c may alias a, and vectorisation is unsafe. */
+
+/* Check whether it actually happened - do not assume: */
+//   gcc -O3 -fopt-info-vec-missed   (tells you WHY it did not)
+
+/* 2. OpenMP, when the compiler needs permission */
+#pragma omp simd
+for (int i = 0; i &lt; n; i++) c[i] = a[i] + b[i];
+
+/* 3. Intrinsics: explicit, portable across compilers, readable */
+#include &lt;arm_neon.h&gt;
+for (int i = 0; i &lt; n; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        vst1q_f32(c + i, vaddq_f32(va, vb));
+}
+
+/* 4. Hand-written assembly. Rarely justified; hard to maintain. */</code></pre>
+
+<div class="warn">
+<b>Why your loop did not vectorise</b>
+<p>The compiler must <em>prove</em> the transformation is safe. Common blockers, roughly in order of
+frequency: possible pointer aliasing (fix with <code>restrict</code>); a loop-carried dependency; a
+data-dependent early exit or <code>break</code>; function calls that cannot be inlined; a non-contiguous or
+indirect access pattern (<code>a[idx[i]]</code>); floating-point reassociation that would change results; and
+a trip count unknown at compile time combined with expensive tail handling. Ask the compiler with
+<code>-fopt-info-vec-missed</code> rather than guessing — it will name the reason.</p>
+</div>
+
+<div class="note">
+<b>SIMD does not rescue a memory-bound loop</b>
+<p>Vector add has an arithmetic intensity of about 0.08 FLOP/byte — far left of the roofline ridge
+(<a href="ca-18-performance.html">chapter 18</a>). Making the arithmetic 4× faster changes nothing when you
+are waiting on DRAM. Vectorise things that are compute bound, or fix the memory behaviour first. This is the
+most common reason a carefully vectorised loop shows no improvement.</p>
+</div>
+
+<h2 id="smt">Thread-level parallelism on one core: SMT</h2>
+
+<p>Simultaneous multithreading keeps two or more architectural contexts in one physical core, so when one
+thread stalls the other uses the idle execution units.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Duplicated per thread</th><th>Shared between threads</th></tr></thead>
+<tbody>
+<tr><td></td><td>Architectural registers, program counter, exception state</td><td>Execution units, caches, TLBs, branch predictors, memory bandwidth</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Typical gain: 10-30%, for maybe 5% extra area. Excellent value —
+when the threads stall a lot and do not fight over cache.
+
+When SMT HURTS:
+  · both threads are compute bound and already saturating the units
+  · they have large, distinct working sets, so each halves the other's
+    effective cache
+  · latency matters: your thread now shares a core with an unknown
+    neighbour, so worst-case timing becomes unpredictable
+  · SECURITY: sharing caches and predictors is a side channel. Threads
+    can observe each other. Cloud providers and hardened systems often
+    disable SMT entirely for this reason.
+
+ARM's application cores generally do NOT implement SMT — the design
+choice has been more, simpler cores instead. Some Neoverse and
+specialised ARM cores do. x86 calls it Hyper-Threading.</pre>
+
+<h2 id="multicore">Multicore</h2>
+
+<p>Putting several processors on one chip sounds straightforward and raises a series of questions that do not arise with one: what they share, how they stay consistent, and whether they should even be identical to each other.</p>
+
+<pre class="diagram">Homogeneous                     Heterogeneous (big.LITTLE, DynamIQ)
+
+  4x identical cores              2x big  (wide, OoO, high power)
+  simple scheduling               4x LITTLE (narrow, in-order, efficient)
+                                  same ISA, very different performance
+
+  Heterogeneity buys energy efficiency: run background work on the
+  LITTLE cores at a fraction of the power, migrate to big under load.
+
+  What it costs YOU:
+    · benchmark results depend on which core you landed on
+    · a thread can migrate mid-measurement
+    · worst-case timing analysis must assume the slowest core
+    · pin with taskset when measuring anything (chapter 18)</pre>
+
+<h3>Why adding cores stops helping</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Limit</th><th>Mechanism</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td><strong>Amdahl's serial fraction</strong></td><td>The sequential part never shrinks</td><td>Parallelise more of it, or accept the ceiling</td></tr>
+<tr><td><strong>Lock contention</strong></td><td>Threads serialise on a shared lock</td><td>Finer-grained locks, per-CPU data, lock-free structures, RCU</td></tr>
+<tr><td><strong>Memory bandwidth</strong></td><td>All cores share one memory controller</td><td>Improve locality; reduce bytes moved (<a href="ca-13-memory-hierarchy.html">ch. 13</a>)</td></tr>
+<tr><td><strong>Cache coherence traffic</strong></td><td>Shared lines ping-pong between cores</td><td>Pad to line boundaries; avoid shared writes (<a href="ca-15-coherence.html">ch. 15</a>)</td></tr>
+<tr><td><strong>False sharing</strong></td><td>Unrelated variables in one cache line</td><td>Align per-thread data to 64 bytes</td></tr>
+<tr><td><strong>Load imbalance</strong></td><td>One thread finishes last; the rest idle</td><td>Dynamic scheduling, work stealing, smaller chunks</td></tr>
+<tr><td><strong>Synchronisation overhead</strong></td><td>Barriers and joins cost more than the work</td><td>Coarser tasks; fewer barriers</td></tr>
+<tr><td><strong>Power and thermal</strong></td><td>All-core turbo is lower than single-core turbo</td><td>Nothing — it is physics (<a href="ca-20-power.html">ch. 20</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>Negative scaling is a specific, diagnosable bug</b>
+<p>If throughput <em>decreases</em> as you add threads, you are almost certainly looking at false sharing or
+lock contention — not at a fundamental limit. Confirm with <code>perf c2c</code> and lock profiling before
+concluding the problem is not parallelisable. Genuine bandwidth saturation flattens the curve; contention
+bends it downwards.</p>
+</div>
+
+<h2 id="models">Parallel programming models</h2>
+
+<p>Hardware parallelism is only useful if software can express it. Each model below makes a different trade between how much control you get and how much of the difficulty it hides.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Shape</th><th>Good for</th><th>Hazard</th></tr></thead>
+<tbody>
+<tr><td><strong>Shared memory threads</strong></td><td>pthreads, <code>std::thread</code></td><td>Fine-grained work on one machine</td><td>Races, deadlock, false sharing</td></tr>
+<tr><td><strong>Task / work stealing</strong></td><td>OpenMP tasks, TBB, Rayon</td><td>Irregular and recursive work</td><td>Task granularity too fine</td></tr>
+<tr><td><strong>Data parallel</strong></td><td><code>#pragma omp parallel for</code></td><td>Regular loops over arrays</td><td>Load imbalance; false sharing at chunk edges</td></tr>
+<tr><td><strong>Message passing</strong></td><td>MPI, channels, actors</td><td>Distributed memory; no shared state by construction</td><td>Message overhead; harder to load balance</td></tr>
+<tr><td><strong>SPMD / GPU</strong></td><td>CUDA, OpenCL, Vulkan compute</td><td>Massive regular data parallelism</td><td>Divergence, transfer cost, memory coalescing</td></tr>
+<tr><td><strong>Pipeline</strong></td><td>Stages connected by queues</td><td>Streaming; heterogeneous stages</td><td>The slowest stage sets throughput</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* the same loop, three ways */
+
+/* data parallel */
+#pragma omp parallel for schedule(dynamic, 64) reduction(+:sum)
+for (int i = 0; i &lt; n; i++)
+        sum += heavy(a[i]);
+/* `dynamic` handles imbalance when heavy() varies per element;
+   `reduction` gives each thread a private accumulator and combines
+   them at the end - which is exactly the false-sharing fix from
+   chapter 15, done for you.                                       */
+
+/* explicit threads with per-thread state, padded */
+struct alignas(64) partial { double sum; };
+std::vector&lt;partial&gt; parts(nthreads);        /* one cache line each */
+
+/* pipeline */
+stage1 -&gt; queue -&gt; stage2 -&gt; queue -&gt; stage3
+/* throughput = 1 / max(stage time). Balance the stages, and size
+   the queues to absorb jitter without adding needless latency.   */</code></pre>
+
+<h2 id="measure">Measuring parallel efficiency</h2>
+
+<p>Adding threads does not reliably make things faster, and the only way to know is to measure. These are the numbers that tell you whether parallelism is actually paying for itself.</p>
+
+<pre><code>speedup    S(n) = T(1) / T(n)
+efficiency E(n) = S(n) / n          # 1.0 = perfect
+
+# plot efficiency against thread count. The SHAPE is diagnostic:
+#   flat near 1.0           -> scaling well, keep going
+#   gradual decline         -> Amdahl's serial fraction, or bandwidth
+#   sharp knee              -> a resource saturated: bandwidth or a lock
+#   DECREASING below 1 core -> false sharing or contention. A bug.
+
+perf stat -e cycles,instructions ./program           # per-thread IPC
+perf c2c record ./program                            # false sharing
+perf lock record ./program &amp;&amp; perf lock report       # lock contention
+perf record -e sched:sched_switch                    # migration, imbalance</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>4 threads give 1.3× speedup</td><td>Large serial fraction, or bandwidth saturation</td></tr>
+<tr><td>Throughput falls as threads are added</td><td>False sharing or lock contention</td></tr>
+<tr><td>Vectorised loop shows no gain</td><td>Memory bound; SIMD was never the bottleneck</td></tr>
+<tr><td>Compiler refuses to vectorise a simple loop</td><td>Possible aliasing — add <code>restrict</code></td></tr>
+<tr><td>Manual unrolling with accumulators gives 4×</td><td>You broke a true dependency chain — an ILP win</td></tr>
+<tr><td>Results differ between scalar and vector versions</td><td>Floating-point reassociation (<a href="ca-03-floating-point.html">ch. 03</a>)</td></tr>
+<tr><td>Benchmark varies 3× between runs</td><td>Thread landed on a LITTLE core; pin it</td></tr>
+<tr><td>Disabling SMT made a latency-sensitive service faster</td><td>Contention and unpredictable sharing on the physical core</td></tr>
+<tr><td>All-core workload runs at a lower clock than single-core</td><td>Power and thermal budget (<a href="ca-20-power.html">ch. 20</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain from P ≈ CV²f why clock speeds stopped rising.</li>
+  <li>Give the four kinds of parallelism and say which require programmer effort.</li>
+  <li>Show how multiple accumulators break a dependency chain, and why the compiler will not do it for floats.</li>
+  <li>Explain what <code>restrict</code> promises and why vectorisation needs it.</li>
+  <li>Explain why SIMD does not help a memory-bound loop.</li>
+  <li>Say what SMT duplicates, what it shares, and give two reasons to disable it.</li>
+  <li>List five reasons adding cores stops helping, and how you would distinguish them.</li>
+  <li>Interpret an efficiency-versus-threads curve that decreases below 1.0.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

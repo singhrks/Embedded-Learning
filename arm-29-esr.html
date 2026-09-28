@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESR: decoding any fault | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>ESR: decoding any fault</h1>
+<p class="lead">One register tells you exactly why the last exception happened. Learn its layout and you can
+read any crash — a kernel oops, a bare-metal hang, a hypervisor trap — and know within seconds what went
+wrong and where to look next.</p>
+
+<h2 id="layout">The register</h2>
+
+<p>When an exception is taken, one register describes precisely what happened. Learning to read it is the single highest-value diagnostic skill in this track — it converts a crash into a specific statement about the instruction that failed.</p>
+
+<pre class="diagram"> 31    26 25 24                                                    0
+┌────────┬──┬─────────────────────────────────────────────────────┐
+│   EC   │IL│                       ISS                            │
+└────────┴──┴─────────────────────────────────────────────────────┘
+
+   EC  [31:26]   Exception Class — WHAT KIND of exception
+   IL  [25]      Instruction Length: 1 = 32-bit, 0 = 16-bit (T32)
+   ISS [24:0]    Instruction Specific Syndrome — the details.
+                 Its meaning depends entirely on EC.
+
+  Read EC FIRST. It tells you how to interpret everything else.
+
+  Companion registers:
+     FAR_ELx    the faulting virtual address (aborts, watchpoints)
+     HPFAR_EL2  the faulting IPA, for stage-2 faults (chapter 16)
+     ELR_ELx    the faulting or returning instruction</pre>
+
+<h2 id="ec">Exception classes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>EC</th><th>Meaning</th><th>Usual cause</th></tr></thead>
+<tbody>
+<tr><td><code>0x00</code></td><td>Unknown reason</td><td>A genuinely undefined instruction, or an instruction disabled at this EL</td></tr>
+<tr><td><code>0x01</code></td><td>Trapped <code>WFI</code>/<code>WFE</code></td><td>A hypervisor trapping guest idling</td></tr>
+<tr><td><code>0x07</code></td><td>Trapped FP/SIMD access</td><td>Lazy FPU switching — <code>CPACR_EL1.FPEN</code></td></tr>
+<tr><td><code>0x0E</code></td><td>Illegal execution state</td><td>Bad <code>SPSR</code> on <code>ERET</code>; <code>PSTATE.IL</code> set</td></tr>
+<tr><td><strong><code>0x15</code></strong></td><td><strong><code>SVC</code> from AArch64</strong></td><td><strong>A system call</strong></td></tr>
+<tr><td><code>0x16</code></td><td><code>HVC</code> from AArch64</td><td>Hypervisor call</td></tr>
+<tr><td><code>0x17</code></td><td><code>SMC</code> from AArch64</td><td>Secure monitor call</td></tr>
+<tr><td><code>0x18</code></td><td>Trapped <code>MSR</code>/<code>MRS</code></td><td>A higher EL intercepted a system register access</td></tr>
+<tr><td><code>0x19</code></td><td>Trapped SVE access</td><td>Lazy SVE state management</td></tr>
+<tr><td><code>0x20</code> / <code>0x21</code></td><td>Instruction abort, lower / same EL</td><td>Fetch failed: unmapped, or execute-never</td></tr>
+<tr><td><code>0x22</code></td><td>PC alignment fault</td><td>PC not 4-byte aligned — usually a corrupted function pointer</td></tr>
+<tr><td><strong><code>0x24</code> / <code>0x25</code></strong></td><td><strong>Data abort, lower / same EL</strong></td><td><strong>The most common fault</strong></td></tr>
+<tr><td><code>0x26</code></td><td>SP alignment fault</td><td>SP not 16-byte aligned (<a href="arm-09-aapcs.html">ch. 09</a>)</td></tr>
+<tr><td><code>0x2C</code></td><td>Floating-point exception</td><td>A trapped FP condition</td></tr>
+<tr><td><code>0x2F</code></td><td>SError</td><td>Imprecise external abort — see below</td></tr>
+<tr><td><code>0x30</code>–<code>0x35</code></td><td>Breakpoint, software step, watchpoint</td><td>Debug</td></tr>
+<tr><td><code>0x3C</code></td><td><code>BRK</code> instruction</td><td>A software breakpoint — <code>BUG()</code> in Linux</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The pairing rule</b>
+<p>Notice <code>0x20</code>/<code>0x21</code> and <code>0x24</code>/<code>0x25</code>. The lower value means
+the exception came from a <em>lower</em> exception level; the higher means it came from the <em>same</em>
+level. So <code>EC = 0x24</code> in a Linux oops means userspace faulted; <code>0x25</code> means the kernel
+did. That single bit tells you immediately whether you are looking at a user bug or a kernel bug.</p>
+</div>
+
+<h2 id="data-abort">Data abort ISS</h2>
+
+<p>Data aborts are the most common exception you will have to diagnose, and their syndrome field is correspondingly rich: it tells you the access size, direction, and the exact stage and level of the translation that failed.</p>
+
+<pre class="diagram">EC = 0x24 or 0x25. The ISS layout:
+
+ 24 23 22 21 20 19    16 15 14 13 12 11 10  9  8  7  6 5      0
+┌──┬─────┬──┬──┬────────┬──┬─────┬──┬──┬──┬──┬──┬──┬──┬────────┐
+│ISV│SAS │SSE│SRT      │SF│AR│VNCR│  │ │EA│CM│S1PTW│WnR│ DFSC │
+└──┴─────┴──┴──┴────────┴──┴─────┴──┴──┴──┴──┴──┴──┴──┴────────┘
+
+   DFSC  [5:0]   Fault Status Code — THE key field
+   WnR   [6]     0 = read, 1 = write
+   S1PTW [7]     the fault occurred on a stage-1 PAGE TABLE WALK
+   CM    [8]     the fault was on a cache maintenance instruction
+   EA    [9]     external abort type
+   FnV   [10]    FAR is NOT valid
+   SET   [12:11] synchronous error type
+   AR    [14]    the access was acquire/release
+   SF    [15]    64-bit register width
+   SRT   [20:16] the destination REGISTER number
+   SSE   [21]    sign-extended
+   SAS   [23:22] access size: 0=byte 1=half 2=word 3=dword
+   ISV   [24]    SAS/SRT/SF/SSE are VALID</pre>
+
+<h2 id="dfsc">Fault status codes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>DFSC</th><th>Meaning</th><th>What to check</th></tr></thead>
+<tbody>
+<tr><td><code>0b0000LL</code></td><td>Address size fault, level LL</td><td>Output address exceeds the configured PA size (<code>TCR.IPS</code>)</td></tr>
+<tr><td><code>0b0001LL</code></td><td><strong>Translation fault, level LL</strong></td><td><strong>Not mapped.</strong> Null pointer, missing <code>ioremap</code>, or a wrong <code>TTBR</code></td></tr>
+<tr><td><code>0b0010LL</code></td><td>Access flag fault, level LL</td><td><code>AF</code> clear in the descriptor (<a href="arm-14-descriptors.html">ch. 14</a>)</td></tr>
+<tr><td><code>0b0011LL</code></td><td><strong>Permission fault, level LL</strong></td><td><strong>Mapped, but not for this.</strong> AP bits, XN, or PAN</td></tr>
+<tr><td><code>0b010000</code></td><td>Synchronous external abort</td><td><strong>The bus refused it.</strong> Clock, power, or a firewall (<a href="arm-25-amba.html">ch. 25</a>)</td></tr>
+<tr><td><code>0b0101LL</code></td><td>External abort on a table walk</td><td>The page table memory itself is unreachable</td></tr>
+<tr><td><code>0b011000</code></td><td>Synchronous parity/ECC error</td><td>Memory corruption detected by hardware</td></tr>
+<tr><td><code>0b100001</code></td><td>Alignment fault</td><td>Unaligned Device access, or <code>SCTLR.A</code></td></tr>
+<tr><td><code>0b110000</code></td><td>TLB conflict abort</td><td>Break-before-make violation (<a href="arm-15-tlb-asid.html">ch. 15</a>)</td></tr>
+<tr><td><code>0b111101</code>/<code>0b111110</code></td><td>Section/page domain fault</td><td>AArch32 only</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tip">
+<b>The four-way triage</b>
+<ul>
+<li><strong>Translation fault</strong> — the address is simply not mapped. Null pointer, use-after-free, a
+missing <code>ioremap</code>, or a stale pointer.</li>
+<li><strong>Permission fault</strong> — it <em>is</em> mapped, just not for this operation. Writing to
+read-only, executing no-execute, EL0 touching an EL1 page, or PAN blocking a kernel access to user memory.</li>
+<li><strong>Access flag fault</strong> — the <code>AF</code> bit was clear. Normal in an OS that uses AF for
+page aging; a bug in hand-written table code.</li>
+<li><strong>External abort</strong> — translation <em>succeeded</em> and the transaction went out on the bus,
+and something out there refused it. This is a hardware or platform problem, not a page table one: an unclocked
+peripheral, a powered-down domain, a wrong address, or an access-control block denying you.</li>
+</ul>
+<p>That one distinction — page tables versus the bus — sends you to completely different parts of the system,
+and it is why reading DFSC first saves hours.</p>
+</div>
+
+<h2 id="decoder">A decoder worth keeping</h2>
+
+<p>Rather than looking fields up each time, this is a compact reference you can apply directly to a value from a real dump.</p>
+
+<div class="codewrap"><div class="code-title">drop this into any bare-metal or kernel fault handler</div>
+<pre><code>static const char *dfsc_name(unsigned dfsc)
+{
+        switch (dfsc &amp; 0x3C) {
+        case 0x00: return "address size fault";
+        case 0x04: return "TRANSLATION fault (not mapped)";
+        case 0x08: return "access flag fault (AF clear)";
+        case 0x0C: return "PERMISSION fault (mapped, wrong perms)";
+        }
+        switch (dfsc) {
+        case 0x10: return "EXTERNAL ABORT (bus refused it)";
+        case 0x18: return "parity/ECC error";
+        case 0x21: return "ALIGNMENT fault";
+        case 0x30: return "TLB conflict (break-before-make bug)";
+        default:   return "unknown";
+        }
+}
+
+void dump_fault(void)
+{
+        uint64_t esr, far, elr;
+        asm volatile("mrs %0, esr_el1" : "=r"(esr));
+        asm volatile("mrs %0, far_el1" : "=r"(far));
+        asm volatile("mrs %0, elr_el1" : "=r"(elr));
+
+        unsigned ec  = (esr &gt;&gt; 26) &amp; 0x3F;
+        unsigned iss =  esr &amp; 0x1FFFFFF;
+
+        printf("ESR=%016llx  EC=0x%02x  FAR=%016llx  ELR=%016llx\n",
+               esr, ec, far, elr);
+
+        switch (ec) {
+        case 0x15:
+                printf("  SVC #%u — a system call\n", iss &amp; 0xFFFF);
+                break;
+
+        case 0x20: case 0x21:
+                printf("  INSTRUCTION abort at %s EL: %s, level %u\n",
+                       ec == 0x20 ? "lower" : "same",
+                       dfsc_name(iss &amp; 0x3F), (iss &amp; 3));
+                printf("  → fetching from %016llx failed\n", far);
+                break;
+
+        case 0x24: case 0x25: {
+                unsigned dfsc = iss &amp; 0x3F;
+                printf("  DATA abort at %s EL on %s of %016llx\n",
+                       ec == 0x24 ? "lower" : "same",
+                       (iss &amp; (1u &lt;&lt; 6)) ? "WRITE" : "READ", far);
+                printf("  %s, level %u\n", dfsc_name(dfsc), dfsc &amp; 3);
+
+                if (iss &amp; (1u &lt;&lt; 7))
+                        printf("  S1PTW: the PAGE TABLE WALK itself faulted\n");
+                if (iss &amp; (1u &lt;&lt; 10))
+                        printf("  FnV: FAR is NOT valid\n");
+                if (iss &amp; (1u &lt;&lt; 24))
+                        printf("  size=%u bytes, dest reg x%u\n",
+                               1u &lt;&lt; ((iss &gt;&gt; 22) &amp; 3), (iss &gt;&gt; 16) &amp; 0x1F);
+                break;
+        }
+
+        case 0x18:
+                printf("  trapped MSR/MRS — a higher EL is watching\n");
+                break;
+
+        case 0x26:
+                printf("  SP ALIGNMENT fault — SP was not 16-byte aligned\n");
+                break;
+
+        case 0x2F:
+                printf("  SError — IMPRECISE. ELR is NOT the cause.\n");
+                break;
+
+        default:
+                printf("  EC 0x%02x — look it up in the ARM ARM, D17.2.37\n", ec);
+        }
+}</code></pre></div>
+
+<h2 id="worked">Worked examples</h2>
+
+<p>Decoding a real value end to end is what makes the preceding tables stick. Work through these before trusting that you can do it under pressure.</p>
+
+<pre><code>/* ESR = 0x96000004, FAR = 0x0000000000000000 */
+   EC   = 0x96000004 &gt;&gt; 26 = 0x25   data abort, SAME EL (kernel)
+   ISS  = 0x000004
+   DFSC = 0x04 = 0b000100          translation fault, level 0
+   WnR  = 0                        a READ
+   FAR  = 0                        address zero
+   → A KERNEL NULL POINTER DEREFERENCE, on a read.
+     Level 0 because nothing at all is mapped at address 0.
+
+/* ESR = 0x9200004F, FAR = 0x0000ffff8a3c1000 */
+   EC   = 0x24                     data abort, LOWER EL (user)
+   DFSC = 0x0F = 0b001111          permission fault, level 3
+   WnR  = 1                        a WRITE
+   → Userspace wrote to a read-only page. A .rodata write, or a
+     copy-on-write page that has not yet been copied (OS ch. 13).
+
+/* ESR = 0x96000010, FAR = 0x0000000040001000 */
+   EC   = 0x25                     kernel
+   DFSC = 0x10                     EXTERNAL ABORT
+   → Translation SUCCEEDED. The bus refused it. Check: is the
+     peripheral clocked? Powered? Is an XPU denying access?
+     This is NOT a page table problem.
+
+/* ESR = 0x86000007, FAR = 0x0000000000401234 */
+   EC   = 0x21                     INSTRUCTION abort, same EL
+   DFSC = 0x07 = 0b000111          translation fault, level 3
+   → Tried to FETCH from an unmapped page. A corrupted function
+     pointer, or a jump into freed memory.
+
+/* ESR = 0x56000000 */
+   EC   = 0x15                     SVC from AArch64
+   ISS  = 0                        svc #0
+   → A normal system call. Not an error at all.</code></pre>
+
+<h2 id="serror">SError: the hard one</h2>
+
+<p>Most exceptions are precise — they name the instruction responsible. SErrors are not, which makes them the hardest class to diagnose and the one where the usual approach does not apply.</p>
+
+<pre><code>/* EC = 0x2F. The ISS layout is different again: */
+   IDS  [24]     IMPLEMENTATION DEFINED syndrome
+   AET  [12:10]  Asynchronous Error Type
+                   0 = uncontainable
+                   1 = unrecoverable
+                   2 = restartable
+                   3 = recoverable
+                   6 = corrected
+   EA   [9]      external abort
+   DFSC [5:0]    0x00 = uncategorised, 0x11 = asynchronous SError
+
+/* The problem: an SError is reported at an arbitrary later
+   instruction. ELR points at whatever was executing when the
+   error was finally taken — which has NOTHING to do with the
+   transaction that failed.
+
+   Typical causes:
+     · a POSTED WRITE rejected by an access-control block long
+       after the store retired (chapter 25, security ch. 20)
+     · an ECC error discovered on a writeback
+     · a device signalling an error asynchronously
+
+   How to narrow it down:
+     1. ESB (Error Synchronization Barrier) at known points
+        confines an SError to a bounded region, so you can
+        bisect where it originates:
+              esb
+        Place them around suspect code and see which region
+        produces it.
+     2. The RAS extension adds ERR&lt;n&gt;STATUS records describing
+        exactly which node reported the error.
+     3. Vendor-specific error registers in the interconnect —
+        an XPU usually LATCHES the offending address and master
+        ID even when the CPU cannot attribute it.
+
+   Linux prints these when it can:
+        dmesg | grep -i 'SError\|RAS\|EDAC'                */</code></pre>
+
+<h2 id="linux">Reading a Linux oops</h2>
+
+<p>A Linux oops prints this register, already partly decoded. Knowing which parts the kernel decoded for you, and which you must decode yourself, is what makes the dump fully readable.</p>
+
+<pre><code>Unable to handle kernel NULL pointer dereference at virtual address 0000000000000010
+Mem abort info:
+  ESR = 0x0000000096000006
+  EC = 0x25: DABT (current EL), IL = 32 bits
+  SET = 0, FnV = 0
+  EA = 0, S1PTW = 0
+  FSC = 0x06: level 2 translation fault
+Data abort info:
+  ISV = 0, ISS = 0x00000006
+  CM = 0, WnR = 0
+CPU: 2 PID: 1834 Comm: cat Tainted: G           O
+pstate: 60400009 (nZCv daif +PAN -UAO)
+pc : my_read+0x48/0x120 [mydriver]
+lr : vfs_read+0xb4/0x1f0
+sp : ffff800009abc000
+Call trace:
+ my_read+0x48/0x120 [mydriver]
+ vfs_read+0xb4/0x1f0
+ ksys_read+0x74/0x110
+ __arm64_sys_read+0x24/0x30
+ el0_svc_common+0x88/0x1a0
+
+/* Reading it in order:
+     EC 0x25   → the KERNEL faulted, not userspace
+     FSC 0x06  → translation fault at level 2
+     WnR 0     → a READ
+     FAR 0x10  → address 16 — a NULL pointer plus a 16-byte
+                 field offset. So: a null struct pointer, and
+                 the field is at offset 0x10.
+     pstate +PAN → PAN was on, so this was NOT an attempt to
+                 read user memory
+     call trace → arrived via a read() syscall from `cat`
+
+   Conclusion: my_read() dereferenced a null pointer and read the
+   member at offset 16. Find it: */
+
+scripts/faddr2line vmlinux my_read+0x48
+pahole -C my_device mydriver.ko | grep -A2 'offset:.*16'</code></pre>
+
+<h2 id="stage2">Stage-2 faults</h2>
+
+<p>Under virtualisation the same register reports faults from the second stage of translation, with slightly different meaning — a distinction worth keeping straight when debugging a guest.</p>
+
+<pre><code>/* Taken to EL2, with ESR_EL2. Two extra things to read: */
+
+   HPFAR_EL2      the faulting IPA:  (HPFAR &amp; ~0xF) &lt;&lt; 8
+   FAR_EL2        the guest VA, when available
+   ESR_EL2.S1PTW  set → the GUEST'S PAGE TABLES are in an
+                  unmapped IPA. The guest did nothing wrong; the
+                  hypervisor has not mapped the memory holding
+                  its tables.
+
+/* And ISV/SAS/SRT are what make MMIO emulation possible without
+   decoding the instruction (chapter 16):                    */
+
+        if (esr &amp; ESR_ISV) {
+                int size = 1 &lt;&lt; ((esr &gt;&gt; 22) &amp; 3);
+                int reg  = (esr &gt;&gt; 16) &amp; 0x1F;
+                bool wr  = esr &amp; (1 &lt;&lt; 6);
+                emulate(ipa, reg, size, wr);
+        } else {
+                decode_instruction_slowly();    /* rare */
+        }</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>ESR pattern</th><th>Diagnosis</th></tr></thead>
+<tbody>
+<tr><td>EC 0x25, DFSC 0b0001xx, FAR near 0</td><td>Kernel null pointer dereference</td></tr>
+<tr><td>EC 0x24, DFSC 0b0001xx</td><td>Userspace segfault — normal, handled by the OS</td></tr>
+<tr><td>EC 0x25, DFSC 0b0011xx, WnR=1</td><td>Kernel wrote to read-only memory</td></tr>
+<tr><td>EC 0x25, DFSC 0b0011xx, PAN set</td><td>Kernel dereferenced a user pointer directly</td></tr>
+<tr><td>DFSC 0b010000</td><td>External abort — clock, power, or a bus firewall</td></tr>
+<tr><td>S1PTW set</td><td>The page tables themselves are unreachable</td></tr>
+<tr><td>EC 0x21, DFSC translation</td><td>Jumped to unmapped memory — corrupted function pointer</td></tr>
+<tr><td>EC 0x26</td><td>SP alignment — hand-written assembly, or stack corruption</td></tr>
+<tr><td>EC 0x22</td><td>PC alignment — a corrupted branch target</td></tr>
+<tr><td>DFSC 0b110000</td><td>TLB conflict — break-before-make violation</td></tr>
+<tr><td>EC 0x2F</td><td>SError — the reported PC is meaningless; use ESB to bisect</td></tr>
+<tr><td>EC 0x18</td><td>A trapped system register — a hypervisor is watching</td></tr>
+<tr><td>EC 0x0E</td><td>Illegal execution state — usually a bad <code>SPSR</code> on <code>ERET</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the three fields of ESR and say which one to read first.</li>
+  <li>Explain the difference between EC 0x24 and 0x25, and why it matters immediately.</li>
+  <li>Give the four main DFSC categories and what each sends you to investigate.</li>
+  <li>Explain why an external abort is not a page table problem.</li>
+  <li>Decode <code>ESR = 0x96000004, FAR = 0</code> into plain English.</li>
+  <li>Explain what <code>S1PTW</code> means and what it implies about the tables.</li>
+  <li>Explain why SError cannot be attributed from <code>ELR</code>, and two ways to narrow it down.</li>
+  <li>Explain how <code>ISV</code>/<code>SAS</code>/<code>SRT</code> enable MMIO emulation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

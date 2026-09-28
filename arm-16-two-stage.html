@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two-stage translation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Two-stage translation</h1>
+<p class="lead">Run the whole translation machinery twice: once under the guest's control, once under the
+hypervisor's. This is what makes virtualisation efficient rather than emulated — and it is the exact same
+structure the SMMU uses for devices.</p>
+
+<h2 id="problem">The problem it solves</h2>
+
+<p>A guest operating system believes it owns physical memory. Two-stage translation is what makes that belief safe: the addresses it thinks are physical are themselves translated again before reaching real memory.</p>
+
+<pre class="diagram">A guest OS believes it owns physical memory starting at 0. So
+does every other guest. Three approaches, historically:
+
+  1. PARAVIRTUALISATION — modify the guest to know it is a guest
+     and to use real physical addresses. Works, but requires
+     changing every OS.
+
+  2. SHADOW PAGE TABLES — the hypervisor maintains its own tables
+     mapping guest-VA directly to host-PA, and traps every guest
+     page table write to keep them in sync. Correct, and very
+     expensive: every guest mmap, fork and page fault becomes a
+     trap plus a shadow table update.
+
+  3. TWO-STAGE TRANSLATION — hardware does both mappings.
+     The guest edits its own tables freely, with NO traps.
+
+  ARM (and Intel EPT, AMD NPT) all took the third path. It is the
+  single feature that made hardware virtualisation practical.</pre>
+
+<h2 id="stages">The two stages</h2>
+
+<p>Two translations happen in sequence for every access, and the second one is under the hypervisor's control rather than the guest's. Following the full path once makes the cost — and the power — of the mechanism clear.</p>
+
+<pre class="diagram">   guest virtual address (VA)
+        │
+        │  STAGE 1 — the GUEST's page tables
+        │  TTBR0_EL1 / TTBR1_EL1, TCR_EL1, MAIR_EL1
+        │  the guest writes these; the hypervisor does not touch them
+        ▼
+   intermediate physical address (IPA)
+        │  "what the guest BELIEVES is physical"
+        │
+        │  STAGE 2 — the HYPERVISOR's tables
+        │  VTTBR_EL2, VTCR_EL2
+        │  the guest cannot read or write these
+        ▼
+   physical address (PA)
+
+  Two independent sets of tables, two independent permission
+  checks. The guest cannot escape stage 2 because it has no
+  access to VTTBR_EL2 — that register is only reachable from EL2.
+
+  HCR_EL2.VM = 1 enables stage 2. With it clear, EL1 accesses go
+  straight to PA and the guest is not confined at all.</pre>
+
+<h2 id="cost">The cost: walks multiply</h2>
+
+<div class="danger">
+<b>Every stage-1 table access itself needs stage-2 translation</b>
+<p>The stage-1 walker reads descriptors from memory using <em>IPAs</em>. Each of those reads must be
+translated by stage 2. With four levels at each stage:</p>
+<pre>
+  stage-1 L0 descriptor read → needs a stage-2 walk (4 accesses)
+  stage-1 L1 descriptor read → needs a stage-2 walk (4 accesses)
+  stage-1 L2 descriptor read → needs a stage-2 walk (4 accesses)
+  stage-1 L3 descriptor read → needs a stage-2 walk (4 accesses)
+  the final IPA              → needs a stage-2 walk (4 accesses)
+  plus the 4 stage-1 descriptor reads themselves       +4
+                                                  ─────────────
+  worst case:  (4 + 1) × 4 + 4  =  <b>24 memory accesses</b>
+</pre>
+<p>Versus four for a native walk. This is why TLB behaviour matters so much more under virtualisation, why
+walk caches are critical, and why huge pages at <em>both</em> stages are a standard tuning step for VM
+workloads.</p>
+</div>
+
+<pre><code>/* Mitigations, in order of impact:
+     · combined TLB entries — the TLB caches VA → PA directly,
+       tagged with both ASID and VMID, so a hit skips both stages
+     · walk caches for intermediate descriptors at both stages
+     · huge pages at stage 2 (a 1 GB block for the guest's RAM
+       is extremely common — one entry covers everything)
+     · huge pages inside the guest as well                    */</code></pre>
+
+<h2 id="vtcr">Stage-2 configuration</h2>
+
+<p>Stage 2 has its own configuration register, separate from the one the guest programs. That separation is precisely what stops a guest from reconfiguring its way out of its own address space.</p>
+
+<pre class="diagram">   VTTBR_EL2    stage-2 table base, plus the VMID in [63:48]
+   VTCR_EL2     stage-2 translation control:
+
+      T0SZ    [5:0]    IPA size:  IPA bits = 64 - T0SZ
+      SL0     [7:6]    STARTING LEVEL — see below
+      IRGN0   [9:8]    walk cacheability
+      ORGN0   [11:10]
+      SH0     [13:12]
+      TG0     [15:14]  granule
+      PS      [18:16]  physical address size
+      VS      [19]     VMID size: 8 or 16 bits
+
+   SL0 is the field unique to stage 2. Because the IPA space is
+   usually much smaller than 48 bits (a guest with 4 GB of RAM
+   needs only 32), stage 2 can START at L1 or L2 rather than L0,
+   removing levels from every walk.
+
+      IPA 40 bits, 4 KB granule → start at L1 (SL0 = 01)
+      IPA 32 bits               → start at L2 (SL0 = 00)
+
+   CONCATENATED TABLES: stage 2 may also use up to 16 contiguous
+   tables at the starting level, effectively widening the first
+   index. A 40-bit IPA can then be covered starting at L1 with
+   two concatenated tables instead of needing an L0.
+
+   Both tricks exist for the same reason: shorten the walk, since
+   it is already being done up to five times.</pre>
+
+<h2 id="perms">Stage-2 descriptors</h2>
+
+<p>Stage-2 descriptors express permission differently from stage-1 ones, because the question being asked is different: not "may this program do this" but "may this virtual machine do this at all".</p>
+
+<pre><code>/* Stage 2 uses a DIFFERENT descriptor layout from stage 1
+   (chapter 14). The important differences:                   */
+
+   S2AP[7:6]      00  no access
+                  01  read-only
+                  10  write-only
+                  11  read/write
+      → ABSOLUTE permissions, not split by exception level.
+        Stage 2 applies to the whole guest, so "EL0 vs EL1" is
+        meaningless here — that distinction belongs to stage 1.
+
+   MemAttr[5:2]   the memory type DIRECTLY encoded, with NO MAIR
+                  indirection. The hypervisor cannot use MAIR_EL1,
+                  because the guest owns it.
+
+   XN[54:53]      execute-never, two bits in newer revisions
+
+/* COMBINING the two stages — the rule is "more restrictive wins":
+
+     permissions:  the intersection. Read-only at either stage
+                   means read-only overall.
+     memory type:  the more restrictive. Device at either stage
+                   means Device overall. Non-cacheable at either
+                   means non-cacheable.
+     XN:           execute-never at either stage means no execute.
+
+   So a hypervisor can force a guest's mapping to be non-cacheable
+   regardless of what the guest asked for — which is exactly how
+   it makes emulated device regions behave correctly even though
+   the guest mapped them as ordinary memory.                 */</code></pre>
+
+<h2 id="faults">Stage-2 faults</h2>
+
+<p>When a guest access fails at stage 2, the hypervisor gets a fault carrying a description of what the guest was trying to do. Decoding it is how emulation of a device actually begins.</p>
+
+<pre class="diagram">A stage-2 fault is taken to EL2, NOT to the guest's EL1. The
+guest never sees it — which is the whole point.
+
+   ESR_EL2.EC = 0x24    data abort from a lower EL
+   ESR_EL2.EC = 0x20    instruction abort from a lower EL
+
+   HPFAR_EL2            the faulting IPA (bits [47:12] &lt;&lt; 4)
+   FAR_EL2              the faulting guest VA, when available
+
+   ESR_EL2.ISS for a stage-2 abort:
+      DFSC   [5:0]     fault status, with the LEVEL
+      WnR    [6]       write (1) or read (0)
+      S1PTW  [7]       the fault occurred while the stage-1 WALKER
+                       was reading a descriptor — i.e. the guest's
+                       PAGE TABLES are in an unmapped IPA
+      ISV    [24]      the remaining fields are valid
+      SAS    [23:22]   access size: 0=byte, 1=half, 2=word, 3=dword
+      SRT    [20:16]   the guest register number involved
+      SF     [15]      64-bit register
+
+   ISV/SAS/SRT are the key to MMIO emulation: they tell the
+   hypervisor exactly what the guest was trying to do, so it can
+   emulate the access without decoding the instruction itself.</pre>
+
+<h2 id="mmio">Emulating a device</h2>
+
+<p>This is the most important use of a stage-2 fault: deliberately leaving a region unmapped so that any access traps, letting the hypervisor emulate hardware that does not exist.</p>
+
+<pre><code>/* The complete flow — this is how QEMU/KVM presents virtual
+   hardware, and it is worth following once end to end.       */
+
+/* GUEST, at EL1: */
+        writel(1, uart_base + UART_CR);
+
+/* 1. stage-1 translation: guest VA → IPA. Succeeds — the guest
+      mapped its "UART" perfectly well.
+   2. stage-2 lookup of that IPA in VTTBR_EL2: the hypervisor
+      deliberately left it UNMAPPED.
+   3. stage-2 data abort → exception to EL2.                 */
+
+/* HYPERVISOR, at EL2: */
+static int handle_mmio(struct kvm_vcpu *v)
+{
+        u64 esr  = read_sysreg(esr_el2);
+        u64 ipa  = (read_sysreg(hpfar_el2) &amp; ~0xFUL) &lt;&lt; 8;
+
+        if (!(esr &amp; ESR_ISV))
+                return decode_instruction_manually(v);  /* rare, slow */
+
+        bool is_write = esr &amp; ESR_WNR;
+        int  size     = 1 &lt;&lt; ((esr &gt;&gt; 22) &amp; 3);
+        int  reg      = (esr &gt;&gt; 16) &amp; 0x1F;
+
+        if (is_write)
+                emulate_device_write(ipa, v-&gt;regs[reg], size);
+        else
+                v-&gt;regs[reg] = emulate_device_read(ipa, size);
+
+        /* advance past the faulting instruction */
+        write_sysreg(read_sysreg(elr_el2) + 4, elr_el2);
+        return 0;                /* then ERET back into the guest */
+}
+
+/* The guest resumes with no idea anything happened. Note the
+   cost: a full world switch per register access, which is why
+   emulated I/O is slow and virtio exists (OS chapter 20).   */</code></pre>
+
+<h2 id="vmid">VMID and TLB tagging</h2>
+
+<p>Just as ASIDs let several processes share a TLB, VMIDs let several virtual machines share one. The two tags coexist, and both must be managed correctly.</p>
+
+<pre><code>/* Stage-2 TLB entries are tagged with the VMID from
+   VTTBR_EL2[63:48], exactly as stage-1 entries are tagged with
+   the ASID. Several VMs coexist in the TLB.                  */
+
+        vttbr = stage2_pgd_pa | ((uint64_t)vmid &lt;&lt; 48);
+        write_sysreg(vttbr, vttbr_el2);
+        isb
+
+/* VMID width is 8 or 16 bits (VTCR_EL2.VS). Like ASIDs, they
+   are a limited resource with a rollover-and-flush scheme.
+
+/* INVALIDATION ORDER MATTERS (chapter 15): when changing a
+   stage-2 mapping, invalidate stage 2 FIRST, because combined
+   TLB entries may have been built using the old stage-2
+   translation:                                               */
+        tlbi    ipas2e1is, x_ipa
+        dsb     ish
+        tlbi    vmalle1is
+        dsb     ish
+        isb
+
+/* Reversing these leaves entries built from a mix of old and new
+   — a hypervisor bug that is extremely hard to reproduce.   */</code></pre>
+
+<h2 id="vhe">VHE: running a host kernel at EL2</h2>
+
+<p>Running a host kernel at EL2 rather than EL1 removes a great deal of switching overhead. It works by making EL2's registers behave like EL1's, which is why an unmodified kernel can run there at all.</p>
+
+<pre class="diagram">The original design assumed a hypervisor was a small, separate
+program at EL2 and the host OS ran at EL1. That is wrong for KVM,
+where the "hypervisor" IS the Linux kernel — which would have to
+run split across two exception levels, with constant switching.
+
+VHE (Virtualization Host Extensions, ARMv8.1) fixes it:
+
+  HCR_EL2.E2H = 1  makes the EL2 regime behave like EL1&0:
+       · EL2 gains TTBR1_EL2 and a two-region address space
+       · EL0 can run directly under EL2 (host userspace)
+       · the _EL1 system register names, when accessed at EL2,
+         are REDIRECTED to their _EL2 equivalents
+       · _EL12 accessors let EL2 reach the real guest EL1 state
+
+  Result: an unmodified Linux kernel runs at EL2, host userspace
+  runs at EL0 under it, and guests run at EL1. No split, and VM
+  entry/exit is far cheaper because the host does not have to
+  save and restore its own EL1 state.
+
+  Without VHE, KVM used a small "hyp stub" at EL2 and paid a
+  world switch on every exit. With VHE the host never leaves EL2.
+  Check: ID_AA64MMFR1_EL1.VH</pre>
+
+<h2 id="smmu">The same structure, for devices</h2>
+
+<div class="key">
+<b>This is exactly what the SMMU does</b>
+<p>An IOMMU applies the identical two-stage scheme to DMA: stage 1 owned by the guest (or the OS) translating
+device IOVAs to IPAs, stage 2 owned by the hypervisor translating IPAs to PAs. Same descriptor format, same
+combining rules, same VMID tagging.</p>
+<p>That is what makes <strong>device passthrough</strong> safe: a device assigned to a guest is programmed
+with guest-physical addresses, and stage 2 confines its DMA to that guest's memory exactly as it confines the
+guest's CPU accesses. Without it, passthrough would let a guest scribble anywhere in host memory. The
+<a href="track.html?t=sec">security track</a> covers this in full.</p>
+</div>
+
+<h2 id="debug">Debugging two-stage translation</h2>
+
+<p>With two translations in play, "which address is this" becomes genuinely ambiguous. These techniques keep the three kinds of address distinct while debugging.</p>
+
+<pre><code>/* The AT instruction understands both stages: */
+        at      s1e1r,  x0       /* stage 1 only → gives the IPA    */
+        at      s12e1r, x0       /* both stages  → gives the PA     */
+        at      s1e2r,  x0       /* the EL2 regime's own mapping    */
+        isb
+        mrs     x1, par_el1
+
+/* PAR_EL1.F = 1 on failure, and bit 8 says WHICH STAGE faulted.
+   Running both forms tells you immediately whether the guest's
+   tables or the hypervisor's are at fault — the single most
+   useful diagnostic here.                                    */
+
+# KVM statistics
+perf stat -e kvm:kvm_exit,kvm:kvm_entry -a sleep 10
+cat /sys/kernel/debug/kvm/*/vcpu0/*         # per-vCPU exit counts
+
+# which exit reasons dominate?
+perf record -e kvm:kvm_exit -a &amp;&amp; perf report
+#   a high count of MMIO exits means you should be using virtio
+#   or passthrough instead of emulation
+
+# stage-2 fault tracing
+echo 1 &gt; /sys/kernel/debug/tracing/events/kvm/kvm_mmio/enable
+cat /sys/kernel/debug/tracing/trace_pipe</code></pre>
+
+<h2 id="deeper">Where this goes next</h2>
+
+<p><a href="virt-05-stage2.html">Virtualisation chapter 05</a> takes stage 2 further: <code>SL0</code> and
+concatenated tables, the descriptor format, the permission and memory-type combining rules, and the
+invalidation sequence that catches everyone. <a href="virt-06-stage2-faults.html">Chapter 06</a> covers what
+happens when a stage-2 walk fails, which is how demand paging, MMIO emulation and live migration all
+work.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest performance far below native on memory-heavy work</td><td>Walk multiplication; enable huge pages at both stages</td></tr>
+<tr><td>Guest I/O is very slow</td><td>Full device emulation — one exit per register access</td></tr>
+<tr><td>Guest can access host memory</td><td><code>HCR_EL2.VM</code> not set, or stage 2 maps too much</td></tr>
+<tr><td>Guest crashes on an address the guest mapped correctly</td><td>Stage-2 fault; check <code>HPFAR_EL2</code></td></tr>
+<tr><td>Fault with <code>S1PTW</code> set</td><td>The guest's <em>page tables</em> are in an unmapped IPA</td></tr>
+<tr><td>Guest memory corruption after a hypervisor remap</td><td>Invalidated stage 1 before stage 2</td></tr>
+<tr><td>Emulation needs slow instruction decoding</td><td><code>ESR.ISV</code> clear — some accesses cannot be decoded from the syndrome</td></tr>
+<tr><td>Guest sees cacheable access to an emulated device</td><td>Stage-2 <code>MemAttr</code> too permissive</td></tr>
+<tr><td>VM exits are unexpectedly expensive</td><td>No VHE — the host is saving and restoring EL1 state per exit</td></tr>
+<tr><td>Passthrough device writes host memory</td><td>No IOMMU stage 2 — the exact reason it is mandatory</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what an IPA is and who owns each stage.</li>
+  <li>Compare shadow page tables with two-stage translation.</li>
+  <li>Compute the worst-case number of memory accesses for a two-stage walk, and explain why.</li>
+  <li>Give three mitigations for walk multiplication.</li>
+  <li>Say how stage-2 descriptors differ from stage-1 and state the combining rule.</li>
+  <li>Explain how <code>ESR.ISV</code>/<code>SAS</code>/<code>SRT</code> make MMIO emulation possible.</li>
+  <li>Give the correct stage-2 then stage-1 invalidation order and why.</li>
+  <li>Explain what VHE changes and why KVM needed it.</li>
+  <li>Explain why device passthrough is unsafe without an IOMMU.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Error handling patterns and devm | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Error handling patterns and <code>devm</code></h1>
+<p class="lead">The kernel has no exceptions and no destructors, so unwinding is manual — and error paths are
+the least-tested code in any driver. Two disciplines make them reliable: the <code>goto</code> ladder, and
+letting the device model free things for you.</p>
+
+<h2 id="goto">The goto ladder</h2>
+
+<p>Kernel C uses <code>goto</code> for error handling, which is startling if you were taught it is always wrong. In a function that acquires several resources in sequence, it produces the only readable structure that unwinds them correctly — and the alternative, repeating cleanup at every exit, is what actually causes bugs.</p>
+
+<pre><code>/* This is idiomatic kernel C, not a code smell. Every label
+   undoes exactly one step, in reverse order.               */
+
+static int mydev_probe(struct platform_device *pdev)
+{
+        struct mydev *d;
+        int ret;
+
+        d = kzalloc(sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        ret = regulator_enable(d-&gt;vdd);
+        if (ret)
+                goto err_free;
+
+        ret = clk_prepare_enable(d-&gt;clk);
+        if (ret)
+                goto err_reg;
+
+        ret = mydev_hw_init(d);
+        if (ret)
+                goto err_clk;
+
+        ret = request_irq(d-&gt;irq, mydev_isr, 0, "mydev", d);
+        if (ret)
+                goto err_hw;
+
+        return 0;
+
+err_hw:
+        mydev_hw_shutdown(d);
+err_clk:
+        clk_disable_unprepare(d-&gt;clk);
+err_reg:
+        regulator_disable(d-&gt;vdd);
+err_free:
+        kfree(d);
+        return ret;
+}
+
+/* WHY IT BEATS THE ALTERNATIVES:
+
+   · nested ifs get unreadable past three levels, and the
+     cleanup is duplicated at each depth
+   · a single "cleanup everything" function must guess how far
+     you got, which means tracking state - more code, more
+     bugs
+   · early returns duplicate the unwind at every exit
+
+   THE RULE THAT MAKES IT WORK: label names say WHAT THEY
+   UNDO, not where they came from. `err_clk` disables the
+   clock. Add a step in the middle and you insert one label
+   and one goto - nothing else changes.
+
+   NAME THEM AFTER THE THING BEING UNDONE, never err1, err2,
+   err3 - those force a renumber every time the order
+   changes, and renumbering is where the mistakes creep in. */</code></pre>
+
+<h2 id="devm">devm: managed resources</h2>
+
+<p>Most of the ladder above can be deleted. Managed allocations register themselves against the device, and the driver core releases them automatically — in the right order — whether probe fails halfway through or the device is unbound years later.</p>
+
+<pre><code>/* The device model can free things automatically when the
+   device unbinds - which deletes most of the ladder.       */
+
+static int mydev_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct mydev *d;
+
+        d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(d-&gt;base))
+                return PTR_ERR(d-&gt;base);
+
+        d-&gt;clk = devm_clk_get_enabled(dev, NULL);
+        if (IS_ERR(d-&gt;clk))
+                return PTR_ERR(d-&gt;clk);
+
+        d-&gt;irq = platform_get_irq(pdev, 0);
+        if (d-&gt;irq &lt; 0)
+                return d-&gt;irq;
+
+        ret = devm_request_irq(dev, d-&gt;irq, mydev_isr, 0,
+                               "mydev", d);
+        if (ret)
+                return ret;
+
+        return 0;      /* no labels, no unwind, no leaks */
+}
+
+/* HOW IT WORKS: each devm_ call appends an entry to a list on
+   the struct device. When the device unbinds - whether
+   because probe failed, remove ran, or the module unloaded -
+   the core walks that list IN REVERSE and calls each release
+   function.
+
+   So the unwinding order is automatically correct, and it is
+   correct on the failure path too, without you writing it.
+
+/* THE COMMON ONES: */
+        devm_kzalloc, devm_kcalloc, devm_kstrdup
+        devm_ioremap, devm_platform_ioremap_resource
+        devm_clk_get, devm_clk_get_enabled, devm_clk_bulk_get
+        devm_regulator_get, devm_regulator_bulk_get
+        devm_reset_control_get
+        devm_gpiod_get, devm_gpiod_get_optional
+        devm_request_irq, devm_request_threaded_irq
+        devm_regmap_init_mmio
+        devm_pm_runtime_enable
+        devm_add_action_or_reset   /* &lt;-- the general one */</code></pre>
+
+<div class="warn">
+<b>What <code>devm</code> does not do</b>
+<p><code>devm_clk_get()</code> releases the clock reference — it does <strong>not</strong> disable the clock.
+<code>devm_regulator_get()</code> does not disable the regulator. <code>devm_gpiod_get()</code> does not
+restore the pin state. Anything you <em>enabled</em> by hand, you must disable by hand in remove. Use
+<code>devm_clk_get_enabled()</code> and the bulk enable helpers where they exist; for the rest, the pattern
+below closes the gap.</p>
+</div>
+
+<h2 id="action">devm_add_action_or_reset</h2>
+
+<p><code>devm_</code> covers the resources the kernel knows about. When you need to undo something it has no concept of — quiescing hardware, freeing a third-party handle — you can register your own cleanup function to run at the same time.</p>
+
+<pre><code>/* Register YOUR OWN cleanup with the device, so anything can
+   participate in managed unwinding.                        */
+
+static void mydev_disable_vdd(void *data)
+{
+        regulator_disable(data);
+}
+
+        ret = regulator_enable(d-&gt;vdd);
+        if (ret)
+                return ret;
+
+        ret = devm_add_action_or_reset(dev, mydev_disable_vdd,
+                                       d-&gt;vdd);
+        if (ret)
+                return ret;
+        /* from here on, the regulator is disabled
+           automatically on unbind - and if the registration
+           itself failed, _or_reset already called the action,
+           so there is nothing to unwind.                    */
+
+/* THE "_or_reset" SUFFIX IS THE POINT: plain
+   devm_add_action() leaves you holding the resource if the
+   registration fails, so you would need an error path for the
+   error path. _or_reset calls the action immediately on
+   failure, so `return ret;` is always correct.
+
+   ALWAYS USE _or_reset. There is no good reason for the
+   plain form in new code.                                   */
+
+/* THIS PATTERN GENERALISES to anything: */
+static void mydev_hw_off(void *data)
+{
+        mydev_hw_shutdown(data);
+}
+        ret = mydev_hw_init(d);
+        if (ret)
+                return ret;
+        ret = devm_add_action_or_reset(dev, mydev_hw_off, d);
+        if (ret)
+                return ret;
+
+/* Now even hardware shutdown is managed, and remove() can be
+   empty - which is the goal: a driver whose teardown cannot
+   be wrong because there is no teardown code to get wrong. */</code></pre>
+
+<h2 id="errptr">ERR_PTR and error returns</h2>
+
+<p>Kernel functions returning a pointer need a way to report <em>why</em> they failed, not just that they did. Rather than an out-parameter, the kernel encodes an error code into the pointer itself — which is why testing these returns against <code>NULL</code> is a bug.</p>
+
+<pre><code>/* Kernel convention: functions returning a pointer encode
+   errors IN the pointer, using the top page of the address
+   space, which no valid pointer occupies.                  */
+
+        void *p = some_function();
+
+        if (IS_ERR(p))
+                return PTR_ERR(p);      /* extract the errno */
+
+/* NOT: */
+        if (!p)                          /* WRONG - an error
+                                            pointer is NOT
+                                            NULL              */
+
+/* WRITING one: */
+struct mydev *mydev_find(int id)
+{
+        if (id &lt; 0)
+                return ERR_PTR(-EINVAL);
+        if (!exists(id))
+                return ERR_PTR(-ENODEV);
+        return &amp;devices[id];
+}
+
+/* THE THREE-WAY CASE - can return NULL, an error, or a valid
+   pointer (optional resources do this): */
+        if (IS_ERR_OR_NULL(p))
+                ...
+        /* or, more precisely: */
+        if (IS_ERR(p))
+                return PTR_ERR(p);      /* a real error */
+        if (!p)
+                /* legitimately absent - the optional case */
+
+/* PRINTING one: */
+        dev_err(dev, "failed: %pe\n", p);
+                -&gt; "failed: -ENOMEM"
+
+/* AND THE ERRNO CODES that matter in drivers: */
+        -ENOMEM         out of memory
+        -EINVAL         bad argument from a caller
+        -ENODEV         no such device / not present
+        -EIO            hardware failed
+        -EBUSY          in use, try later
+        -ETIMEDOUT      hardware did not respond
+        -EPROBE_DEFER   a supplier is not ready yet
+        -ENOTSUPP       this hardware cannot do that
+        -ENOTTY         no such ioctl
+        -EAGAIN         nothing available right now
+        -ERESTARTSYS    interrupted, please restart
+
+/* PICK THE SPECIFIC ONE. -EINVAL for everything makes a
+   userspace program's diagnostics useless, and yours too. */</code></pre>
+
+<h2 id="deverrprobe">dev_err_probe</h2>
+
+<p>Nearly every failure in <code>probe()</code> wants to do the same three things: log a message, avoid shouting about a deferred probe, and return the code. One helper does all three, which is why modern probe functions are so much shorter than older ones.</p>
+
+<pre><code>/* Every resource acquisition in probe should use it: */
+
+        d-&gt;clk = devm_clk_get(dev, "core");
+        if (IS_ERR(d-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;clk),
+                                     "failed to get core clock\n");
+
+/* IT DOES FOUR THINGS:
+     1. logs with the device name prefixed
+     2. for -EPROBE_DEFER, logs at DEBUG level instead of
+        ERROR - so normal boot is not flooded with messages
+        about deferrals that resolve
+     3. records the deferral reason, visible in
+        /sys/kernel/debug/devices_deferred
+     4. returns the error code, so `return` composes
+
+   THE ALTERNATIVE people write: */
+        if (IS_ERR(d-&gt;clk)) {
+                dev_err(dev, "no clock\n");      /* spams on
+                                                    every retry */
+                return PTR_ERR(d-&gt;clk);
+        }
+/* which works but floods the log during normal deferred
+   probe, and loses the deferral reason.                    */</code></pre>
+
+<h2 id="cleanup">Scope-based cleanup</h2>
+
+<p>The newest addition to kernel C borrows an idea from C++ and Rust: variables that clean themselves up when they go out of scope. It removes whole classes of leak, and you will increasingly see it in new code.</p>
+
+<pre><code>/* Newer kernels have __cleanup__-based helpers, borrowed from
+   C++ RAII. They release on EVERY exit from the scope,
+   including returns and gotos.                             */
+
+#include &lt;linux/cleanup.h&gt;
+
+/* LOCKS: */
+static int mydev_do_thing(struct mydev *d)
+{
+        guard(mutex)(&amp;d-&gt;lock);       /* held until return */
+
+        if (!d-&gt;ready)
+                return -EAGAIN;        /* unlocked correctly */
+
+        return mydev_thing(d);         /* and here too */
+}
+
+/* a narrower scope: */
+        scoped_guard(spinlock_irqsave, &amp;d-&gt;lock) {
+                d-&gt;count++;
+        }
+
+/* MEMORY: */
+        char *buf __free(kfree) = kmalloc(len, GFP_KERNEL);
+        if (!buf)
+                return -ENOMEM;
+        ...
+        return 0;              /* buf freed automatically */
+
+/* REFERENCE COUNTS: */
+        struct device_node *np __free(device_node) =
+                of_parse_phandle(dev-&gt;of_node, "partner", 0);
+
+/* WHERE THIS HELPS MOST: functions with many early returns
+   under a lock, which is exactly where forgotten unlocks
+   live. It does not replace the goto ladder for probe -
+   ordered hardware teardown still needs explicit sequencing -
+   but it removes a whole class of lock leaks.
+
+   Check whether your target kernel has it before relying on
+   it; it landed in 6.4 and later.                          */</code></pre>
+
+<h2 id="test">Testing error paths</h2>
+
+<p>Error paths are the least-tested code in any driver, because they only run when something goes wrong — which in normal testing is never. These techniques make failures happen deliberately, so the paths get exercised before a customer finds them.</p>
+
+<pre><code># Error paths are the least-executed and least-tested code in
+# any driver. Force them.
+
+# 1. FAULT INJECTION on allocations:
+    CONFIG_FAILSLAB=y
+    CONFIG_FAULT_INJECTION_DEBUG_FS=y
+    echo 10   > /sys/kernel/debug/failslab/probability
+    echo 100  > /sys/kernel/debug/failslab/times
+    echo 1    > /sys/kernel/debug/failslab/verbose
+    # then load your driver repeatedly. 10% of allocations
+    # fail; anything that crashes is an unchecked return.
+
+# 2. REMOVE RESOURCES from the device tree, one at a time:
+#      delete the clocks property   -> probe must fail cleanly
+#      delete the interrupt         -> same
+#      point reg at a bad address   -> the ID check must catch it
+
+# 3. BIND/UNBIND in a loop, under KASAN:
+    for i in $(seq 100); do
+      echo 1c000000.my-device > .../unbind
+      echo 1c000000.my-device > .../bind
+    done
+    dmesg | grep -i -e kasan -e "warn" -e "bug"
+
+# 4. CHECK FOR LEAKS after a failed probe:
+    cat /proc/iomem      | grep 1c000000    # should be gone
+    cat /proc/interrupts | grep my-device   # should be gone
+    cat /sys/kernel/debug/kmemleak
+
+# EVERY ONE of these finds real bugs in drivers that pass
+# their functional tests. The fault-injection run in
+# particular usually finds two or three unchecked returns the
+# first time it is used on a driver.</code></pre>
+
+<div class="key">
+<b>The rule that prevents most of it</b>
+<p>Whenever you write a line that acquires something, write the line that releases it <em>in the same
+edit</em> — the <code>goto</code> label, the <code>devm_add_action_or_reset</code>, or the
+<code>__free</code> annotation. Deferring "I will add the cleanup later" is how leaks are born, because
+later never has the full context of what order things were acquired in.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Crash when a NULL check "passed"</td><td>Checked for NULL where <code>IS_ERR</code> was needed</td></tr>
+<tr><td>Resource leak after a failed probe</td><td>Missing unwind step, or an early return past the ladder</td></tr>
+<tr><td>Region still in <code>/proc/iomem</code> after unbind</td><td>Bare <code>ioremap</code> instead of the devm/resource form</td></tr>
+<tr><td>Clock stays on after unbind</td><td><code>devm_clk_get</code> does not disable — use <code>devm_clk_get_enabled</code></td></tr>
+<tr><td>Regulator refcount imbalance warnings</td><td><code>regulator_enable</code> without a matching disable path</td></tr>
+<tr><td>Second bind fails after a successful unbind</td><td>State left behind — something not released</td></tr>
+<tr><td>Log flooded with "failed to get clock" at boot</td><td><code>dev_err</code> instead of <code>dev_err_probe</code> on a deferral</td></tr>
+<tr><td>Deadlock on an error path</td><td>Early return under a lock — <code>guard()</code> prevents this class</td></tr>
+<tr><td>Crash only under memory pressure</td><td>Unchecked allocation — fault injection finds it in minutes</td></tr>
+<tr><td>Unwind order wrong, hardware left in a bad state</td><td>Manual cleanup function that guessed how far setup got</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write a <code>goto</code> ladder and explain the label-naming rule.</li>
+  <li>Explain how <code>devm</code> unwinding works and in what order.</li>
+  <li>List three things <code>devm</code> does <em>not</em> release for you.</li>
+  <li>Use <code>devm_add_action_or_reset</code> and explain what the suffix guarantees.</li>
+  <li>Distinguish <code>IS_ERR</code>, NULL and <code>IS_ERR_OR_NULL</code>, and print an error
+  pointer.</li>
+  <li>Choose the right errno for six different failures.</li>
+  <li>Explain all four things <code>dev_err_probe</code> does.</li>
+  <li>Use <code>guard()</code> and <code>__free()</code> and say which problem each removes.</li>
+  <li>Run fault injection against your driver and fix what it finds.</li>
+  <li>Verify no resources leak after a deliberately failed probe.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

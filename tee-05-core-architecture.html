@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OP-TEE OS architecture | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>OP-TEE OS architecture</h1>
+<p class="lead">OP-TEE is a small preemptible kernel with a fixed pool of threads, its own MMU regime, a
+demand pager, and a strict rule that it never runs unless the normal world asked it to. Those four
+properties explain almost every behaviour you will observe, including the deadlock in the last section.</p>
+
+<h2 id="shape">The shape of it</h2>
+
+<p>The trusted OS has the same concerns as any kernel — memory, threads, entry points — solved differently because of where it runs and what it must guarantee.</p>
+
+<pre class="diagram">   S-EL0    TA        TA        TA
+            |         |         |
+            |  SVC (the GP Internal API is a syscall
+            |       interface, exactly like Linux's)
+            v
+   +-----------------------------------------------------+
+   |  OP-TEE CORE                               S-EL1    |
+   |                                                     |
+   |   thread pool     N threads, N fixed at build time  |
+   |   TA manager      load, verify, map, session state  |
+   |   MMU             one address space per TA          |
+   |   pager           optional demand paging of core    |
+   |   crypto          libtomcrypt / mbedTLS, plus       |
+   |                   hardware accelerator drivers      |
+   |   drivers         GIC, timer, RNG, RPMB, i2c...     |
+   |   pseudo TAs      services built into the core      |
+   |   RPC             asking the normal world for help  |
+   +-----------------------------------------------------+
+            |
+            |  SMC
+            v
+   EL3      TF-A BL31
+
+   Things OP-TEE deliberately does NOT have:
+
+     no scheduler of its own in the usual sense - the NORMAL
+       world schedules it, by choosing when to make an SMC
+     no interrupts it services on its own behalf, except its
+       own timer and secure interrupts
+     no dynamic memory beyond fixed pools
+     no filesystem - it asks the normal world (chapter 9)
+     no network, no USB, no display, unless a platform adds one
+
+   It is closer to a very careful library with an MMU than to
+   an operating system, and that is deliberate: a small
+   trusted computing base is the entire product.</pre>
+
+<h2 id="threads">The thread pool</h2>
+
+<p>The secure world has a small, fixed number of execution contexts rather than a scheduler creating them on demand. That limit is a design decision with consequences the normal world can feel.</p>
+
+<pre><code>/* OP-TEE has a FIXED number of threads, set at build time:   */
+
+    CFG_NUM_THREADS = 8      /* typical; sometimes 2 or 4      */
+
+/* One thread is occupied for the ENTIRE duration of a normal-
+   world call. From the SMC that enters OP-TEE until the SMC
+   that returns, that thread belongs to that caller.          */
+
+  normal world calls in       -> a thread is allocated
+     TA runs
+     TA does secure storage   -> RPC out to tee-supplicant.
+                                 THE THREAD IS STILL HELD - it
+                                 is suspended waiting for the
+                                 normal world to answer.
+     TA finishes
+  return to normal world      -> thread freed
+
+/* Consequences:
+
+   1. At most CFG_NUM_THREADS concurrent TA invocations,
+      system-wide. The 9th caller gets
+      TEEC_ERROR_BUSY / OPTEE_SMC_RETURN_ETHREAD_LIMIT and
+      libteec retries.
+
+   2. A TA that blocks holds a thread. A TA that blocks
+      FOR EVER holds it for ever.
+
+   3. Thread stacks are statically allocated:
+        CFG_STACK_THREAD_SIZE   default 8192 bytes
+        CFG_STACK_TMP_SIZE      the temporary/abort stack
+      8 threads x 8 KB is 64 KB of your secure memory budget,
+      before any TA runs.
+
+   4. TA stack size is separate and per-TA:
+        TA_STACK_SIZE in the TA's user_ta_header_defines.h    */</code></pre>
+
+<div class="danger">
+<b>The thread-exhaustion deadlock</b>
+<p>All <code>CFG_NUM_THREADS</code> threads are inside OP-TEE, each waiting on an RPC to
+<code>tee-supplicant</code>. <code>tee-supplicant</code> is a normal-world process; to service any of them it
+must be scheduled by Linux. If <code>tee-supplicant</code> itself needs to enter OP-TEE — or if the Linux
+thread that would run it is itself blocked in an OP-TEE call — nothing can make progress. The system hangs
+with no error anywhere.</p>
+<p>Avoid it by: never calling into the TEE from a thread that services the TEE; keeping RPC use out of hot
+paths; and raising <code>CFG_NUM_THREADS</code> so transient bursts do not saturate the pool. It is a design
+constraint, not a bug to be fixed later.</p>
+</div>
+
+<h2 id="entry">How a call enters</h2>
+
+<p>Every call into the secure world arrives at a defined entry point, and following one from the SMC to the trusted application's code shows how the layers connect.</p>
+
+<pre><code>/* core/arch/arm/kernel/thread_spmc.c and entry_a64.S       */
+
+  BL31 ERETs into OP-TEE's vector table at one of:
+
+    fast_smc_entry        a "fast" call - runs to completion
+                          with interrupts masked, on the
+                          temporary stack, no thread allocated.
+                          Used for: version queries, memory
+                          config, cache maintenance requests.
+
+    std_smc_entry         a "standard" call - allocates a
+                          THREAD, can be preempted by a
+                          non-secure interrupt, can make RPCs.
+                          Used for: everything that runs a TA.
+
+    fiq_entry             a secure interrupt arrived while the
+                          normal world was running
+
+    cpu_on/off/suspend/resume_entry
+                          PSCI events forwarded by BL31 so
+                          OP-TEE can save and restore per-CPU
+                          state
+
+/* The distinction matters. A fast call cannot:
+     - allocate memory
+     - call a TA
+     - make an RPC
+     - be interrupted
+   It must be short and self-contained. Trying to do real work
+   in a fast call is a classic porting mistake and produces
+   hangs with interrupts masked.                             */
+
+/* Foreign (non-secure) interrupt handling: while a standard
+   call is running, an interrupt destined for the NORMAL world
+   causes OP-TEE to save the thread's state and return to the
+   normal world with OPTEE_SMC_RETURN_RPC_FOREIGN_INTR. Linux
+   services the interrupt, then RESUMES the same thread. The TA
+   never notices. This is why a long-running TA does not block
+   Linux's timekeeping.                                       */</code></pre>
+
+<h2 id="mem">Memory layout</h2>
+
+<p>How the trusted OS lays out memory determines what is isolated from what, and it must account for memory shared with an untrusted world.</p>
+
+<pre class="diagram">   TEE_RAM  - OP-TEE's own memory. Secure, and never mapped
+              into any TA.
+      TEE_RAM_RX   code, read+execute
+      TEE_RAM_RW   data, heap, thread stacks
+      TEE_RAM_RO
+
+   TA_RAM   - the pool TA memory is allocated from. Each TA
+              gets its own mapping; TAs cannot see each other.
+
+   SHM      - non-secure shared memory. The ONLY region both
+              worlds can touch. Chapter 7.
+
+   +------------------------------------------------+
+   |  TEE_RAM      core code + data      SECURE     |
+   +------------------------------------------------+
+   |  TA_RAM       TA code + data        SECURE     |
+   +------------------------------------------------+
+   |  SHM          shared buffers        NON-SECURE |
+   +------------------------------------------------+
+
+   Each TA runs at S-EL0 with its own translation tables. A TA
+   cannot:
+     read another TA's memory
+     read TEE_RAM
+     read normal-world memory except a buffer explicitly
+       passed to it
+     execute anything it did not bring
+
+   The isolation between TAs is exactly the isolation between
+   Linux processes, implemented by the same hardware. That is
+   the point of running TAs at S-EL0 rather than linking them
+   into the core.</pre>
+
+<h2 id="pager">The pager</h2>
+
+<p>Secure memory is scarce, so a trusted OS may page parts of itself in and out — with integrity and confidentiality maintained, since the backing store is not trusted.</p>
+
+<pre><code>/* CFG_WITH_PAGER=y makes OP-TEE demand-page its own code.   */
+
+  Why: secure on-chip SRAM is small - often 128-256 KB - and
+  OP-TEE plus crypto plus drivers does not fit. But external
+  DRAM is not trustworthy: an attacker with bus access could
+  read or modify it.
+
+  Solution: keep a small resident part in SRAM, and page the
+  rest in from DRAM, where it is stored ENCRYPTED and
+  AUTHENTICATED.
+
+     +---------------------------+
+     |  SRAM (secure, on-chip)   |
+     |    unpaged core           |
+     |    the pager itself       |
+     |    page tables            |
+     |    a pool of page frames  |
+     +---------------------------+
+              ^  page fault
+              |  decrypt + verify + map
+              v
+     +---------------------------+
+     |  DRAM                     |
+     |    encrypted pages, each  |
+     |    with an authentication |
+     |    tag                    |
+     +---------------------------+
+
+  Cost: a page fault inside OP-TEE now involves AES and a MAC
+  check. Measurable, and worth it when the alternative is not
+  fitting.
+
+  On QEMU there is plenty of secure DRAM, so the pager is
+  usually off. On real SoCs with small secure SRAM it is
+  essential. tee-pager_v2.bin and tee-pageable_v2.bin in the
+  FIP (chapter 2) are exactly this split.                    */</code></pre>
+
+<h2 id="ta-vs-pta">TAs, pseudo TAs and early TAs</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>User-mode TA</th><th>Pseudo TA</th><th>Early TA</th></tr></thead>
+<tbody>
+<tr><td>Runs at</td><td>S-EL0</td><td><strong>S-EL1, inside the core</strong></td><td>S-EL0</td></tr>
+<tr><td>Isolated from the core</td><td>Yes, by the MMU</td><td><strong>No</strong></td><td>Yes</td></tr>
+<tr><td>Where it lives</td><td><code>/lib/optee_armtz/&lt;uuid&gt;.ta</code></td><td>Linked into
+<code>tee.elf</code></td><td>Linked into <code>tee.elf</code>, extracted at boot</td></tr>
+<tr><td>Loaded by</td><td><code>tee-supplicant</code>, on demand</td><td>Nothing — always
+there</td><td>The core, at boot</td></tr>
+<tr><td>Needs the normal world to load</td><td>Yes</td><td>No</td><td>No</td></tr>
+<tr><td>Can be updated separately</td><td>Yes</td><td>No — rebuild OP-TEE</td><td>No</td></tr>
+<tr><td>A bug means</td><td>A crashed TA</td><td><strong>A compromised trusted OS</strong></td><td>A crashed
+TA</td></tr>
+<tr><td>Use when</td><td>Almost always</td><td>You need core services or must run before the normal world can
+help</td><td>You must work before <code>tee-supplicant</code> exists</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Default to a user-mode TA.</strong> A pseudo TA runs with the trusted OS's full privilege and no
+memory isolation; the only good reasons are needing a core API that is not exposed to S-EL0, or needing to
+run before the normal world can load anything. <a href="tee-18-pseudo-ta.html">Chapter 18</a> covers the
+cases where it is genuinely right.</p>
+
+<h2 id="tour">Reading the source</h2>
+
+<p>A short guided tour of the source tree, so that the concepts above map onto files you can actually open.</p>
+
+<pre><code># The files that repay reading, in order:
+
+optee_os/core/arch/arm/kernel/
+    entry_a64.S            the vector table. Where every call
+                           arrives. Read this first.
+    thread.c               the thread pool, suspend/resume
+    thread_spmc.c          the SMC-side protocol
+    boot.c                 initialisation order
+
+optee_os/core/kernel/
+    tee_ta_manager.c       sessions, TA lifecycle, the locking
+    ree_fs_ta.c            loading a TA from the normal world
+    pseudo_ta.c
+    scall.c                the S-EL0 syscall dispatch - the
+                           other side of the GP Internal API
+
+optee_os/core/mm/
+    core_mmu.c  core_mmu_lpae.c   the core's own mappings
+    vm.c                   per-TA address spaces
+    pgt_cache.c            page table allocation
+    tee_pager.c            the pager
+
+optee_os/core/tee/
+    tee_svc*.c             the syscall implementations
+    tee_fs*.c              secure storage
+    tee_rpmb_fs.c          RPMB
+
+optee_os/ldelf/            the loader that maps a TA - it runs
+                           in the TA's own address space,
+                           which is an unusual and elegant
+                           design
+
+# Find where a GP function is implemented:
+$ grep -rn "TEE_AllocateOperation" optee_os/lib/libutee/
+$ grep -rn "syscall_cryp_obj_alloc" optee_os/core/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Calls fail with <code>TEEC_ERROR_BUSY</code> under load</td><td>Thread pool exhausted; raise
+<code>CFG_NUM_THREADS</code> or reduce concurrency</td></tr>
+<tr><td>Whole system hangs, no error</td><td>Thread-exhaustion deadlock — every thread waiting on an RPC that
+cannot be serviced</td></tr>
+<tr><td>TA crashes with a stack dump on the secure console</td><td><code>TA_STACK_SIZE</code> too small, or a
+genuine bug</td></tr>
+<tr><td>Core panics with a stack overflow</td><td><code>CFG_STACK_THREAD_SIZE</code> too small for deep crypto
+call chains</td></tr>
+<tr><td>Everything hangs with interrupts masked</td><td>Real work attempted in a fast SMC</td></tr>
+<tr><td>Out of secure memory as TAs are added</td><td>Fixed pools; see <a href="tee-06-secure-memory.html">chapter
+6</a></td></tr>
+<tr><td>A pseudo TA bug takes down the whole TEE</td><td>By design — it runs at S-EL1 with no
+isolation</td></tr>
+<tr><td>A TA works, then fails only when another TA is busy</td><td>Shared thread pool</td></tr>
+<tr><td>Paged build is slow</td><td>Every fault decrypts and authenticates a page</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the components of the OP-TEE core and three things it deliberately lacks.</li>
+  <li>Explain the fixed thread pool and what happens to the ninth concurrent caller.</li>
+  <li>Explain precisely how the thread-exhaustion deadlock occurs and how to avoid it.</li>
+  <li>Distinguish a fast SMC from a standard one and list what a fast call cannot do.</li>
+  <li>Explain what happens when a normal-world interrupt arrives during a TA invocation.</li>
+  <li>Name the three memory regions and say who can access each.</li>
+  <li>Explain why the pager exists and what it costs.</li>
+  <li>Compare user-mode TAs, pseudo TAs and early TAs across privilege, isolation and update.</li>
+  <li>Give two legitimate reasons to write a pseudo TA.</li>
+  <li>Locate, in the source tree, where an SMC first arrives and where a GP syscall is dispatched.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

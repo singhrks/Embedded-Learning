@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Addressing modes | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Addressing modes</h1>
+<p class="lead">Since only loads and stores touch memory, how they compute an address is where a surprising
+amount of performance lives. Array indexing, struct access, stack frames and pointer walking each map onto a
+specific mode, and recognising them makes disassembly readable.</p>
+
+<h2 id="modes">The modes</h2>
+
+<p>Every one of these exists to make one specific C pattern compile to a single instruction rather than a
+separate address calculation followed by a load. The base-plus-immediate form covers a struct field at a fixed
+offset; the base-plus-scaled-register form covers array indexing, where the index must be multiplied by the
+element size before it is added; and the pre/post-index forms fold the pointer's own update into the same
+instruction that dereferences it, which is exactly what a pointer walk or a stack push does. Reading down the
+"compiles from" column right to left is often the fastest way to understand a mode you have not memorised.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Syntax</th><th>Address used</th><th>Side effect on <code>Xn</code></th><th>Compiles from</th></tr></thead>
+<tbody>
+<tr><td><code>[Xn]</code></td><td>Xn</td><td>None</td><td><code>*p</code></td></tr>
+<tr><td><code>[Xn, #imm]</code></td><td>Xn + imm</td><td>None</td><td><code>p-&gt;field</code>, <code>a[3]</code></td></tr>
+<tr><td><code>[Xn, Xm]</code></td><td>Xn + Xm</td><td>None</td><td><code>p[i]</code> for byte arrays</td></tr>
+<tr><td><code>[Xn, Xm, LSL #s]</code></td><td>Xn + (Xm &lt;&lt; s)</td><td>None</td><td><strong><code>a[i]</code></strong> — the scaled index</td></tr>
+<tr><td><code>[Xn, Wm, SXTW #s]</code></td><td>Xn + (sign-extend Wm &lt;&lt; s)</td><td>None</td><td><code>a[i]</code> with a 32-bit signed index</td></tr>
+<tr><td><code>[Xn, #imm]!</code></td><td>Xn + imm</td><td><strong>Xn += imm first</strong></td><td>Push; <code>*++p</code></td></tr>
+<tr><td><code>[Xn], #imm</code></td><td>Xn</td><td><strong>Xn += imm after</strong></td><td>Pop; <code>*p++</code></td></tr>
+<tr><td><code>label</code> (PC-relative)</td><td>PC &plusmn; imm19&times;4</td><td>None</td><td>Literal pools, <code>ADR</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Pre-index versus post-index — the distinction that trips people up
+
+   PRE-INDEX   [x0, #8]!      "update, then use"
+        x0 = x0 + 8
+        access [x0]
+
+   POST-INDEX  [x0], #8       "use, then update"
+        access [x0]
+        x0 = x0 + 8
+
+  Mnemonic: the ! is where the update happens relative to the
+  bracket. Inside the bracket → before. After the bracket → after.
+
+  This is exactly *++p versus *p++ in C, and it is why a linked-
+  list walk or a memcpy loop needs no separate ADD instruction.</pre>
+
+<h2 id="scaled">The scaled index, and why it matters</h2>
+
+<p>Indexing an array is so common that the architecture folds the multiply into the load itself. That single feature removes an instruction from the inner loop of an enormous amount of real code.</p>
+
+<pre><code>/* Array indexing is ONE instruction, because the shift is free —
+   it happens in the address generation unit, not the ALU.   */
+
+long a[100];
+long f(long *a, int i) { return a[i]; }
+/*      ldr     x0, [x0, w1, sxtw #3]     // x0 + (sign-ext w1)*8
+        ret                                                   */
+
+/* The shift amount matches the element size:
+        #0  → 1-byte elements       #2  → 4-byte (int, float)
+        #1  → 2-byte                #3  → 8-byte (long, pointer)
+        #4  → 16-byte (Q registers)
+
+   Note SXTW: a signed 32-bit index must be sign-extended to 64
+   bits. If you index with a size_t (unsigned 64-bit) instead,
+   the extension disappears:                                 */
+
+long g(long *a, size_t i) { return a[i]; }
+/*      ldr     x0, [x0, x1, lsl #3]      // no extension needed */
+
+/* This is a real, if small, reason to prefer size_t for indices
+   in hot loops — and it also removes the signed-overflow UB
+   from the index arithmetic (C chapter 15).                */</code></pre>
+
+<h2 id="offsets">Immediate offset ranges</h2>
+
+<p>The offset you can encode in a load or store is limited, and the limit depends on the access size in a way that looks arbitrary until you see the encoding. It explains why the compiler sometimes materialises an address separately.</p>
+
+<pre class="diagram">The encodable range depends on the ACCESS SIZE, because the
+offset is scaled by it:
+
+   LDRB/STRB    unsigned imm12, scaled by 1   →  0 .. 4095
+   LDRH/STRH    unsigned imm12, scaled by 2   →  0 .. 8190,  even
+   LDR/STR (W)  unsigned imm12, scaled by 4   →  0 .. 16380, mult of 4
+   LDR/STR (X)  unsigned imm12, scaled by 8   →  0 .. 32760, mult of 8
+
+   Unscaled signed form (LDUR/STUR): -256 .. 255, any alignment.
+   The assembler picks it automatically when needed.
+
+   LDP/STP      signed imm7, scaled          →  -512 .. 504 for X
+
+WHY THIS MATTERS IN PRACTICE:
+
+  · a struct field at offset 32760 is one instruction; at 32768
+    it needs an extra ADD. Very large structs cost more to access.
+
+  · this is why the compiler sometimes rebases a pointer into the
+    middle of a large structure — to bring fields into range.
+
+  · stack frames larger than ~32 KB generate extra address
+    arithmetic on every local variable access. Another reason
+    large stack arrays are a bad idea (C chapter 09).</pre>
+
+<h2 id="ldp">Load and store pair</h2>
+
+<p>Moving two registers in one instruction halves the instruction count of every function prologue and epilogue in the system. It is also why ARM stack frames look the way they do.</p>
+
+<pre><code>/* LDP/STP move TWO registers in ONE instruction. This is why
+   prologues save registers in pairs and why the stack moves in
+   multiples of 16 bytes.                                     */
+
+        stp     x29, x30, [sp, #-32]!   // push both, pre-decrement
+        stp     x19, x20, [sp, #16]
+        ...
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #32     // pop both, post-increment
+
+/* Also used for bulk copies — a 16-byte-at-a-time memcpy: */
+1:      ldp     x2, x3, [x1], #16
+        stp     x2, x3, [x0], #16
+        subs    x4, x4, #16
+        b.ne    1b
+
+/* And with Q registers, 32 bytes at a time: */
+        ldp     q0, q1, [x1], #32
+        stp     q0, q1, [x0], #32
+
+/* Constraint: both registers must be the same size, and the
+   offset is a signed 7-bit value scaled by the access size —
+   a much narrower range than a single LDR.                  */</code></pre>
+
+<h2 id="pc-relative">PC-relative addressing</h2>
+
+<p>Position-independent code needs to refer to data without knowing where it will be loaded. PC-relative addressing is how that works, and it is the basis of shared libraries, ASLR and most modern binaries.</p>
+
+<pre><code>        adr     x0, label        // PC ± 1 MB, byte granular
+        adrp    x0, symbol       // PC ± 4 GB, PAGE granular (4 KB)
+
+/* ADRP gives the address of the 4 KB PAGE containing the symbol,
+   with the low 12 bits ZEROED. The low bits are supplied
+   separately:                                                */
+
+        adrp    x0, my_global
+        add     x0, x0, :lo12:my_global     // full address
+        ldr     w1, [x0]
+
+/* Or folded into the load's own offset — one instruction fewer: */
+        adrp    x0, my_global
+        ldr     w1, [x0, :lo12:my_global]
+
+/* Why the split: a single 32-bit instruction cannot encode a
+   ±4 GB byte offset. Splitting it into a page offset (21 bits)
+   plus a 12-bit low part covers the full range.
+
+   This is also why the LINKER has relocation types specifically
+   for the two halves (R_AARCH64_ADR_PREL_PG_HI21 and
+   R_AARCH64_ADD_ABS_LO12_NC), and why an ADRP/ADD pair must not
+   be separated by the compiler — Cortex-A53 erratum 843419 is
+   precisely a bug in that sequence (chapter 01).           */
+
+/* LITERAL POOLS: a PC-relative load of a constant stored in the
+   code stream. The assembler's = syntax generates one:      */
+        ldr     x0, =0x123456789abcdef0
+/*  becomes:
+        ldr     x0, .Lpool
+        ...
+    .Lpool: .quad 0x123456789abcdef0                          */</code></pre>
+
+<h2 id="sizes">Access sizes and extension</h2>
+
+<p>A load can move one, two, four or eight bytes, and when it moves fewer than eight there is a question of what fills the rest of the register. Getting the signed and unsigned forms confused produces values that are wildly wrong rather than slightly wrong.</p>
+
+<pre><code>        ldrb    w0, [x1]        // load byte,  ZERO-extend to 32
+        ldrh    w0, [x1]        // load half,  zero-extend
+        ldr     w0, [x1]        // load word   (upper 32 of x0 zeroed)
+        ldr     x0, [x1]        // load 64 bits
+
+        ldrsb   w0, [x1]        // load byte,  SIGN-extend to 32
+        ldrsb   x0, [x1]        // ...to 64
+        ldrsh   x0, [x1]
+        ldrsw   x0, [x1]        // load word, sign-extend to 64
+                                //   — very common for int → long
+
+        strb    w0, [x1]        // store the low 8 bits
+        strh    w0, [x1]
+        str     w0, [x1]        // store 32
+        str     x0, [x1]        // store 64
+
+/* Note there is no STRSB: sign extension is a property of
+   LOADING, not storing. And remember that writing Wn zeroes the
+   top half of Xn (chapter 04), so LDR Wn is implicitly a
+   zero-extending 64-bit write.                             */</code></pre>
+
+<h2 id="special-loads">Ordered, exclusive and non-temporal</h2>
+
+<p>A plain <code>LDR</code>/<code>STR</code> says nothing about ordering, atomicity, or cache behaviour beyond
+the memory type it targets — it just moves data. Each row below adds exactly one of those properties on top of
+an ordinary load or store, and they combine: <code>LDAXR</code> is simultaneously exclusive (for building an
+atomic read-modify-write) and acquire-ordered (so nothing after it can be reordered before it completes). You
+reach for these only when the plain form is provably not enough — for synchronisation primitives, for crossing
+the user/kernel boundary safely, or for streaming data you know you will not reuse.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Form</th><th>Meaning</th><th>Chapter</th></tr></thead>
+<tbody>
+<tr><td><code>LDAR</code> / <code>STLR</code></td><td>Load-acquire / store-release — ordering attached to the access</td><td><a href="arm-21-barriers.html">21</a></td></tr>
+<tr><td><code>LDXR</code> / <code>STXR</code></td><td>Exclusive, for atomic sequences</td><td><a href="arm-22-atomics.html">22</a></td></tr>
+<tr><td><code>LDAXR</code> / <code>STLXR</code></td><td>Both: exclusive and ordered</td><td>22</td></tr>
+<tr><td><code>LDNP</code> / <code>STNP</code></td><td>Non-temporal pair — a hint not to pollute the cache</td><td><a href="arm-17-cache-hierarchy.html">17</a></td></tr>
+<tr><td><code>LDTR</code> / <code>STTR</code></td><td>Unprivileged — behaves as an EL0 access even when executed at EL1. Used by <code>copy_to_user</code>.</td><td><a href="arm-05-pstate.html">05</a></td></tr>
+<tr><td><code>PRFM</code></td><td>Prefetch hint: <code>PLDL1KEEP</code>, <code>PSTL2STRM</code>…</td><td><a href="ca-13-memory-hierarchy.html">CA 13</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* LDTR/STTR are worth understanding: they let kernel code access
+   user memory with USER permissions, so a malicious pointer
+   pointing at kernel memory faults rather than succeeding. That
+   is how copy_from_user enforces the boundary in hardware
+   rather than by checking the address (OS chapter 03).      */
+
+/* Non-temporal, for streaming through data you will not reuse: */
+1:      ldnp    q0, q1, [x1], #32
+        stnp    q0, q1, [x0], #32
+        subs    x2, x2, #32
+        b.ne    1b
+/* Avoids evicting the working set for a bulk copy — the same
+   idea as MADV_DONTNEED at a different level.               */</code></pre>
+
+<h2 id="reading">Reading addressing in disassembly</h2>
+
+<p>Addressing modes are where disassembly looks most alien to someone used to high-level code. The notation is consistent, and once decoded it tells you a great deal about the data structure being accessed.</p>
+
+<pre><code>/* Each pattern tells you what the source code was doing: */
+
+  ldr  x0, [x1]                  *p
+  ldr  x0, [x1, #24]             p-&gt;field  (at offset 24)
+  ldr  x0, [x1, x2, lsl #3]      a[i]      (8-byte elements)
+  ldr  x0, [x1], #8              *p++      (pointer walk)
+  ldr  x0, [x1, #8]!             *++p
+  ldp  x0, x1, [x2, #16]         two adjacent fields, one instruction
+  ldr  x0, [sp, #40]             a local variable, or a spilled reg
+  adrp x0, sym / add x0,x0,:lo12: a global
+  ldr  w0, [x1, w2, sxtw #2]     a[i] with an int index
+
+/* And the absence of loads inside a loop tells you the compiler
+   kept everything in registers — which is the goal.        */</code></pre>
+
+<div class="tip">
+<b>The addressing mode reveals the data structure</b>
+<p>When reverse-engineering or reviewing generated code, the addressing mode is the strongest clue about the
+underlying type. A constant offset means a struct field; a scaled register offset means an array; post-index
+means a sequential walk; an indirect <code>BLR</code> after a load means a function pointer or vtable
+(<a href="c-12-function-pointers.html">C ch. 12</a>). Reading these patterns is a large part of what makes
+disassembly useful rather than opaque.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Extra <code>ADD</code> before every struct access</td><td>Field offset beyond the immediate range — the struct is very large</td></tr>
+<tr><td>Extra sign-extension in an indexing loop</td><td>Index is <code>int</code>; use <code>size_t</code></td></tr>
+<tr><td>Pointer advances unexpectedly</td><td>Post-index side effect — <code>[Xn], #imm</code> updates <code>Xn</code></td></tr>
+<tr><td>Stack access needs extra arithmetic</td><td>Frame larger than the encodable offset range</td></tr>
+<tr><td>Alignment fault on a Device-memory access</td><td>Unaligned MMIO always faults (<a href="arm-11-memory-types.html">ch. 11</a>)</td></tr>
+<tr><td>Link error about relocation truncation</td><td>Symbol beyond <code>ADRP</code>'s &plusmn;4 GB, or a branch beyond &plusmn;128 MB</td></tr>
+<tr><td>Kernel accepts a user pointer into kernel memory</td><td>Used a normal load instead of <code>LDTR</code>/<code>copy_from_user</code></td></tr>
+<tr><td>A bulk copy evicts the working set</td><td>Use <code>LDNP</code>/<code>STNP</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the addressing modes and the C construct each typically compiles from.</li>
+  <li>Explain pre-index versus post-index and the C operators they correspond to.</li>
+  <li>Explain why <code>a[i]</code> is one instruction and what the shift amount encodes.</li>
+  <li>Say why the immediate offset range differs between <code>LDRB</code> and <code>LDR X</code>.</li>
+  <li>Explain what <code>ADRP</code> produces and why the low bits are separate.</li>
+  <li>Give three load forms that sign-extend and say why there is no store equivalent.</li>
+  <li>Explain what <code>LDTR</code> is for and how it enforces the user/kernel boundary.</li>
+  <li>Given <code>ldr x0, [x1, x2, lsl #3]</code>, describe the source construct.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

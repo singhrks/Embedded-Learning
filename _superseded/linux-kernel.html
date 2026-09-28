@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux kernel development | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 08</p>
+<h1>Linux kernel development</h1>
+<p class="lead">Everything you learned about ARM now has a user. This chapter covers how the Linux kernel is
+organised, how it boots on an ARM SoC, how memory and scheduling work, and the concurrency rules you must
+obey — because kernel code has no safety net.</p>
+
+<h2 id="different">How kernel code differs from everything else you have written</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>User space</th><th>Kernel space</th></tr></thead>
+<tbody>
+<tr><td>A bug</td><td>Segfault, one process dies</td><td>Oops or panic — the whole machine, possibly filesystem corruption</td></tr>
+<tr><td>C library</td><td>All of libc</td><td>None. No <code>printf</code>, <code>malloc</code>, <code>fopen</code>. A separate, smaller API.</td></tr>
+<tr><td>Floating point</td><td>Free to use</td><td>Effectively forbidden — FP state is not saved on kernel entry</td></tr>
+<tr><td>Stack</td><td>8 MB, grows automatically</td><td><strong>16 KB, fixed</strong>. No recursion, no big local arrays.</td></tr>
+<tr><td>Memory protection</td><td>Between processes</td><td>None within the kernel — any pointer bug can corrupt anything</td></tr>
+<tr><td>Preemption</td><td>Always preemptible</td><td>Depends on context and configuration; some contexts must not sleep</td></tr>
+<tr><td>Debugging</td><td>gdb, printf</td><td>printk, ftrace, crash dumps, KGDB, JTAG</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>The single most important rule</b>
+<p><strong>Never sleep in atomic context.</strong> Interrupt handlers, code holding a spinlock, and code with
+preemption disabled must not call anything that can block. Violate this and you get a deadlock or the
+"scheduling while atomic" bug. Everything in the concurrency section flows from this rule.</p>
+</div>
+
+<h2 id="layout">The source tree</h2>
+
+<pre class="diagram">linux/
+├── arch/arm64/         architecture-specific: boot, MMU setup, exception vectors
+│   ├── boot/dts/       device tree source files, per vendor and board
+│   ├── kernel/         entry.S, setup.c, smp.c, psci.c
+│   └── mm/             page table code for arm64
+├── block/              block layer, I/O schedulers
+├── drivers/            ~70% of the tree. Where your driver goes.
+│   ├── base/           the device model: bus, class, device, driver
+│   ├── char/           character devices
+│   ├── gpio/  i2c/  spi/  net/  usb/  pci/  iommu/ ...
+│   └── of/             device tree parsing
+├── fs/                 VFS + every filesystem
+├── include/
+│   ├── linux/          the kernel-internal API — read these headers constantly
+│   └── uapi/           the user-space ABI. Changing anything here breaks programs.
+├── init/               main.c — start_kernel(), the first C the kernel runs
+├── ipc/                System V IPC
+├── kernel/             core: scheduler, timers, locking, tracing, cgroups
+├── lib/                data structures, string functions, sorting, CRC
+├── mm/                 memory management: page allocator, slab, vmalloc, page cache
+├── net/                the entire network stack
+├── security/           LSM, SELinux, AppArmor
+├── sound/              ALSA
+└── tools/              perf, bpf, selftests</pre>
+
+<div class="tip">
+<b>How to find anything</b>
+<p>Learn one tool well: <code>cscope</code>, <code>ctags</code>, or the web at
+<a href="https://elixir.bootlin.com">elixir.bootlin.com</a>, which cross-references every identifier in every
+kernel version. When you meet an unfamiliar function, look at its <em>callers</em> first — that tells you the
+context it runs in, which matters more than what it does.</p>
+</div>
+
+<h2 id="boot">Boot flow on an ARM64 SoC</h2>
+
+<figure>
+<svg viewBox="0 0 780 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Boot sequence from power on through firmware stages to userspace init">
+  <rect class="svg-box-d" x="30" y="14" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="34">Power on — BL1 Boot ROM (EL3)</text>
+  <text class="svg-tm" x="44" y="50">immutable; verifies and loads BL2</text>
+
+  <rect class="svg-box-w" x="30" y="70" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="90">BL2 — Trusted Boot Firmware</text>
+  <text class="svg-tm" x="44" y="106">DDR init, load+verify BL31/BL32/BL33</text>
+
+  <rect class="svg-box-w" x="30" y="126" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="146">BL31 — EL3 Runtime (TF-A)</text>
+  <text class="svg-tm" x="44" y="162">stays resident; provides PSCI</text>
+
+  <rect class="svg-box-g" x="30" y="182" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="202">BL33 — U-Boot (EL2 or EL1)</text>
+  <text class="svg-tm" x="44" y="218">loads Image + .dtb, sets up x0 = dtb</text>
+
+  <rect class="svg-box-a" x="30" y="238" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="258">head.S — kernel entry</text>
+  <text class="svg-tm" x="44" y="274">drop EL2-&gt;EL1, build initial page tables</text>
+
+  <rect class="svg-box-a" x="30" y="294" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="314">MMU on -&gt; jump to virtual addresses</text>
+  <text class="svg-tm" x="44" y="330">__primary_switch, then start_kernel()</text>
+
+  <rect class="svg-box-a" x="30" y="350" width="300" height="44" rx="7"/>
+  <text class="svg-tb" x="44" y="370">start_kernel() — init/main.c</text>
+  <text class="svg-tm" x="44" y="386">setup_arch, mm_init, sched_init, rest_init</text>
+
+  <rect class="svg-box-g" x="30" y="406" width="300" height="48" rx="7"/>
+  <text class="svg-tb" x="44" y="428">/sbin/init (PID 1) — userspace</text>
+  <text class="svg-tm" x="44" y="444">systemd / busybox init</text>
+
+  <path class="svg-line-a" d="M180 58 L180 70 M180 114 L180 126 M180 170 L180 182 M180 226 L180 238
+                              M180 282 L180 294 M180 338 L180 350 M180 394 L180 406" marker-end="url(#b1)"/>
+  <defs><marker id="b1" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="svg-arrow-a" d="M0,0 L7,3.5 L0,7 z"/></marker></defs>
+
+  <rect class="svg-box" x="370" y="238" width="390" height="216" rx="7"/>
+  <text class="svg-tb" x="384" y="260">Inside start_kernel(), in order:</text>
+  <text class="svg-tm" x="384" y="284">setup_arch()      parse the device tree, reserve memory,</text>
+  <text class="svg-tm" x="384" y="300">                  discover CPUs, set up early console</text>
+  <text class="svg-tm" x="384" y="322">mm_init()         hand memory to the page allocator, init slab</text>
+  <text class="svg-tm" x="384" y="344">sched_init()      create the runqueues and the idle task</text>
+  <text class="svg-tm" x="384" y="366">init_IRQ()        probe and initialise the GIC</text>
+  <text class="svg-tm" x="384" y="388">time_init()       start the generic timer</text>
+  <text class="svg-tm" x="384" y="410">rest_init()       create kernel_init (PID 1) and kthreadd,</text>
+  <text class="svg-tm" x="384" y="426">                  then become the idle task forever</text>
+  <text class="svg-tm" x="384" y="448">kernel_init()     run all initcalls, mount root, exec /sbin/init</text>
+
+  <rect class="svg-box" x="370" y="14" width="390" height="200" rx="7"/>
+  <text class="svg-tb" x="384" y="36">What U-Boot must hand the kernel</text>
+  <text class="svg-tm" x="384" y="60">x0 = physical address of the flattened device tree</text>
+  <text class="svg-tm" x="384" y="78">x1, x2, x3 = 0</text>
+  <text class="svg-tm" x="384" y="100">MMU off, D-cache off, I-cache may be on</text>
+  <text class="svg-tm" x="384" y="118">interrupts masked at the CPU</text>
+  <text class="svg-tm" x="384" y="136">running at EL2 (preferred) or EL1</text>
+  <text class="svg-tm" x="384" y="158">all secondary CPUs parked (PSCI or spin-table)</text>
+  <text class="svg-tm" x="384" y="182">This contract is documented in</text>
+  <text class="svg-tm" x="384" y="198">Documentation/arch/arm64/booting.rst — read it.</text>
+</svg>
+<figcaption>ARM64 boot. Notice how much happens before Linux exists at all — this is why firmware knowledge matters.</figcaption>
+</figure>
+
+<h3>initcalls — how drivers get started</h3>
+<p>The kernel does not call driver init functions explicitly. Each driver registers one via a macro, the
+linker collects them into ordered sections, and <code>do_initcalls()</code> runs them level by level:</p>
+
+<pre><code>early_initcall()        /* level 0 — before most subsystems      */
+core_initcall()         /* 1 — core subsystems                   */
+postcore_initcall()     /* 2                                     */
+arch_initcall()         /* 3 — architecture-specific             */
+subsys_initcall()       /* 4 — bus types, classes                */
+fs_initcall()           /* 5                                     */
+device_initcall()       /* 6 — most drivers. module_init() maps here */
+late_initcall()         /* 7 — anything that needs everything else  */</code></pre>
+
+<p>Within a level, order follows link order — which follows the Makefile. Depending on that order is a bug;
+use proper dependencies (<code>-EPROBE_DEFER</code>, described in
+<a href="linux-drivers.html">chapter 09</a>) instead.</p>
+
+<h2 id="memory">Kernel memory management</h2>
+
+<h3>The address space</h3>
+<pre class="diagram">arm64 virtual address layout (48-bit VA, 4 KB pages)
+
+ 0xffff_ffff_ffff_ffff  +--------------------------+
+                        |  fixmap, vectors, PCI IO |
+                        +--------------------------+
+                        |  vmalloc / ioremap area  |  virtually contiguous,
+                        |                          |  physically scattered
+                        +--------------------------+
+                        |  vmemmap (struct page[]) |
+                        +--------------------------+
+ 0xffff_0000_0000_0000  |  linear map of all RAM   |  PA + PAGE_OFFSET
+                        |  __va() / __pa()         |  contiguous both ways
+                        +--------------------------+   [ TTBR1_EL1 ]
+                        ~   non-canonical hole     ~
+ 0x0000_ffff_ffff_ffff  +--------------------------+   [ TTBR0_EL1 ]
+                        |  user space (per process)|
+ 0x0000_0000_0000_0000  +--------------------------+</pre>
+
+<h3>The allocators</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>API</th><th>Gives you</th><th>Use for</th><th>Limits</th></tr></thead>
+<tbody>
+<tr><td><code>alloc_pages(gfp, order)</code></td><td>2^order physically contiguous pages</td><td>Large buffers, DMA, page tables</td><td>Buddy allocator; high orders fail under fragmentation</td></tr>
+<tr><td><code>kmalloc(size, gfp)</code></td><td>Physically contiguous bytes</td><td>The default. Structures, small buffers, anything for DMA</td><td>Practical limit a few MB; slab-backed</td></tr>
+<tr><td><code>kzalloc()</code></td><td>Same, zeroed</td><td>Always prefer this for structs</td><td></td></tr>
+<tr><td><code>vmalloc(size)</code></td><td>Virtually contiguous only</td><td>Very large buffers where contiguity does not matter</td><td><strong>Not usable for DMA.</strong> Slower (TLB pressure)</td></tr>
+<tr><td><code>kmem_cache_alloc()</code></td><td>Objects from a dedicated slab cache</td><td>When you allocate the same struct constantly</td><td>Create the cache at init</td></tr>
+<tr><td><code>devm_kzalloc(dev, ...)</code></td><td>Memory freed automatically when the device unbinds</td><td><strong>Driver allocations — strongly preferred</strong></td><td>Only valid with a <code>struct device</code></td></tr>
+<tr><td><code>dma_alloc_coherent()</code></td><td>Memory plus a device-visible address</td><td>DMA descriptor rings — see <a href="smmu.html">chapter 05</a></td><td>Can be expensive/uncached</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>GFP flags — the part people get wrong</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Meaning</th><th>Allowed in</th></tr></thead>
+<tbody>
+<tr><td><code>GFP_KERNEL</code></td><td>Normal allocation; <strong>may sleep</strong> to reclaim memory</td><td>Process context only</td></tr>
+<tr><td><code>GFP_ATOMIC</code></td><td>Will not sleep; may fail; dips into emergency reserves</td><td>Interrupt handlers, spinlock-held code</td></tr>
+<tr><td><code>GFP_NOWAIT</code></td><td>Will not sleep and will not use reserves</td><td>Atomic context where failure is fine</td></tr>
+<tr><td><code>GFP_DMA32</code></td><td>Memory addressable below 4 GB</td><td>Legacy 32-bit-only devices</td></tr>
+<tr><td><code>__GFP_ZERO</code></td><td>Zero the memory</td><td>Combine with any of the above</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Using <code>GFP_KERNEL</code> in an interrupt handler</b>
+<p>is one of the most common kernel bugs. It may work for months, until memory pressure makes the allocator
+actually try to sleep — then the machine deadlocks. Rule: if you cannot sleep, you must use
+<code>GFP_ATOMIC</code>, and you must handle allocation failure.</p>
+</div>
+
+<h3>Talking to user space</h3>
+<pre><code>/* NEVER dereference a user pointer directly. Always use these. */
+copy_to_user(void __user *to, const void *from, unsigned long n);
+copy_from_user(void *to, const void __user *from, unsigned long n);
+get_user(x, ptr);     put_user(x, ptr);           /* single values */
+
+/* They return the number of bytes NOT copied. Zero means success. */
+if (copy_to_user(ubuf, kbuf, len))
+        return -EFAULT;</code></pre>
+
+<p>These functions validate that the address really is in user space, and install a fixup so that a fault
+returns an error instead of oopsing. The <code>__user</code> annotation is checked by
+<code>sparse</code> (<code>make C=1</code>) — run it.</p>
+
+<h2 id="processes">Processes, threads and scheduling</h2>
+
+<p>Linux has no separate thread concept in the kernel. Everything schedulable is a
+<code>struct task_struct</code>; threads are simply tasks that share an address space. <code>current</code>
+is a macro giving you the running task.</p>
+
+<h3>Task states</h3>
+<pre class="diagram">   TASK_RUNNING  &lt;-- on a runqueue, running or ready to run
+        |  ^
+ sleep  |  |  wake_up()
+        v  |
+   TASK_INTERRUPTIBLE     sleeping; signals will wake it   (use this by default)
+   TASK_UNINTERRUPTIBLE   sleeping; signals will NOT       (the "D state" in ps)
+        |
+        v
+   TASK_STOPPED / TASK_TRACED / EXIT_ZOMBIE / EXIT_DEAD</pre>
+
+<h3>Scheduling classes</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>Policy</th><th>For</th></tr></thead>
+<tbody>
+<tr><td>Deadline</td><td><code>SCHED_DEADLINE</code></td><td>Hard real time: runtime, deadline and period specified explicitly. Highest priority.</td></tr>
+<tr><td>Real time</td><td><code>SCHED_FIFO</code>, <code>SCHED_RR</code></td><td>Priority 1–99. A FIFO task runs until it blocks or yields — it can starve everything below it.</td></tr>
+<tr><td>Fair</td><td><code>SCHED_OTHER</code> (CFS / EEVDF)</td><td>Everything normal. Nice values −20..+19 weight the share of CPU.</td></tr>
+<tr><td>Idle</td><td><code>SCHED_IDLE</code></td><td>Only when nothing else wants the CPU</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>PREEMPT_RT</b>
+<p>The real-time patch set, now largely merged upstream, converts most spinlocks into sleeping mutexes and
+makes interrupt handlers into threads. This trades throughput for bounded latency and is the standard
+choice for industrial and audio systems. It changes what "atomic context" means, so RT-correct driver code
+is stricter than mainline-correct code.</p>
+</div>
+
+<h2 id="concurrency">Concurrency — the part that will bite you</h2>
+
+<p>The kernel is fully preemptive and runs on many cores. Your driver's functions can be entered
+simultaneously by different processes, and interrupted by an interrupt handler that touches the same data.</p>
+
+<h3>Sources of concurrency</h3>
+<ul>
+  <li>Two user processes calling into your driver on two cores.</li>
+  <li>An interrupt arriving while your process-context code holds the data.</li>
+  <li>A timer or workqueue callback firing.</li>
+  <li>Kernel preemption suspending you mid-update.</li>
+  <li>A second CPU seeing your writes out of order (the ARM memory model — <a href="arm-architecture.html#barriers">chapter 03</a>).</li>
+</ul>
+
+<h3>Choosing a lock</h3>
+<pre class="diagram">  Do I need to sleep while holding it?  (kmalloc(GFP_KERNEL), copy_to_user,
+                                         mutex, I/O, msleep...)
+        |
+        +-- YES --> use a MUTEX (or a semaphore, or an rwsem)
+        |             mutex_lock(&amp;d-&gt;lock) ... mutex_unlock(&amp;d-&gt;lock)
+        |             Process context only. Cannot be used in an interrupt.
+        |
+        +-- NO  --> is the data ALSO touched by an interrupt handler?
+                      |
+                      +-- NO  --> spin_lock(&amp;d-&gt;lock)
+                      |
+                      +-- YES --> spin_lock_irqsave(&amp;d-&gt;lock, flags)
+                                  ... spin_unlock_irqrestore(&amp;d-&gt;lock, flags)
+                                  (disables interrupts on THIS core, so the
+                                   handler cannot deadlock against you)
+
+  Is it a simple counter or flag?   -> atomic_t / atomic64_t, no lock needed
+  Read-mostly, rarely written?      -> RCU
+  Just need to wait for an event?   -> wait_event_interruptible() + wake_up()
+  Counting a resource?              -> semaphore, or completion for one-shot</pre>
+
+<div class="codewrap"><div class="code-title">the standard shape of a driver's locking</div>
+<pre><code>struct my_device {
+        struct mutex      lock;      /* protects process-context state       */
+        spinlock_t        irq_lock;  /* protects state shared with the ISR   */
+        struct list_head  pending;
+        atomic_t          open_count;
+        wait_queue_head_t readq;
+        bool              data_ready;
+};
+
+/* --- process context: may sleep, so a mutex is fine --- */
+static ssize_t my_read(struct file *f, char __user *buf, size_t n, loff_t *off)
+{
+        struct my_device *d = f-&gt;private_data;
+        int ret;
+
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;          /* woken by a signal */
+
+        while (!d-&gt;data_ready) {
+                mutex_unlock(&amp;d-&gt;lock);       /* never sleep holding the lock */
+                if (f-&gt;f_flags &amp; O_NONBLOCK)
+                        return -EAGAIN;
+                if (wait_event_interruptible(d-&gt;readq, d-&gt;data_ready))
+                        return -ERESTARTSYS;
+                if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                        return -ERESTARTSYS;
+        }
+
+        ret = copy_to_user(buf, /* ... */ NULL, 0) ? -EFAULT : 0;
+        mutex_unlock(&amp;d-&gt;lock);
+        return ret;
+}
+
+/* --- interrupt context: cannot sleep, must use a spinlock --- */
+static irqreturn_t my_isr(int irq, void *dev_id)
+{
+        struct my_device *d = dev_id;
+        unsigned long flags;
+
+        spin_lock_irqsave(&amp;d-&gt;irq_lock, flags);
+        d-&gt;data_ready = true;
+        spin_unlock_irqrestore(&amp;d-&gt;irq_lock, flags);
+
+        wake_up_interruptible(&amp;d-&gt;readq);     /* safe from interrupt context */
+        return IRQ_HANDLED;
+}</code></pre></div>
+
+<h3>Deferred work</h3>
+<p>Interrupt handlers must be short. Anything slow is deferred:</p>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Context</th><th>Can sleep?</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>Softirq</strong></td><td>Atomic</td><td>No</td><td>Networking, block I/O. Statically defined; you almost never add one.</td></tr>
+<tr><td><strong>Tasklet</strong></td><td>Atomic</td><td>No</td><td>Legacy; being removed. Use a workqueue or a threaded IRQ instead.</td></tr>
+<tr><td><strong>Workqueue</strong></td><td>Process (kernel thread)</td><td><strong>Yes</strong></td><td>The usual answer. <code>schedule_work()</code>, or your own <code>alloc_workqueue()</code>.</td></tr>
+<tr><td><strong>Threaded IRQ</strong></td><td>Process (dedicated thread)</td><td><strong>Yes</strong></td><td>Best for most drivers: a tiny hard handler acknowledges, the thread does the work.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* threaded IRQ: the modern default */
+ret = devm_request_threaded_irq(dev, irq,
+                                my_hard_isr,   /* atomic: ack the device, return */
+                                my_thread_fn,  /* process ctx: may sleep         */
+                                IRQF_ONESHOT, "mydev", d);
+
+static irqreturn_t my_hard_isr(int irq, void *p)
+{
+        struct my_device *d = p;
+        u32 status = readl(d-&gt;regs + STATUS);
+        if (!(status &amp; IRQ_PENDING))
+                return IRQ_NONE;            /* not ours — essential for shared IRQs */
+        writel(status, d-&gt;regs + STATUS);   /* clear at the device */
+        return IRQ_WAKE_THREAD;
+}</code></pre>
+
+<h2 id="build">Building and booting your own kernel</h2>
+
+<pre><code># get the source
+git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+cd linux
+
+export ARCH=arm64
+export CROSS_COMPILE=aarch64-linux-gnu-
+
+# start from a known-good configuration
+make defconfig                 # generic arm64
+# or:  make your_board_defconfig
+make menuconfig                # tweak; / searches for a symbol by name
+
+# build (Image is the arm64 kernel binary; dtbs are the device trees)
+make -j$(nproc) Image modules dtbs
+
+# install modules into a staging rootfs
+make INSTALL_MOD_PATH=/path/to/rootfs modules_install
+
+# artefacts
+#   arch/arm64/boot/Image
+#   arch/arm64/boot/dts/vendor/board.dtb</code></pre>
+
+<h3>Try it with no hardware at all</h3>
+<pre><code>qemu-system-aarch64 \
+  -M virt -cpu cortex-a57 -smp 2 -m 1024 \
+  -kernel arch/arm64/boot/Image \
+  -initrd rootfs.cpio.gz \
+  -append "console=ttyAMA0 earlycon" \
+  -nographic
+
+# add  -s -S  to wait for a debugger, then:
+aarch64-linux-gnu-gdb vmlinux -ex 'target remote :1234'</code></pre>
+
+<div class="tip">
+<b>Debug options worth enabling while you learn</b>
+<p><code>CONFIG_DEBUG_KERNEL</code>, <code>CONFIG_DEBUG_ATOMIC_SLEEP</code> (catches sleeping in atomic context —
+turn this on),
+<code>CONFIG_PROVE_LOCKING</code> (lockdep: finds deadlocks before they happen),
+<code>CONFIG_DEBUG_OBJECTS</code>, <code>CONFIG_KASAN</code> (use-after-free and buffer overflow detection),
+<code>CONFIG_DEBUG_INFO</code>, <code>CONFIG_FTRACE</code>, <code>CONFIG_DYNAMIC_DEBUG</code>.
+They cost performance and are worth every cycle during development.</p>
+</div>
+
+<h2 id="modules">Kernel modules</h2>
+
+<pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/init.h&gt;
+
+static int __init my_init(void)
+{
+        pr_info("hello, kernel\n");
+        return 0;                 /* non-zero aborts loading */
+}
+
+static void __exit my_exit(void)
+{
+        pr_info("goodbye\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");            /* not "GPL" -> tainted kernel, no GPL symbols */
+MODULE_AUTHOR("You");
+MODULE_DESCRIPTION("Example");</code></pre>
+
+<pre><code>obj-m += hello.o
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean</code></pre>
+
+<pre><code>sudo insmod hello.ko            # load
+lsmod | grep hello              # list
+modinfo hello.ko                # metadata
+sudo rmmod hello                # unload
+dmesg | tail                    # see the output
+sudo modprobe hello             # load with dependency resolution (needs install)</code></pre>
+
+<div class="warn">
+<b>There is no stable in-kernel ABI</b>
+<p>A module built against 6.6 will not load on 6.7. This is deliberate: it forces drivers upstream, where
+they are maintained alongside the API. Out-of-tree drivers are a permanent maintenance cost — plan for it,
+or upstream your driver.</p>
+</div>
+
+<h2 id="subsystems">Subsystems you should know exist</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Subsystem</th><th>Purpose</th><th>Entry point for a driver</th></tr></thead>
+<tbody>
+<tr><td>Device model (<code>drivers/base</code>)</td><td>Buses, devices, drivers, matching, sysfs</td><td><code>struct device_driver</code>, <code>probe()</code></td></tr>
+<tr><td>Device tree (<code>drivers/of</code>)</td><td>Hardware description parsing</td><td><code>of_match_table</code>, <code>of_property_read_*</code></td></tr>
+<tr><td>Clock framework</td><td>Enable, set and query clocks</td><td><code>devm_clk_get()</code>, <code>clk_prepare_enable()</code></td></tr>
+<tr><td>Regulator framework</td><td>Power supplies</td><td><code>devm_regulator_get()</code>, <code>regulator_enable()</code></td></tr>
+<tr><td>Pinctrl</td><td>Pin muxing and electrical config</td><td>Usually automatic from the device tree</td></tr>
+<tr><td>GPIO / GPIOD</td><td>Individual pins</td><td><code>devm_gpiod_get()</code></td></tr>
+<tr><td>IRQ domain</td><td>Mapping hardware interrupt numbers to Linux IRQ numbers</td><td><code>platform_get_irq()</code></td></tr>
+<tr><td>Regmap</td><td>Uniform register access over MMIO, I2C or SPI, with caching</td><td><code>devm_regmap_init_mmio()</code></td></tr>
+<tr><td>Power management</td><td>Runtime PM and system suspend</td><td><code>pm_runtime_*</code>, <code>dev_pm_ops</code></td></tr>
+<tr><td>DMA engine</td><td>Generic API for DMA controllers</td><td><code>dma_request_chan()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="debug">Kernel debugging basics</h2>
+
+<pre><code># messages
+dmesg -w                                    # follow the kernel log
+echo 8 &gt; /proc/sys/kernel/printk            # raise the console log level
+
+# dynamic debug: enable pr_debug() without rebuilding
+echo 'module mydriver +p' &gt; /sys/kernel/debug/dynamic_debug/control
+echo 'file my_driver.c line 120-160 +p' &gt; /sys/kernel/debug/dynamic_debug/control
+
+# ftrace: what is the kernel actually doing?
+cd /sys/kernel/debug/tracing
+echo function_graph &gt; current_tracer
+echo my_driver_probe &gt; set_graph_function
+echo 1 &gt; tracing_on; cat trace_pipe
+
+# find the source line for an oops address
+scripts/faddr2line vmlinux my_read+0x48/0x120
+
+# useful sysfs / procfs
+cat /proc/interrupts        # interrupt counts per CPU — is your ISR firing?
+cat /proc/iomem             # who owns which physical range
+cat /proc/meminfo
+cat /sys/kernel/debug/clk/clk_summary</code></pre>
+
+<h3>Reading an oops</h3>
+<pre><code>Unable to handle kernel NULL pointer dereference at virtual address 0000000000000010
+Mem abort info:
+  ESR = 0x0000000096000006          &lt;-- EC=0x25 data abort, DFSC=0b000110
+  Data abort info:
+  ISV = 0, ISS = 0x00000006
+  CM = 0, WnR = 0                   &lt;-- it was a READ
+CPU: 2 PID: 1834 Comm: cat Tainted: G           O
+pc : my_read+0x48/0x120 [mydriver]  &lt;-- the faulting instruction
+lr : vfs_read+0xb4/0x1f0            &lt;-- who called it
+Call trace:
+ my_read+0x48/0x120 [mydriver]
+ vfs_read+0xb4/0x1f0
+ ksys_read+0x74/0x110
+ __arm64_sys_read+0x24/0x30
+ el0_svc_common+0x88/0x1a0          &lt;-- arrived via a system call from EL0</code></pre>
+
+<p>Everything you learned in <a href="exception-levels.html#esr">chapter 04</a> applies directly: decode the
+ESR, note read vs write, then use the call trace to find which pointer was null.</p>
+
+<h2 id="style">Kernel coding style and culture</h2>
+<ul>
+  <li>Tabs, 8 wide. 80 columns is a soft limit. Read <code>Documentation/process/coding-style.rst</code>.</li>
+  <li>Run <code>scripts/checkpatch.pl --strict</code> before you show anyone your code.</li>
+  <li>Return <code>0</code> for success and a negative errno for failure. Never invent your own error codes.</li>
+  <li>Use <code>goto</code> for unwinding on error paths — it is idiomatic here, not a code smell.</li>
+  <li>Prefer <code>devm_*</code> functions so cleanup happens automatically.</li>
+  <li>Never add a new user-space ABI without thinking hard: <code>include/uapi/</code> is forever.</li>
+  <li>One logical change per patch. Commit messages explain <em>why</em>, not what.</li>
+</ul>
+
+<h2 id="checklist">Chapter checklist</h2>
+<ul class="checklist">
+  <li>You can explain three ways kernel code differs from user code and why each matters.</li>
+  <li>You can describe the boot flow from BL1 to <code>/sbin/init</code>.</li>
+  <li>You can choose between <code>kmalloc</code>, <code>vmalloc</code>, <code>devm_kzalloc</code> and <code>dma_alloc_coherent</code> and justify the choice.</li>
+  <li>You can pick the right lock given a description of who touches the data.</li>
+  <li>You can explain why <code>GFP_KERNEL</code> in an ISR is a bug.</li>
+  <li>You can build a kernel, boot it under QEMU, and load a module into it.</li>
+  <li>You can read an oops and name the faulting function and the access type.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

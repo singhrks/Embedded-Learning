@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a preemptive RTOS from scratch | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a preemptive RTOS from scratch</h1>
+<p class="lead">About 300 lines gives you a real preemptive kernel: fixed-priority scheduling, blocking delays,
+mutexes with priority inheritance, and message queues. Writing one is the fastest way to stop finding
+FreeRTOS mysterious, because every line of it will be something you have already decided.</p>
+
+<h2 id="scope">Scope</h2>
+
+<pre class="diagram">   WHAT IT HAS                    WHAT IT DELIBERATELY LACKS
+
+   fixed-priority preemption      dynamic task creation
+   round-robin within a priority  task deletion
+   k_sleep with a tick wheel      software timers
+   counting semaphores            event groups
+   mutexes + priority inheritance recursive mutexes
+   fixed-size message queues      stack overflow detection
+   idle task with WFI             (add the MPU guard from
+                                   chapter 14 as an exercise)
+
+   Everything is STATICALLY allocated - tasks are declared at
+   compile time. That removes an entire class of failure and
+   keeps the code readable.
+
+   Target: any Cortex-M3/M4. Runs under QEMU:
+     qemu-system-arm -M netduinoplus2 -cpu cortex-m4 \
+                     -nographic -kernel kernel.elf</pre>
+
+<h2 id="tcb">Part 1: the task control block</h2>
+
+<pre><code>/* kernel.h */
+
+#define MAX_TASKS      8
+#define MAX_PRIO       8
+
+typedef enum {
+    T_READY, T_RUNNING, T_BLOCKED, T_SLEEPING
+} tstate_t;
+
+typedef struct tcb {
+    uint32_t     *sp;          /* MUST be offset 0 - ch 18   */
+    tstate_t      state;
+    uint8_t       prio;        /* current, may be inherited  */
+    uint8_t       base_prio;   /* what it was declared with  */
+    uint32_t      wake_tick;
+    struct tcb   *next;        /* ready or wait list link    */
+    void         *wait_obj;    /* what it is blocked on      */
+    uint32_t     *stack_base;
+    uint32_t      stack_words;
+    const char   *name;
+} tcb_t;
+
+extern tcb_t *current_tcb;     /* the assembly reads this    */
+
+/* Ready lists: one singly-linked list per priority, plus a
+   bitmap so "highest ready priority" is one instruction.   */
+static tcb_t   *ready[MAX_PRIO];
+static uint32_t ready_bits;
+
+static inline int highest_ready(void)
+{
+    /* CLZ: count leading zeros. Bit 31 = priority 0.
+       31 - clz gives the highest set bit, and one
+       instruction replaces a loop. This is exactly the
+       trick FreeRTOS uses in its optimised port.           */
+    return ready_bits ? (31 - __builtin_clz(ready_bits)) : -1;
+}
+
+static void ready_add(tcb_t *t)
+{
+    t-&gt;state = T_READY;
+    t-&gt;next  = ready[t-&gt;prio];
+    ready[t-&gt;prio] = t;
+    ready_bits |= (1u &lt;&lt; t-&gt;prio);
+}
+
+static tcb_t *ready_pop(int prio)
+{
+    tcb_t *t = ready[prio];
+    if (t) {
+        ready[prio] = t-&gt;next;
+        if (!ready[prio]) { ready_bits &amp;= ~(1u &lt;&lt; prio); }
+    }
+    return t;
+}
+</code></pre>
+
+<h2 id="sched">Part 2: the scheduler</h2>
+
+<pre><code>/* This is the C function chapter 18's assembly calls. All
+   the POLICY is here; the assembly is pure mechanism.     */
+
+void scheduler_next(void)
+{
+    /* Put the outgoing task back if it is still runnable. */
+    if (current_tcb &amp;&amp; current_tcb-&gt;state == T_RUNNING) {
+        ready_add(current_tcb);
+    }
+
+    int p = highest_ready();
+    /* p is never -1: the idle task is always ready at
+       priority 0, which is why an idle task must exist.   */
+    tcb_t *next = ready_pop(p);
+    next-&gt;state = T_RUNNING;
+    current_tcb = next;
+}
+
+/* Requesting a switch. One store, callable from anywhere -
+   task code or any ISR (chapter 18).                      */
+static inline void yield(void)
+{
+    SCB-&gt;ICSR = SCB_ICSR_PENDSVSET_Msk;
+    __DSB(); __ISB();
+}
+
+/* The tick: accounting plus wake-ups. */
+volatile uint32_t g_ticks;
+
+void SysTick_Handler(void)
+{
+    g_ticks++;
+    int woke = 0;
+
+    for (int i = 0; i &lt; MAX_TASKS; i++) {
+        tcb_t *t = &amp;g_tasks[i];
+        if (t-&gt;state == T_SLEEPING &amp;&amp;
+            (int32_t)(g_ticks - t-&gt;wake_tick) &gt;= 0) {  /* wrap-safe */
+            ready_add(t);
+            woke = 1;
+        }
+    }
+
+    /* Switch if someone woke, or to round-robin the current
+       priority level.                                      */
+    if (woke || ready[current_tcb-&gt;prio]) {
+        yield();
+    }
+}
+
+/* The O(MAX_TASKS) scan is fine for 8 tasks and wrong for
+   200. A real kernel keeps a delta list sorted by wake time
+   so the tick is O(1). Worth implementing as an exercise -
+   it is the difference between a toy and a kernel.        */
+</code></pre>
+
+<h2 id="switch">Part 3: the switch</h2>
+
+<pre><code>/* Chapter 18's handler, unchanged. This is the only
+   assembly in the project.                                */
+
+__attribute__((naked)) void PendSV_Handler(void)
+{
+    __asm volatile (
+    "   mrs   r0, psp             \n"
+    "   cbz   r0, 1f              \n"
+    "   subs  r0, r0, #32         \n"
+    "   stm   r0, {r4-r11}        \n"
+    "   ldr   r1, =current_tcb    \n"
+    "   ldr   r2, [r1]            \n"
+    "   str   r0, [r2]            \n"   /* sp at offset 0    */
+    "1:                           \n"
+    "   push  {lr}                \n"
+    "   bl    scheduler_next      \n"
+    "   pop   {lr}                \n"
+    "   ldr   r1, =current_tcb    \n"
+    "   ldr   r2, [r1]            \n"
+    "   ldr   r0, [r2]            \n"
+    "   ldm   r0, {r4-r11}        \n"
+    "   adds  r0, r0, #32         \n"
+    "   msr   psp, r0             \n"
+    "   isb                       \n"
+    "   bx    lr                  \n"
+    );
+}
+
+/* Task creation: fabricate a frame (chapter 18). */
+void task_create(tcb_t *t, const char *name,
+                 void (*entry)(void *), void *arg,
+                 uint8_t prio, uint32_t *stack, uint32_t words)
+{
+    for (uint32_t i = 0; i &lt; words; i++) {
+        stack[i] = 0xA5A5A5A5u;              /* watermark    */
+    }
+
+    uint32_t *sp = (uint32_t *)(((uint32_t)(stack + words)) &amp; ~7u);
+    *(--sp) = 0x01000000u;                   /* xPSR: T BIT  */
+    *(--sp) = (uint32_t) entry &amp; ~1u;        /* PC           */
+    *(--sp) = (uint32_t) task_exit;          /* LR           */
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
+    *(--sp) = (uint32_t) arg;                /* R0           */
+    for (int i = 0; i &lt; 8; i++) { *(--sp) = 0; }  /* R4-R11  */
+
+    t-&gt;sp = sp;  t-&gt;name = name;
+    t-&gt;prio = t-&gt;base_prio = prio;
+    t-&gt;stack_base = stack;  t-&gt;stack_words = words;
+    ready_add(t);
+}
+</code></pre>
+
+<h2 id="blocking">Part 4: blocking, and a mutex that inherits</h2>
+
+<pre><code>/* Critical sections use BASEPRI, so high-priority interrupts
+   keep running through them (chapters 03, 08).            */
+
+#define KERNEL_PRIO  (5u &lt;&lt; (8 - __NVIC_PRIO_BITS))
+
+static inline uint32_t enter_critical(void)
+{
+    uint32_t old = __get_BASEPRI();
+    __set_BASEPRI(KERNEL_PRIO);
+    __DSB(); __ISB();
+    return old;
+}
+static inline void exit_critical(uint32_t old)
+{
+    __set_BASEPRI(old);
+}
+
+void k_sleep(uint32_t ms)
+{
+    uint32_t s = enter_critical();
+    current_tcb-&gt;wake_tick = g_ticks + ms;
+    current_tcb-&gt;state     = T_SLEEPING;
+    exit_critical(s);
+    yield();                      /* switches away here     */
+}
+
+/* MUTEX WITH PRIORITY INHERITANCE - the feature that
+   distinguishes a mutex from a semaphore (chapter 19).    */
+
+typedef struct {
+    tcb_t *owner;
+    tcb_t *waiters;
+    int    locked;
+} mutex_t;
+
+void mutex_lock(mutex_t *m)
+{
+    uint32_t s = enter_critical();
+
+    if (!m-&gt;locked) {
+        m-&gt;locked = 1;
+        m-&gt;owner  = current_tcb;
+        exit_critical(s);
+        return;
+    }
+
+    /* THE INHERITANCE. If we outrank the owner, lend it our
+       priority so it cannot be preempted by anything in
+       between - which is exactly the unbounded inversion of
+       the concurrency track, chapter 15.                   */
+    if (current_tcb-&gt;prio &gt; m-&gt;owner-&gt;prio) {
+        /* remove, re-prioritise, re-insert: the owner may be
+           sitting in a ready list under its old priority.   */
+        ready_remove(m-&gt;owner);
+        m-&gt;owner-&gt;prio = current_tcb-&gt;prio;
+        if (m-&gt;owner-&gt;state == T_READY) { ready_add(m-&gt;owner); }
+    }
+
+    current_tcb-&gt;state    = T_BLOCKED;
+    current_tcb-&gt;wait_obj = m;
+    current_tcb-&gt;next     = m-&gt;waiters;
+    m-&gt;waiters            = current_tcb;
+
+    exit_critical(s);
+    yield();
+}
+
+void mutex_unlock(mutex_t *m)
+{
+    uint32_t s = enter_critical();
+
+    /* Drop any inherited priority first. */
+    current_tcb-&gt;prio = current_tcb-&gt;base_prio;
+
+    tcb_t *best = NULL, **link = &amp;m-&gt;waiters;
+    for (tcb_t **p = &amp;m-&gt;waiters; *p; p = &amp;(*p)-&gt;next) {
+        if (!best || (*p)-&gt;prio &gt; best-&gt;prio) { best = *p; link = p; }
+    }
+
+    if (best) {
+        *link     = best-&gt;next;
+        m-&gt;owner  = best;
+        ready_add(best);
+    } else {
+        m-&gt;locked = 0;
+        m-&gt;owner  = NULL;
+    }
+
+    exit_critical(s);
+    yield();
+}
+</code></pre>
+
+<div class="key">
+<b>Where this kernel is honestly simplified</b>
+<p>Inheritance here is one level deep: if the owner is itself blocked on a second mutex, the boost does not
+propagate down the chain. Real kernels handle that transitively. The kernel also has no deadlock detection, no
+timeout on <code>mutex_lock</code>, and an O(n) tick. Each is a deliberate omission you can now see the shape
+of — which is the point of writing one. Read FreeRTOS's <code>xTaskPriorityInherit</code> afterwards and it
+will read as a careful version of code you have already written.</p>
+</div>
+
+<h2 id="demo">Part 5: it running</h2>
+
+<pre><code>static uint32_t s_hi[256], s_lo[256], s_idle[64];
+static tcb_t    t_hi, t_lo, t_idle;
+static mutex_t  bus;
+
+static void hi_task(void *a)
+{
+    for (;;) {
+        k_sleep(100);
+        uint32_t t0 = DWT-&gt;CYCCNT;
+        mutex_lock(&amp;bus);
+        use_shared_bus();
+        mutex_unlock(&amp;bus);
+        record_max(DWT-&gt;CYCCNT - t0);   /* blocking time     */
+    }
+}
+
+static void lo_task(void *a)
+{
+    for (;;) {
+        mutex_lock(&amp;bus);
+        busy_work(50);           /* hold it a long time      */
+        mutex_unlock(&amp;bus);
+        k_sleep(10);
+    }
+}
+
+static void idle_task(void *a) { for (;;) { __WFI(); } }
+
+int main(void)
+{
+    clock_init();  uart_init(115200);  cycle_counter_init();
+
+    task_create(&amp;t_hi,   "hi",   hi_task,   NULL, 5, s_hi,   256);
+    task_create(&amp;t_lo,   "lo",   lo_task,   NULL, 2, s_lo,   256);
+    task_create(&amp;t_idle, "idle", idle_task, NULL, 0, s_idle,  64);
+
+    NVIC_SetPriority(PendSV_IRQn,  0xFF);   /* LOWEST - ch 18 */
+    NVIC_SetPriority(SysTick_IRQn, 0xFE);
+
+    current_tcb = ready_pop(highest_ready());
+    current_tcb-&gt;state = T_RUNNING;
+    __set_PSP((uint32_t) current_tcb-&gt;sp + 32);
+    __set_CONTROL(0x02);
+    __ISB();                                /* MANDATORY      */
+
+    SysTick-&gt;LOAD = (SystemCoreClock / 1000u) - 1u;
+    SysTick-&gt;VAL  = 0;
+    SysTick-&gt;CTRL = 7u;
+
+    ((void (*)(void *)) hi_task)(NULL);      /* never returns  */
+    for (;;) { }
+}
+
+/* THE EXPERIMENT WORTH RUNNING: add a medium-priority task
+   at priority 3 that does nothing but busy_work. Then
+   disable the inheritance block in mutex_lock and compare
+   the recorded worst-case blocking time of hi_task.
+
+   Without inheritance it grows without bound as the medium
+   task takes more CPU - that is unbounded priority
+   inversion, reproduced on your own desk in about twenty
+   lines. Re-enable inheritance and it collapses to the
+   length of lo_task's critical section. Seeing that number
+   change is worth more than any amount of reading about
+   Mars Pathfinder.                                         */
+</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<ul>
+  <li><strong>Reproduce unbounded inversion</strong> as described above, and plot worst-case blocking against
+  the medium task's CPU share.</li>
+  <li><strong>Add a message queue</strong> with blocking send and receive, and the wake-on-send that makes a
+  waiting receiver runnable immediately rather than at the next tick.</li>
+  <li><strong>Replace the O(n) tick</strong> with a delta list sorted by wake time.</li>
+  <li><strong>Add the MPU stack guard</strong> from chapter 14, one region per task, reloaded in
+  <code>scheduler_next</code>. Then recurse until it fires and confirm the fault names the right task.</li>
+  <li><strong>Add FP context saving</strong> and verify with two tasks doing float maths that corruption
+  appears without it and vanishes with it.</li>
+  <li><strong>Make inheritance transitive</strong> across a chain of two mutexes.</li>
+  <li><strong>Measure the switch.</strong> Toggle a pin in PendSV and count cycles with DWT. Compare against
+  FreeRTOS on the same board.</li>
+</ul>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Fault the moment the first task starts</td><td>T bit missing from the fabricated xPSR</td></tr>
+<tr><td>Faults after the first switch, not before</td><td>No null check for the first entry, or
+<code>sp</code> not at TCB offset 0</td></tr>
+<tr><td>Corruption under interrupt load</td><td>PendSV not the lowest priority exception</td></tr>
+<tr><td>Scheduler picks the wrong task</td><td><code>ready_bits</code> not cleared when a list
+empties</td></tr>
+<tr><td>Everything hangs when all tasks sleep</td><td>No idle task — <code>highest_ready()</code> returns
+−1</td></tr>
+<tr><td>System stops after ~49 days of ticks</td><td>Tick comparison not wrap-safe</td></tr>
+<tr><td>A woken task waits up to a full tick</td><td>No <code>yield()</code> after making it ready</td></tr>
+<tr><td>Priority stays boosted after unlock</td><td><code>base_prio</code> not restored in
+<code>mutex_unlock</code></td></tr>
+<tr><td>Inheritance has no effect</td><td>Owner left in a ready list under its old priority — remove and
+re-add</td></tr>
+<tr><td>Corruption once two tasks use <code>float</code></td><td>FP registers not saved in the switch</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why <code>sp</code> must be the first member of the TCB.</li>
+  <li>Explain the CLZ trick for finding the highest ready priority.</li>
+  <li>Say why an idle task is structurally required, not merely convenient.</li>
+  <li>Explain why critical sections use BASEPRI rather than PRIMASK.</li>
+  <li>Describe what priority inheritance does and why the owner must be re-inserted.</li>
+  <li>Explain why <code>base_prio</code> is stored separately from <code>prio</code>.</li>
+  <li>Say why the tick's sleep scan is wrap-safe and what it costs at scale.</li>
+  <li>Describe the experiment that demonstrates unbounded priority inversion.</li>
+  <li>Name three ways this kernel is simplified relative to FreeRTOS.</li>
+  <li>Explain why <code>yield()</code> is safe to call from an ISR.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

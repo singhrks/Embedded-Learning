@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fine-tuning, instruction tuning and RLHF | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Fine-tuning, instruction tuning and RLHF</h1>
+<p class="lead">Turning a text completer into something useful. Post-training costs a tiny fraction of
+pretraining and accounts for almost everything a user perceives about a model's character and
+usefulness.</p>
+
+<h2 id="stages">The stages</h2>
+
+<p>A shipped assistant is the product of several distinct training stages, and confusing them makes the whole pipeline hard to reason about. Each stage changes something different about the model.</p>
+
+<pre class="diagram">   1. PRETRAINING          (chapter 23)
+        trillions of tokens, months, millions of dollars
+        -> a BASE MODEL that completes text
+
+   2. SUPERVISED FINE-TUNING (SFT) / INSTRUCTION TUNING
+        10k-1M curated (instruction, response) pairs
+        hours to days
+        -> a model that FOLLOWS INSTRUCTIONS
+
+   3. PREFERENCE OPTIMISATION (RLHF, DPO, and relatives)
+        10k-1M human preference comparisons
+        -> a model that is HELPFUL, HONEST AND HARMLESS
+           according to whoever wrote the guidelines
+
+   4. (optional) CONTINUED PRETRAINING on domain data,
+        inserted between 1 and 2 when you need domain
+        knowledge rather than domain style
+
+   THE PROPORTIONS ARE STRIKING:
+        pretraining      >99% of the compute
+        post-training     <1% of the compute
+        but post-training is responsible for essentially
+        ALL of the difference between "a strange text
+        completer" and "a useful assistant".
+
+   THE STANDARD INTERPRETATION - the SUPERFICIAL ALIGNMENT
+   HYPOTHESIS: post-training does not teach new knowledge.
+   It teaches the model WHICH OF ITS EXISTING CAPABILITIES
+   TO SURFACE, and in what format. Evidence: a few thousand
+   high-quality examples get most of the benefit, and
+   fine-tuning rarely adds facts the base model did not
+   already contain.
+
+   THE PRACTICAL COROLLARY, and it is the most useful thing
+   in this chapter:
+
+     IF THE BASE MODEL DOES NOT KNOW SOMETHING,
+     FINE-TUNING WILL NOT TEACH IT RELIABLY.
+     IT WILL TEACH IT TO SOUND CONFIDENT ABOUT IT.
+
+   For new facts, use RETRIEVAL (chapter 17) or continued
+   pretraining on a lot of domain text - not a few thousand
+   Q&amp;A pairs.</pre>
+
+<h2 id="sft">Supervised fine-tuning</h2>
+
+<p>Supervised fine-tuning is the same training loop you already know pointed at a much smaller, much more curated dataset — and it is where the model learns the format of being helpful.</p>
+
+<pre><code>/* MECHANICALLY IDENTICAL TO PRETRAINING - same
+   cross-entropy, same optimiser. Only the data changes. */
+
+    TRAINING EXAMPLE:
+      &lt;|im_start|&gt;user
+      Explain what a mutex is.&lt;|im_end|&gt;
+      &lt;|im_start|&gt;assistant
+      A mutex is a synchronisation primitive that...&lt;|im_end|&gt;
+
+    AND THE ONE IMPORTANT DETAIL:
+
+      MASK THE LOSS ON THE PROMPT TOKENS.
+
+    You want the model to learn to PRODUCE the response, not
+    to predict the user's question. Set the prompt positions
+    to ignore_index (chapter 16).
+
+        labels = input_ids.clone()
+        labels[:prompt_len] = -100     # ignored by
+                                       # cross_entropy
+
+    Omitting this still "works" and produces a measurably
+    worse model that sometimes continues by inventing the
+    next user turn.
+
+/* --- WHAT MAKES GOOD SFT DATA --- */
+    QUALITY BEATS QUANTITY, decisively. The LIMA result:
+    1,000 carefully curated examples produced a model
+    competitive with one trained on 50,000 mediocre ones.
+
+    WHAT TO CURATE FOR:
+      · DIVERSITY of task types, lengths and formats
+      · CONSISTENT STYLE - the model learns the average, so
+        inconsistent formatting produces inconsistent output
+      · CORRECTNESS. A wrong answer in the data teaches the
+        model to be wrong confidently.
+      · REFUSALS where appropriate, or the model will
+        never decline anything
+      · and MULTI-TURN conversations, or it will handle only
+        single turns well
+
+    SOURCES: human-written (expensive, best), model-generated
+    and filtered (Self-Instruct, Evol-Instruct), converted
+    from existing datasets, or DISTILLED from a stronger
+    model (check the licence).
+
+/* --- LoRA: the technique that made this accessible --- */
+    Freeze W. Learn a LOW-RANK UPDATE (chapters 03, 05):
+
+        W_new = W + (alpha/r) * B @ A
+
+        A: (r, d_in)   initialised randomly
+        B: (d_out, r)  INITIALISED TO ZERO, so the model
+                       starts unchanged
+
+    For d = 4096 and r = 16:
+        full fine-tune  16.8M parameters per matrix
+        LoRA             131k parameters
+        -> 128x fewer trainable parameters
+
+    WHY IT WORKS: the weight UPDATE during fine-tuning has
+    low intrinsic rank. Adaptation lives in a small
+    subspace, so representing it compactly loses little.
+
+    THE PRACTICAL BENEFITS:
+      · fine-tune a 7B model on one consumer GPU
+      · the adapter is a few megabytes - ship many task
+        adapters for one base model, swap at runtime
+      · NO INFERENCE COST if you merge B@A into W afterwards
+      · and QLoRA: quantise the frozen base to 4 bits
+        (chapter 26) and train the adapter in bf16. A 70B
+        model fine-tunes on a single 48 GB card.
+
+    HYPERPARAMETERS THAT MATTER: r (8-64), alpha (usually
+    2r), and WHICH MODULES to adapt - attention projections
+    only is the classic recipe, but including the FFN
+    generally works better.
+
+    from peft import LoraConfig, get_peft_model
+    cfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                     target_modules=["q_proj","k_proj",
+                                     "v_proj","o_proj",
+                                     "gate_proj","up_proj",
+                                     "down_proj"])
+    model = get_peft_model(base_model, cfg)
+    model.print_trainable_parameters()
+    # trainable: 0.24% of all parameters
+
+/* --- CATASTROPHIC FORGETTING --- */
+    Fine-tuning hard on a narrow task degrades everything
+    else. A model tuned only on SQL forgets how to write
+    prose.
+
+    MITIGATIONS: a LOW learning rate (1e-5 to 5e-5, an order
+    of magnitude below pretraining), FEW epochs (1-3), MIX
+    IN general data, or use LoRA - which by constraining the
+    update to a low-rank subspace forgets substantially
+    less.                                                  */</code></pre>
+
+<h2 id="rlhf">Learning from preferences</h2>
+
+<p>Preference learning exists because the thing you want is easy to recognise and almost impossible to write a loss function for. The workaround is ingenious and has known pathologies.</p>
+
+<pre><code>/* THE PROBLEM SFT CANNOT SOLVE: for most requests there is
+   no single correct answer, only better and worse ones. And
+   it is far easier for a human to say "B is better than A"
+   than to write the ideal A.
+
+/* --- CLASSIC RLHF, THREE STEPS --- */
+
+  1. COLLECT PREFERENCES
+       Sample two responses to the same prompt. A human
+       picks the better one. Repeat 10k-1M times, against
+       written guidelines.
+
+  2. TRAIN A REWARD MODEL
+       A copy of the model with a scalar head, trained so
+       that preferred responses score higher:
+
+         L = -log sigmoid( r(chosen) - r(rejected) )
+
+       (The Bradley-Terry model - the same logistic form as
+       chapter 13.)
+
+  3. OPTIMISE THE POLICY AGAINST THE REWARD, with PPO,
+     subject to a KL PENALTY:
+
+         objective = E[ r(x, y) ]
+                     - beta * KL(policy || reference)
+
+       THE KL TERM IS ESSENTIAL. Without it the policy
+       finds adversarial inputs that the reward model scores
+       highly and humans find worthless - REWARD HACKING.
+       Classic failure modes: extreme verbosity, excessive
+       hedging, opening every response with flattery,
+       compulsive list-making. IF YOU HAVE NOTICED MODELS
+       DOING THESE THINGS, THIS IS WHERE THEY COME FROM.
+
+       It is the REVERSE KL of chapter 10 - mode-seeking,
+       keeping the policy near the reference.
+
+/* --- DPO: what most people use now --- */
+    Direct Preference Optimisation removes the reward model
+    and the RL loop entirely. The insight: the optimal
+    policy under a KL-constrained reward objective has a
+    closed form, so the reward can be expressed in terms of
+    the policy itself. Substituting gives a plain
+    supervised loss over preference pairs:
+
+      L = -log sigmoid( beta * [
+              log pi(y_w|x) - log pi_ref(y_w|x)
+            - log pi(y_l|x) + log pi_ref(y_l|x) ] )
+
+    NO REWARD MODEL. NO SAMPLING LOOP. NO PPO. Just a loss
+    function over (prompt, chosen, rejected) triples, run
+    like any other fine-tune.
+
+    · far simpler and more stable
+    · usually comparable results
+    · the main loss is that you cannot do online exploration
+      against a learned reward
+
+    VARIANTS: IPO, KTO (needs only binary good/bad labels,
+    not pairs), ORPO (merges SFT and preference learning
+    into one stage), SimPO (reference-free).
+
+/* --- RLAIF AND CONSTITUTIONAL AI --- */
+    Replace the human labeller with a model, guided by an
+    explicit written set of principles. The model critiques
+    and revises its own outputs against the constitution,
+    and those revisions become training data.
+
+    · dramatically cheaper and faster to iterate
+    · the principles are WRITTEN DOWN and inspectable, which
+      is a genuine transparency advantage over implicit
+      preferences in a labelling pool
+    · and the obvious concern: the judging model's biases
+      become the training signal
+
+/* --- RLVR: verifiable rewards --- */
+    For maths, code and other checkable domains, skip
+    preferences entirely: RUN THE TESTS. Reward = did the
+    unit test pass, did the proof check, is the answer
+    correct.
+
+    An objective, unhackable reward signal, and the basis of
+    the recent reasoning-model results. It only works where
+    correctness is mechanically checkable - which is a real
+    limit, and also exactly the situation in a great deal of
+    engineering work.                                       */</code></pre>
+
+<div class="key">
+<b>Choosing your approach</b>
+<pre>NEED A FORMAT OR STYLE          -> SFT, or just prompting
+NEED DOMAIN KNOWLEDGE           -> RETRIEVAL first;
+                                   continued pretraining
+                                   if you have a lot of
+                                   text
+NEED BETTER JUDGEMENT/TONE      -> DPO on preference pairs
+NEED CHECKABLE CORRECTNESS      -> RLVR against tests
+LIMITED COMPUTE                 -> LoRA or QLoRA
+JUST TRYING SOMETHING           -> PROMPT FIRST</pre>
+<p><strong>Try prompting before fine-tuning.</strong> A good system prompt plus a few in-context examples
+solves a surprising fraction of what people reach for fine-tuning to do, costs nothing, and can be changed
+in a minute rather than a day.</p>
+</div>
+
+<h2 id="practice">Doing it</h2>
+
+<p>Full fine-tuning is out of reach for most people and mostly unnecessary. These are the methods that make adaptation practical on hardware you can actually rent.</p>
+
+<pre><code>from transformers import (AutoModelForCausalLM,
+                          AutoTokenizer, TrainingArguments)
+from peft import LoraConfig
+from trl import SFTTrainer, DPOTrainer
+
+# --- SFT ---
+model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.1-8B", torch_dtype="bfloat16",
+            device_map="auto")
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+
+args = TrainingArguments(
+    output_dir="out",
+    num_train_epochs=2,            # 1-3. MORE OVERFITS.
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8, # effective batch 32
+    learning_rate=2e-5,            # LOW (chapter 11)
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    gradient_checkpointing=True,
+    logging_steps=10,
+    eval_strategy="steps", eval_steps=100,
+)
+
+trainer = SFTTrainer(
+    model=model, args=args,
+    train_dataset=train_ds, eval_dataset=eval_ds,
+    peft_config=LoraConfig(r=16, lora_alpha=32),
+    max_seq_length=2048,
+)
+trainer.train()
+
+# --- DPO, on a dataset of {prompt, chosen, rejected} ---
+dpo = DPOTrainer(
+    model=sft_model,
+    ref_model=None,        # LoRA: the base with adapters
+                           # disabled IS the reference
+    args=dpo_args,
+    beta=0.1,              # the KL strength
+    train_dataset=pref_ds,
+)
+dpo.train()
+
+# --- MERGE AND EXPORT ---
+merged = model.merge_and_unload()   # folds B@A into W
+merged.save_pretrained("final")     # zero inference
+                                    # overhead
+
+/* --- EVALUATION: THE PART PEOPLE SKIP --- */
+    · HOLD OUT a test set BEFORE you start (chapter 12)
+    · CHECK FOR REGRESSION on general benchmarks, not only
+      your task - catastrophic forgetting is invisible if
+      you only measure what you tuned for
+    · LLM-AS-JUDGE for open-ended quality, with the known
+      biases accounted for: judges prefer LONGER answers,
+      prefer their own family's style, and are sensitive to
+      option ORDER (so randomise it)
+    · AND READ THE OUTPUTS. A hundred generations, by hand.
+      Every automated metric misses things that are obvious
+      on inspection (chapter 12).
+
+/* --- WHAT GOES WRONG --- */
+    OVERFITTING       loss near zero, outputs degenerate and
+                      repetitive. Fewer epochs.
+    FORGETTING        general ability drops. Lower lr, mix
+                      in general data, use LoRA.
+    FORMAT COLLAPSE   every answer takes the same shape.
+                      Diversify the data.
+    SYCOPHANCY        preference training rewards agreement,
+                      so the model agrees with incorrect
+                      user claims. A known and actively
+                      studied side effect of RLHF.
+    VERBOSITY         reward models like long answers. A
+                      length penalty helps.
+    OVER-REFUSAL      too many refusal examples, or too
+                      broad. The model declines benign
+                      requests. Balance deliberately.     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Model invents the next user turn</td><td>Loss not masked on prompt tokens</td></tr>
+<tr><td>Confidently wrong on domain facts</td><td>Fine-tuning taught style, not knowledge — use retrieval</td></tr>
+<tr><td>General ability drops after tuning</td><td>Catastrophic forgetting — lower LR, fewer epochs, LoRA</td></tr>
+<tr><td>Outputs repetitive and degenerate</td><td>Too many epochs on too little data</td></tr>
+<tr><td>Answers grow steadily longer</td><td>Reward hacking on length</td></tr>
+<tr><td>Model agrees with incorrect user claims</td><td>Sycophancy from preference training</td></tr>
+<tr><td>Benign requests refused</td><td>Refusal data too broad</td></tr>
+<tr><td>Policy diverges into nonsense during RL</td><td>KL penalty too weak or absent</td></tr>
+<tr><td>LLM-judge scores disagree with human reading</td><td>Length and position bias — randomise and read outputs</td></tr>
+<tr><td>LoRA has no effect</td><td>Wrong <code>target_modules</code>, or <code>alpha</code> too small</td></tr>
+<tr><td>Fine-tuned model is slower</td><td>Adapters not merged</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the post-training stages and their relative compute cost.</li>
+  <li>State the superficial alignment hypothesis and its practical corollary.</li>
+  <li>Explain prompt-token loss masking and what happens without it.</li>
+  <li>Give four properties of good SFT data.</li>
+  <li>Write the LoRA update, say why B starts at zero, and compute the parameter saving.</li>
+  <li>Explain QLoRA and what it makes possible.</li>
+  <li>Describe the three RLHF steps and the reward-model loss.</li>
+  <li>Explain the KL penalty and name four reward-hacking behaviours it prevents.</li>
+  <li>Explain what DPO removes and why it is simpler.</li>
+  <li>Describe RLAIF and RLVR, and the limit of each.</li>
+  <li>Choose an approach for six different needs.</li>
+  <li>List three known biases of LLM-as-judge evaluation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

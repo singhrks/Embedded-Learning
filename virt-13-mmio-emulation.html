@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trapping MMIO and emulating a device | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Trapping MMIO and emulating a device</h1>
+<p class="lead">A device model is a state machine driven by faults. The guest stores to an address that has
+no memory behind it, the hypervisor decodes what that store meant, updates some software state, and possibly
+raises an interrupt. This chapter builds one from nothing, and shows why doing it in the fewest possible
+traps is the entire design problem.</p>
+
+<h2 id="hole">A device is a hole in the address space</h2>
+
+<p>A virtual device is, mechanically, a region of guest address space that is deliberately left unmapped so that every access faults. That is the whole trick.</p>
+
+<pre class="diagram">   Guest's view of its own physical memory:
+
+     0x0000_0000  +--------------------+
+                  |  (nothing)         |
+     0x0800_0000  +--------------------+
+                  |  GIC distributor   |  &lt;- emulated
+     0x0801_0000  +--------------------+
+                  |  GIC redistributor |  &lt;- emulated
+     0x0900_0000  +--------------------+
+                  |  PL011 UART        |  &lt;- emulated
+     0x0900_1000  +--------------------+
+                  |  RTC               |  &lt;- emulated
+     0x0a00_0000  +--------------------+
+                  |  virtio-mmio x32   |  &lt;- emulated
+     0x1000_0000  +--------------------+
+                  |  PCIe ECAM         |  &lt;- emulated
+     0x4000_0000  +--------------------+
+                  |                    |
+                  |  RAM               |  &lt;- REAL memory,
+                  |                    |     mapped at stage 2
+                  +--------------------+
+
+   Stage 2 maps the RAM region and leaves EVERYTHING ELSE
+   unmapped. Every access to a device region therefore takes a
+   stage-2 translation fault, which is exactly the notification
+   the hypervisor wants.
+
+   In KVM this is expressed as MEMSLOTS: user space registers
+   "guest physical range X is backed by this host virtual
+   address". Anything outside a memslot is, by definition, MMIO.</pre>
+
+<h2 id="path">The path of one register write</h2>
+
+<p>Following one register write from the guest instruction to the device model and back shows exactly where the cost is.</p>
+
+<pre><code>/* Guest driver:                                             */
+        writel(0x41, uart_base + UARTDR);   /* print 'A'      */
+
+/* 1. STR w0, [x1] where x1 -> IPA 0x0900_0000               */
+
+/* 2. Stage-2 translation fault. ESR_EL2:
+        EC   = 0x24  data abort from lower EL
+        ISV  = 1     syndrome valid
+        SAS  = 0b10  word access
+        SRT  = 0      register x0
+        WnR  = 1      it was a write
+        DFSC = 0b000111  translation fault, level 3
+
+      HPFAR_EL2 gives IPA 0x0900_0000.                       */
+
+/* 3. KVM: is 0x0900_0000 inside a memslot?  No.
+      -> it is MMIO. Is there an in-kernel device claiming it?
+         (vGIC, arch timer, PV interfaces)  No.
+      -> hand it to user space.                              */
+
+/* 4. KVM_RUN returns. kvm_run-&gt;exit_reason = KVM_EXIT_MMIO:  */
+
+        struct {
+                __u64 phys_addr;   /* 0x09000000              */
+                __u8  data[8];     /* 0x41                    */
+                __u32 len;         /* 4                       */
+                __u8  is_write;    /* 1                       */
+        } mmio;
+
+/* 5. QEMU dispatches to the PL011 model, which appends 'A' to
+      the character device. If this were a READ, QEMU would
+      instead fill kvm_run-&gt;mmio.data before re-entering.    */
+
+/* 6. ioctl(KVM_RUN) again. KVM writes the read data into the
+      guest's register x0 if needed, ADVANCES THE GUEST PC past
+      the faulting instruction, and ERETs.
+
+      Note: skip, not retry. The access was emulated, not
+      fixed - the opposite of a memory fault (chapter 06).    */</code></pre>
+
+<div class="key">
+<b>Two tiers of device model</b>
+<p>Devices that are hot and simple live <em>in the kernel</em>: the vGIC, the architected timer, the PV
+interfaces. Their exits never leave <code>KVM_RUN</code>, costing single-digit microseconds. Everything else
+lives in user space, costing ten times that but gaining the ability to be written in ordinary code with
+files, threads and sockets. Deciding which tier a device belongs in is the main performance lever you
+have.</p>
+</div>
+
+<h2 id="write-one">Writing a device model</h2>
+
+<p>Device models are less mysterious than they sound, and a small complete one makes the pattern obvious.</p>
+
+<pre><code>/* A minimal PL011 UART model. This is the shape of every
+   device model you will ever write: a struct of state, a read
+   function, a write function, and an interrupt line.        */
+
+struct pl011 {
+        uint32_t dr;          /* data                        */
+        uint32_t fr;          /* flags                       */
+        uint32_t imsc;        /* interrupt mask              */
+        uint32_t ris;         /* raw interrupt status        */
+        uint32_t cr;          /* control                     */
+        uint8_t  rxfifo[16];
+        unsigned rxhead, rxtail;
+        int      irq;         /* which vINTID we raise       */
+        int      chr_fd;      /* where output goes           */
+};
+
+#define UARTDR    0x000
+#define UARTFR    0x018
+#define UARTIMSC  0x038
+#define UARTRIS   0x03c
+#define UARTMIS   0x040
+#define UARTCR    0x030
+#define UARTICR   0x044
+
+#define FR_RXFE   (1u &lt;&lt; 4)   /* receive FIFO empty          */
+#define FR_TXFF   (1u &lt;&lt; 5)   /* transmit FIFO full          */
+#define INT_RX    (1u &lt;&lt; 4)
+#define INT_TX    (1u &lt;&lt; 5)
+
+static uint32_t pl011_read(struct pl011 *u, uint64_t off)
+{
+        switch (off) {
+        case UARTDR: {
+                uint32_t c = 0;
+                if (u-&gt;rxhead != u-&gt;rxtail) {
+                        c = u-&gt;rxfifo[u-&gt;rxtail++ % 16];
+                        if (u-&gt;rxhead == u-&gt;rxtail)
+                                u-&gt;fr |= FR_RXFE;
+                }
+                /* READING CLEARS STATE. This is why speculative
+                   reads of device memory are forbidden - see
+                   chapter 07.                                */
+                pl011_update_irq(u);
+                return c;
+        }
+        case UARTFR:   return u-&gt;fr;
+        case UARTRIS:  return u-&gt;ris;
+        case UARTMIS:  return u-&gt;ris &amp; u-&gt;imsc;
+        case UARTIMSC: return u-&gt;imsc;
+        default:       return 0;      /* never fault the guest
+                                         for an unknown offset -
+                                         real hardware does not */
+        }
+}
+
+static void pl011_write(struct pl011 *u, uint64_t off, uint32_t v)
+{
+        switch (off) {
+        case UARTDR: {
+                uint8_t c = v &amp; 0xff;
+                write(u-&gt;chr_fd, &amp;c, 1);
+                u-&gt;ris |= INT_TX;       /* transmit completed   */
+                pl011_update_irq(u);
+                break;
+        }
+        case UARTIMSC: u-&gt;imsc = v; pl011_update_irq(u); break;
+        case UARTICR:  u-&gt;ris &amp;= ~v;  pl011_update_irq(u); break;
+        case UARTCR:   u-&gt;cr   = v; break;
+        }
+}
+
+static void pl011_update_irq(struct pl011 *u)
+{
+        int level = (u-&gt;ris &amp; u-&gt;imsc) != 0;
+        set_irq_line(u-&gt;irq, level);     /* KVM_IRQ_LINE ioctl  */
+}
+
+/* Rules this small function already demonstrates:
+
+   1. NEVER fault on an unrecognised offset. Return 0 and log.
+      Guests probe. Hardware tolerates probing.
+   2. Model side effects of READS explicitly (clear-on-read,
+      FIFO pop). Getting these wrong causes lost data that
+      looks like a driver bug.
+   3. Recompute the interrupt line after any state change, and
+      drive it as a LEVEL, not an edge. Level semantics are
+      self-correcting; edges get lost.
+   4. Handle partial-width accesses. A guest may read a byte of
+      a 32-bit register.                                      */</code></pre>
+
+<h2 id="cost">The cost, and how to escape it</h2>
+
+<p>The cost per access is high enough that it shapes designs, which is the reason virtio exists at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Path</th><th>Typical cost</th><th>When it applies</th></tr></thead>
+<tbody>
+<tr><td>In-kernel device (vGIC, timer)</td><td>1–3 µs</td><td>Hot, simple, no external I/O</td></tr>
+<tr><td>User-space device (QEMU)</td><td>10–30 µs</td><td>Anything needing files, sockets or complex
+state</td></tr>
+<tr><td><code>ioeventfd</code></td><td>~1 µs, and asynchronous</td><td>A write to one address whose
+<em>value</em> does not matter — a doorbell</td></tr>
+<tr><td><code>irqfd</code></td><td>~1 µs</td><td>Raising an interrupt from another thread or from the kernel
+without an ioctl</td></tr>
+<tr><td>vhost (in-kernel datapath)</td><td>Comparable to host I/O</td><td>virtio net/blk where the whole
+datapath moves into the kernel</td></tr>
+<tr><td>Passthrough</td><td>Zero for MMIO</td><td>The guest owns the real device
+(<a href="virt-16-passthrough.html">chapter 17</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* ioeventfd: the single most valuable optimisation for a
+   device model, and the reason virtio is fast.             */
+
+  Ordinary path for "kick the queue":
+     guest writes QueueNotify
+       -> stage-2 fault
+       -> exit to EL2
+       -> exit to host kernel
+       -> exit to QEMU
+       -> QEMU decodes, finds the queue, processes
+       -> re-enter (4 transitions)
+
+  With ioeventfd:
+     QEMU tells KVM in advance:
+        "a write to 0x0a000050 of any value means: signal
+         eventfd 7. Do not tell me the value. Do not return
+         from KVM_RUN."
+
+     guest writes QueueNotify
+       -> stage-2 fault
+       -> KVM writes eventfd 7 and IMMEDIATELY RE-ENTERS
+       -> a separate QEMU thread (or vhost kernel thread)
+          wakes on eventfd 7 and does the work CONCURRENTLY
+          with the guest continuing to run.
+
+  The guest never waits. The exit is a light one. This is the
+  difference between "virtio is fine" and "virtio is fast".  */
+
+/* The registration, in QEMU terms: */
+   struct kvm_ioeventfd ke = {
+           .addr     = 0x0a000050,
+           .len      = 4,
+           .fd       = evfd,
+           .flags    = 0,     /* KVM_IOEVENTFD_FLAG_DATAMATCH
+                                 if you need to distinguish
+                                 which queue was kicked      */
+   };
+   ioctl(vmfd, KVM_IOEVENTFD, &amp;ke);</code></pre>
+
+<h2 id="dt">Telling the guest the device exists</h2>
+
+<p>A guest will not use a device it does not know about, and how it is told differs between platform and discoverable buses.</p>
+
+<pre><code>/* A device model is useless unless the guest is told where it
+   is. Two mechanisms; on embedded arm64 it is the device tree. */
+
+/ {
+        soc {
+                #address-cells = &lt;2&gt;;
+                #size-cells    = &lt;2&gt;;
+
+                pl011@9000000 {
+                        compatible = "arm,pl011", "arm,primecell";
+                        reg = &lt;0x0 0x09000000 0x0 0x1000&gt;;
+                        interrupts = &lt;0 1 4&gt;;  /* SPI 1, level  */
+                        clocks = &lt;&amp;uartclk&gt;;
+                        clock-names = "uartclk";
+                };
+
+                virtio_mmio@a000000 {
+                        compatible = "virtio,mmio";
+                        reg = &lt;0x0 0x0a000000 0x0 0x200&gt;;
+                        interrupts = &lt;0 16 1&gt;;
+                };
+        };
+};
+
+/* QEMU GENERATES this device tree at runtime from the machine
+   model, which is why -M virt "just works" for any memory size
+   and CPU count. To see what your guest was actually given: */
+
+$ qemu-system-aarch64 -M virt,dumpdtb=virt.dtb -nographic ...
+$ dtc -I dtb -O dts virt.dtb | less
+
+/* And from inside a running guest: */
+$ ls /sys/firmware/devicetree/base/
+$ dtc -I fs -O dts /sys/firmware/devicetree/base | less
+
+/* A mismatch between the model's address and the device tree's
+   reg property produces a device that is never probed, or a
+   guest that faults on a region nothing models. The dumpdtb
+   trick resolves this in seconds and is the first thing to
+   reach for when "my device does not appear".              */</code></pre>
+
+<div class="warn">
+<b>Never fault the guest for an unknown register</b>
+<p>It is tempting to signal an abort when a guest touches an offset you did not implement. Do not. Guests
+probe hardware, read reserved fields, and read whole register blocks in a loop to dump state. Real silicon
+returns zero or garbage and carries on. A model that aborts turns a harmless probe into a guest kernel
+panic, and the panic points at the guest driver rather than at your model.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest panics probing a device</td><td>Model aborts on an unimplemented offset instead of returning
+zero</td></tr>
+<tr><td>Device never appears in the guest</td><td>Device tree <code>reg</code> does not match the address the
+model claims, or <code>compatible</code> matches no driver</td></tr>
+<tr><td>Guest receives the first interrupt only</td><td>Interrupt driven as an edge; the line was never
+lowered, so the next rise is not seen</td></tr>
+<tr><td>Characters lost on an emulated UART</td><td>Clear-on-read side effects modelled incorrectly, or the RX
+FIFO overrun path missing</td></tr>
+<tr><td>VM killed: "no valid syndrome"</td><td>Guest used <code>memcpy</code>/<code>LDP</code> on the MMIO
+region; <code>ISV=0</code> (<a href="virt-06-stage2-faults.html">chapter 06</a>)</td></tr>
+<tr><td>Throughput far below expectations</td><td>Doorbell handled as a full user-space exit instead of an
+<code>ioeventfd</code></td></tr>
+<tr><td>Guest hangs on a byte access to a 32-bit register</td><td>Model assumes word-width accesses
+only</td></tr>
+<tr><td>Interrupt raised but guest never runs its handler</td><td><code>irqfd</code>/<code>KVM_IRQ_LINE</code>
+targeting the wrong vINTID, or the vGIC not told the line is level-triggered</td></tr>
+<tr><td>Device works in TCG but not with KVM</td><td>The model relies on ordering QEMU's own emulation
+provided; real guest CPUs reorder</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain how a hypervisor arranges to be notified of a device access, in terms of stage 2 and
+  memslots.</li>
+  <li>Trace a guest <code>writel()</code> to an emulated UART through every layer to the host's
+  terminal.</li>
+  <li>Say whether the guest PC is advanced or not after MMIO emulation, and contrast with a memory
+  fault.</li>
+  <li>Give three rules a device model must follow to survive guest probing.</li>
+  <li>Explain why a device's interrupt should be modelled as a level, not an edge.</li>
+  <li>Describe what <code>ioeventfd</code> changes and count the transitions it removes.</li>
+  <li>Describe what <code>irqfd</code> is for.</li>
+  <li>Explain how a guest learns a device exists, and how you inspect what it was told.</li>
+  <li>Give the cost ratio between an in-kernel device and a user-space one, and the criterion for
+  choosing.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

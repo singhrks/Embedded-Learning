@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging in practice: four failures, hunted down | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging in practice: four failures, hunted down</h1>
+<p class="lead">Hypervisor bugs are unpleasant because the symptom appears in the guest and the cause is in the
+host, with a hardware boundary in between that hides most of your usual tools. These are four real shapes of
+failure, followed from the symptom to the line, with the reasoning shown rather than the answer announced.</p>
+
+<h2 id="tools">The instruments, and what each one can see</h2>
+
+<p>Before the cases, it is worth being clear about which side of the boundary each tool sits on — because the
+commonest mistake is spending an hour with a tool that structurally cannot observe the thing you are looking
+for.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Sees</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>perf kvm stat</code></td><td>Exit counts by reason, live</td><td>The first question, always: is
+it exiting, and why</td></tr>
+<tr><td><code>trace-cmd</code> / ftrace on <code>kvm:*</code></td><td>Every exit, entry, MMIO and interrupt
+injection, with timestamps</td><td>Sequence questions — what happened just before the hang</td></tr>
+<tr><td>KVM debugfs counters</td><td>Per-VM totals</td><td>Cheap sanity checks without tracing
+overhead</td></tr>
+<tr><td>The guest's own console</td><td>Only what the guest managed to print</td><td>Often nothing, which is
+itself information</td></tr>
+<tr><td>QEMU's <code>gdbstub</code></td><td>Guest registers and memory, from outside</td><td>A guest that
+hangs with no output</td></tr>
+<tr><td>QEMU <code>-d int,mmu,guest_errors</code></td><td>Emulated exceptions and translation</td><td>Under
+emulation only — no help on real silicon</td></tr>
+<tr><td>A JTAG probe</td><td>Everything, including EL2</td><td>Real hardware, when the host itself is
+broken</td></tr>
+<tr><td><code>dmesg</code> on the host</td><td>KVM's own complaints</td><td>Read this first; it is free and
+frequently decisive</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The single most useful habit is to establish, in the first minute, <em>which side is running</em>. A guest
+that is not being entered at all is a completely different investigation from a guest that is running and
+producing nothing, and one <code>perf kvm stat</code> distinguishes them.</p>
+
+<h2 id="case1">Case 1: the guest boots to silence</h2>
+
+<p>A new board port. The hypervisor starts the guest, and nothing appears on the guest console — no kernel
+banner, no panic, nothing at all.</p>
+
+<pre class="diagram">   SYMPTOM   no output, no crash, no host error.
+
+   FIRST QUESTION: is it running at all?
+
+     $ perf kvm stat live
+     ... exits accumulating steadily, mostly MMIO ...
+
+   SO IT IS RUNNING. That eliminates half the possibilities
+   immediately - the vCPU is being entered, the stage-2
+   tables are good enough to fetch instructions, and it is
+   not stuck in the host.
+
+   A guest that were NOT running would show zero exits, and
+   the investigation would go to the entry path instead.
+
+   ---------------------------------------------------------
+
+   SECOND QUESTION: what is it touching?
+
+     $ trace-cmd record -e kvm:kvm_mmio -e kvm:kvm_exit
+     $ trace-cmd report | head
+
+       kvm_exit: reason DABT_LOW ... ipa 0x09000000
+       kvm_mmio: mmio write len 4 gpa 0x9000000 val 0x58
+       kvm_exit: reason DABT_LOW ... ipa 0x09000000
+       kvm_mmio: mmio write len 4 gpa 0x9000000 val 0x59
+
+   IT IS WRITING CHARACTERS. 0x58 is 'X', 0x59 is 'Y'. The
+   guest is printing happily to 0x09000000 and something
+   downstream is dropping it.
+
+   ---------------------------------------------------------
+
+   THIRD QUESTION: who owns 0x09000000?
+
+     In the device model: the UART is registered at
+     0x09000000. Good.
+     In the device tree handed to the guest: also
+     0x09000000. Good.
+
+   So both ends agree - and yet nothing comes out. The
+   remaining possibility is that the write is REACHING the
+   model and the model is discarding it.
+
+     static void uart_write(u64 off, u32 val) {
+         if (off == UART_DR)
+             putchar(val);
+     }
+
+   AND THE TRACE SAID: gpa 0x9000000, which is the BASE.
+   What offset did the model compute?
+
+     off = gpa - base;       /* 0 - correct */
+
+   ... unless base was never initialised for this platform,
+   in which case off is 0x9000000, UART_DR is 0x00, the
+   comparison fails, and every character is silently
+   dropped.
+
+   ---------------------------------------------------------
+
+   THE BUG   a per-platform base address left at zero.
+   THE FIX   one line.
+   THE LESSON  "no output" made this look like a serious
+   bring-up problem. Two traces showed the guest was fine
+   and the fault was three layers above the hardware. ASK
+   WHETHER IT IS RUNNING BEFORE ASSUMING IT IS NOT.</pre>
+
+<h2 id="case2">Case 2: the guest hangs under load, and only sometimes</h2>
+
+<p>A guest that has been stable for weeks starts hanging during heavy I/O, roughly once a day, with no panic.
+Attaching a debugger shows every vCPU idle in <code>WFI</code>, waiting for an interrupt that never comes.</p>
+
+<pre class="diagram">   SYMPTOM   intermittent hang; all vCPUs in WFI; the device
+             says it completed the work.
+
+   "AN INTERRUPT WENT MISSING" is the diagnosis, and it is
+   almost always one of three things (chapter 11):
+
+     A. never injected       - the hypervisor did not do it
+     B. injected and lost    - a list register was reused
+     C. injected, guest got it, guest never EOI'd
+
+   DISTINGUISHING THEM IS THE WHOLE JOB, and the vGIC state
+   answers it directly.
+
+   ---------------------------------------------------------
+
+     $ trace-cmd record -e kvm:kvm_vgic\* -e kvm:kvm_entry
+
+   On the hang, the last records show:
+
+     vgic_update_irq_pending  irq=42 level=1
+     kvm_entry                (no injection recorded)
+
+   SO IT WAS MARKED PENDING AND NEVER PLACED IN A LIST
+   REGISTER. That eliminates B and C, and points at the code
+   that chooses which pending interrupts to inject.
+
+   ---------------------------------------------------------
+
+   THE LIST REGISTERS ARE A FIXED, SMALL RESOURCE - four on
+   many implementations. If more interrupts are pending than
+   there are registers, the hypervisor must:
+
+     1. inject as many as fit,
+     2. enable a MAINTENANCE INTERRUPT so it is told when
+        one is consumed,
+     3. inject the rest then.
+
+   Step 2 is the one that gets forgotten, because under
+   light load there are never more than four pending and the
+   code path never runs. Under heavy I/O it does, and the
+   surplus interrupt waits forever for a hypervisor that is
+   not going to be woken.
+
+   ---------------------------------------------------------
+
+   THE BUG   the underflow maintenance interrupt was enabled
+             only on the first overflow, not re-armed.
+   THE LESSON  "intermittent, only under load" is very often
+   a FIXED-SIZE RESOURCE being exhausted for the first time.
+   Ask what is finite, and what is supposed to happen when
+   it runs out - then check that path has ever executed.</pre>
+
+<h2 id="case3">Case 3: virtio corrupts data, rarely, on one core type</h2>
+
+<p>A virtio-blk implementation passes every test on the development machine and corrupts occasional sectors on
+the target — a big.LITTLE SoC, and only when the workload migrates between clusters.</p>
+
+<pre class="diagram">   SYMPTOM   rare corruption; reproduces on target hardware,
+             never on x86; correlates with migration between
+             cores.
+
+   THAT CORRELATION IS THE ENTIRE CLUE. A bug that appears
+   on a weakly ordered machine and not on a strongly ordered
+   one is a MEMORY ORDERING bug until proven otherwise
+   (chapter 15).
+
+   ---------------------------------------------------------
+
+   THE VIRTQUEUE PROTOCOL has a strict publication order.
+   The driver must:
+
+     1. write the descriptor
+     2. BARRIER
+     3. write the available-ring index
+     4. BARRIER
+     5. notify
+
+   Step 2 is the load-bearing one: it guarantees the device
+   cannot observe the new index before the descriptor it
+   refers to. Without it, on a weakly ordered core, the two
+   stores can become visible in either order.
+
+   SO THE DEVICE READS AN INDEX POINTING AT A DESCRIPTOR
+   THAT HAS NOT LANDED YET, and processes whatever was in
+   that slot before - stale addresses, stale lengths.
+
+   ---------------------------------------------------------
+
+   WHY x86 NEVER SHOWED IT: on a strongly ordered machine,
+   stores become visible in program order anyway. The
+   barrier is a no-op there, so omitting it is invisible.
+   THE CODE WAS ALWAYS WRONG. Only the hardware changed.
+
+   ---------------------------------------------------------
+
+   FINDING IT, when the trace tells you nothing:
+
+     · REVIEW THE BARRIERS AGAINST THE SPECIFICATION. The
+       virtio spec states the required order explicitly, and
+       this is one of the rare bugs where reading is faster
+       than measuring.
+     · LOG THE DESCRIPTOR the device consumed alongside the
+       index. A mismatch confirms it in one run.
+     · Under emulation, ordering bugs USUALLY DISAPPEAR -
+       which is itself evidence, and a reason not to trust a
+       clean run under QEMU as proof.
+
+   THE LESSON  "works on one machine, not another" plus
+   "rare" plus "shared memory" is a memory-model bug. Do not
+   start by suspecting the device.</pre>
+
+<h2 id="case4">Case 4: a ten-line change made everything three times slower</h2>
+
+<p>A guest that ran acceptably now runs at a third of the speed. The change was small and looked harmless, and
+nothing in the guest was touched.</p>
+
+<pre class="diagram">   SYMPTOM   large uniform slowdown after a small host-side
+             change. The guest is unmodified.
+
+   THE FIRST MEASUREMENT IS ALWAYS THE SAME (chapter 23):
+
+     $ perf kvm stat live
+
+       BEFORE    ~4,000 exits/sec
+       AFTER     ~900,000 exits/sec, almost all SYSREG
+
+   AN EXIT STORM, and the reason field names the culprit
+   class immediately. This is why exits are step one: the
+   answer is usually in the first command.
+
+   ---------------------------------------------------------
+
+   WHICH REGISTER?
+
+     $ trace-cmd record -e kvm:kvm_sys_access
+     $ trace-cmd report | awk '{print $NF}' | sort | uniq -c | sort -rn
+
+       871204 CNTV_CTL_EL0
+          312 ...
+
+   The guest is touching a timer register constantly and
+   trapping every time.
+
+   ---------------------------------------------------------
+
+   WHY? The change enabled a trap bit "for observability" -
+   a debugging aid that was meant to be temporary and was
+   committed. The guest's idle loop reads that register on
+   every tick, and each read is now a full world switch:
+   roughly two microseconds instead of a few nanoseconds
+   (chapter 08).
+
+   A REGISTER READ MADE A THOUSAND TIMES MORE EXPENSIVE, in
+   the hottest loop the guest has.
+
+   ---------------------------------------------------------
+
+   THE LESSON, and it generalises past this bug:
+
+     TRAPS ARE A POLICY DECISION WITH A PRICE TAG (chapter
+     04). Enabling one is cheap to write and can be
+     catastrophic to run, and NOTHING WARNS YOU - the system
+     stays correct, it just becomes slow.
+
+     So: after any change to trap configuration, count the
+     exits. It is one command, and it is the difference
+     between shipping this and finding it in the field.</pre>
+
+<h2 id="method">The method underneath all four</h2>
+
+<p>The cases differ; the procedure does not. Working in this order is what stops an investigation wandering.</p>
+
+<pre class="diagram">   1. WHICH SIDE IS RUNNING?
+        Zero exits means the guest is not executing - look
+        at entry, stage-2, or the host. Exits accumulating
+        means the guest is fine and something it depends on
+        is not.
+
+   2. COUNT BEFORE YOU TRACE.
+        perf kvm stat is one command and frequently names
+        the problem. Tracing everything first buries the
+        signal.
+
+   3. NARROW BY EXIT REASON, then by address or register.
+        Every case above was solved by "which reason, and
+        which specific thing".
+
+   4. ASK WHAT IS FINITE.
+        Intermittent, load-dependent failures are usually a
+        fixed-size resource - list registers, queue slots,
+        shared-memory regions - overflowing for the first
+        time.
+
+   5. ASK WHAT THE HARDWARE GUARANTEES.
+        "Works on one machine, not another" is a memory
+        model or a feature-detection problem, not a logic
+        problem.
+
+   6. CHANGE ONE THING AND RE-MEASURE.
+        With exit counts as the metric, a regression is
+        visible in seconds rather than arguable for days.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+<tbody>
+<tr><td>No guest output, exits accumulating</td><td>The guest is fine; the console path is broken above
+it</td></tr>
+<tr><td>No guest output, zero exits</td><td>The guest is not running — entry, stage-2, or the boot
+address</td></tr>
+<tr><td>Hangs only under load</td><td>A fixed-size resource exhausted for the first time</td></tr>
+<tr><td>All vCPUs idle in <code>WFI</code></td><td>A lost interrupt; check the vGIC state to classify
+it</td></tr>
+<tr><td>Rare corruption on weakly ordered cores only</td><td>A missing barrier in a shared-memory
+protocol</td></tr>
+<tr><td>Clean under emulation, fails on hardware</td><td>Ordering, timing or a feature the emulator does not
+model</td></tr>
+<tr><td>Sudden large slowdown, no guest change</td><td>An exit storm — count them first</td></tr>
+<tr><td>Slow but exit counts are normal</td><td>Steal time or stage-2 TLB pressure, in that order</td></tr>
+<tr><td>Fault at a plausible-looking address</td><td>Decode the syndrome rather than guessing at the
+address</td></tr>
+<tr><td>Reproduces once a day</td><td>Add counters rather than trying to catch it live</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say which tool answers "is the guest running at all", and what its two answers mean.</li>
+  <li>Explain why "no output" does not imply the guest failed to start.</li>
+  <li>Name the three ways an interrupt can go missing, and how the vGIC state distinguishes them.</li>
+  <li>Explain why list-register exhaustion only appears under load.</li>
+  <li>Say why a virtio ordering bug never reproduces on x86.</li>
+  <li>Give the required publication order for a virtqueue and the load-bearing barrier.</li>
+  <li>Explain why a clean run under emulation is weak evidence for an ordering bug.</li>
+  <li>Describe how one trap bit tripled the cost of a workload.</li>
+  <li>State what you should measure after any trap-configuration change.</li>
+  <li>Give the six steps of the method, in order.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secure memory: carve-outs, TZASC and pools | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Secure memory: carve-outs, TZASC and pools</h1>
+<p class="lead">The secure world's memory is secure because a hardware filter in the interconnect refuses
+non-secure transactions to it. Configuring that filter correctly — and making sure the normal world never
+believes it owns the same addresses — is the single most common cause of a board that boots on QEMU and dies
+on real silicon.</p>
+
+<h2 id="how">What makes memory secure</h2>
+
+<p>Secure memory is not merely protected by permissions — it is invisible to the normal world, enforced by hardware outside the processor. How that partition is established is a boot-time decision.</p>
+
+<pre class="diagram">   Every bus transaction on an ARM SoC carries an extra signal:
+   AxPROT[1], the NS bit. 0 = secure, 1 = non-secure.
+
+     CPU at S-EL1  -> issues transactions with NS=0
+     CPU at EL1    -> NS=1
+     a DMA master  -> whatever the SMMU/interconnect assigns it
+
+   A filter in the path enforces a region policy:
+
+     TZASC / TZC-400   for DRAM
+     TZPC              for peripherals
+     vendor XPU / RPU  the same idea, different name
+                       (see the isolation track, ch. 17-20)
+
+   +--------+     +---------------------+     +-----------+
+   |  CPU   |---&gt;|  TZC-400            |---&gt;|   DRAM    |
+   | NS bit |     |  region 0: 0-1GB    |     |           |
+   +--------+     |    NS read/write OK |     +-----------+
+                  |  region 1: 1GB-1.5GB|
+                  |    SECURE ONLY      |
+                  |    NS access -&gt;     |
+                  |    DECERR or RAZ/WI |
+                  +---------------------+
+
+   A non-secure read of a secure region returns zeros or an
+   external abort, depending on how the filter is configured.
+   It NEVER returns the data.
+
+   Crucially: this is enforced in the INTERCONNECT, not in the
+   CPU. So it also stops a DMA-capable peripheral that the
+   normal world programmed. That is the whole reason it exists
+   rather than relying on the MMU.</pre>
+
+<div class="key">
+<b>Who programs the filter</b>
+<p>Early secure firmware — BL2 or BL31 — configures the TZASC before any non-secure code runs, and then
+<em>locks</em> it. If the normal world could reconfigure it, the protection would be worthless. On a real
+port, the TZASC setup lives in your platform's TF-A code and is one of the first things to get right.</p>
+</div>
+
+<h2 id="map">The memory map, concretely</h2>
+
+<p>What actually sits in secure memory, and how much of it there is, is fixed at build or boot and is usually far smaller than people expect.</p>
+
+<pre><code>/* optee_os/core/arch/arm/plat-vexpress/platform_config.h    */
+
+#define TZDRAM_BASE   0x0e100000     /* secure DRAM starts     */
+#define TZDRAM_SIZE   0x03000000     /* 48 MB                  */
+
+#define TEE_RAM_START      TZDRAM_BASE
+#define TEE_RAM_VA_SIZE    (4 * 1024 * 1024)    /* core: 4 MB  */
+
+#define TA_RAM_START  (TEE_RAM_START + TEE_RAM_VA_SIZE)
+#define TA_RAM_SIZE   (TZDRAM_SIZE - TEE_RAM_VA_SIZE)
+                                      /* TAs: the remaining
+                                         44 MB                 */
+
+#define TEE_SHMEM_START  0x42000000  /* NON-secure shared      */
+#define TEE_SHMEM_SIZE   0x00200000  /* 2 MB                   */
+
+/* Which produces:
+
+   0x40000000  +--------------------------+
+               |  normal-world DRAM       |  Linux lives here
+   0x0e100000  +--------------------------+  &lt;- must NOT
+               |  TEE_RAM   4 MB SECURE   |     overlap!
+   0x0e500000  +--------------------------+
+               |  TA_RAM   44 MB SECURE   |
+   0x11100000  +--------------------------+
+   ...
+   0x42000000  +--------------------------+
+               |  SHM  2 MB NON-SECURE    |  both worlds
+   0x42200000  +--------------------------+
+
+   THE INVARIANT: the normal world's device tree must describe
+   its RAM as excluding every secure region, and the TZASC must
+   protect exactly the regions OP-TEE claims. Three descriptions
+   of the same memory - platform_config.h, the TZASC
+   programming, and the non-secure device tree - and all three
+   must agree.
+
+   Disagreement produces:
+     DT includes secure RAM -> Linux allocates there -> reads
+        return zeros -> random corruption, unattributable
+     TZASC protects less than OP-TEE claims -> the secure world
+        is NOT actually protected, and everything appears to
+        work perfectly
+     TZASC protects more -> OP-TEE or Linux takes an external
+        abort on a legitimate access                          */</code></pre>
+
+<pre><code># Confirm the normal world's view excludes secure regions:
+$ cat /proc/iomem | head
+40000000-41ffffff : System RAM
+42200000-7fffffff : System RAM
+# note the gap at 0x42000000-0x421fffff - that is the shared
+# memory carve-out, correctly excluded.
+
+$ dtc -I fs -O dts /sys/firmware/devicetree/base | grep -A3 'memory@'
+    memory@40000000 {
+        reg = &lt;0x00 0x40000000 0x00 0x40000000&gt;;
+        device_type = "memory";
+    };
+
+# And reserved regions:
+$ ls /sys/firmware/devicetree/base/reserved-memory/
+$ cat /proc/device-tree/reserved-memory/*/reg | xxd
+
+# The definitive test on real hardware: from Linux, try to read
+# an address OP-TEE claims. It must return zeros or fault, not
+# data.
+$ sudo devmem2 0x0e100000 w
+# /dev/mem access to a secure address should not show you
+# OP-TEE's code. If it does, the TZASC is not configured.</code></pre>
+
+<h2 id="pools">The allocation pools</h2>
+
+<p>The trusted OS divides its memory into pools with different properties and different users. Knowing which pool an allocation comes from explains several failure modes.</p>
+
+<pre><code>/* OP-TEE has no general heap. It has a small number of pools,
+   each sized at build time, each for one purpose.           */
+
+  TEE_RAM        the core's own .text/.data/.bss plus
+                 - thread stacks: CFG_NUM_THREADS x
+                                  CFG_STACK_THREAD_SIZE
+                 - the core heap: CFG_CORE_HEAP_SIZE
+                                  (default 65536 bytes)
+                   used by malloc() inside the core
+
+  TA_RAM         one region per loaded TA, containing its
+                 code, data, stack and heap. Sized per TA by
+                 its own header:
+                     TA_STACK_SIZE
+                     TA_DATA_SIZE
+                 A TA is mapped here when loaded and unmapped
+                 when the last session closes.
+
+  SHM            the non-secure shared memory pool. Chapter 7.
+
+  SDP            secure data path buffers, if
+                 CFG_SECURE_DATA_PATH=y - for media pipelines
+                 where a decoder must write into memory the
+                 normal world cannot read.
+
+/* Budgeting, worked:
+
+     TZDRAM_SIZE                          48 MB
+   - TEE_RAM (core code+data+heap+stacks)  4 MB
+   = TA_RAM                               44 MB
+
+     one TA with TA_DATA_SIZE = 1 MB, TA_STACK_SIZE = 32 KB,
+     plus its code, mapped with 4 KB granularity
+       -> roughly 1.2 MB resident while a session is open
+
+     so ~35 concurrent TA instances before TA_RAM is exhausted.
+
+   In practice you hit CFG_NUM_THREADS (8 concurrent calls)
+   long before you hit TA_RAM - but a TA that leaks sessions
+   will find this limit, and the error is
+   TEE_ERROR_OUT_OF_MEMORY at session open.                  */</code></pre>
+
+<pre><code># Watch memory usage. Requires CFG_WITH_STATS=y.
+$ xtest --stats
+
+TEE stats:
+  Pool: TEE_RAM
+    Allocated: 1048576, Max allocated: 1187840, Size: 4194304
+  Pool: TA_RAM
+    Allocated: 2097152, Max allocated: 4194304, Size: 46137344
+
+# "Max allocated" is the high-water mark - the number that
+# tells you whether you are close to the limit. Watch it
+# during a stress run, not at idle.
+
+# From the secure console, with debug logging:
+D/TC:0   tee_mm_alloc:...  0x0e500000 size 0x120000
+D/TC:0   tee_mm_free:...</code></pre>
+
+<div class="warn">
+<b>Sizing is a platform decision made once</b>
+<p><code>TZDRAM_SIZE</code> must be chosen before the TZASC is programmed and before the non-secure device
+tree is written. Growing it later means changing firmware, the device tree and possibly a signed boot image
+in lockstep. Size it generously at the start of a project — secure DRAM is cheap; a field update to three
+components is not.</p>
+</div>
+
+<h2 id="sdp">Secure data path, briefly</h2>
+
+<p>Some data must be protected from the normal world while still being processed by devices — a decoded video frame, for instance. That requires the SMMU and the memory partitioning to cooperate.</p>
+
+<pre><code>/* The problem: a DRM video pipeline decodes protected content.
+   The decoded frames must reach the display without the normal
+   world ever being able to read them - but the decoder and the
+   display controller are normal-world-programmed hardware.
+
+   The answer: buffers in SECURE memory, with those two
+   specific DMA masters permitted to access them by the SMMU
+   and the TZASC, while the CPU in the normal world is not.
+
+     CFG_SECURE_DATA_PATH=y
+     CFG_TEE_SDP_MEM_BASE / CFG_TEE_SDP_MEM_SIZE
+
+   Linux allocates from a dmabuf heap backed by that region;
+   the buffers can be passed to the decoder and the display but
+   never mapped by an application.
+
+   $ ls /dev/dma_heap/
+   linux,cma  system  sdp
+
+   This is the mechanism behind Widevine L1 and PlayReady
+   SL3000, and it is the reason "secure playback" requires
+   platform support rather than just a TA.                   */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Boots on QEMU, random corruption on hardware</td><td>Non-secure device tree includes secure RAM; Linux
+allocated in it</td></tr>
+<tr><td>Linux reads zeros from a region it thinks it owns</td><td>Same — the TZASC is doing its job</td></tr>
+<tr><td>Everything works but a security review fails</td><td>TZASC not configured at all; the "secure" region is
+readable from Linux</td></tr>
+<tr><td>External abort during OP-TEE boot</td><td>TZASC protects a region OP-TEE needs to access as non-secure,
+or vice versa</td></tr>
+<tr><td><code>TEE_ERROR_OUT_OF_MEMORY</code> opening a session</td><td>TA_RAM exhausted — leaked sessions, or
+<code>TZDRAM_SIZE</code> too small</td></tr>
+<tr><td>Core panics allocating in a deep call chain</td><td><code>CFG_CORE_HEAP_SIZE</code> too small</td></tr>
+<tr><td>TA panics with a stack overflow under load</td><td><code>TA_STACK_SIZE</code> too small</td></tr>
+<tr><td>Works with one TA, fails when a second is loaded</td><td>TA_RAM budget</td></tr>
+<tr><td>Secure playback shows a black screen</td><td>SDP region not configured, or the display controller's
+StreamID not permitted</td></tr>
+<tr><td>TZASC settings lost after suspend/resume</td><td>Not restored on resume — the filter is per-boot state
+that PSCI resume must re-establish</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what physically makes a region of DRAM secure, and where the enforcement happens.</li>
+  <li>Say why enforcement in the interconnect matters more than enforcement in the MMU.</li>
+  <li>Name who programs the TZASC and why it must be locked.</li>
+  <li>Name the three descriptions of memory that must agree, and give a failure for each
+  disagreement.</li>
+  <li>Draw the QEMU memory map with TEE_RAM, TA_RAM and SHM.</li>
+  <li>Name the four allocation pools and what each holds.</li>
+  <li>Budget TA_RAM for a given <code>TZDRAM_SIZE</code> and TA footprint.</li>
+  <li>Explain why "max allocated" is the number to watch.</li>
+  <li>Verify from Linux that a secure region is genuinely inaccessible.</li>
+  <li>Explain what a secure data path is for and why it needs platform support.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

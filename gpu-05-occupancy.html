@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Occupancy and latency hiding | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Occupancy and latency hiding</h1>
+<p class="lead">Occupancy is how many warps are resident on an SM as a fraction of the maximum. It is the
+knob everyone tunes first and the one most often misunderstood: more is not always better, and 100% occupancy
+is frequently the wrong target.</p>
+
+<h2 id="budget">Three budgets, and the smallest wins</h2>
+
+<pre class="diagram">   An SM has fixed resources. A block consumes some of each.
+   The number of resident blocks is the MINIMUM across all
+   limits.
+
+   Typical modern SM:
+     max warps resident ....... 64      (2048 threads)
+     max blocks resident ...... 16-32
+     register file ............ 65,536 x 32-bit
+     shared memory ............ up to 164 KB
+
+   WORKED EXAMPLE
+     block = 256 threads = 8 warps
+     registers per thread = 40
+     shared memory per block = 8 KB
+
+     by warps:      64 / 8            = 8 blocks
+     by registers:  65536 / (256*40)  = 6.4  -> 6 blocks
+     by shared mem: 164 KB / 8 KB     = 20 blocks
+     by block limit:                    16 blocks
+
+     LIMIT = 6 blocks = 48 warps = 48/64 = 75% occupancy
+     and REGISTERS are the binding constraint.
+
+   NOW ADD ONE VARIABLE that pushes registers to 48:
+     by registers: 65536 / (256*48)   = 5.3  -> 5 blocks
+     = 40 warps = 62% occupancy
+
+   One local variable cost you 13% of your occupancy. This is
+   why GPU performance is famously sensitive to trivial code
+   changes, and why "register pressure" is a phrase you will
+   hear constantly.</pre>
+
+<pre><code># Find out which budget binds, before guessing.
+$ nvcc -Xptxas -v --generate-line-info kernel.cu
+ptxas info : Compiling entry function '_Z6kernelPfS_i'
+ptxas info : Function properties for _Z6kernelPfS_i
+             0 bytes stack frame, 0 bytes spill stores,
+             0 bytes spill loads                &lt;-- WATCH THIS
+ptxas info : Used 40 registers, 8192 bytes smem, 380 bytes cmem[0]
+
+# Non-zero spill stores/loads means registers overflowed into
+# LOCAL memory - which is global memory with a friendly name,
+# 400+ cycles away. A spilling kernel is usually far worse
+# than a lower-occupancy one that does not spill.
+
+$ ncu --set full ./app          # reports achieved occupancy,
+                                # not just theoretical
+
+# Cap registers to raise occupancy - and measure, because it
+# may cause spills that cost more than the occupancy gained:
+$ nvcc -maxrregcount=32 kernel.cu
+  __launch_bounds__(256, 4)     /* 256 threads, want 4 blocks
+                                   per SM - lets the compiler
+                                   budget registers itself   */</code></pre>
+
+<h2 id="enough">How much is enough</h2>
+
+<pre class="diagram">   Occupancy exists to hide latency. Once latency is hidden,
+   more occupancy buys NOTHING.
+
+   THE LITTLE'S LAW VIEW
+     needed parallelism = latency x throughput
+
+     to hide a 500-cycle memory latency on an SM that issues
+     4 instructions/cycle, you need ~2000 instructions in
+     flight. If each warp has 10 independent instructions
+     between dependent loads, that is 200 warp-instructions -
+     roughly 25 warps.
+
+   TYPICAL SHAPE OF THE CURVE
+
+     performance
+        |            ....------------------  flat
+        |         ..
+        |       .
+        |     .
+        |   .
+        | .
+        +------------------------------------- occupancy
+        0%   25%   50%   75%   100%
+
+     The knee is usually between 25% and 50%. Past it you are
+     tuning a number that does not affect the outcome.
+
+   AND THE CURVE CAN GO DOWN:
+     * more warps share the same L1 and L2, so each gets less
+       cache. A tiled kernel with a working set that fits at
+       50% occupancy may thrash at 100%.
+     * fewer registers per thread means less data kept close,
+       so more memory traffic.
+
+   INSTRUCTION-LEVEL PARALLELISM SUBSTITUTES FOR OCCUPANCY.
+   Volkov's well-known result: a kernel where each thread
+   processes 4 independent elements can hit peak at 25%
+   occupancy, because the 4 loads are in flight simultaneously
+   from one warp. Fewer, fatter threads often beat more,
+   thinner ones.</pre>
+
+<div class="key">
+<b>The right question</b>
+<p>Not "how do I get to 100% occupancy" but "am I latency-bound, bandwidth-bound or compute-bound?" Occupancy
+only helps the first. If you are already at 80% of peak memory bandwidth, no amount of extra occupancy
+matters — you need to move fewer bytes (<a href="gpu-04-memory-hierarchy.html">chapter 4</a>). Nsight's
+Speed-of-Light section answers this in one screen and should be the first thing you look at.</p>
+</div>
+
+<h2 id="ilp">Trading occupancy for work per thread</h2>
+
+<pre><code>/* ONE ELEMENT PER THREAD - maximum occupancy, minimum ILP.
+   Each thread issues one load and then waits.              */
+__global__ void v1(float *out, const float *a, const float *b, int n)
+{
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i &lt; n) out[i] = a[i] * b[i];
+}
+
+/* FOUR ELEMENTS PER THREAD - fewer warps, but four
+   INDEPENDENT loads in flight per thread. The scheduler can
+   overlap them without needing another warp.               */
+__global__ void v4(float4 *out, const float4 *a, const float4 *b, int n4)
+{
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i &lt; n4) {
+                float4 x = a[i];        /* ONE 16-byte load -
+                                           wider transactions,
+                                           fewer of them      */
+                float4 y = b[i];
+                out[i] = make_float4(x.x*y.x, x.y*y.y,
+                                     x.z*y.z, x.w*y.w);
+        }
+}
+/* Two wins at once:
+     - vectorised loads (float4 = 16 bytes) use the memory
+       system better than four separate 4-byte loads
+     - more independent work per thread, so lower occupancy
+       still hides the latency
+
+   Requires 16-byte alignment. cudaMalloc guarantees 256-byte
+   alignment, so the base is fine; an offset into the middle
+   of an array may not be.
+
+   THE GENERAL TECHNIQUE is called THREAD COARSENING, and it
+   is usually worth trying 2 or 4 elements per thread before
+   any other optimisation.                                   */</code></pre>
+
+<h2 id="blocksize">Choosing a block size</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Size</th><th>Warps</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>32</td><td>1</td><td>Too small — the block limit (16–32 blocks) caps you at 32 warps before any other
+resource does</td></tr>
+<tr><td>128</td><td>4</td><td>Good default. Divides evenly into most SM limits, flexible for the
+scheduler</td></tr>
+<tr><td>256</td><td>8</td><td>The most common choice. Good balance of granularity and overhead</td></tr>
+<tr><td>512</td><td>16</td><td>Fine if register use is low; coarse granularity wastes an SM on the tail</td></tr>
+<tr><td>1024</td><td>32</td><td>Maximum. Only one or two blocks fit, so a single barrier stalls half the SM.
+Rarely best</td></tr>
+<tr><td>Not a multiple of 32</td><td>—</td><td>Always wrong. The final warp runs with idle lanes</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Do not guess - ask the runtime. */
+int block, grid;
+cudaOccupancyMaxPotentialBlockSize(&amp;grid, &amp;block, my_kernel, 0, 0);
+my_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...);
+
+/* Or query for a specific choice: */
+int blocks_per_sm;
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &amp;blocks_per_sm, my_kernel, 256, 0);
+
+/* AND SIZE THE GRID FOR THE MACHINE, not for the data, when
+   using a grid-stride loop (chapter 4): */
+int nsm;
+cudaDeviceGetAttribute(&amp;nsm, cudaDevAttrMultiProcessorCount, 0);
+int grid = nsm * blocks_per_sm;     /* fill the GPU exactly    */
+
+/* THE TAIL EFFECT, worth knowing:
+     108 SMs, 110 blocks -> the last 2 blocks run alone while
+     106 SMs idle. The kernel takes twice as long as the work
+     requires. Either round the grid to a multiple of the SM
+     count with a grid-stride loop, or use many small blocks
+     so the imbalance is proportionally tiny.                */</code></pre>
+
+<div class="warn">
+<b>Register spilling beats occupancy every time</b>
+<p>Forcing <code>-maxrregcount=32</code> to reach 100% occupancy, and thereby spilling ten registers to local
+memory, is a large net loss: each spill is a global-memory round trip in the inner loop. Always check the
+<code>ptxas</code> spill counters after changing register limits. Zero spills at 50% occupancy is almost
+always better than heavy spilling at 100%.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Low achieved occupancy, low performance</td><td>Register or shared-memory pressure — check
+<code>-Xptxas -v</code></td></tr>
+<tr><td>Adding a variable halved throughput</td><td>Crossed a register threshold, evicting a resident
+block</td></tr>
+<tr><td>Raising occupancy changed nothing</td><td>You were bandwidth- or compute-bound, not
+latency-bound</td></tr>
+<tr><td>Raising occupancy made it slower</td><td>Cache thrashing, or spills introduced by the register
+cap</td></tr>
+<tr><td>Achieved occupancy far below theoretical</td><td>Load imbalance, or the tail effect — some SMs finish
+early</td></tr>
+<tr><td>Kernel time does not scale with grid size</td><td>The tail: a partial final wave of blocks</td></tr>
+<tr><td>Block size 1024 is slower than 256</td><td>Coarse granularity and barrier cost across 32
+warps</td></tr>
+<tr><td>Non-zero spill stores in the build log</td><td>Registers exhausted — reduce live values or raise the
+cap</td></tr>
+<tr><td>Four elements per thread beat one</td><td>ILP substituting for occupancy, plus wider
+transactions</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define occupancy and name the four budgets that limit it.</li>
+  <li>Work an example and identify the binding constraint.</li>
+  <li>Explain why one extra variable can cost 13% occupancy.</li>
+  <li>Use Little's law to estimate the warps needed to hide a 500-cycle latency.</li>
+  <li>Draw the occupancy-versus-performance curve and mark the knee.</li>
+  <li>Give two reasons more occupancy can reduce performance.</li>
+  <li>Explain how ILP substitutes for occupancy, with an example.</li>
+  <li>Say why block sizes must be multiples of 32 and why 1024 is rarely best.</li>
+  <li>Describe the tail effect and two ways to avoid it.</li>
+  <li>Explain why zero spills at 50% occupancy usually beats spilling at 100%.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

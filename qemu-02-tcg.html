@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCG: how emulation actually works | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TCG: how emulation actually works</h1>
+<p class="lead">QEMU does not interpret instructions one at a time — that would be a hundred times slower
+still. It translates blocks of guest code into host code, caches them, and chains them together so that
+straight-line guest execution never returns to the translator. Understanding that machinery explains every
+performance surprise and every debugging limitation you will meet.</p>
+
+<h2 id="idea">Translate, cache, chain</h2>
+
+<pre class="diagram">   guest PC = 0x40080000, nothing cached
+        |
+        v
+   +--------------------------------------------------+
+   | 1. FIND: is there a translation block for this   |
+   |    (PC, CPU flags, MMU mode)?  No.               |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 2. TRANSLATE. Decode guest instructions from the |
+   |    PC until a branch, a system instruction, or a |
+   |    page boundary. Emit TCG IR - a small, target- |
+   |    independent RISC-like intermediate language.  |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 3. OPTIMISE the IR: dead code, constant folding, |
+   |    liveness. Cheap passes only - translation time|
+   |    is on the critical path.                      |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 4. EMIT host machine code into the code cache.   |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 5. EXECUTE it. Guest registers live in a struct  |
+   |    (CPUARMState); the emitted code loads and     |
+   |    stores them.                                  |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 6. CHAIN. If the block ends in a direct branch   |
+   |    to a block already translated, PATCH the jump |
+   |    so it goes straight there next time, without  |
+   |    returning to the dispatcher at all.           |
+   +--------------------------------------------------+
+
+   A hot loop therefore becomes host code jumping directly to
+   host code. The translator runs once. That is why TCG is
+   10-50x slower than native and not 1000x.</pre>
+
+<h2 id="ir">The intermediate representation</h2>
+
+<pre><code># See it for yourself. This is the single most useful QEMU
+# debugging flag nobody knows about.
+
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic \
+    -kernel Image -d in_asm,op,out_asm 2&gt;trace.log
+
+# Or, more usefully, on a single small binary:
+$ qemu-aarch64 -d in_asm,op,out_asm ./hello 2&gt;trace.log
+
+----------------
+IN: main                      &lt;-- the GUEST instructions
+0x00400594:  d10083ff  sub sp, sp, #0x20
+0x00400598:  a9017bfd  stp x29, x30, [sp, #16]
+0x0040059c:  910043fd  add x29, sp, #0x10
+0x004005a0:  94000010  bl  #+0x40
+
+OP:                           &lt;-- the TCG IR
+ ld_i64 tmp0,env,$0xffffffffffffffd8
+ movi_i64 tmp1,$0x20
+ sub_i64 tmp0,tmp0,tmp1
+ st_i64 tmp0,env,$0xffffffffffffffd8
+ ...
+ goto_tb $0x0
+ exit_tb $0x7f2c14000043
+
+OUT: [size=124]               &lt;-- the HOST instructions
+0x7f2c14000000:  48 8b 6d f0    mov -0x10(%rbp),%rbp
+0x7f2c14000004:  48 83 ed 20    sub $0x20,%rbp
+...
+
+# The IR is deliberately tiny - about 150 operations. Adding a
+# new guest architecture means writing a FRONT END that emits
+# this IR; adding a new host means writing a BACK END that
+# consumes it. That N+M rather than N*M structure is why QEMU
+# supports so many combinations.</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Shows</th><th>Volume</th></tr></thead>
+<tbody>
+<tr><td><code>-d in_asm</code></td><td>Guest instructions as they are translated</td><td>One line per
+instruction, once per block</td></tr>
+<tr><td><code>-d op</code></td><td>TCG IR before optimisation</td><td>Large</td></tr>
+<tr><td><code>-d op_opt</code></td><td>IR after optimisation</td><td>Large</td></tr>
+<tr><td><code>-d out_asm</code></td><td>Emitted host code</td><td>Large</td></tr>
+<tr><td><code>-d exec</code></td><td>Every block <em>execution</em></td><td>Enormous — this is the one that
+traces control flow</td></tr>
+<tr><td><code>-d cpu</code></td><td>Full register dump at each block</td><td>Enormous</td></tr>
+<tr><td><code>-d int</code></td><td>Every exception and interrupt taken</td><td>Modest — extremely
+useful</td></tr>
+<tr><td><code>-d mmu</code></td><td>MMU faults and translation</td><td>Modest</td></tr>
+<tr><td><code>-d guest_errors</code></td><td>Guest doing something invalid</td><td>Small — always turn this
+on</td></tr>
+<tr><td><code>-d unimp</code></td><td>Unimplemented device or CPU features</td><td>Small — always turn this
+on</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="helpers">Helpers: the escape hatch</h2>
+
+<pre><code>/* Some guest instructions are too complex to express in 150 IR
+   operations. For those, TCG emits a CALL to a C function
+   called a HELPER.                                          */
+
+/* target/arm/helper.c - a real one, simplified: */
+
+void HELPER(msr_i_daifset)(CPUARMState *env, uint32_t imm)
+{
+        env-&gt;daif |= (imm &lt;&lt; 6) &amp; PSTATE_DAIF;
+        arm_rebuild_hflags(env);
+}
+
+/* And in the translator, target/arm/translate-a64.c: */
+
+    gen_helper_msr_i_daifset(cpu_env, tcg_constant_i32(imm));
+
+/* What becomes a helper:
+     - system register access
+     - MMU translation (the slow path; the fast path is the
+       software TLB, below)
+     - floating point and SIMD, mostly
+     - cryptographic instructions
+     - anything touching CPU mode or exception state
+
+   What stays in IR:
+     - arithmetic, logic, shifts
+     - loads and stores (fast path)
+     - branches
+
+   A helper call costs a real host function call, so an
+   instruction that becomes a helper is far slower than one
+   that does not. This is why FP-heavy code is
+   disproportionately slow under TCG, and why crypto benchmarks
+   inside QEMU are meaningless.                              */</code></pre>
+
+<h2 id="softmmu">The software TLB</h2>
+
+<pre class="diagram">   Every guest load and store needs a guest-virtual to
+   host-virtual translation. Doing a full page-table walk in
+   software per access would be catastrophic, so TCG keeps a
+   direct-mapped software TLB and inlines the lookup.
+
+   Emitted code for a guest LDR, conceptually:
+
+     index = (guest_addr &gt;&gt; 12) & (CPU_TLB_SIZE - 1)
+     entry = env-&gt;tlb_table[mmu_idx][index]
+
+     if (entry.addr_read == (guest_addr & TARGET_PAGE_MASK)) {
+             /* FAST PATH: a few host instructions            */
+             host_addr = guest_addr + entry.addend;
+             value = *(uint64_t *)host_addr;
+     } else {
+             /* SLOW PATH: call a helper that walks the guest
+                page tables, fills the TLB entry, and may
+                raise a guest fault - or dispatches to a
+                DEVICE MODEL if the address is MMIO.          */
+             value = helper_ldq_mmu(env, guest_addr, oi, ra);
+     }
+
+   Consequences you can feel:
+
+   * A guest that thrashes its own TLB thrashes QEMU's too, and
+     the slow path is a C function call plus a walk.
+   * MMIO is ALWAYS the slow path, by construction - that is
+     how device models get called.
+   * mmu_idx encodes the exception level and translation
+     regime, so a guest that switches EL frequently invalidates
+     less than you would fear but still pays.
+   * Flushing: any guest TLBI causes QEMU to flush its software
+     TLB. A guest doing aggressive TLB maintenance is slow
+     under TCG for a reason that does not exist on hardware.</pre>
+
+<h2 id="invalidate">Self-modifying code and page protection</h2>
+
+<pre><code>/* The cached translation is only valid while the guest code it
+   came from is unchanged. If the guest rewrites its own
+   instructions - JIT compilers, bootloaders relocating
+   themselves, module loaders - QEMU must notice.
+
+   Mechanism: any guest page that has been translated is
+   marked, and writes to it are detected. The affected
+   translation blocks are invalidated and retranslated.     */
+
+  Symptoms of a guest that fights this:
+
+    * A JIT (a JVM, V8, or the kernel's BPF JIT) inside a TCG
+      guest is dramatically slower than the rest of the guest,
+      because it repeatedly invalidates translations.
+
+    * A guest that writes data into the same PAGE as code -
+      even not overlapping the code - triggers invalidation.
+      Literal pools next to code, or a bootloader keeping
+      variables in its text section, do this.
+
+  Tuning the code cache, which matters for large guests:
+
+$ qemu-system-aarch64 -accel tcg,tb-size=512 ...
+      # 512 MB of translation cache. Default is smaller and is
+      # sized from RAM. A large kernel plus a large userspace
+      # can thrash a small cache, and the symptom is a guest
+      # that gets SLOWER the longer it runs.
+
+$ qemu-system-aarch64 -accel tcg,one-insn-per-tb=on ...
+      # one guest instruction per block. Very slow, but exact:
+      # every instruction boundary is a block boundary, so
+      # breakpoints, tracing and -d exec become precise.</code></pre>
+
+<div class="warn">
+<b>What TCG does not model</b>
+<p>Caches, pipelines, branch prediction, memory latency, DVFS, and real interrupt timing. A cycle count from
+TCG is not merely inaccurate — it is meaningless. Use TCG to prove that logic is correct and to observe what
+the guest <em>did</em>; use hardware or KVM to find out how long it takes.</p>
+</div>
+
+<h2 id="plugins">TCG plugins</h2>
+
+<pre><code># Since QEMU 4.2 you can load a shared library that gets called
+# on translation and execution events. This is the closest
+# thing to a hardware trace probe that costs nothing.
+
+$ ls /usr/lib/qemu/         # or build them from tests/plugin/
+libinsn.so  libmem.so  libhotblocks.so  libhotpages.so
+libcache.so libhowvec.so
+
+# Count every instruction executed:
+$ qemu-aarch64 -plugin /usr/lib/qemu/libinsn.so -d plugin ./workload
+insns: 48120311
+
+# Find the hottest basic blocks:
+$ qemu-system-aarch64 -M virt -kernel Image \
+    -plugin /usr/lib/qemu/libhotblocks.so -d plugin ...
+collected 25011 entries
+pc, hits, insns
+0x40081234, 1204551, 12
+0x40095678,  883012,  8
+
+# Model a cache and count misses - a real one, not a guess:
+$ qemu-system-aarch64 ... \
+    -plugin /usr/lib/qemu/libcache.so,dcachesize=32768,\
+dassoc=4,dblksize=64
+
+# Trace every memory access:
+$ qemu-aarch64 -plugin /usr/lib/qemu/libmem.so,inline=on ./prog
+
+# Writing your own is ~100 lines: register callbacks in
+# qemu_plugin_install(), then use
+#   qemu_plugin_register_vcpu_insn_exec_cb()
+#   qemu_plugin_register_vcpu_mem_cb()
+# This is how you answer "how many times does my driver touch
+# that register?" without changing the driver.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest gets slower the longer it runs</td><td>Code cache thrashing — raise
+<code>tb-size</code></td></tr>
+<tr><td>A JIT inside the guest is pathologically slow</td><td>Self-modifying-code invalidation; unavoidable
+under TCG</td></tr>
+<tr><td>FP or crypto benchmarks absurdly slow</td><td>Those instructions become helper calls</td></tr>
+<tr><td>Breakpoint fires at the wrong instruction</td><td>Block-granular execution; use
+<code>one-insn-per-tb=on</code></td></tr>
+<tr><td><code>-d exec</code> produces gigabytes</td><td>Working as intended. Filter with
+<code>-D file</code> and a narrow window</td></tr>
+<tr><td>Guest hits an instruction QEMU does not implement</td><td><code>-d unimp</code> will say so — always
+enable it during bring-up</td></tr>
+<tr><td>Device access silently returns zero</td><td>No model at that address; <code>-d guest_errors</code>
+reports it</td></tr>
+<tr><td>Timing-dependent code behaves differently every run</td><td>Use <code>-icount</code> to make runs
+deterministic</td></tr>
+<tr><td>Guest TLB-heavy workload disproportionately slow</td><td>Every guest <code>TLBI</code> flushes QEMU's
+software TLB</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the six steps from an untranslated guest PC to executing host code.</li>
+  <li>Explain block chaining and why it is the reason TCG is not catastrophically slow.</li>
+  <li>Explain the N+M structure of front ends and back ends around the IR.</li>
+  <li>Define a helper and name three instruction classes that become one.</li>
+  <li>Describe the software TLB fast path and say what always takes the slow path.</li>
+  <li>Explain why a guest JIT is slow under TCG.</li>
+  <li>Name five <code>-d</code> flags and say what each is for.</li>
+  <li>List four things TCG does not model, and say what that invalidates.</li>
+  <li>Use a TCG plugin to count instructions or find hot blocks.</li>
+  <li>Explain what <code>one-insn-per-tb=on</code> changes and when you would pay for it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

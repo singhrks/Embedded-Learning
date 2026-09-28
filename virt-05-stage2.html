@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage-2 translation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Stage-2 translation</h1>
+<p class="lead">The guest builds page tables and believes their output is a physical address. It is not — it
+is an <em>intermediate</em> physical address, and a second, entirely separate MMU translation that the guest
+cannot see or configure turns it into the real thing. This is the mechanism that makes modern virtualisation
+cheap.</p>
+
+<h2 id="ipa">Three address spaces, not two</h2>
+
+<p>Virtualisation inserts a third address space between the two you already know, and almost every confusion in this chapter comes from losing track of which one is being discussed.</p>
+
+<pre class="diagram">   BARE METAL                    UNDER A HYPERVISOR
+
+   VA  virtual address           VA   virtual address
+    |   stage 1                   |    stage 1  - the GUEST'S tables,
+    |   TTBR0/1_EL1               |    TTBR0/1_EL1, guest-controlled
+    v                             v
+   PA  physical address          IPA  INTERMEDIATE physical address
+    |                             |      "what the guest calls physical"
+    v                             |    stage 2 - the HYPERVISOR'S tables,
+   memory                         |    VTTBR_EL2, guest cannot see them
+                                  v
+                                 PA   real physical address
+                                  |
+                                  v
+                                 memory
+
+   The guest's entire world model - "RAM starts at 0x4000_0000,
+   the UART is at 0x0900_0000" - is a statement about IPAs.
+   It can be completely false about PAs and the guest will never
+   know.
+
+   Crucially: the guest configures stage 1 FREELY. It writes
+   TTBR0_EL1 and TCR_EL1 without trapping (HCR_EL2.TVM is clear).
+   Whatever it produces is confined by stage 2 regardless.</pre>
+
+<div class="key">
+<b>Why this replaced shadow page tables</b>
+<p>Under shadow paging the hypervisor had to intercept every guest page-table edit and rebuild a composed
+table. Under stage 2 the hardware composes on the fly. The guest edits its own tables at full speed; the
+hypervisor only touches stage 2 when the <em>memory map</em> changes, which is rare. Fork-heavy workloads
+went from crippling to free.</p>
+</div>
+
+<h2 id="regs">The registers</h2>
+
+<p>A small set of registers configures the whole second stage. Each one answers a question the hardware cannot infer.</p>
+
+<pre><code>/* VTTBR_EL2 - Virtualisation Translation Table Base Register */
+
+   bits [47:1]   BADDR   physical base of the stage-2 table
+   bits [63:48]  VMID    the VM identity (or [63:56] if 8-bit)
+   bit  [0]      CnP     common-not-private
+
+/* One register carries BOTH the table pointer and the VM tag.
+   Switching VMs is therefore literally one MSR. That is not an
+   accident - it is what makes a vCPU switch affordable.       */
+
+
+/* VTCR_EL2 - Virtualisation Translation Control Register     */
+
+   T0SZ   [5:0]    input size: IPA space is (64 - T0SZ) bits
+   SL0    [7:6]    STARTING LEVEL of the stage-2 walk
+   IRGN0  [9:8]    inner cacheability of table walks
+   ORGN0  [11:10]  outer cacheability
+   SH0    [13:12]  shareability of table walks
+   TG0    [15:14]  granule: 00=4K, 01=64K, 10=16K
+   PS     [18:16]  physical address size
+   VS     [19]     VMID size: 0 = 8-bit, 1 = 16-bit
+   HA/HD  [21:22]  hardware access flag / dirty bit management
+   NSW/NSA         secure-world controls
+
+/* Example: 40-bit IPA space, 4K granule, 16-bit VMIDs */
+
+   T0SZ = 64 - 40 = 24
+   TG0  = 0b00
+   VS   = 1</code></pre>
+
+<h2 id="sl0">SL0: the part people get wrong</h2>
+
+<p>Stage 1 always starts its walk at a level implied by <code>TCR_EL1.T0SZ</code>. Stage 2 makes the starting
+level <em>explicit</em>, because the IPA space is usually smaller than a full 48-bit space and starting at
+level 0 would waste an entire table on one used entry. Getting <code>SL0</code> inconsistent with
+<code>T0SZ</code> is the classic silent stage-2 misconfiguration.</p>
+
+<pre class="diagram">   4K granule. Each level consumes 9 bits, leaf offset is 12.
+
+   IPA bits   levels needed         SL0 encoding   concat?
+   --------   --------------------  ------------   -------
+   &lt;= 30      2:  L2 -&gt; L3          0b00 (start 2)  no
+   31..39     3:  L1 -&gt; L2 -&gt; L3     0b01 (start 1)  maybe
+   40..48     4:  L0 -&gt; L1 -&gt;L2 -&gt;L3 0b10 (start 0)  maybe
+
+   The 40-bit case, worked:
+
+     IPA[39:30] -&gt; level 1 index   (10 bits, not 9!)
+     IPA[29:21] -&gt; level 2 index   (9 bits)
+     IPA[20:12] -&gt; level 3 index   (9 bits)
+     IPA[11:0]  -&gt; page offset
+
+   Ten bits at the top means 1024 entries, but a 4K table holds
+   only 512. Stage 2 solves this with CONCATENATED TABLES: you
+   allocate 2 contiguous 4K tables (8K, 8K-aligned) and the
+   hardware treats them as one 1024-entry table.
+
+   Stage 1 has no such feature. It is unique to stage 2, it
+   exists purely to avoid a wasteful extra level, and up to 16
+   tables may be concatenated.</pre>
+
+<div class="warn">
+<b>The concatenation trap</b>
+<p>If your IPA size requires concatenation and you allocate one table instead of two — or allocate two that
+are not <em>contiguous and aligned to the total size</em> — the walk reads garbage for the upper half of the
+address space. Low addresses work, so the guest boots; the failure appears only when it touches memory above
+the halfway mark. Diagnose it by checking that <code>VTTBR_EL2.BADDR</code> is aligned to
+<code>table_size * count</code>, not merely to 4K.</p>
+</div>
+
+<h2 id="descriptors">Stage-2 descriptors differ from stage-1</h2>
+
+<p>Stage-2 descriptors look like stage-1 descriptors and differ in several fields that matter — the permission encoding in particular is not the same.</p>
+
+<pre class="diagram">   Stage-2 block/page descriptor, lower attributes:
+
+    63    55 54 53 52  51        12 11 10 9  8  7 6 5 4    2 1 0
+   +--------+--+--+--+-------------+--+--+---+--+---+------+-+-+
+   | ignored|XN|  |CT| output addr |nG|AF| SH |S2AP| MemAttr |1|V|
+   +--------+--+--+--+-------------+--+--+---+--+---+------+-+-+
+
+   The important differences from stage 1:
+
+   S2AP [7:6]   access permissions - and they are ABSOLUTE, not
+                relative to a privilege level:
+                  00  no access
+                  01  read only
+                  10  write only   (yes, really)
+                  11  read/write
+                There is no "EL0 vs EL1" split here. Stage 2 does
+                not care which privilege level the guest was in;
+                that is stage 1's business.
+
+   MemAttr[5:2] memory attributes ENCODED DIRECTLY - there is no
+                MAIR indirection at stage 2:
+                  0b0000  Device-nGnRnE
+                  0b0001  Device-nGnRE
+                  0b0010  Device-nGRE
+                  0b0011  Device-GRE
+                  0b1111  Normal, inner+outer write-back cacheable
+                  0b0101  Normal, outer WT, inner non-cacheable
+                  ...
+
+   XN [54]      execute never. On ARMv8.2 this widens to XN[54:53]
+                so you can forbid execution at EL1 but allow it
+                at EL0, or vice versa.
+
+   AF [10]      access flag - set by hardware if VTCR_EL2.HA, else
+                a fault the hypervisor must service.</pre>
+
+<h2 id="combine">How the two stages combine</h2>
+
+<p>The two stages are not independent: permissions intersect and memory attributes combine by a rule the hypervisor cannot override. This is where a guest's expectations get quietly overruled.</p>
+
+<pre><code>/* PERMISSIONS: the strictest of the two wins. Always. */
+
+   stage 1 says RW, stage 2 says RO   -> read only
+   stage 1 says RO, stage 2 says RW   -> read only
+   stage 1 says X,  stage 2 says XN   -> no execute
+
+/* There is no way for a guest to widen a permission stage 2
+   denied. That is the isolation guarantee, in one line.     */
+
+
+/* MEMORY TYPE: the more restrictive/stronger type wins.      */
+
+   stage 1 Normal WB  + stage 2 Normal WB     -> Normal WB
+   stage 1 Normal WB  + stage 2 Device        -> DEVICE
+   stage 1 Device     + stage 2 Normal        -> Device
+   stage 1 Normal NC  + stage 2 Normal WB     -> Normal NC
+
+/* "Device beats Normal, non-cacheable beats cacheable."
+
+   This has a consequence people trip over constantly: if the
+   hypervisor maps guest RAM as Device at stage 2 (perhaps by
+   accident, perhaps because it came from a PCI BAR), then the
+   guest's careful Normal-cacheable mapping is DOWNGRADED. The
+   guest's unaligned accesses now fault, its exclusives may
+   fail, and its memcpy throughput collapses. The guest is
+   blameless and its page tables look perfect.               */
+
+/* HCR_EL2.DC and HCR_EL2.FWB modify this:
+
+   DC  = 1 : while the guest's stage-1 MMU is OFF, treat its
+             accesses as Normal cacheable rather than Device.
+             Used during guest boot so early code is coherent.
+
+   FWB = 1 : (ARMv8.4) "forced write-back" - stage 2 OVERRIDES
+             stage 1 rather than combining with it. Simplifies
+             the hypervisor enormously: you stop caring what the
+             guest chose. Modern KVM uses it where available.  */</code></pre>
+
+<h2 id="walk">The full walk, counted</h2>
+
+<p>Counting the actual memory accesses in a nested walk is the clearest way to see why TLB pressure matters so much more under virtualisation.</p>
+
+<pre class="diagram">   A single guest load, worst case, 4K granule, 48-bit VA,
+   40-bit IPA, cold TLB:
+
+   stage 1 walk needs 4 table reads (L0,L1,L2,L3).
+   BUT each of those reads produces an IPA, which must itself
+   be translated by stage 2 - and stage 2 is a 3-level walk.
+
+     s1 L0 descriptor address (an IPA) -> 3 stage-2 reads
+     s1 L1 descriptor address (an IPA) -> 3 stage-2 reads
+     s1 L2 descriptor address (an IPA) -> 3 stage-2 reads
+     s1 L3 descriptor address (an IPA) -> 3 stage-2 reads
+     final IPA from stage 1            -> 3 stage-2 reads
+     ------------------------------------------------------
+                                          15 stage-2 reads
+                                        +  4 stage-1 reads
+                                        = 19 memory accesses
+                                          for ONE load.
+
+   With a 4-level stage 2 it reaches 24. This is why:
+
+     * TLBs matter more under virtualisation, not less
+     * huge pages / blocks at stage 2 are a big win (they cut
+       stage-2 levels AND increase reach)
+     * the walk cache (intermediate descriptors) is critical
+     * VMID tagging is essential - flushing on every VM switch
+       would mean paying this cost constantly</pre>
+
+<h2 id="build">Building a stage-2 table</h2>
+
+<p>Building the tables is ordinary page-table code with a few stage-2 specific differences, and it is worth seeing concretely before reading a real hypervisor's version.</p>
+
+<pre><code>/* Minimal, illustrative. 4K granule, 40-bit IPA, so a 3-level
+   walk starting at level 1 with 2 concatenated L1 tables.    */
+
+#define S2_VALID      (1UL &lt;&lt; 0)
+#define S2_TABLE      (3UL &lt;&lt; 0)   /* valid + table            */
+#define S2_BLOCK      (1UL &lt;&lt; 0)   /* valid + block            */
+#define S2_PAGE       (3UL &lt;&lt; 0)   /* valid + page (level 3)   */
+#define S2_AF         (1UL &lt;&lt; 10)
+#define S2_SH_IS      (3UL &lt;&lt; 8)
+#define S2_AP_RW      (3UL &lt;&lt; 6)
+#define S2_AP_RO      (1UL &lt;&lt; 6)
+#define S2_MEM_NORMAL (0xfUL &lt;&lt; 2)
+#define S2_MEM_DEVICE (0x1UL &lt;&lt; 2)  /* Device-nGnRE            */
+#define S2_XN         (1UL &lt;&lt; 54)
+
+static u64 *l1;    /* 2 contiguous 4K pages, 8K-aligned        */
+
+void s2_map_block_2m(u64 ipa, u64 pa, bool device, bool exec)
+{
+        u64 *l2 = get_or_alloc_l2(l1, ipa);
+        u64  attr = S2_BLOCK | S2_AF | S2_SH_IS | S2_AP_RW
+                  | (device ? S2_MEM_DEVICE : S2_MEM_NORMAL)
+                  | (exec ? 0 : S2_XN);
+
+        l2[(ipa &gt;&gt; 21) & 0x1ff] = (pa & ~0x1fffffUL) | attr;
+
+        /* Publish before any walker can see it. */
+        dsb(ishst);
+}
+
+void s2_enable(u64 vttbr_base, u16 vmid)
+{
+        u64 vtcr = (24UL &lt;&lt; 0)       /* T0SZ: 40-bit IPA        */
+                 | (1UL  &lt;&lt; 6)       /* SL0 = 1: start level 1  */
+                 | (3UL  &lt;&lt; 8)       /* IRGN0 = WBWA            */
+                 | (3UL  &lt;&lt; 10)      /* ORGN0 = WBWA            */
+                 | (3UL  &lt;&lt; 12)      /* SH0 = inner shareable   */
+                 | (0UL  &lt;&lt; 14)      /* TG0 = 4K                */
+                 | (2UL  &lt;&lt; 16)      /* PS = 40-bit PA          */
+                 | (1UL  &lt;&lt; 19);     /* VS = 16-bit VMID        */
+
+        write_sysreg(vtcr, vtcr_el2);
+        write_sysreg(((u64)vmid &lt;&lt; 48) | vttbr_base, vttbr_el2);
+        isb();
+
+        /* Only now turn stage 2 on. */
+        write_sysreg(read_sysreg(hcr_el2) | HCR_VM, hcr_el2);
+        isb();
+}</code></pre>
+
+<h2 id="tlbi">Invalidating stage-2 entries</h2>
+
+<p>Stage-2 invalidation has its own instructions and its own scoping rules, and getting the scope wrong produces bugs that appear only under load.</p>
+
+<pre><code>/* Stage-2 has its own TLBI instructions, and they take IPAs. */
+
+    TLBI IPAS2E1IS,  x0    /* by IPA, current VMID, inner-shareable
+                              x0 = IPA &gt;&gt; 12                    */
+    TLBI IPAS2LE1IS, x0    /* ...last level only                */
+    TLBI VMALLS12E1IS      /* all stage-1 AND stage-2 entries for
+                              the current VMID                   */
+    TLBI ALLE1IS           /* all EL1 entries, all VMIDs         */
+    TLBI VMALLE1IS         /* stage-1 only, current VMID         */
+
+/* The sequence that actually works when you unmap a page: */
+
+    write the descriptor to 0
+    dsb(ishst);                 /* descriptor is visible         */
+    tlbi ipas2e1is, ipa &gt;&gt; 12;
+    dsb(ish);                   /* invalidation has completed    */
+    tlbi vmalle1is;             /* stage-1 entries CACHED THE
+                                   COMBINED translation - they
+                                   must go too!                  */
+    dsb(ish);
+    isb();
+
+/* That second TLBI surprises people. A stage-1 TLB entry holds
+   a VA -> PA mapping that already folded stage 2 in. Changing
+   stage 2 therefore invalidates stage-1 entries, even though
+   the guest's stage-1 tables did not change.                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest boots, then dies once it touches high memory</td><td>Concatenated tables not allocated
+contiguously or not aligned to the combined size</td></tr>
+<tr><td>Stage-2 walk reads nonsense immediately</td><td><code>SL0</code> inconsistent with
+<code>T0SZ</code> — the walk starts at the wrong level</td></tr>
+<tr><td>Guest memcpy is 10x slow; unaligned accesses fault</td><td>Guest RAM mapped as Device at stage 2; the
+combine rule downgraded the guest's Normal mapping</td></tr>
+<tr><td>Guest exclusives (<code>LDXR</code>/<code>STXR</code>) never succeed</td><td>Same cause — exclusives
+require Normal memory</td></tr>
+<tr><td>Guest sees stale data after the hypervisor remaps memory</td><td>Missing <code>TLBI VMALLE1IS</code>
+after the stage-2 invalidate</td></tr>
+<tr><td>Second VM sees the first VM's translations</td><td>VMID not changed, or VMID rollover without a global
+invalidate</td></tr>
+<tr><td>Guest cannot execute from a page it can read</td><td>Stage-2 <code>XN</code> set — common when memory
+was mapped through a device path</td></tr>
+<tr><td>Performance collapses under memory pressure</td><td>Stage 2 built entirely from 4K pages; no blocks, so
+every walk is maximal</td></tr>
+<tr><td>Works with the guest MMU off, breaks when it turns it on</td><td><code>HCR_EL2.DC</code> was papering
+over a stage-2 attribute mistake that becomes visible once stage 1 is live</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define VA, IPA and PA and say which software owns the translation between each pair.</li>
+  <li>Explain why stage 2 replaced shadow page tables and what it bought.</li>
+  <li>Explain what <code>VTTBR_EL2</code> holds besides a table address, and why that matters for switch
+  cost.</li>
+  <li>Given a 40-bit IPA and a 4K granule, work out <code>T0SZ</code>, <code>SL0</code> and whether
+  concatenation is needed.</li>
+  <li>Name three ways a stage-2 descriptor differs from a stage-1 one.</li>
+  <li>State the permission-combining rule and the memory-type-combining rule.</li>
+  <li>Explain how mapping guest RAM as Device at stage 2 breaks a guest that looks correct.</li>
+  <li>Count the memory accesses in a worst-case two-stage walk and say what reduces it.</li>
+  <li>Write the correct invalidation sequence for unmapping a stage-2 page, and justify the second
+  TLBI.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

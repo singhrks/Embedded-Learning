@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Register allocation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Register allocation</h1>
+<p class="lead">The IR has unlimited virtual registers; the machine has 31. Deciding which values live in
+registers and which get pushed to memory is an NP-complete problem the compiler solves thousands of times a
+second — and it explains why your variable "does not exist" in the debugger.</p>
+
+<h2 id="problem">The problem</h2>
+
+<pre class="diagram">   AFTER instruction selection:
+
+      %1 = ldr [%a]
+      %2 = ldr [%b]
+      %3 = add %1, %2
+      %4 = ldr [%c]
+      %5 = mul %3, %4
+      str [%d], %5
+
+   Six virtual registers. AArch64 has:
+
+      x0-x7     arguments and results     CALLER-saved
+      x8        indirect result location
+      x9-x15    temporaries               CALLER-saved
+      x16, x17  IP0, IP1 - linker veneers
+      x18       PLATFORM register (TLS on some ABIs;
+                RESERVED - never use it)
+      x19-x28   CALLEE-saved
+      x29       frame pointer
+      x30       link register
+      sp/xzr    stack pointer / zero register
+
+      v0-v31    FP/SIMD; v8-v15's LOW 64 BITS are callee-saved
+
+   So roughly 29 usable general-purpose registers - generous
+   by historical standards, and still not unlimited.
+
+   THE JOB: map virtual registers to physical ones, such that
+   two values that are LIVE AT THE SAME TIME never share a
+   register. When that is impossible, SPILL one to the stack.</pre>
+
+<h2 id="liveness">Liveness</h2>
+
+<pre><code>/* A value is LIVE from its definition until its LAST USE. */
+
+        a = 1;          /* a live from here            */
+        b = 2;          /* b live                      */
+        c = a + b;      /* a and b DIE here; c is born */
+        d = c * 2;      /* c dies                      */
+        return d;       /* d dies                      */
+
+   LIVE RANGES:
+        a:  |---|
+        b:   |--|
+        c:      |--|
+        d:         |--|
+
+   MAXIMUM SIMULTANEOUSLY LIVE = 2. Two registers suffice.
+
+/* COMPUTED BY BACKWARD DATAFLOW over the CFG: */
+
+        live_out(B) = union of live_in(S) for successors S
+        live_in(B)  = used(B) ∪ (live_out(B) − defined(B))
+
+/* Iterate to a fixed point. In SSA (chapter 05) this is
+   cheaper, because each value has exactly one definition and
+   the live range is the region dominated by it that reaches a
+   use.                                                     */
+
+/* REGISTER PRESSURE at a point = the number of values live
+   there. Where pressure exceeds the register count, a spill
+   is unavoidable. THAT is what the allocator is measuring,
+   and it is why:
+     · long-lived variables cost more than short-lived ones
+     · a value used once far from its definition is expensive
+     · calls are pressure points, because they clobber every
+       caller-saved register                              */</code></pre>
+
+<h2 id="colouring">Graph colouring</h2>
+
+<pre class="diagram">Chaitin's insight (1981): this is GRAPH COLOURING.
+
+  Build an INTERFERENCE GRAPH: a node per value, an edge
+  between any two values live at the same time.
+
+     a --- b
+      \   /
+       \ /
+        c --- d
+
+  Colour the graph with K colours (K = number of registers)
+  such that no two adjacent nodes share a colour.
+
+  With K = 2:  a=red, b=blue, c=red, d=blue.  Done.
+
+  THE ALGORITHM (Chaitin-Briggs):
+
+   1. BUILD the interference graph.
+   2. SIMPLIFY: repeatedly remove any node with FEWER THAN K
+      neighbours, pushing it on a stack. Such a node can
+      always be coloured later, whatever its neighbours get.
+   3. If only nodes with >= K neighbours remain, SPILL one -
+      choose by a heuristic: highest degree, lowest use
+      count, not inside a loop.
+   4. When the graph is empty, POP the stack and assign each
+      node a colour differing from its already-coloured
+      neighbours.
+   5. If a spill was chosen, rewrite the code with store/load
+      around it and START AGAIN - the new loads and stores
+      create new, very short live ranges.
+
+  GRAPH COLOURING IS NP-COMPLETE, so this is a heuristic. It
+  is also why compilation time can jump on functions with
+  enormous basic blocks - the graph gets large.
+
+  THE OTHER ALGORITHM you will meet: LINEAR SCAN. Sort live
+  intervals by start point, sweep, assign the first free
+  register, spill the interval ending latest. Far faster,
+  slightly worse code. LLVM's -O0 uses "fast" allocation;
+  -O2 uses a greedy allocator that is closer to colouring in
+  quality and closer to linear scan in speed.</pre>
+
+<h2 id="spilling">Spilling</h2>
+
+<pre><code>/* When a value cannot get a register, it lives on the STACK,
+   loaded before each use and stored after each definition. */
+
+/* WITHOUT spilling: */
+        add  w0, w1, w2
+
+/* WITH the result spilled: */
+        add  w0, w1, w2
+        str  w0, [sp, #16]              ; SPILL
+        ...
+        ldr  w0, [sp, #16]              ; RELOAD
+        mul  w3, w0, w4
+
+/* THE COST: two memory accesses. L1 hits, so a few cycles
+   each - but in a hot loop, per iteration, it adds up
+   quickly.
+
+/* HOW THE ALLOCATOR CHOOSES what to spill:
+        spill cost ≈ (loads + stores) × 10^(loop depth)
+                     ─────────────────────────────────
+                              degree
+   So a value used once outside a loop is cheap to spill; one
+   used every iteration of a triple-nested loop is not.
+
+/* SPILL SLOTS live in the stack frame, which is why a
+   register-pressured function has a large frame - and why
+   -Wframe-larger-than can fire on code with no large locals
+   at all (Linux chapter 02).
+
+/* WHAT CAUSES PRESSURE, in order of how often it is the
+   cause:
+     1. too many live variables - long functions doing many
+        things at once
+     2. aggressive inlining, which merges several functions'
+        pressure into one
+     3. unrolling and vectorisation, which multiply the live
+        values per iteration
+     4. large structs passed or returned by value
+     5. many function arguments (more than 8 on AArch64 go on
+        the stack anyway)
+     6. taking the address of locals, which prevents promotion
+        entirely (chapter 05)
+
+/* AND THE FIX, in the same order: split the function. A
+   200-line function with 40 live variables will spill; four
+   50-line functions will not, and the compiler will inline
+   them back if it helps.                                 */</code></pre>
+
+<div class="key">
+<b>"Optimized out" in the debugger</b>
+<p>When gdb says <code>&lt;optimized out&gt;</code>, the variable has no single location — it lives in a
+register for part of its range, in a different register later, on the stack briefly, and nowhere at all
+where the compiler proved it unnecessary. DWARF location lists (<a href="cmp-14-debug-info.html">chapter
+14</a>) can describe this, and modern compilers emit them, but not for values that genuinely no longer
+exist. Build with <code>-Og</code> when you need to inspect everything.</p>
+</div>
+
+<h2 id="abi">Calling conventions constrain it</h2>
+
+<pre><code>/* The ABI (chapter 10) divides registers into two classes,
+   and the allocator must respect it. */
+
+   CALLER-SAVED (volatile): x0-x18, v0-v7, v16-v31
+        A call may destroy them. If a value must survive a
+        call, the CALLER saves it - or the allocator puts it
+        in a callee-saved register instead.
+
+   CALLEE-SAVED (non-volatile): x19-x28, v8-v15 (low 64 bits)
+        A function using one must save and restore it in its
+        prologue and epilogue.
+
+/* THE ALLOCATION STRATEGY that follows:
+
+     a value NOT live across any call
+          -&gt; prefer a CALLER-saved register: free, no
+             prologue cost
+
+     a value live ACROSS a call
+          -&gt; prefer a CALLEE-saved register: pay once in the
+             prologue rather than at every call site       */
+
+/* WHICH IS WHY a leaf function looks like this: */
+        f:
+                add   w0, w0, #1
+                ret
+/* no prologue at all - it uses only caller-saved registers
+   and calls nothing.
+
+/* AND A FUNCTION WITH A CALL IN A LOOP looks like this: */
+        g:
+                stp   x29, x30, [sp, #-32]!    ; FP and LR
+                mov   x29, sp
+                stp   x19, x20, [sp, #16]      ; callee-saved
+                mov   w19, w0                  ; keep the arg
+                                               ; across calls
+        .Lloop:
+                bl    helper                   ; clobbers
+                                               ; x0-x18
+                add   w19, w19, w0             ; w19 SURVIVED
+                ...
+                ldp   x19, x20, [sp, #16]
+                ldp   x29, x30, [sp], #32
+                ret
+
+/* THE `stp`/`ldp` PAIRS are the prologue and epilogue, and
+   their size tells you immediately how many callee-saved
+   registers the function needed - which is a proxy for how
+   much simultaneous state it carries.                   */</code></pre>
+
+<h2 id="coalescing">Coalescing and rematerialisation</h2>
+
+<pre><code>/* --- COALESCING: eliminate copies ----------------------- */
+
+/* Phi elimination (chapter 05) inserts copies: */
+        mov  w1, w0
+        ...uses of w1...
+
+/* If w0 and w1 do NOT interfere, give them the same register
+   and delete the move. That is coalescing, and it is why
+   phi nodes usually cost nothing.
+
+   THE TENSION: coalescing MERGES two nodes in the
+   interference graph, and the merged node has the union of
+   both neighbour sets - a higher degree, which may make the
+   graph uncolourable and force a spill. So aggressive
+   coalescing can be worse than none.
+
+   CONSERVATIVE COALESCING (Briggs): only merge if the result
+   has fewer than K neighbours of significant degree. This is
+   what production allocators use.                        */
+
+/* --- REMATERIALISATION: recompute instead of reload ----- */
+
+/* Spilling a constant is silly: */
+        mov  w0, #42
+        str  w0, [sp, #8]       ; spill
+        ...
+        ldr  w0, [sp, #8]       ; reload
+
+/* Just recompute it: */
+        mov  w0, #42
+        ...
+        mov  w0, #42            ; REMATERIALISED - one
+                                ; instruction, no memory
+
+/* REMATERIALISABLE VALUES: constants, addresses of globals,
+   the frame pointer plus an offset, and anything computed
+   from values that are still live. The allocator prefers
+   rematerialisation to spilling whenever it applies, which
+   is why constants almost never occupy a register across a
+   call.                                                   */
+
+/* --- LIVE RANGE SPLITTING ------------------------------ */
+/* Instead of spilling a value for its whole range, split the
+   range at the pressure point:                            */
+        v is live from A to Z
+        pressure is high only between M and N
+   -&gt;   keep v in a register A..M
+        spill it M..N
+        reload into a (possibly different) register N..Z
+/* This is what LLVM's greedy allocator does, and it is the
+   main reason its output beats a naive colouring
+   allocator.                                             */</code></pre>
+
+<h2 id="see">Seeing the pressure</h2>
+
+<pre><code># --- How big is the frame? Spills live there. ---
+    objdump -d prog | grep -A2 '&lt;myfunc&gt;:'
+    ; look at the first `sub sp, sp, #N` or `stp ... [sp,#-N]!`
+
+    gcc -fstack-usage prog.c
+    ; writes prog.su:  prog.c:10:5:myfunc  128  static
+
+    gcc -Wstack-usage=256
+    gcc -Wframe-larger-than=1024      ; the kernel sets this
+
+# --- Count the spills directly ---
+    llvm: -mllvm -stats 2&gt;&amp;1 | grep -i spill
+      12 regalloc - Number of spill slots allocated
+      34 regalloc - Number of spills inserted
+      41 regalloc - Number of reloads inserted
+
+    gcc: -fdump-rtl-ira -fdump-rtl-reload
+
+# --- In the assembly, look for str/ldr to [sp, #N] ---
+# that are not obviously part of the ABI. A loop body with
+# stack traffic in it is spilling.
+
+# --- Reduce pressure, in order of effectiveness ---
+#   1. split the function
+#   2. shorten variable lifetimes - declare at first use,
+#      not at the top
+#   3. avoid taking the address of locals
+#   4. pass large structs by pointer, not by value
+#   5. reduce unrolling: #pragma clang loop unroll(disable)
+#   6. reduce inlining: __attribute__((noinline)) on the
+#      callee, or -finline-limit=
+#   7. on FP-heavy code, check whether v8-v15 spilling is the
+#      issue - those are callee-saved and expensive
+
+# THE FIRST ONE IS ALMOST ALWAYS THE ANSWER. Register
+# pressure is a symptom of a function doing too much.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>&lt;optimized out&gt;</code> in gdb</td><td>The value has no single home — use <code>-Og</code></td></tr>
+<tr><td>Loop body contains <code>str</code>/<code>ldr</code> to the stack</td><td>Spilling — reduce pressure</td></tr>
+<tr><td>Large stack frame with no large locals</td><td>Spill slots</td></tr>
+<tr><td><code>-Wframe-larger-than</code> fires unexpectedly</td><td>Same</td></tr>
+<tr><td>Performance drops after inlining</td><td>Merged pressure caused spills</td></tr>
+<tr><td>Performance drops after unrolling</td><td>More live values per iteration</td></tr>
+<tr><td>A function got much slower after adding one variable</td><td>It crossed the pressure threshold</td></tr>
+<tr><td>Compile time spikes on one function</td><td>A huge basic block; the interference graph is large</td></tr>
+<tr><td>Long prologue with many <code>stp</code> pairs</td><td>Many callee-saved registers needed</td></tr>
+<tr><td>Constants reloaded from the stack</td><td>Rematerialisation did not apply — often an address that is not statically known</td></tr>
+<tr><td>Code uses <code>x18</code> and crashes on some platforms</td><td>It is reserved — never allocate it by hand</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State AArch64's register classes and which are callee-saved.</li>
+  <li>Compute live ranges for a straight-line sequence and the maximum pressure.</li>
+  <li>Explain graph colouring allocation and the simplify/spill/select loop.</li>
+  <li>Explain why the algorithm restarts after inserting spill code.</li>
+  <li>Contrast graph colouring with linear scan.</li>
+  <li>Give the spill cost heuristic and say why loop depth dominates it.</li>
+  <li>List six causes of register pressure and the fix for each.</li>
+  <li>Explain why a value live across a call prefers a callee-saved register.</li>
+  <li>Explain coalescing and why aggressive coalescing can hurt.</li>
+  <li>Explain rematerialisation and when it applies.</li>
+  <li>Measure spills in a real function and reduce them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

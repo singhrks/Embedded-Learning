@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The GIC: interrupt lifecycle | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The GIC: interrupt lifecycle</h1>
+<p class="lead">An interrupt moves through a defined state machine from assertion to completion. Every
+interrupt bug — storms, lost edges, spurious IDs, priority failures — is a specific wrong transition in that
+machine.</p>
+
+<h2 id="states">The state machine</h2>
+
+<p>Every interrupt moves through a small set of states, and nearly every interrupt bug is the result of a transition that did not happen. Fixing this state machine in your head makes those bugs obvious.</p>
+
+<pre class="diagram">                    ┌──────────┐
+                    │ INACTIVE │ ◄──────────────────┐
+                    └────┬─────┘                    │
+        device asserts   │                          │ EOI, and the
+        or SGI written   ▼                          │ source is
+                    ┌──────────┐                    │ deasserted
+                    │ PENDING  │                    │
+                    └────┬─────┘                    │
+        core reads       │                          │
+        ICC_IAR1_EL1     ▼                          │
+                    ┌──────────┐   EOI              │
+                    │  ACTIVE  │────────────────────┘
+                    └────┬─────┘
+     source still        │
+     asserted, or a      ▼
+     new event      ┌──────────────────┐
+                    │ ACTIVE + PENDING │
+                    └──────────────────┘
+
+  ACTIVE means "a core is handling it". While active, the GIC will
+  NOT signal the same interrupt again — which is what prevents an
+  interrupt from re-entering its own handler.
+
+  ACTIVE+PENDING is the interesting state: the interrupt fired
+  again while being handled. After EOI it goes straight back to
+  PENDING and fires immediately.</pre>
+
+<h2 id="flow">The complete flow</h2>
+
+<p>Here is the complete path, from a device asserting a signal to your handler returning. Each step corresponds to a register access, and each is a place the process can stall.</p>
+
+<pre><code>/* 1. The device asserts its interrupt line, or writes an MSI
+      doorbell. */
+
+/* 2. The distributor (or redistributor, for PPIs/SGIs) marks the
+      INTID PENDING, checks it is enabled, and compares its
+      priority against what the target core is running. */
+
+/* 3. If it wins, the GIC asserts IRQ or FIQ to that core. */
+
+/* 4. The core takes the exception — if PSTATE.I permits, and if
+      the priority passes ICC_PMR_EL1 (chapter 28 for the entry
+      sequence). */
+
+/* 5. ACKNOWLEDGE: the handler reads the acknowledge register.
+      This returns the INTID and moves it PENDING → ACTIVE. */
+        mrs     x0, ICC_IAR1_EL1
+        /* x0 = INTID, or 1023 (spurious) if nothing was pending */
+
+/* 6. SERVICE the device — and crucially, CLEAR THE INTERRUPT
+      CONDITION AT THE DEVICE, not just at the GIC. */
+        writel(status, regs + IRQ_STATUS);      /* W1C at source */
+
+/* 7. END OF INTERRUPT: write the INTID back. This drops the
+      running priority, allowing lower-priority interrupts. */
+        msr     ICC_EOIR1_EL1, x0
+
+/* 8. ERET back to the interrupted code. */</code></pre>
+
+<div class="danger">
+<b>Step 6 before step 7, always</b>
+<p>If you EOI without clearing the condition at the device, a level-triggered line is still asserted. The GIC
+immediately re-signals it, the core re-enters the handler, and nothing else ever runs. The system appears hung
+with 100% CPU in the interrupt handler.</p>
+<p>Linux's spurious-interrupt detector eventually notices and prints
+<code>"irq N: nobody cared (try booting with the &quot;irqpoll&quot; option)"</code>, then disables the
+line. That message is a diagnosis, not a fix.</p>
+</div>
+
+<h2 id="eoi">EOI modes</h2>
+
+<p>Signalling the end of an interrupt can be done in one step or two, and the two-step mode exists specifically to support virtualisation and priority manipulation.</p>
+
+<pre><code>/* ICC_CTLR_EL1.EOImode selects one of two behaviours: */
+
+/* EOImode = 0 — the simple case, and the default */
+        msr     ICC_EOIR1_EL1, x0
+/*      does BOTH: drops the running priority AND deactivates
+        the interrupt. One write, done.                       */
+
+/* EOImode = 1 — priority drop and deactivation are SEPARATE */
+        msr     ICC_EOIR1_EL1, x0     /* priority drop only    */
+        ...
+        msr     ICC_DIR_EL1, x0       /* deactivate            */
+
+/* Why the split exists: it lets you re-enable higher-priority
+   interrupts (by dropping priority) while the current interrupt
+   remains ACTIVE, so it cannot re-fire. This is essential for:
+
+     · THREADED interrupt handlers — Linux drops priority when
+       the hard handler returns, but does not deactivate until
+       the threaded handler completes, preventing a storm from
+       a level-triggered device whose condition is cleared late
+
+     · VIRTUALISATION — the hypervisor drops priority, injects
+       the interrupt into a guest, and deactivates only when the
+       guest EOIs it                                          */
+
+/* Linux uses EOImode=1 when running as a host hypervisor,
+   EOImode=0 otherwise. You can see which in dmesg:          */
+//   GICv3: Using split EOI/Deactivate mode</code></pre>
+
+<h2 id="edge-level">Edge and level</h2>
+
+<p>The distinction comes down to what the GIC actually remembers about the request. A level-triggered line is
+a continuous electrical assertion — the GIC's pending bit simply mirrors "is the wire currently high", so as
+long as the device has not been serviced the interrupt stays pending no matter how many times you look, which
+is what makes it safe for several devices to share one line: each handler checks its own status register, and
+whoever actually has the flag set clears it. An edge-triggered line is a one-shot transition that the GIC
+<em>latches</em> the instant it happens — there is no ongoing signal to re-observe, so if that latch is
+missed (because the line was masked, or the pending bit was cleared without the source being serviced) the
+event is gone forever and nothing will ever raise it again. That asymmetry is exactly why the two failure modes
+in this table are opposites: a level interrupt that is never properly cleared re-fires forever (a storm), while
+an edge interrupt that is missed never fires again (a silent hang).</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Level-triggered</th><th>Edge-triggered</th></tr></thead>
+<tbody>
+<tr><td>Pending while</td><td>The source is asserted</td><td>Latched on the transition</td></tr>
+<tr><td>Cleared by</td><td>Deasserting at the <em>device</em></td><td>Acknowledge, or writing <code>GICD_ICPENDR</code></td></tr>
+<tr><td>Sharing</td><td><strong>Possible</strong> — each handler checks and clears its own</td><td>Unsafe — two simultaneous edges register as one</td></tr>
+<tr><td>Can be missed?</td><td>No — the line stays asserted</td><td><strong>Yes</strong>, if masked at the wrong moment</td></tr>
+<tr><td>Failure mode</td><td>Interrupt storm</td><td>Silent hang, waiting for an event that already happened</td></tr>
+<tr><td>Configured in</td><td colspan="2"><code>GICD_ICFGR&lt;n&gt;</code>, two bits per interrupt</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The edge-triggered race, and the standard defence: */
+
+static irqreturn_t isr(int irq, void *dev)
+{
+        u32 status;
+
+        do {
+                status = readl(regs + STATUS);
+                if (!status)
+                        break;
+                writel(status, regs + STATUS);   /* clear */
+                handle(status);
+        } while (readl(regs + STATUS));          /* RE-CHECK */
+
+        return IRQ_HANDLED;
+}
+
+/* Without the loop, an event arriving between handle() and the
+   return produces no new edge — the device has already raised
+   its line and lowered it. The interrupt is lost forever and the
+   device waits for a response that never comes.
+
+   The symptom: the device works fine at low rates and hangs
+   under load. Extremely common, and easy to misattribute.  */</code></pre>
+
+<h2 id="shared">Shared interrupt lines</h2>
+
+<p>When several devices share one interrupt line, every driver on it is called and each must decide whether the interrupt was theirs. Handling that incorrectly produces either missed interrupts or an interrupt storm.</p>
+
+<pre><code>/* Several devices on one level-triggered SPI. Every handler is
+   called; each must determine whether it was theirs.       */
+
+static irqreturn_t my_isr(int irq, void *dev_id)
+{
+        struct my_dev *d = dev_id;
+        u32 status = readl(d-&gt;regs + STATUS);
+
+        if (!(status &amp; MY_IRQ_PENDING))
+                return IRQ_NONE;        /* NOT OURS — essential */
+
+        writel(status, d-&gt;regs + STATUS);
+        /* ... handle ... */
+        return IRQ_HANDLED;
+}
+
+/* Returning IRQ_HANDLED when it was not yours breaks the kernel's
+   spurious-interrupt detection: it can no longer tell that
+   nobody serviced the line, so a genuinely stuck interrupt is
+   never caught and the machine simply hangs.
+
+   Registering with IRQF_SHARED requires a valid dev_id, because
+   that is how free_irq identifies which handler to remove.  */
+        request_irq(irq, my_isr, IRQF_SHARED, name, d);</code></pre>
+
+<h2 id="masking">Masking, at four levels</h2>
+
+<p>An interrupt can be prevented from reaching your code at four different places, and knowing which one is in effect is essential when the answer to "why is my handler not running" is not obvious.</p>
+
+<pre class="diagram">There are four independent places an interrupt can be blocked.
+Diagnosing "my interrupt never fires" means checking all four,
+from the source outward:
+
+  1. AT THE DEVICE       the peripheral's own interrupt enable
+                         → readl(regs + IRQ_ENABLE)
+
+  2. AT THE DISTRIBUTOR  GICD_ISENABLER / GICD_ICENABLER
+                         → per-INTID enable
+                         → Linux: /proc/interrupts shows it only
+                           if a handler is registered
+
+  3. AT THE CPU INTERFACE  ICC_PMR_EL1 priority mask, and
+                           ICC_IGRPEN1_EL1 group enable
+
+  4. AT THE CORE         PSTATE.I (IRQ) or PSTATE.F (FIQ)
+                         → local_irq_disable() in Linux
+
+  A fifth, easily forgotten: the interrupt may be routed to a
+  DIFFERENT CORE than the one you are watching. Check
+  /proc/interrupts across all CPUs, not just CPU0.</pre>
+
+<h2 id="ipi">Software-generated interrupts</h2>
+
+<p>Cores need to interrupt each other — to schedule work, to flush a TLB, to stop for a debugger. These software-generated interrupts are the mechanism, and they underpin most multiprocessor coordination.</p>
+
+<pre><code>/* SGIs are how cores talk to each other. Sending one is a system
+   register write.                                            */
+
+        msr     ICC_SGI1R_EL1, x0
+
+/*  x0 encodes:
+       [55:48] Aff3      [39:32] Aff2      [23:16] Aff1
+       [27:24] SGI ID (0-15)
+       [15:0]  TargetList — a bitmask of cores WITHIN that Aff1
+                            cluster
+       [40]    IRM — 1 means "all cores except self"          */
+
+/* Linux's IPI usage — visible in /proc/interrupts: */
+   IPI0  Rescheduling         wake a core to run the scheduler
+   IPI1  Function call        run a function on another core
+   IPI2  CPU stop             halt for panic or reboot
+   IPI3  CPU crash stop
+   IPI4  Timer broadcast      wake a core in deep idle for a timer
+   IPI5  IRQ work             deferred work from NMI context
+   IPI6  CPU wakeup
+
+/* Note what is NOT an IPI on ARM: TLB shootdown. TLBI ...IS
+   broadcasts in hardware (chapter 15), so no interrupt is needed
+   — a genuine architectural advantage over x86, which must send
+   an IPI and wait for acknowledgement.                     */</code></pre>
+
+<h2 id="latency">Interrupt latency, decomposed</h2>
+
+<p>The time between a device asserting a signal and your code running is a sum of several distinct contributions. Knowing what they are is the only way to reduce it deliberately rather than by trial and error.</p>
+
+<pre class="diagram">   device asserts
+        │  ① propagation to the GIC, arbitration                ~10s ns
+        │  ② the core has interrupts DISABLED somewhere    ◄── DOMINANT
+        │     (a spinlock, a critical section)                and VARIABLE
+        │  ③ exception entry: ELR/SPSR/ESR, vector fetch        ~10s cycles
+        │  ④ the handler stub saves 30 registers                ~30 cycles
+        │  ⑤ read ICC_IAR1_EL1, dispatch to the handler         ~10s cycles
+        ▼
+   your ISR's first instruction
+        │  ⑥ ISR duration
+        ▼
+   bottom half / thread wakeup
+        │  ⑦ PREEMPTION disabled somewhere                 ◄── the other
+        │  ⑧ scheduler decision + context switch               big term
+        ▼
+   your task runs
+
+  ② and ⑦ are the terms that ruin guarantees, because they depend
+  on the LONGEST such region anywhere in the kernel — including
+  in a driver you did not write.
+
+  PREEMPT_RT attacks exactly these: most spinlocks become sleeping
+  mutexes and handlers become threads, bounding both (OS ch. 19).
+
+  MEASURING it:
+     cyclictest -t4 -p 90 -i 200 -m -D 3600     ← report the MAX
+     ftrace irqsoff tracer → finds the longest disabled region
+                              AND its stack trace</pre>
+
+<h2 id="linux">The Linux view</h2>
+
+<p>Linux presents all of this through its own abstraction, and mapping between the kernel's vocabulary and the GIC's is necessary as soon as you debug an interrupt problem on a real system.</p>
+
+<pre><code>/* Linux abstracts the GIC behind IRQ DOMAINS, which map a
+   hardware interrupt number to a Linux virtual IRQ number.  */
+
+        hwirq (GIC INTID 88)  ──irq_domain──►  virq (Linux irq 24)
+
+/* Why: an SoC may have several cascaded controllers (a GPIO
+   controller behind an SPI, for instance). Each gets a domain,
+   and drivers use virq numbers without caring which controller
+   is underneath.                                             */
+
+        irq = platform_get_irq(pdev, 0);      /* resolves the DT
+                                                 specifier → virq */
+        devm_request_threaded_irq(dev, irq, hard, thread,
+                                  IRQF_ONESHOT, name, data);
+
+/* The chip operations the GIC driver implements: */
+struct irq_chip {
+        void (*irq_mask)(struct irq_data *);
+        void (*irq_unmask)(struct irq_data *);
+        void (*irq_eoi)(struct irq_data *);
+        int  (*irq_set_affinity)(struct irq_data *, const cpumask_t *, bool);
+        int  (*irq_set_type)(struct irq_data *, unsigned int flow);
+};
+
+/* Return values, and why they matter: */
+   IRQ_HANDLED      it was mine and I dealt with it
+   IRQ_NONE         NOT mine — required on shared lines
+   IRQ_WAKE_THREAD  wake the threaded handler</code></pre>
+
+<h2 id="debug">Debugging interrupts</h2>
+
+<p>The GIC's registers will tell you the exact state of any interrupt: whether it is enabled, pending, active, and where it is routed. That usually identifies the problem immediately.</p>
+
+<pre><code># is it firing at all, and on which core?
+watch -n1 'cat /proc/interrupts | grep -E "CPU|uart"'
+
+# what does the kernel think the configuration is?
+cat /sys/kernel/debug/irq/irqs/24
+#   handler:  handle_fasteoi_irq
+#   status:   0x00000000
+#   istate:   0x00000000
+#   ddepth:   0
+#   wdepth:   0
+#   dstate:   0x02400200
+#   node:     0
+#   affinity: 0-3
+#   effectiv: 0
+#   domain:  :interrupt-controller@2f000000
+#    hwirq:   0x38            ← the raw GIC INTID
+#    chip:    GICv3
+
+cat /sys/kernel/debug/irq/domains/*
+
+# trace them
+echo 1 &gt; /sys/kernel/debug/tracing/events/irq/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# how long do handlers take?
+perf record -e irq:irq_handler_entry -e irq:irq_handler_exit -a
+sudo bpftrace -e 'tracepoint:irq:irq_handler_entry {
+        @start[cpu] = nsecs; }
+    tracepoint:irq:irq_handler_exit /@start[cpu]/ {
+        @us = hist((nsecs - @start[cpu]) / 1000); }'
+
+# find long interrupts-disabled regions
+echo irqsoff &gt; /sys/kernel/debug/tracing/current_tracer
+echo 0 &gt; /sys/kernel/debug/tracing/tracing_max_latency
+cat /sys/kernel/debug/tracing/trace</code></pre>
+
+<div class="tip">
+<b>The five-question checklist for "my interrupt never fires"</b>
+<ol>
+<li><strong>Is the device generating it?</strong> Read its status register directly, in a loop.</li>
+<li><strong>Is the INTID right?</strong> Device tree SPI numbers are relative to 32.</li>
+<li><strong>Is the trigger type right?</strong> An edge configuration on a level source fires once, then
+never.</li>
+<li><strong>Is it enabled at all four levels?</strong> Device, distributor, CPU interface, PSTATE.</li>
+<li><strong>Is it routed to the core you are watching?</strong> Check every CPU column.</li>
+</ol>
+<p>In practice, the answer is (2) or (3) most of the time, and both are device tree errors rather than
+driver bugs.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>System hangs at 100% CPU in the handler</td><td>EOI'd without clearing at the device — a storm</td></tr>
+<tr><td><code>"irq N: nobody cared"</code></td><td>A shared handler returned <code>IRQ_HANDLED</code> without handling it, or nothing owns the line</td></tr>
+<tr><td>Device works at low rate, hangs under load</td><td>Lost edge — add the re-check loop</td></tr>
+<tr><td>Interrupt fires exactly once</td><td>Not EOI'd, or configured edge when it is level</td></tr>
+<tr><td>Count stays zero</td><td>Wrong INTID, wrong trigger, not enabled, or routed elsewhere</td></tr>
+<tr><td>Spurious INTID 1023</td><td>Acknowledged with nothing pending — a race, or a stale read</td></tr>
+<tr><td>All interrupts on CPU0, poor scaling</td><td>No affinity spreading</td></tr>
+<tr><td>Latency spikes on isolated cores</td><td>Interrupts not steered away</td></tr>
+<tr><td>High-priority interrupt does not preempt</td><td>Binary point grouping both at one preemption level</td></tr>
+<tr><td>Threaded handler storms on a level interrupt</td><td>Needs <code>IRQF_ONESHOT</code> and split EOI mode</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the interrupt state machine and explain what ACTIVE prevents.</li>
+  <li>Give the eight steps from device assertion to <code>ERET</code>.</li>
+  <li>Explain why clearing at the device must precede EOI.</li>
+  <li>Explain the two EOI modes and give two uses for the split form.</li>
+  <li>Compare edge and level on sharing and on lost interrupts.</li>
+  <li>Write an edge-safe handler and explain the re-check loop.</li>
+  <li>Say why returning <code>IRQ_HANDLED</code> incorrectly breaks spurious detection.</li>
+  <li>Name the four masking levels and the fifth thing to check.</li>
+  <li>Explain why ARM needs no IPI for TLB shootdown.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

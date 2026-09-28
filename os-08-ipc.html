@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interprocess communication | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Interprocess communication</h1>
+<p class="lead">Isolation is the point of a process, so any communication must be arranged deliberately
+through the kernel. The mechanisms differ in throughput, latency, direction, naming and what they can carry
+— and choosing wrongly is the difference between microseconds and milliseconds.</p>
+
+<h2 id="axes">The choices that matter</h2>
+
+<p>There are a dozen ways for two processes to talk, and choosing between them is easier once you see that they differ along only a few axes. Fix those and the right mechanism usually names itself.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Options</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td><strong>Data or control?</strong></td><td>Bulk bytes vs a signal or event</td><td>Shared memory vs eventfd</td></tr>
+<tr><td><strong>How much data?</strong></td><td>Bytes vs megabytes</td><td>Copy cost decides everything</td></tr>
+<tr><td><strong>Same machine?</strong></td><td>Local vs network</td><td>Unix sockets vs TCP</td></tr>
+<tr><td><strong>Related processes?</strong></td><td>Parent/child vs unrelated</td><td>Anonymous pipe vs a named object</td></tr>
+<tr><td><strong>Message or stream?</strong></td><td>Preserved boundaries vs a byte stream</td><td>Datagram vs stream socket</td></tr>
+<tr><td><strong>One-to-one or many?</strong></td><td>Point-to-point vs multicast</td><td>Pipe vs pub/sub</td></tr>
+<tr><td><strong>Synchronisation included?</strong></td><td>Blocking built in, or your problem</td><td>Pipes block; shared memory does not</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Rough cost, same machine, small messages:
+
+  shared memory + atomics    ~20-100 ns     no syscall in steady state
+  futex wake                 ~1-5 µs        only when actually blocking
+  pipe / socketpair          ~5-15 µs       two copies + two switches
+  Unix domain socket         ~5-20 µs
+  POSIX message queue        ~5-20 µs
+  D-Bus / Binder             ~50-200 µs     plus marshalling
+  loopback TCP               ~20-50 µs      full protocol stack
+
+The pattern: anything that copies through the kernel costs
+microseconds. Shared memory costs nanoseconds but hands you the
+entire synchronisation problem in exchange.</pre>
+
+<h2 id="pipes">Pipes</h2>
+
+<p>The simplest IPC in Unix, and the one the shell uses for every pipeline. Its behaviour at the edges — a full buffer, a closed reader — is what determines how programs using it actually terminate.</p>
+
+<pre><code>int fd[2];
+pipe(fd);                       /* fd[0] read end, fd[1] write end */
+
+if (fork() == 0) {
+        close(fd[0]);                    /* child writes           */
+        dup2(fd[1], STDOUT_FILENO);      /* stdout → pipe          */
+        close(fd[1]);
+        execlp("ls", "ls", NULL);
+}
+close(fd[1]);                            /* parent MUST close its
+                                            write end, or it never
+                                            sees EOF                */
+char buf[4096];
+ssize_t n;
+while ((n = read(fd[0], buf, sizeof buf)) &gt; 0)
+        process(buf, n);
+/* read returns 0 (EOF) only when ALL write ends are closed */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td>Direction</td><td>Unidirectional. Two pipes for bidirectional, or use <code>socketpair()</code>.</td></tr>
+<tr><td>Naming</td><td>Anonymous — inherited across <code>fork</code>. <code>mkfifo()</code> gives a named pipe for unrelated processes.</td></tr>
+<tr><td>Boundaries</td><td>A byte stream. Two writes may be read as one. <strong>Frame it yourself.</strong></td></tr>
+<tr><td>Capacity</td><td>64 KB by default (<code>F_SETPIPE_SZ</code> to change). Writer blocks when full; reader blocks when empty.</td></tr>
+<tr><td>Atomicity</td><td>Writes up to <code>PIPE_BUF</code> (4096) are atomic — they will not interleave with other writers.</td></tr>
+<tr><td>Closed reader</td><td>Writing gives <code>SIGPIPE</code>, which kills the process by default. Almost always you want <code>signal(SIGPIPE, SIG_IGN)</code> and to handle <code>EPIPE</code>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The two pipe bugs everyone writes</b>
+<p><strong>Forgetting to close unused ends.</strong> If the parent keeps its copy of the write end open, the
+reader never sees EOF and hangs forever. Every process must close every descriptor it does not use.</p>
+<p><strong>Assuming message boundaries.</strong> A pipe is a byte stream. If you <code>write()</code> two
+100-byte messages, the reader may get 200 bytes in one <code>read()</code>, or 37 then 163. Prefix each
+message with a length, or use a datagram mechanism.</p>
+</div>
+
+<h2 id="sockets">Sockets</h2>
+
+<p>Sockets work between machines and, in their local form, between processes on one machine. That uniformity is why a program written for one frequently works for the other unchanged.</p>
+
+<pre><code>/* Unix domain sockets: the default choice for local IPC.
+   Same API as network sockets, but no protocol stack overhead. */
+
+int sv[2];
+socketpair(AF_UNIX, SOCK_STREAM, 0, sv);   /* bidirectional pipe */
+
+/* Named, for unrelated processes */
+int s = socket(AF_UNIX, SOCK_STREAM, 0);
+struct sockaddr_un a = { .sun_family = AF_UNIX };
+strcpy(a.sun_path, "/run/myservice.sock");
+bind(s, (struct sockaddr *)&amp;a, sizeof a);
+listen(s, 16);
+int c = accept(s, NULL, NULL);
+
+/* SOCK_DGRAM preserves message boundaries;
+   SOCK_SEQPACKET gives boundaries AND reliable ordering.     */</code></pre>
+
+<pre><code>/* The killer feature: passing FILE DESCRIPTORS between processes.
+   No other local IPC mechanism can do this.                    */
+
+struct msghdr msg = {0};
+char cmsgbuf[CMSG_SPACE(sizeof(int))];
+msg.msg_control = cmsgbuf;
+msg.msg_controllen = sizeof cmsgbuf;
+
+struct cmsghdr *cm = CMSG_FIRSTHDR(&amp;msg);
+cm-&gt;cmsg_level = SOL_SOCKET;
+cm-&gt;cmsg_type  = SCM_RIGHTS;              /* "here is an fd"      */
+cm-&gt;cmsg_len   = CMSG_LEN(sizeof(int));
+memcpy(CMSG_DATA(cm), &amp;fd_to_send, sizeof(int));
+
+sendmsg(sock, &amp;msg, 0);
+
+/* The receiver gets a NEW descriptor in its own table, referring
+   to the same open file. This is how systemd socket activation,
+   privilege separation, Wayland buffer passing and container
+   runtimes all work — a privileged process opens the resource
+   and hands the descriptor to an unprivileged one.
+   SCM_CREDENTIALS similarly passes verified pid/uid/gid.      */</code></pre>
+
+<h2 id="shm">Shared memory</h2>
+
+<p>The fastest IPC is no copying at all: two processes mapping the same physical memory. It is also the only mechanism with no built-in synchronisation, which you must therefore supply yourself.</p>
+
+<pre><code>/* POSIX shared memory — the fastest mechanism, and the one with
+   no synchronisation included.                                */
+
+int fd = shm_open("/myshm", O_CREAT | O_RDWR, 0600);
+ftruncate(fd, SIZE);
+void *p = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+close(fd);                     /* the mapping keeps it alive     */
+/* ... both processes now see the same physical pages ...        */
+munmap(p, SIZE);
+shm_unlink("/myshm");          /* remove the name                */
+
+/* Anonymous shared memory, for related processes: */
+void *p = mmap(NULL, SIZE, PROT_READ | PROT_WRITE,
+               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+fork();                        /* both see the same pages        */
+
+/* memfd_create: an anonymous, sealable region you can pass by fd */
+int fd = memfd_create("buf", MFD_ALLOW_SEALING);
+fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
+/* Sealing lets the receiver TRUST that the sender cannot shrink
+   the region underneath it — otherwise a malicious sender causes
+   SIGBUS in the receiver. This is what Android and Wayland use. */</code></pre>
+
+<div class="danger">
+<b>Shared memory gives you no synchronisation whatsoever</b>
+<p>You get raw memory shared between address spaces. Everything from
+<a href="ca-15-coherence.html">CA chapter 15</a> applies in full: you need atomics with correct memory
+ordering, or a lock placed <em>in the shared region itself</em>. And because the peer may be malicious, you
+must additionally validate everything you read — a shared-memory protocol is a trust boundary.</p>
+<pre><code>/* A lock that lives in the shared region */
+pthread_mutexattr_t a;
+pthread_mutexattr_init(&amp;a);
+pthread_mutexattr_setpshared(&amp;a, PTHREAD_PROCESS_SHARED);   /* essential */
+pthread_mutexattr_setrobust(&amp;a, PTHREAD_MUTEX_ROBUST);      /* see below */
+pthread_mutex_init(&amp;shared-&gt;lock, &amp;a);
+
+/* ROBUST matters: if the peer dies holding the lock, a normal
+   mutex is stuck forever. A robust mutex returns EOWNERDEAD to
+   the next acquirer, which can repair the state and call
+   pthread_mutex_consistent().                                */</code></pre>
+</div>
+
+<h2 id="events">Signalling without data</h2>
+
+<p>Sometimes you need to signal that something happened without transferring data. Several mechanisms do this, and they differ mostly in whether they compose with a polling loop.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Use</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>eventfd</code></td><td>A counter you can <code>poll()</code></td><td>The standard way to wake an event loop from another thread or process</td></tr>
+<tr><td><code>signalfd</code></td><td>Signals as a readable fd</td><td>Removes async-signal-safety from the problem entirely</td></tr>
+<tr><td><code>timerfd</code></td><td>Timers as a readable fd</td><td>Integrates cleanly with <code>epoll</code></td></tr>
+<tr><td><code>futex</code></td><td>Fast userspace mutex</td><td>The primitive under every Linux lock — see below</td></tr>
+<tr><td>POSIX semaphores</td><td><code>sem_open</code>, <code>sem_wait</code></td><td>Named or in shared memory</td></tr>
+<tr><td>Signals</td><td><code>kill(pid, SIGUSR1)</code></td><td>No payload, can be coalesced, async-safety restrictions</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">The futex, which is worth understanding once
+
+  A mutex that never contends should cost ZERO syscalls. A mutex
+  that does contend must eventually sleep, which requires the kernel.
+  futex gives you both:
+
+    lock:   atomic compare-and-swap in USER SPACE
+            uncontended → done, ~20 ns, no syscall
+            contended   → futex(FUTEX_WAIT) → kernel puts you to sleep
+
+    unlock: atomic store in user space
+            if waiters were recorded → futex(FUTEX_WAKE)
+
+  The kernel is involved ONLY on contention. This is why an
+  uncontended pthread_mutex_lock is nearly free and a contended
+  one costs microseconds — the cliff is exactly one syscall pair.
+
+  Every Linux mutex, condition variable, semaphore and barrier is
+  built on this.</pre>
+
+<h2 id="sysv">System V IPC</h2>
+
+<p>The older System V facilities predate most of the above, persist beyond process lifetime, and are generally worth avoiding — but you will meet them in existing code and need to recognise them.</p>
+
+<pre><code>/* The 1983 API: message queues, semaphores and shared memory,
+   named by integer keys.                                     */
+key_t key = ftok("/some/path", 'A');
+int shmid = shmget(key, SIZE, IPC_CREAT | 0600);
+void *p = shmat(shmid, NULL, 0);
+
+/* Avoid in new code:
+     · a global integer namespace with collisions and no cleanup
+     · objects PERSIST after all processes exit (ipcs / ipcrm)
+     · not pollable — cannot be used with epoll
+     · clumsier API
+
+   POSIX equivalents (shm_open, mq_open, sem_open) are namespaced
+   under a filesystem path, follow fd semantics, and are pollable.
+   Use those.                                                  */
+
+ipcs -a          # list leftover System V objects
+ipcrm -m ID      # clean them up manually</code></pre>
+
+<h2 id="highlevel">Higher-level IPC</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>System</th><th>Built on</th><th>Adds</th></tr></thead>
+<tbody>
+<tr><td><strong>D-Bus</strong></td><td>Unix sockets</td><td>Naming, method calls, signals, introspection, activation. Desktop and systemd.</td></tr>
+<tr><td><strong>Binder</strong></td><td>A kernel driver</td><td>Android's IPC: reference-counted object passing, one-copy transfers, priority inheritance across calls</td></tr>
+<tr><td><strong>gRPC / Cap'n Proto</strong></td><td>Sockets</td><td>Schema, serialisation, versioning, works locally or over a network</td></tr>
+<tr><td><strong>Wayland</strong></td><td>Unix sockets + <code>SCM_RIGHTS</code></td><td>Passes graphics buffers by fd — zero copy for pixels</td></tr>
+<tr><td><strong>io_uring</strong></td><td>Shared memory rings</td><td>Kernel/user "IPC" with often zero syscalls in steady state</td></tr>
+<tr><td><strong>virtio</strong></td><td>Shared memory rings</td><td>Guest ↔ host communication; the same ring design as io_uring</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>The recurring design</b>
+<p>Notice that io_uring, virtio, Binder and every high-performance IPC converge on the same structure: a
+<strong>shared-memory ring buffer</strong> with atomic head and tail indices, plus a doorbell (an eventfd, an
+MMIO write, a futex) used only when the peer needs waking. Bulk data by shared memory; wake-ups by syscall,
+as rarely as possible. Once you recognise this shape you will see it everywhere in systems design.</p>
+</div>
+
+<h2 id="choosing">Choosing</h2>
+
+<p>With the mechanisms covered, this is the decision reduced to a short procedure — because the common cases have a clear best answer rather than a trade-off.</p>
+
+<pre class="diagram">  Need to wake an event loop?              eventfd
+  Parent/child, one direction, a stream?   pipe
+  Bidirectional, local, need fd passing?   Unix socket (socketpair)
+  Message boundaries matter?               SOCK_SEQPACKET or datagram
+  Megabytes of data?                       shared memory + a ring
+  Across machines?                         TCP, or a real RPC framework
+  Unrelated processes, need naming?        named socket or shm_open
+  Structured API with versioning?          D-Bus, gRPC
+  Absolute lowest latency?                 shared memory + busy poll
+
+Default answer for local IPC on Linux: a Unix domain socket. It is
+bidirectional, ordered, has a sane API, passes credentials and file
+descriptors, works with epoll, and cleans up when the process dies.
+Reach for shared memory only when you have measured that it matters.</pre>
+
+<h2 id="debug">Debugging IPC</h2>
+
+<p>When IPC stops working the question is usually which side is blocked and why. These tools answer that directly rather than by inference.</p>
+
+<pre><code># what is open, and connected to what
+lsof -p PID
+ls -l /proc/PID/fd/
+ss -xp                          # Unix sockets and their peers
+lsof -U
+
+# System V leftovers
+ipcs -a
+
+# shared mappings
+cat /proc/PID/maps | grep -E 'shm|SYSV|memfd'
+cat /proc/PID/smaps             # Shared_Clean / Shared_Dirty per mapping
+
+# trace the traffic
+strace -e trace=read,write,sendmsg,recvmsg -p PID
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_futex { @[comm] = count(); }'
+
+# a hang: where is each side blocked?
+cat /proc/PID/stack
+cat /proc/PID/wchan
+gdb -p PID -batch -ex 'thread apply all bt'</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Reader hangs, never gets EOF</td><td>Some process still holds the write end open</td></tr>
+<tr><td>Process dies silently on write</td><td><code>SIGPIPE</code> — the reader closed; ignore it and handle <code>EPIPE</code></td></tr>
+<tr><td>Messages arrive merged or split</td><td>Stream semantics; add length framing</td></tr>
+<tr><td>Writer blocks forever</td><td>Pipe full and the reader is not consuming — a flow-control bug</td></tr>
+<tr><td>Deadlock with two pipes</td><td>Both sides blocked writing while neither reads; use non-blocking + <code>poll</code></td></tr>
+<tr><td>Shared-memory data occasionally corrupt</td><td>No synchronisation or wrong memory ordering</td></tr>
+<tr><td>Peer crashed and the lock is stuck</td><td>Non-robust process-shared mutex</td></tr>
+<tr><td><code>SIGBUS</code> reading shared memory</td><td>Sender truncated it; use <code>memfd</code> seals</td></tr>
+<tr><td>System V objects accumulate after restarts</td><td>They persist beyond process lifetime; use POSIX instead</td></tr>
+<tr><td>Loopback TCP much slower than expected</td><td>Full protocol stack; use a Unix socket</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the seven questions that determine which IPC mechanism to use.</li>
+  <li>Explain why a pipe reader may never see EOF, and the rule that prevents it.</li>
+  <li>Explain why pipes do not preserve message boundaries and what to do about it.</li>
+  <li>Describe <code>SCM_RIGHTS</code> and name two systems that depend on it.</li>
+  <li>Say what shared memory does <em>not</em> provide, and two things you must add.</li>
+  <li>Explain robust mutexes and the failure they address.</li>
+  <li>Explain how a futex avoids syscalls in the uncontended case.</li>
+  <li>Describe the ring-buffer-plus-doorbell pattern and name three systems using it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

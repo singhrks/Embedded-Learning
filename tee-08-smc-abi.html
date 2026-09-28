@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The SMC ABI and the OP-TEE message protocol | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The SMC ABI and the OP-TEE message protocol</h1>
+<p class="lead">Everything the two worlds say to each other travels as an <code>SMC</code> instruction with
+eight register arguments, plus a message structure in shared memory. This chapter is the wire format —
+enough to read a trace, debug a handshake, or implement the normal-world side yourself.</p>
+
+<h2 id="smccc">SMCCC: the calling convention</h2>
+
+<p>Every call into the secure world is an SMC, and the standard calling convention is what stops each vendor inventing its own register usage. This is the layer beneath the friendly client API.</p>
+
+<pre class="diagram">   SMC #0 with a function ID in w0. The ID is structured:
+
+    31  30      29 28        24 23    16 15                  0
+   +---+----------+-------------+--------+--------------------+
+   |FST| SMC64    |  reserved   | OWNER  |   function number  |
+   +---+----------+-------------+--------+--------------------+
+
+   bit 31    0 = yielding (may be preempted, may make RPCs)
+             1 = fast (runs to completion, interrupts masked)
+   bit 30    0 = SMC32 (32-bit arguments)
+             1 = SMC64 (64-bit arguments)
+   [29:24]   must be zero
+   [23:16]   OWNER - who handles this call:
+                0x00  Arm architecture calls
+                0x01  CPU service calls
+                0x02  SiP (silicon partner) calls
+                0x03  OEM calls
+                0x04  Standard Secure Service - PSCI lives here
+                0x05  Standard Hypervisor Service
+                0x06  Vendor Hypervisor Service
+                0x30-0x31  TRUSTED APPLICATION calls
+                0x32-0x3F  TRUSTED OS calls  &lt;-- OP-TEE
+   [15:0]    the function itself
+
+   Arguments in x1-x7 (or w1-w7 for SMC32), results in x0-x3.
+
+   Examples:
+     0x84000000  PSCI_VERSION      fast, SMC32, owner 4
+     0xC4000003  PSCI_CPU_ON       fast, SMC64, owner 4
+     0xB2000000  OPTEE_SMC_CALLS_UID
+     0x32000004  OPTEE_SMC_CALL_WITH_ARG   yielding, owner 0x32</pre>
+
+<h2 id="handshake">The handshake at probe</h2>
+
+<p>Before any real work, the normal world and the trusted OS negotiate capabilities and shared-memory arrangements. That handshake is what the kernel driver does at probe time.</p>
+
+<pre><code>/* Before it will use OP-TEE, the Linux driver asks four
+   questions. Reading this sequence tells you exactly where a
+   broken bring-up failed.                                    */
+
+  1. "Who are you?"
+       SMC(OPTEE_SMC_CALLS_UID)              = 0xBF00FF01
+     returns four words - a UUID. Must equal
+       384fb3e0-e7f8-11e3-af63-0002a5d5c51b
+     Anything else: not OP-TEE, or not a TEE at all. The
+     driver gives up quietly.
+
+  2. "What revision?"
+       SMC(OPTEE_SMC_CALLS_REVISION)         = 0xBF00FF03
+     returns major, minor. The driver checks compatibility.
+       -> dmesg: "optee: revision 4.1"
+
+  3. "What memory can we share?"
+       SMC(OPTEE_SMC_GET_SHM_CONFIG)         = 0xB2000007
+     returns the physical base, size and settings of the
+     static shared memory pool.
+
+  4. "What do you support?"
+       SMC(OPTEE_SMC_EXCHANGE_CAPABILITIES)  = 0xB2000009
+     the driver sends what IT can do:
+       OPTEE_SMC_NSEC_CAP_UNIPROCESSOR
+     OP-TEE replies with what it can do:
+       OPTEE_SMC_SEC_CAP_HAVE_RESERVED_SHM
+       OPTEE_SMC_SEC_CAP_DYNAMIC_SHM
+       OPTEE_SMC_SEC_CAP_MEMREF_NULL
+       OPTEE_SMC_SEC_CAP_ASYNC_NOTIF
+       OPTEE_SMC_SEC_CAP_VIRTUALIZATION
+       -> dmesg: "optee: dynamic shared memory is enabled"
+
+  Then, if all four succeed:
+       -> "optee: initialized driver", /dev/tee0 appears.
+
+/* drivers/tee/optee/smc_abi.c - optee_probe(). Worth reading
+   once; it is about 200 lines and it is the whole
+   negotiation.                                              */</code></pre>
+
+<h2 id="msg">The message structure</h2>
+
+<p>Requests are described by a message structure in shared memory rather than by registers alone, because registers cannot carry buffers. The layout of that structure is the real ABI.</p>
+
+<pre><code>/* Registers carry only the call type and a pointer. The real
+   request lives in shared memory as an optee_msg_arg.       */
+
+struct optee_msg_arg {
+        uint32_t cmd;           /* OPEN_SESSION, INVOKE_COMMAND ... */
+        uint32_t func;          /* the TA's command ID              */
+        uint32_t session;       /* which session                    */
+        uint32_t cancel_id;
+        uint32_t pad;
+        uint32_t ret;           /* TEE_Result out                   */
+        uint32_t ret_origin;    /* who failed: API, comms, TEE, TA  */
+        uint32_t num_params;
+        struct optee_msg_param params[];   /* flexible array        */
+};
+
+struct optee_msg_param {
+        uint64_t attr;          /* type + direction                 */
+        union {
+                struct { uint64_t a, b, c; } value;
+                struct { uint64_t offs, size; uint64_t shm_ref; } rmem;
+                struct { uint64_t buf_ptr, size, shm_ref; } tmem;
+        } u;
+};
+
+/* attr values: */
+#define OPTEE_MSG_ATTR_TYPE_NONE            0x0
+#define OPTEE_MSG_ATTR_TYPE_VALUE_INPUT     0x1
+#define OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT    0x2
+#define OPTEE_MSG_ATTR_TYPE_VALUE_INOUT     0x3
+#define OPTEE_MSG_ATTR_TYPE_RMEM_INPUT      0x5  /* registered  */
+#define OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT     0x6
+#define OPTEE_MSG_ATTR_TYPE_RMEM_INOUT      0x7
+#define OPTEE_MSG_ATTR_TYPE_TMEM_INPUT      0x9  /* temporary   */
+#define OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT     0xa
+#define OPTEE_MSG_ATTR_TYPE_TMEM_INOUT      0xb
+
+/* Commands: */
+#define OPTEE_MSG_CMD_OPEN_SESSION          0
+#define OPTEE_MSG_CMD_INVOKE_COMMAND        1
+#define OPTEE_MSG_CMD_CLOSE_SESSION         2
+#define OPTEE_MSG_CMD_CANCEL                3
+#define OPTEE_MSG_CMD_REGISTER_SHM          4
+#define OPTEE_MSG_CMD_UNREGISTER_SHM        5
+#define OPTEE_MSG_CMD_DO_BOTTOM_HALF        6
+#define OPTEE_MSG_CMD_STOP_ASYNC_NOTIF      7</code></pre>
+
+<h2 id="flow">One invocation, register by register</h2>
+
+<p>Following a complete call — from the client library, through the kernel, across the SMC, into the trusted application and back — ties every layer together and is the path you trace when debugging.</p>
+
+<pre class="diagram">   Client calls TEEC_InvokeCommand(sess, 5, &amp;op, &amp;origin).
+
+   1. libteec fills a struct tee_ioctl_invoke_arg and calls
+        ioctl(fd, TEE_IOC_INVOKE, &amp;arg)
+
+   2. The kernel driver allocates an optee_msg_arg in shared
+      memory and fills it:
+        cmd        = OPTEE_MSG_CMD_INVOKE_COMMAND
+        func       = 5
+        session    = the session id
+        num_params = 4
+        params[0].attr = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT
+        params[0].u.value.a = ...
+        params[1].attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT
+        params[1].u.tmem.buf_ptr = physical address
+        params[1].u.tmem.size    = length
+        params[1].u.tmem.shm_ref = cookie
+
+   3. The driver issues:
+        x0 = OPTEE_SMC_CALL_WITH_ARG   (0x32000004)
+        x1 = upper 32 bits of the msg_arg physical address
+        x2 = lower 32 bits
+        x3-x7 = 0
+        SMC #0
+
+   4. EL3 (opteed) saves the non-secure context, restores the
+      secure one, ERETs into OP-TEE's std_smc_entry.
+
+   5. OP-TEE allocates a thread, reads the msg_arg from shared
+      memory, translates the parameters, finds the session,
+      and calls the TA's TA_InvokeCommandEntryPoint.
+
+   6. The TA runs. If it needs the normal world (to read a
+      file, to get the time, to load another TA) it makes an
+      RPC - which RETURNS through this same path with a
+      "please do this for me" code, and the call is later
+      resumed. Chapter 9.
+
+   7. The TA returns. OP-TEE writes ret and ret_origin into
+      the msg_arg, frees the thread, and executes
+        SMC(TEESMC_OPTEED_RETURN_CALL_DONE)
+
+   8. EL3 restores the non-secure context. The driver's SMC
+      returns with:
+        x0 = OPTEE_SMC_RETURN_OK      (0)
+      or
+        x0 = OPTEE_SMC_RETURN_ETHREAD_LIMIT  - retry later
+        x0 = OPTEE_SMC_RETURN_RPC_*          - do this first
+
+   9. The driver reads ret/ret_origin out of the msg_arg and
+      returns them up through the ioctl to libteec.</pre>
+
+<h2 id="origin">Return origin: who actually failed</h2>
+
+<p>When something fails, the return value says which layer produced the error as well as what it was. That origin field is usually more useful than the code itself.</p>
+
+<pre><code>/* Every failure carries an ORIGIN, and it is the most
+   under-used debugging aid in the whole API.               */
+
+  TEEC_ORIGIN_API          0x1  libteec itself rejected it -
+                                bad arguments in your client
+  TEEC_ORIGIN_COMMS        0x2  the transport failed - driver,
+                                SMC, or the message never
+                                arrived
+  TEEC_ORIGIN_TEE          0x3  OP-TEE core rejected it - no
+                                such session, TA not found,
+                                out of memory, bad params
+  TEEC_ORIGIN_TRUSTED_APP  0x4  YOUR TA returned this. The
+                                value is whatever your TA
+                                returned.
+
+/* So:
+     res = 0xFFFF0006, origin = 3  -> OP-TEE says bad params.
+                                      Your paramTypes disagree.
+     res = 0xFFFF0006, origin = 4  -> your TA returned
+                                      TEE_ERROR_BAD_PARAMETERS.
+                                      Different bug entirely.
+     res = 0x00000001, origin = 4  -> your TA's own error code.
+                                      Nothing standard about it.
+
+   Always print both. A client that prints only the result
+   throws away half the information.                        */
+
+  printf("failed: res=0x%08x origin=%u\n", res, origin);</code></pre>
+
+<pre><code>/* The standard result codes worth recognising on sight: */
+
+#define TEEC_SUCCESS                    0x00000000
+#define TEEC_ERROR_GENERIC              0xFFFF0000
+#define TEEC_ERROR_ACCESS_DENIED        0xFFFF0001
+#define TEEC_ERROR_CANCEL               0xFFFF0002
+#define TEEC_ERROR_ACCESS_CONFLICT      0xFFFF0003
+#define TEEC_ERROR_EXCESS_DATA          0xFFFF0004
+#define TEEC_ERROR_BAD_FORMAT           0xFFFF0005
+#define TEEC_ERROR_BAD_PARAMETERS       0xFFFF0006
+#define TEEC_ERROR_BAD_STATE            0xFFFF0007
+#define TEEC_ERROR_ITEM_NOT_FOUND       0xFFFF0008  /* TA not
+                                                       found   */
+#define TEEC_ERROR_NOT_IMPLEMENTED      0xFFFF0009
+#define TEEC_ERROR_NOT_SUPPORTED        0xFFFF000A
+#define TEEC_ERROR_NO_DATA              0xFFFF000B
+#define TEEC_ERROR_OUT_OF_MEMORY        0xFFFF000C
+#define TEEC_ERROR_BUSY                 0xFFFF000D
+#define TEEC_ERROR_COMMUNICATION        0xFFFF000E
+#define TEEC_ERROR_SECURITY             0xFFFF000F  /* signature
+                                                       check
+                                                       failed  */
+#define TEEC_ERROR_SHORT_BUFFER         0xFFFF0010
+#define TEEC_ERROR_TARGET_DEAD          0xFFFF3024  /* the TA
+                                                       PANICKED */</code></pre>
+
+<div class="key">
+<b><code>TEEC_ERROR_TARGET_DEAD</code> means read the secure console</b>
+<p>0xFFFF3024 is OP-TEE telling you the TA panicked — dereferenced a bad pointer, failed an assertion, or
+called <code>TEE_Panic()</code>. The client cannot know why. The secure console printed a stack dump at the
+moment it happened. This is the single strongest argument for the two-console setup in
+<a href="tee-04-qemu-bringup.html">chapter 4</a>.</p>
+</div>
+
+<h2 id="trace">Watching the traffic</h2>
+
+<p>All of this traffic can be observed, which turns questions about what the two sides actually exchanged into an observation rather than an inference.</p>
+
+<pre><code># The Linux driver has tracepoints and dynamic debug:
+$ echo 'module optee +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+$ dmesg -w
+
+# Under QEMU, trace every SMC that reaches EL3 by building TF-A
+# with debug:
+$ make -C arm-trusted-firmware PLAT=qemu DEBUG=1 LOG_LEVEL=50 ...
+
+# OP-TEE's own view, at flow level:
+$ make CFG_TEE_CORE_LOG_LEVEL=4
+# secure console then shows every entry and exit:
+F/TC:0 0 thread_alloc_and_run:...
+F/TC:0 0 tee_ta_open_session:...
+F/TC:0 0 tee_ta_invoke_command:...
+
+# And from the guest, the ioctl layer:
+$ strace -e trace=ioctl ./my_client
+ioctl(3, TEE_IOC_VERSION, ...)     = 0
+ioctl(3, TEE_IOC_OPEN_SESSION, ...) = 0
+ioctl(3, TEE_IOC_INVOKE, ...)      = 0
+ioctl(3, TEE_IOC_CLOSE_SESSION, ...) = 0
+
+# The ioctl numbers, if you ever implement a client without
+# libteec:
+#   TEE_IOC_VERSION        get driver capabilities
+#   TEE_IOC_SHM_ALLOC      allocate shared memory, returns a fd
+#   TEE_IOC_SHM_REGISTER   register your own memory
+#   TEE_IOC_OPEN_SESSION
+#   TEE_IOC_INVOKE
+#   TEE_IOC_CANCEL
+#   TEE_IOC_CLOSE_SESSION
+#   TEE_IOC_SUPPL_RECV     tee-supplicant only
+#   TEE_IOC_SUPPL_SEND</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Driver does not probe, no error</td><td>The UID call returned something else — OP-TEE is not
+there</td></tr>
+<tr><td><code>optee: api uid mismatch</code></td><td>Something answered the SMC but is not OP-TEE</td></tr>
+<tr><td><code>optee: unsupported revision</code></td><td>Kernel driver and OP-TEE versions too far
+apart</td></tr>
+<tr><td><code>TEEC_ERROR_COMMUNICATION</code></td><td>The SMC path failed — check EL3 built with
+<code>SPD=opteed</code></td></tr>
+<tr><td><code>TEEC_ERROR_TARGET_DEAD</code></td><td>The TA panicked. The reason is on the secure
+console</td></tr>
+<tr><td><code>TEEC_ERROR_BUSY</code> under load</td><td><code>ETHREAD_LIMIT</code> — the thread pool is full
+(<a href="tee-05-core-architecture.html">chapter 5</a>)</td></tr>
+<tr><td>Same error code, two different bugs</td><td>You are ignoring the origin. Print it</td></tr>
+<tr><td>Client hangs forever in an invoke</td><td>The TA is blocked, or a thread-exhaustion
+deadlock</td></tr>
+<tr><td>Works with small buffers, fails with large</td><td>Static SHM pool size, or a temporary memref larger
+than the pool</td></tr>
+<tr><td>Registered memory rejected</td><td><code>DYNAMIC_SHM</code> not in the exchanged
+capabilities</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Decode an SMC function ID into fast/yielding, 32/64-bit and owner.</li>
+  <li>Name the four questions the Linux driver asks at probe and what each confirms.</li>
+  <li>Describe <code>optee_msg_arg</code> and say where it lives.</li>
+  <li>Explain how a buffer parameter is expressed in <code>optee_msg_param</code>.</li>
+  <li>Trace one <code>TEEC_InvokeCommand</code> from ioctl to TA entry point and back, naming both
+  SMCs.</li>
+  <li>Explain <code>OPTEE_SMC_RETURN_ETHREAD_LIMIT</code> and what the driver does about it.</li>
+  <li>Name the four return origins and give a case where the same result code means two different
+  things.</li>
+  <li>Say what <code>TEEC_ERROR_TARGET_DEAD</code> means and where to look next.</li>
+  <li>Recognise <code>0xFFFF0008</code>, <code>0xFFFF000F</code> and <code>0xFFFF0010</code> on
+  sight.</li>
+  <li>Enable driver, TF-A and OP-TEE tracing simultaneously and correlate one call across all
+  three.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

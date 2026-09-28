@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory types: Normal versus Device | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Memory types: Normal versus Device</h1>
+<p class="lead">ARM tags every region of memory with a type that changes what the hardware is permitted to do
+with accesses to it — reorder them, merge them, speculate them, cache them. Choosing the wrong type is one of
+the most common and most confusing driver bugs, because the symptom rarely points at the cause.</p>
+
+<h2 id="why">Why a type is needed at all</h2>
+
+<div class="key">
+<b>RAM and registers are not the same thing</b>
+<p>Reading RAM twice gives the same answer and costs nothing. Reading a FIFO register twice <em>consumes two
+bytes</em>. Writing RAM has no effect until someone reads it; writing a control register starts a motor.</p>
+<p>The optimisations that make RAM fast — caching, speculation, write merging, reordering — are all
+<em>incorrect</em> for a peripheral. So the architecture provides a type that switches them off, and the page
+table says which is which.</p>
+</div>
+
+<h2 id="comparison">The two types</h2>
+
+<p>Every one of these differences traces back to one fact: a peripheral register is not memory, even though
+you access it with a load or store instruction. RAM does not care how many times you read it, does not mind if
+the CPU speculatively reads an address "just in case", and does not care whether two adjacent bytes are
+combined into one wider access. A UART's status register cares about all three — reading it twice can consume
+a byte you never asked for, a speculative read can trigger a side effect that should never have happened, and
+merging two 8-bit register accesses into one 16-bit bus transaction can hit two registers that were never meant
+to be touched together. Device memory exists to switch all of that hardware behaviour off.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Normal</th><th>Device</th></tr></thead>
+<tbody>
+<tr><td>Used for</td><td>RAM, code, data, DMA buffers</td><td>Peripheral registers (MMIO)</td></tr>
+<tr><td>Reordering</td><td>Freely, subject to the memory model</td><td>Not reordered relative to other Device accesses</td></tr>
+<tr><td><strong>Speculative access</strong></td><td>Allowed — the CPU may read addresses you never asked for</td><td><strong>Never</strong></td></tr>
+<tr><td>Merging / splitting</td><td>Allowed</td><td>Depends on sub-type</td></tr>
+<tr><td>Repeating an access</td><td>Allowed</td><td>Not allowed</td></tr>
+<tr><td>Unaligned access</td><td>Allowed</td><td><strong>Always faults</strong></td></tr>
+<tr><td>Cacheable</td><td>Yes — write-back, write-through, or non-cacheable</td><td>Never</td></tr>
+<tr><td>Exclusives (<code>LDXR</code>)</td><td>Supported</td><td><strong>Not supported</strong> — undefined behaviour</td></tr>
+<tr><td>Instruction fetch</td><td>Yes</td><td>Unpredictable — never execute from Device memory</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="device-subtypes">Device sub-types</h2>
+
+<p>Device memory is not one thing. The sub-types differ in what the processor may reorder, combine or repeat — and picking a more permissive one than your hardware tolerates produces failures that appear only under load.</p>
+
+<pre class="diagram">Written Device-&lt;G|nG&gt;&lt;R|nR&gt;&lt;E|nE&gt;, each letter a permission:
+
+   G / nG   GATHERING — may two accesses be merged into one
+                        larger access, or one access split?
+   R / nR   REORDERING — may accesses to DIFFERENT addresses in
+                        this region be reordered with each other?
+   E / nE   EARLY WRITE ACKNOWLEDGEMENT — may a write be
+                        acknowledged before it reaches the
+                        endpoint (i.e. buffered en route)?
+
+   Device-nGnRnE   nothing allowed. The strictest.
+                   Use for: control registers where every write
+                   must land, in order, before the next.
+                   MAIR encoding 0x00
+
+   Device-nGnRE    early ack permitted, still no gathering or
+                   reordering. The common default for most
+                   peripherals — noticeably faster than nGnRnE
+                   because writes need not stall.
+                   MAIR encoding 0x04
+
+   Device-nGRE     reordering permitted
+                   MAIR encoding 0x08
+
+   Device-GRE      everything permitted. Use for framebuffers and
+                   large streaming windows, where throughput
+                   matters and individual accesses have no
+                   side effects.
+                   MAIR encoding 0x0C
+
+  Ordering of strictness: nGnRnE > nGnRE > nGRE > GRE
+
+  Note that even the most relaxed Device type is NOT cacheable and
+  NOT speculatable. Those two properties define "Device".</pre>
+
+<h2 id="normal-subtypes">Normal memory cacheability</h2>
+
+<p>Ordinary memory can be cached in several different ways, and the choice is made per region rather than globally. The options matter most when memory is shared with something that is not a CPU.</p>
+
+<pre><code>/* Normal memory has independent INNER and OUTER cacheability
+   attributes, each one of:                                   */
+
+   Non-cacheable
+   Write-Through,  Read-Allocate / Write-Allocate
+   Write-Back,     Read-Allocate / Write-Allocate    ← the usual
+
+/* "Inner" and "Outer" are implementation-defined boundaries.
+   Typically Inner = the CPU cluster's caches (L1, L2), Outer =
+   a system-level cache beyond it. Most software sets them the
+   same.                                                       */
+
+/* And a SHAREABILITY attribute, which is separate:            */
+   Non-shareable       no coherency maintained
+   Inner Shareable     coherent within the inner domain — this is
+                       what SMP kernel memory uses
+   Outer Shareable     coherent across a wider domain, including
+                       some DMA masters
+
+/* Shareability determines how far a barrier or a TLBI
+   propagates (chapters 19 and 21). Getting it wrong gives you
+   coherency bugs that only appear on multi-core.             */</code></pre>
+
+<h2 id="mair">MAIR: how a descriptor names a type</h2>
+
+<p>A page descriptor does not carry a memory type directly; it carries an index into a register that defines eight possible types. That indirection is why changing one register can alter the behaviour of every mapping at once.</p>
+
+<pre class="diagram">A page table descriptor has only 3 bits for attributes (AttrIndx).
+Three bits cannot encode all the combinations above, so ARM uses
+INDIRECTION:
+
+   MAIR_EL1 holds EIGHT 8-bit attribute values, one per slot.
+   The descriptor's AttrIndx selects a slot.
+
+   MAIR_EL1 = 0x00000000_0044FF04
+                             ││ ││
+                             ││ │└─ slot 0 = 0x04 Device-nGnRE
+                             ││ └── slot 1 = 0xFF Normal WB RW-alloc
+                             │└──── slot 2 = 0x44 Normal Non-cacheable
+                             └───── slot 3 = 0x00 Device-nGnRnE
+
+   Encoding of each byte:
+      0x00        Device-nGnRnE
+      0x04        Device-nGnRE
+      0x08        Device-nGRE
+      0x0C        Device-GRE
+      0xFF        Normal, Inner+Outer WB, RW-allocate
+      0x44        Normal, Inner+Outer Non-cacheable
+      high nibble = Outer, low nibble = Inner (for Normal)
+
+   Change MAIR and EVERY page using that slot changes type at
+   once — which is convenient, and also a way to break the whole
+   system with one register write.</pre>
+
+<pre><code>/* Setting it up, in boot code */
+#define MAIR_DEVICE_nGnRnE  0x00
+#define MAIR_DEVICE_nGnRE   0x04
+#define MAIR_NORMAL_NC      0x44
+#define MAIR_NORMAL_WB      0xFF
+
+#define IDX_DEVICE_nGnRnE   0
+#define IDX_DEVICE_nGnRE    1
+#define IDX_NORMAL_NC       2
+#define IDX_NORMAL_WB       3
+
+        uint64_t mair =
+                ((uint64_t)MAIR_DEVICE_nGnRnE &lt;&lt; (8 * IDX_DEVICE_nGnRnE)) |
+                ((uint64_t)MAIR_DEVICE_nGnRE  &lt;&lt; (8 * IDX_DEVICE_nGnRE))  |
+                ((uint64_t)MAIR_NORMAL_NC     &lt;&lt; (8 * IDX_NORMAL_NC))     |
+                ((uint64_t)MAIR_NORMAL_WB     &lt;&lt; (8 * IDX_NORMAL_WB));
+
+        asm volatile("msr mair_el1, %0" :: "r"(mair));
+        asm volatile("isb");            /* chapter 06 */
+
+/* then a descriptor references a slot: */
+        pte = pa | PTE_VALID | PTE_AF
+                 | PTE_ATTR(IDX_DEVICE_nGnRE)   /* bits [4:2] */
+                 | PTE_UXN | PTE_PXN;           /* never execute MMIO */</code></pre>
+
+<h2 id="bugs">The bugs, and why they are confusing</h2>
+
+<div class="danger">
+<b>MMIO mapped as Normal cacheable</b>
+<p>This is the classic, and it produces four distinct failure modes that look unrelated:</p>
+<ol>
+<li><strong>Writes never reach the device.</strong> They sit in a dirty cache line until eviction — which may
+be never, or may happen minutes later at an unrelated moment.</li>
+<li><strong>Reads return stale values forever.</strong> The first read caches the line; every subsequent read
+hits the cache. A status register appears frozen.</li>
+<li><strong>A FIFO drains spontaneously.</strong> Speculative execution reads addresses the program never
+touched. Reading a FIFO register <em>pops</em> it, so data vanishes with no code responsible.</li>
+<li><strong>Writes are merged or reordered.</strong> A sequence that must be written in order arrives
+coalesced, and the device sees an illegal state transition.</li>
+</ol>
+<p>The tell: it often works under a debugger (single-stepping defeats the caching and speculation) and fails
+at speed. If a peripheral "works in debug, fails in release", check the mapping attributes before anything
+else.</p>
+</div>
+
+<div class="warn">
+<b>Normal memory mapped as Device</b>
+<p>The reverse mistake is less dramatic but very costly: correctness is fine, performance collapses. No
+caching, no speculation, no merging — every access goes to DRAM individually. A memcpy through a
+Device-mapped buffer can be 50–100× slower than through Normal memory. This is a common cause of
+"why is my DMA buffer so slow to fill?".</p>
+</div>
+
+<pre><code>/* Two more subtle ones: */
+
+/* 1. Exclusives on Device memory are UNDEFINED. */
+        /* A spinlock in a Device-mapped shared region will not
+           work — LDXR/STXR need a coherent monitor that Device
+           memory does not provide. Shared memory between a CPU
+           and a device must be Normal Non-cacheable, not Device,
+           if you intend to use atomics on it.                */
+
+/* 2. Unaligned access to Device memory ALWAYS faults, even
+      though the same code works on Normal memory.           */
+        uint8_t *regs = ioremap(...);
+        uint32_t v = *(uint32_t *)(regs + 1);   /* alignment fault */
+        /* Which is why casting a byte pointer into a register
+           block is a bug, and why register structs must have
+           explicit padding (C chapter 07).                   */</code></pre>
+
+<h2 id="os">How the OS picks the type for you</h2>
+
+<p>In practice you rarely set these yourself — the operating system chooses based on which API you called. Knowing the mapping from API to memory type is what lets you predict the behaviour you will get.</p>
+
+<pre><code>/* Linux — the mapping function encodes the choice: */
+
+ioremap(phys, size)          /* Device-nGnRE — the default for MMIO */
+ioremap_np(phys, size)       /* Device-nGnRnE — "non-posted", for
+                                registers needing strict ordering  */
+ioremap_wc(phys, size)       /* Normal Non-cacheable, write-combining
+                                — framebuffers, large windows      */
+ioremap_cache(phys, size)    /* Normal cacheable — ROM, or memory
+                                the device does not modify         */
+memremap(phys, size, MEMREMAP_WB)   /* explicitly Normal WB        */
+
+/* And the accessors that go with them: */
+readl(addr) / writel(v, addr)               /* with barriers        */
+readl_relaxed() / writel_relaxed()          /* without              */
+
+/* Windows */
+MmMapIoSpaceEx(pa, len, PAGE_READWRITE | PAGE_NOCACHE);
+MmMapIoSpaceEx(pa, len, PAGE_READWRITE | PAGE_WRITECOMBINE);
+READ_REGISTER_ULONG / WRITE_REGISTER_ULONG
+
+/* In device tree, a region's cacheability for DMA is expressed
+   separately, by whether the device is coherent:              */
+        dma-coherent;         /* device participates in coherency  */
+        no-map;               /* kernel must not map this at all   */</code></pre>
+
+<h2 id="dma">DMA buffers: the third case</h2>
+
+<p>Memory shared with a device is the case where all of this becomes unavoidable, because two different agents with different caching behaviour are looking at the same bytes.</p>
+
+<pre class="diagram">A DMA buffer is Normal memory, but WHICH Normal memory depends on
+whether the device is coherent:
+
+  COHERENT DEVICE (ACE-Lite, CHI, `dma-coherent` in DT)
+     map Normal Write-Back Inner-Shareable
+     the interconnect keeps the device's view coherent with the
+     CPU's caches — no maintenance needed
+     dma_alloc_coherent() gives you cacheable memory
+
+  NON-COHERENT DEVICE
+     option A: Normal Non-cacheable
+               simple and correct, but CPU access is slow
+               dma_alloc_coherent() gives you this on such systems
+     option B: Normal Write-Back plus explicit cache maintenance
+               fast CPU access, but you must clean before the
+               device reads and invalidate before you read what
+               it wrote (chapter 18, CA chapter 15)
+               dma_map_single() / dma_sync_* do this for you
+
+  NEVER map a DMA buffer as Device. It is memory, not registers:
+  you want the CPU side to be fast, and the device does not care.
+
+  This is precisely why you must use the DMA API rather than
+  choosing yourself — it knows which case applies.</pre>
+
+<h2 id="checking">Checking what you got</h2>
+
+<p>When a device sees stale data or a write appears to vanish, the memory type is the first suspect. These are the ways to find out what attributes a mapping actually has, rather than what you intended.</p>
+
+<pre><code># Linux: what is mapped where, and how
+cat /proc/vmallocinfo | grep ioremap
+#   0xffff800010000000-0xffff800010002000  8192 ioremap ...
+
+cat /proc/iomem                    # physical resource map
+cat /proc/self/pagemap             # per-page details (needs root)
+
+# read MAIR and a descriptor from a debug module
+pr_info("MAIR_EL1 = %016llx\n", read_sysreg(mair_el1));
+
+# in gdb on a bare-metal target
+p/x $MAIR_EL1
+p/x $TCR_EL1
+# then walk the tables by hand for the address in question
+# (chapter 13) and read AttrIndx from bits [4:2]
+
+# the AT instruction asks the hardware to translate for you
+        at      s1e1r, x0          // stage-1, EL1, read
+        mrs     x1, par_el1        // result: PA plus attributes
+/* PAR_EL1 reports the memory attributes actually applied —
+   the definitive answer to "how is this address mapped?"   */</code></pre>
+
+<div class="tip">
+<b><code>AT</code> plus <code>PAR_EL1</code> is the debugging tool to remember</b>
+<p>Rather than walking page tables by hand, ask the MMU. <code>AT S1E1R, Xn</code> performs a translation and
+writes the resulting physical address <em>and its memory attributes</em> into <code>PAR_EL1</code>. If the
+translation fails, <code>PAR_EL1.F</code> is set and the fault status tells you why. This answers "is this
+address mapped, and as what?" in two instructions, from a live system.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device works under a debugger, fails at speed</td><td>MMIO mapped cacheable; stepping hid it</td></tr>
+<tr><td>Status register value never changes</td><td>Cached read hitting a stale line</td></tr>
+<tr><td>Register writes have no effect</td><td>Sitting in a dirty cache line</td></tr>
+<tr><td>FIFO loses data with no code reading it</td><td>Speculative reads on a cacheable MMIO mapping</td></tr>
+<tr><td>Device sees an illegal register sequence</td><td>Writes merged or reordered — needs a stricter Device sub-type</td></tr>
+<tr><td>Alignment fault on one region only</td><td>Device memory always faults on unaligned access</td></tr>
+<tr><td>Spinlock in shared memory never acquires</td><td>Exclusives on Device memory are undefined</td></tr>
+<tr><td>DMA buffer is extremely slow to fill</td><td>Mapped Device or Non-cacheable when it need not be</td></tr>
+<tr><td>Framebuffer updates are slow</td><td>Mapped Device-nGnRnE instead of write-combining</td></tr>
+<tr><td>Works on one SoC, fails on another</td><td>One is DMA-coherent, the other is not</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three optimisations that are correct for RAM and wrong for a peripheral.</li>
+  <li>List five differences between Normal and Device memory.</li>
+  <li>Decode <code>Device-nGnRE</code> letter by letter and say when you would use it.</li>
+  <li>Explain what MAIR indirection buys and how a descriptor names a type.</li>
+  <li>Give the four failure modes of mapping MMIO as cacheable.</li>
+  <li>Explain why unaligned access faults on Device memory but not Normal.</li>
+  <li>Say why a DMA buffer should never be Device memory, and what determines its cacheability.</li>
+  <li>Explain how <code>AT</code> and <code>PAR_EL1</code> answer "how is this address mapped?".</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

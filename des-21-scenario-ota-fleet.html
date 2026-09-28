@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scenario: OTA updates for a fleet | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Scenario: OTA updates for a fleet</h1>
+<p class="lead">A systems design round rather than a board design one. It tests whether you think about
+failure at scale, and it has a characteristic trap: the mechanism on one device is the easy half.</p>
+
+<div class="key">
+<b>The prompt</b>
+<p>"We have 500,000 battery-powered devices in the field on cellular connections. Design the firmware update
+system. Assume the devices are already deployed and cannot be recalled."</p>
+</div>
+
+<h2 id="clarify">1 · Clarify</h2>
+
+<pre><code>  WHAT DO THE DEVICES ALREADY SUPPORT? -&gt; THE FIRST
+        QUESTION. "Already deployed" means the on-device
+        mechanism may be fixed. If they have A/B and
+        signature verification, this is a server and
+        process problem. If they do not, the answer is
+        very different and much more constrained.
+        ASSUME: A/B slots, signature verification, and a
+        bootloader that can revert. If they lack it, say
+        clearly that the first update must be the one that
+        adds it, and that update is the riskiest one you
+        will ever ship.
+
+  IMAGE SIZE?          ~400 kB.
+  CONNECTIVITY?        NB-IoT, intermittent, expensive per
+                       byte, and the device chooses when to
+                       connect.
+  BATTERY?             the update itself costs energy that
+                       is not in the original budget.
+  HOW OFTEN?           a few times a year, plus emergency
+                       security fixes.
+  ACCEPTABLE ROLLOUT TIME? -&gt; weeks is fine for a feature
+                       release; a security fix may need
+                       days, which is a different design
+                       point.
+  CAN A DEVICE BE VISITED?  -&gt; assume no, or at prohibitive
+                       cost. That makes brick-avoidance the
+                       overriding requirement.
+
+RESTATE:
+  "500k devices, no physical access, cellular and
+  intermittent, energy-constrained, 400 kB images. The
+  device-side mechanism is largely solved by A/B; the hard
+  parts are the rollout process, the energy cost, and
+  making sure a bad image cannot take out the fleet. I'll
+  focus there."</code></pre>
+
+<h2 id="device">2 · The device side</h2>
+
+<pre class="diagram">   THE SEQUENCE, and each step has a failure it exists to
+   handle.
+
+   1. CHECK IN. On its normal schedule, the device reports
+      its version and asks whether an update is available.
+      The DEVICE initiates - nothing can reach a sleeping
+      device on a cellular link.
+
+   2. DECIDE. The server answers based on the rollout
+      cohort, the device's battery state, and its signal
+      quality. A device at 15% battery should not attempt
+      a 400 kB download.
+
+   3. DOWNLOAD IN CHUNKS, RESUMABLE. A single long session
+      is both an energy spike and a failure risk; a
+      dropped connection must resume, not restart. Each
+      chunk is verified on arrival.
+
+   4. VERIFY THE WHOLE IMAGE: hash, then signature. Only
+      then mark slot B valid.
+
+   5. FLAG AND REBOOT at a moment the device chooses -
+      not mid-measurement, and not when it has unsent
+      data it would lose.
+
+   6. CONFIRM. B must reach the server and report its new
+      version within a window. Only then is B marked
+      permanent.
+
+   7. If confirmation does not happen, the watchdog
+      resets and the bootloader reverts to A - which
+      then reports the failure on its next check-in, so
+      the SERVER LEARNS the image is bad.
+
+   STEP 7 IS THE ONE THAT MAKES THE SYSTEM SAFE AT SCALE:
+   a failed update is not just survived, it is REPORTED,
+   which is what lets an automatic halt work.
+
+   THE CONFIRMATION CRITERION MATTERS ENORMOUSLY. "The
+   application started" would pass an image that boots and
+   cannot connect - which is precisely the failure that
+   bricks a fleet. It must be "reached the server", because
+   that is the property you actually need to preserve:
+   MANAGEABILITY.</pre>
+
+<h2 id="energy">3 · The energy budget nobody plans for</h2>
+
+<pre><code>A 400 kB DOWNLOAD OVER NB-IoT, at perhaps 20-60 kbit/s
+effective:
+
+    400 kB = 3.2 Mbit
+    at 40 kbit/s = 80 seconds of radio time
+    at, say, 100 mA average while active
+    = 80 x 100 = 8000 mA-s = 2.2 mAh
+
+  Against a device budgeted at, say, 30 uA average (about
+  0.72 mAh per day), a single update costs roughly THREE
+  DAYS of normal operation. Two or three updates a year is
+  perhaps 1% of the annual budget - acceptable, and worth
+  stating explicitly so nobody is surprised.
+
+  BUT: a device that retries a failed download repeatedly
+  can burn far more. So the design needs
+    - a bounded retry count per update attempt
+    - a minimum battery threshold below which it refuses
+    - backoff between attempts
+    - and the server should stop offering an update to a
+      device that has failed it several times, rather than
+      letting it drain itself trying
+
+  THE LEVERS if the energy cost is too high:
+    compress the image (typically 2-3x on firmware)
+    delta updates against the known previous version -
+      much smaller, at the cost of per-device state on the
+      server and a patch applier that must itself be
+      power-fail safe (chapter 12)
+    schedule downloads when signal is strong, since poor
+      signal means retransmissions and much higher energy
+      per byte</code></pre>
+
+<h2 id="rollout">4 · The rollout — where fleets are actually saved</h2>
+
+<pre class="diagram">   STAGED ROLLOUT WITH AUTOMATIC HALT.
+
+     cohort 0   internal test devices        ~50
+     cohort 1   1% of the fleet            5,000
+     cohort 2   10%                       50,000
+     cohort 3   remainder                445,000
+
+   BETWEEN COHORTS, WAIT AND WATCH. The metric is not
+   "did the download succeed" - it is CHECK-IN RATE.
+   Devices that took the update and then went quiet are
+   the signal that matters, and they are invisible if you
+   only count successful downloads.
+
+     halt if: check-in rate for updated devices falls
+              below baseline by more than a threshold
+              revert rate exceeds a threshold
+              crash reports rise
+              any device fails to confirm more than once
+
+   THE WAIT PERIOD must exceed the devices' natural
+   check-in interval by a comfortable margin - if devices
+   report daily, a two-hour soak proves nothing.
+
+   THIS IS THE MECHANISM THAT TURNS A FLEET-WIDE OUTAGE
+   INTO 5,000 AFFECTED DEVICES. Everything else on this
+   page is about surviving on one device; this is about
+   surviving as a fleet, and it is what candidates most
+   often omit.
+
+   PLUS:
+     - a KILL SWITCH: the ability to stop a rollout
+       immediately and to roll back devices that have
+       already taken it
+     - version pinning per cohort, so a device that
+       reappears after months does not jump to an
+       untested version
+     - and the ability to hold specific devices back -
+       there is always a customer who must not be touched</pre>
+
+<h2 id="fail">5 · Failure modes at scale</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Failure</th><th>Detection</th><th>Response</th></tr></thead>
+<tbody>
+<tr><td>Download interrupted</td><td>Chunk verification / session drop</td><td>Resume from the last good chunk;
+bounded retries; back off</td></tr>
+<tr><td>Corrupted image that still flashes</td><td>Whole-image hash and signature before marking valid</td><td>Discard;
+report; do not reboot</td></tr>
+<tr><td>Image boots but cannot connect</td><td>Confirmation window expires</td><td>Revert to A; report the
+failure on next check-in; server halts the rollout</td></tr>
+<tr><td>Power lost mid-flash</td><td>—</td><td>A/B means A is untouched; the device simply boots A</td></tr>
+<tr><td>Device battery too low</td><td>Pre-check before download</td><td>Refuse; report; the server stops
+offering</td></tr>
+<tr><td>Whole fleet reconnects at once</td><td>Server load</td><td>Jitter on all schedules; server can defer a
+device with a "come back later" response</td></tr>
+<tr><td>Signing key compromised</td><td>Out of band</td><td>Key revocation via a monotonic counter in fuses;
+this must have been designed in</td></tr>
+<tr><td>Device dormant for a year, then returns</td><td>Version reported at check-in</td><td>Must be able to
+update from any historical version — so keep every image, and test the oldest-to-newest path</td></tr>
+<tr><td>Rollout halted with the fleet in mixed versions</td><td>Version distribution telemetry</td><td>The
+server and protocol must support several versions concurrently — indefinitely</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="qbank">
+<div class="qbank-head"><h3 id="q">Follow-up questions</h3><span class="qbank-count"></span></div>
+
+<details class="qa">
+<summary>The devices in the field do not have A/B or signature verification. Now what?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Then the first update is the most dangerous one the company will ever ship, and it should be treated
+accordingly.</p>
+<p>What is possible depends entirely on what the existing bootloader can do. If there is a bootloader that can
+receive an image over the air at all, the first update replaces the application with one that <em>adds</em>
+A/B and verification for the future — accepting that this particular update has no fallback. That means: an
+extremely small and heavily reviewed change; extensive testing on hardware identical to the field units,
+including at low battery and poor signal; a very slow staged rollout starting with tens of devices; and a
+willingness to stop permanently if the early cohort shows any problem.</p>
+<p>If flash space does not allow adding a second slot, the honest answer may be that full A/B is impossible on
+this hardware and the best achievable is a minimal recovery loader that can always re-download — which still
+leaves a window requiring connectivity.</p>
+<p>And I would say plainly that this is a design failure being paid for later, and that the fix for the
+<em>next</em> product is to ship the update mechanism before shipping the product.</p>
+<div class="qa-listen"><b>Listening for</b>Recognising the first update has no safety net, and proportionate
+caution rather than confidence.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What is the right confirmation criterion, and why does it matter so much?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>"Successfully connected to the server and reported the new version." Not "the application started", and not
+"a self-test passed".</p>
+<p>The reason is that the property you must preserve above all others is <em>manageability</em> — the ability to
+update the device again. An image that boots perfectly and cannot connect is functionally a brick on a device
+you cannot visit, and a weaker criterion would confirm it as good and then propagate it to the rest of the
+fleet.</p>
+<p>The complication is legitimate outages: a device in a cellular dead spot or during a network incident will
+fail to connect through no fault of the new image, and reverting it unnecessarily wastes energy and churns the
+fleet.</p>
+<p>So a practical scheme uses two windows: confirm provisionally on a local self-test so the device does not
+reboot-loop, but keep the ability to revert until a successful server contact within a much longer window —
+days rather than minutes. Devices in a genuine outage then survive; an image that broke connectivity still
+rolls back eventually.</p>
+<div class="qa-listen"><b>Listening for</b>Manageability as the property being protected, and handling the
+legitimate-outage case with two windows.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you avoid all 500,000 devices downloading at once?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Several layers, and they compose.</p>
+<p><strong>Cohorts:</strong> only a fraction of the fleet is eligible at any time, which caps concurrency by
+design.</p>
+<p><strong>Server-side admission:</strong> the device asks, and the server can say "yes", "no", or "come back
+in N hours" — so the server controls the rate directly and can shed load. This is much better than devices
+deciding for themselves, because it adapts to actual capacity.</p>
+<p><strong>Jitter:</strong> devices check in on randomised schedules, not on the hour, so there is no natural
+synchronisation. This matters most after any event that synchronises them — a network outage or a mass reboot
+— because otherwise they all return together.</p>
+<p><strong>Content delivery:</strong> serve images from a CDN so the bandwidth is not a single origin's
+problem, and use range requests so resumed downloads do not re-fetch.</p>
+<p>The failure this prevents is the thundering herd, and it is worth naming: without jitter and admission
+control, a regional outage causes every affected device to reconnect and request simultaneously, the server
+degrades, connections fail, devices back off in lockstep and do it again — oscillating for hours.</p>
+<div class="qa-listen"><b>Listening for</b>Server-side admission control, and naming the thundering herd
+explicitly.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>A security vulnerability needs patching in days, not weeks. How does that change things?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>It compresses the staged rollout, which is exactly the safety mechanism you would rather not compress — so
+the decision is a risk trade and should be made explicitly rather than by default.</p>
+<p>What I would do: shorten but do not skip the stages — even a few hours at 1% catches a catastrophic image,
+and catching it is worth more than the hours lost. Increase the observation sensitivity so a halt triggers on
+weaker evidence. Prioritise the most exposed devices first if the vulnerability's exploitability varies. And
+prepare the rollback path before starting, rather than after.</p>
+<p>The levers that genuinely speed things up without reducing safety: a smaller patch (delta or a minimal
+targeted fix rather than a full release), so downloads complete faster and fewer devices are mid-update; asking
+devices to check in more frequently for the duration, accepting the energy cost; and having the server actively
+offer to every device that appears rather than waiting for a schedule.</p>
+<p>And the honest framing for the business: shipping a fix to 500,000 devices in days carries real risk of a
+worse outcome than the vulnerability, and that comparison should be made with the security team rather than
+assumed either way.</p>
+<div class="qa-listen"><b>Listening for</b>Refusing to skip staging entirely, and framing it as an explicit
+risk trade.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>A device has been offline for a year and reappears on an old version. What happens?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>It must be able to update from whatever version it is on to current, which has several consequences that
+are easy to miss.</p>
+<p><strong>Keep every released image indefinitely</strong>, and their signing metadata, because you cannot
+predict which version a returning device will report. <strong>Test the oldest-to-newest path</strong> — not
+just the last-to-current one — because migration logic (a changed configuration format, a new key derivation,
+a different data layout) may only be correct for adjacent versions.</p>
+<p>If updates must be sequential — which delta updates force, and which stepwise data migrations may also
+force — then the device may need several update cycles to catch up, each costing energy and each a chance to
+fail. That argues for keeping full images available even if deltas are the normal path, so a far-behind device
+can jump directly.</p>
+<p>Also: the server must still speak the old protocol version the device is using, which is why the
+device-server protocol needs versioning and long-term backward compatibility. And the device's certificate may
+have expired while it was away, so there must be a path to re-establish trust that does not require the very
+connectivity being authenticated.</p>
+<div class="qa-listen"><b>Listening for</b>Testing the oldest path, and the expired-certificate problem.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you know the rollout is going well?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>By watching the devices that took it, not the downloads that completed — and the distinction is the whole
+point.</p>
+<p>The primary metric is <strong>check-in rate among updated devices compared with baseline</strong>. A device
+that downloaded successfully, rebooted and then went quiet is exactly the failure mode that matters, and a
+"download success" counter shows it as a success.</p>
+<p>Supporting metrics: revert rate (devices that confirmed nothing and fell back); crash and watchdog reset
+counts reported after update; error counters per subsystem compared before and after; battery drain rate, since
+a regression that keeps the radio awake shows here first; and the version distribution across the fleet, which
+should move as expected.</p>
+<p>The operational requirements: a defined baseline measured before the rollout, because "normal" varies by
+cohort and by season; a wait period longer than the natural check-in interval, or the data is meaningless; and
+automatic halt thresholds set in advance rather than judged in the moment.</p>
+<p>And keep the ability to compare cohorts directly — updated versus not-yet-updated devices in the same
+population is a far stronger signal than comparing against last week.</p>
+<div class="qa-listen"><b>Listening for</b>Check-in rate rather than download success, and the cohort
+comparison.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What could still take out the whole fleet despite all of this?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Several things, and being able to name them is the point of the question.</p>
+<p><strong>A server-side change</strong> — the fleet is fine, but an API change, an expired server certificate
+or a DNS misconfiguration makes every device unable to connect. This is often more likely than a bad firmware
+image and receives far less scrutiny, because it does not go through the staged rollout process. The mitigation
+is treating server changes with the same discipline, plus devices that tolerate failures gracefully rather than
+entering a bad state.</p>
+<p><strong>A certificate expiring</strong> on the device side, with no path to update the trust store.</p>
+<p><strong>A time-based bug</strong> — a counter wrapping, a leap-second or date-handling error — which fires
+on every device simultaneously regardless of firmware version, because they share the trigger rather than the
+rollout.</p>
+<p><strong>A compromised signing key</strong>, which allows an attacker to push a malicious image through the
+legitimate mechanism — hence revocation.</p>
+<p><strong>A common environmental cause</strong> — a cellular operator changing network configuration, or
+retiring a technology the modems depend on.</p>
+<p>The general lesson: staged rollout protects against changes <em>you</em> make to firmware. It does not
+protect against changes to everything else, and those need their own discipline.</p>
+<div class="qa-listen"><b>Listening for</b>Server-side and time-based failures, which bypass the rollout
+protection entirely.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What would you insist on before the first product ships, knowing this?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>A short list, all of which are cheap before shipping and impossible after.</p>
+<p><strong>A/B slots with confirmation</strong>, and the flash budgeted for it from the start — this is the
+single most important item and the one most often sacrificed to save part cost.
+<strong>Signature verification anchored in ROM and fuses</strong>, with a revocation counter, so a leaked key
+does not end the product. <strong>An updatable trust store</strong>, so certificate expiry is survivable.</p>
+<p><strong>Telemetry designed in:</strong> version, battery, error counters, reset causes and check-in
+reliability, because without them a rollout cannot be monitored and a fleet cannot be diagnosed.
+<strong>A protocol version field</strong> in everything, device-to-server and between processors, so
+incompatible versions degrade instead of breaking.</p>
+<p><strong>Archived build artefacts and symbols per release</strong>, so a crash log from a three-year-old
+version can still be decoded.</p>
+<p>And organisationally: an end-of-support policy stated up front, and the update mechanism tested — including
+the revert path and the oldest-version path — as a release gate, not as a feature someone will get to.</p>
+<div class="qa-listen"><b>Listening for</b>Prioritising A/B with the flash budget, and treating the revert
+path as something to be tested rather than assumed.</div>
+</div>
+</details>
+
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what to establish first when the devices are already deployed.</li>
+  <li>Give the seven-step device-side sequence and the failure each step handles.</li>
+  <li>State the correct confirmation criterion and explain what property it protects.</li>
+  <li>Compute the energy cost of a 400 kB update and express it in days of normal operation.</li>
+  <li>Give four ways to reduce the energy cost of updating.</li>
+  <li>Describe the staged rollout and the metric that must be watched.</li>
+  <li>Explain why the wait between cohorts must exceed the check-in interval.</li>
+  <li>Name four mechanisms that prevent a thundering herd.</li>
+  <li>Say what must be true for a device returning after a year on an old version.</li>
+  <li>Name three failures that a staged rollout does not protect against.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/qa.js"></script>
+</body>
+</html>

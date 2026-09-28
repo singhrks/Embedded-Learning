@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boot and initialisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Boot and initialisation</h1>
+<p class="lead">Boot is a chain of increasingly capable programs, each loading and validating the next. It is
+where firmware, security and the OS meet, and where bring-up problems are most opaque — because when it fails
+you often have no output at all.</p>
+
+<h2 id="problem">The bootstrap problem</h2>
+
+<div class="key">
+<b>Why there are so many stages</b>
+<p>At reset the CPU has no DRAM, no stack, no filesystem and no drivers — only a fixed address it starts
+executing from. Each stage exists to make the <em>next</em> one possible: on-chip ROM runs from a few
+kilobytes of SRAM and its only job is to initialise enough to load a slightly larger program; that program
+initialises DRAM so a full bootloader will fit; the bootloader has drivers enough to read a filesystem and
+load a kernel. Each stage is bigger and more capable because the previous one earned it the resources.</p>
+</div>
+
+<h2 id="arm">ARM64 embedded boot</h2>
+
+<p>Booting an ARM system is a chain of programs, each verifying and loading the next. Knowing the sequence matters because a board that fails to boot stopped at one specific link, and each is debugged differently.</p>
+
+<pre class="diagram">   power on / reset
+        │
+   ┌────▼─────────────────────────────────────────────────┐
+   │ BL1  Boot ROM            EL3, on-chip SRAM            │
+   │  · mask-programmed, immutable — the ROOT OF TRUST     │
+   │  · reads boot-mode straps: eMMC? SD? USB? UART?       │
+   │  · loads and VERIFIES BL2                             │
+   └────┬─────────────────────────────────────────────────┘
+   ┌────▼─────────────────────────────────────────────────┐
+   │ BL2  Trusted Boot Firmware       EL1-S               │
+   │  · DRAM INIT — the single most fragile step in boot   │
+   │  · loads and verifies BL31, BL32, BL33                │
+   └────┬─────────────────────────────────────────────────┘
+   ┌────▼─────────────────────────────────────────────────┐
+   │ BL31 EL3 Runtime Firmware (TF-A)  — stays RESIDENT    │
+   │  · the secure monitor; owns SCR_EL3.NS                │
+   │  · provides PSCI: CPU_ON, CPU_OFF, SYSTEM_RESET       │
+   └────┬─────────────────────────────────────────────────┘
+        ├──────────► BL32  Trusted OS (OP-TEE) at S-EL1
+        │
+   ┌────▼─────────────────────────────────────────────────┐
+   │ BL33 U-Boot / UEFI               EL2 or EL1, NS       │
+   │  · enough drivers to read storage and network         │
+   │  · loads Image + .dtb (or an EFI stub kernel)         │
+   └────┬─────────────────────────────────────────────────┘
+   ┌────▼─────────────────────────────────────────────────┐
+   │ Linux kernel                                          │
+   └───────────────────────────────────────────────────────┘
+
+The security dimension of this chain — signature verification at
+every arrow, anti-rollback, fuses — is the subject of the security
+track. Here we care about the mechanics.</pre>
+
+<h3>The kernel's entry contract</h3>
+
+<pre><code>/* Documented in Documentation/arch/arm64/booting.rst. The
+   bootloader MUST deliver exactly this state:              */
+
+    x0 = physical address of the flattened device tree blob
+    x1 = x2 = x3 = 0                      (reserved, must be zero)
+
+    MMU        OFF
+    D-cache    OFF   (and the image must be cache-clean to PoC)
+    I-cache    may be on or off
+    interrupts masked at the CPU
+    running at EL2 if available (preferred — enables KVM), else EL1
+    all secondary CPUs parked, released via PSCI or a spin-table
+
+/* Getting any of this wrong gives a kernel that hangs before it can
+   print anything — which is why `earlycon` exists and why a serial
+   console is the first thing you bring up on new hardware.     */</code></pre>
+
+<h2 id="kernel">Inside the kernel</h2>
+
+<p>Once the kernel image gets control, it has a substantial amount of work to do before anything recognisable as an operating system exists — and the order of that work is dictated by dependencies rather than convenience.</p>
+
+<pre class="diagram">   head.S — arch/arm64/kernel/head.S
+     · if at EL2 and not using KVM, drop to EL1
+     · set up an IDENTITY map plus the initial kernel page tables
+     · enable the MMU
+     · BRANCH TO VIRTUAL ADDRESSES  ◄── the moment the kernel
+       (__primary_switch)               starts living in its own
+     · zero .bss, set up the initial stack       address space
+        │
+        ▼
+   start_kernel()  — init/main.c
+     setup_arch()        parse the DTB or ACPI, reserve memory,
+                         discover CPUs, set up earlycon
+     mm_init()           hand memory to the buddy allocator, slab
+     sched_init()        runqueues and the idle task
+     init_IRQ()          probe and initialise the GIC
+     time_init()         start the generic timer
+     rest_init()         create PID 1 and kthreadd, then become
+                         the idle task forever
+        │
+        ▼
+   kernel_init()  (PID 1, still in kernel mode)
+     do_initcalls()      run every initcall level in order
+     smp_init()          bring up secondary CPUs via PSCI CPU_ON
+     mount the root filesystem
+     free the initrd
+     execve("/sbin/init")  ◄── PID 1 becomes a user process and
+                               NEVER returns to the kernel</pre>
+
+<pre><code>/* initcalls: drivers are not called explicitly. Each registers via
+   a macro; the linker collects them into ordered sections.     */
+early_initcall()      /* level 0 */
+core_initcall()       /* 1 */
+postcore_initcall()   /* 2 */
+arch_initcall()       /* 3 */
+subsys_initcall()     /* 4 — bus types, classes */
+fs_initcall()         /* 5 */
+device_initcall()     /* 6 — most drivers; module_init maps here */
+late_initcall()       /* 7 */
+
+/* Within a level, order follows LINK order, which follows the
+   Makefile. Depending on that is a bug. Express real dependencies
+   with -EPROBE_DEFER (OS chapter 16) instead.                 */</code></pre>
+
+<h2 id="initramfs">initramfs and the root filesystem</h2>
+
+<p>The kernel needs a root filesystem, and the driver for the device holding it may itself need to be loaded from a filesystem. The temporary filesystem in memory is how that circularity is broken.</p>
+
+<pre class="diagram">The chicken-and-egg problem:
+   to mount the root filesystem you need its driver
+   the driver is a module
+   the module lives on the root filesystem
+
+INITRAMFS solves it: a cpio archive, loaded into RAM by the
+bootloader (or built into the kernel), containing exactly the
+modules and tools needed to reach the real root.
+
+   bootloader loads Image + initramfs
+        │
+   kernel unpacks the cpio into a tmpfs — this IS the initial root
+        │
+   /init runs (a shell script, or systemd)
+     · load storage, RAID, LVM, crypto modules
+     · assemble arrays, unlock LUKS, activate LVM
+     · possibly fetch a network root
+     · mount the real root at /sysroot
+        │
+   switch_root /sysroot /sbin/init
+     · move the mounts, free the initramfs memory, exec the real init
+
+Embedded systems often skip it entirely: build the storage driver
+into the kernel and boot straight to a fixed root. Fewer moving
+parts, faster boot.</pre>
+
+<pre><code># the kernel command line drives most of this
+root=/dev/mmcblk0p2 rootwait rw
+root=PARTUUID=abcd-1234        # stable across device renumbering
+rootfstype=ext4
+console=ttyAMA0,115200 earlycon
+init=/bin/sh                   # emergency: skip the init system
+initcall_debug                 # print every initcall and its timing
+loglevel=8 ignore_loglevel
+
+# see what you booted with
+cat /proc/cmdline</code></pre>
+
+<h2 id="userspace">User space boot</h2>
+
+<p>With the kernel running, the first user-space process starts everything else. What it does — and in what order — determines most of a system's boot time.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Init system</th><th>Model</th><th>Suits</th></tr></thead>
+<tbody>
+<tr><td><strong>SysV init</strong></td><td>Numbered shell scripts, run sequentially</td><td>Historical; simple to read, slow</td></tr>
+<tr><td><strong>BusyBox init</strong></td><td>Minimal, <code>/etc/inittab</code></td><td>Embedded — small and predictable</td></tr>
+<tr><td><strong>systemd</strong></td><td>Declarative units, dependency graph, parallel start, socket and bus activation</td><td>Desktops and servers; increasingly embedded</td></tr>
+<tr><td><strong>OpenRC / runit / s6</strong></td><td>Supervision-focused, lighter</td><td>Minimal systems, containers</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># systemd's key idea: SOCKET ACTIVATION removes ordering entirely.
+# systemd creates the listening socket first, then starts the
+# service lazily and passes it the fd (SCM_RIGHTS, OS chapter 08).
+# Clients can connect before the service has started — their
+# connections simply queue. Nothing needs to wait for anything.
+
+systemd-analyze                 # total boot time, split by phase
+systemd-analyze blame           # slowest units
+systemd-analyze critical-chain  # the dependency path that determined
+                                # total boot time — the only one worth
+                                # optimising
+systemd-analyze plot &gt; boot.svg</code></pre>
+
+<h2 id="smp">Bringing up secondary CPUs</h2>
+
+<p>Only one processor runs during early boot. The others are started deliberately, much later, by a mechanism that differs between platforms.</p>
+
+<pre><code>/* Only CPU0 runs at reset. The others are parked. */
+
+/* PSCI — the standard mechanism, implemented by EL3 firmware */
+    SMC #0 with x0 = PSCI_CPU_ON (0xC4000003)
+                x1 = target MPIDR
+                x2 = entry point physical address
+                x3 = context id
+/* The firmware releases that core, which enters at the given
+   address with the MMU off, exactly like the primary CPU did. */
+
+/* The kernel then, per CPU:
+     · set up its per-CPU page tables and stack
+     · enable the MMU
+     · initialise its GIC redistributor and local timer
+     · calibrate, and mark itself online
+     · enter the idle loop, ready for the scheduler          */
+
+/* Older platforms used a SPIN-TABLE: secondaries poll a memory
+   location written by the primary. PSCI is preferred because it
+   also handles CPU_OFF, SUSPEND and SYSTEM_RESET uniformly.  */
+
+cat /sys/devices/system/cpu/online
+echo 0 &gt; /sys/devices/system/cpu/cpu3/online     # hotplug offline</code></pre>
+
+<h2 id="fast">Fast boot</h2>
+
+<p>Boot time is a sum of contributions, most of which are measurable and several of which are removable. This is where the time actually goes on a typical embedded system.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Technique</th><th>Saves</th></tr></thead>
+<tbody>
+<tr><td>Skip the bootloader's countdown and menu</td><td>Seconds — usually the largest single win</td></tr>
+<tr><td>Compile in the storage driver; drop initramfs</td><td>Hundreds of ms</td></tr>
+<tr><td>Trim the kernel config aggressively</td><td>Decompression and initcall time</td></tr>
+<tr><td>Choose the decompressor deliberately (LZ4 &gt; gzip &gt; XZ for speed)</td><td>Hundreds of ms; trades image size</td></tr>
+<tr><td><code>quiet</code> on the command line</td><td>Serial console output is astonishingly slow at 115200</td></tr>
+<tr><td>Defer non-essential drivers to after userspace starts</td><td>Perceived boot time</td></tr>
+<tr><td>Suspend-to-RAM or hibernate instead of a cold boot</td><td>Nearly everything</td></tr>
+<tr><td>Execute-in-place (XIP) from NOR flash</td><td>The whole copy-and-decompress step</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># find where the time actually goes
+dmesg | head -50                       # timestamps are seconds since start
+systemd-analyze blame
+cat /proc/cmdline                       # is initcall_debug on?
+
+# with initcall_debug, dmesg shows every initcall's duration:
+dmesg | grep 'initcall' | sort -t= -k2 -rn | head -20
+
+# a 5-second gap in dmesg timestamps is almost always a probe
+# timeout — a device that is not there, or is not responding.</code></pre>
+
+<h2 id="debug">When boot fails silently</h2>
+
+<p>A system that fails during boot often produces no output at all, because the console is not up yet. These are the techniques for seeing what happened in that window.</p>
+
+<pre class="diagram">Work down the chain. At each step, the question is "did we get
+this far?", and the answer needs SOME form of output.
+
+  1. No bootloader output at all
+       → power rails, clocks, reset, boot-mode straps, or the
+         boot medium. Attach JTAG: can the probe see the core's
+         IDCODE? If not, stop and fix that first.
+
+  2. Bootloader runs, kernel produces nothing
+       → almost always the console. Add `earlycon` and check that
+         the device tree's chosen/stdout-path names the right UART
+         at the right address.
+       → or the entry contract was violated (x0 not the DTB, MMU
+         left on, D-cache left on)
+
+  3. Kernel prints, then stops at "Starting kernel..."
+       → DTB wrong or absent; decompression failure; wrong load
+         address; memory node describing memory that is not there
+
+  4. Kernel boots, panics with "Unable to mount root fs"
+       → the storage driver is a module and there is no initramfs,
+         or `root=` names the wrong device. `rootwait` helps when
+         the device appears late.
+
+  5. Boots to a shell but a device is missing
+       → the device tree node, its status property, or driver
+         binding (OS chapter 16)
+
+Tools: earlycon, `initcall_debug`, `ignore_loglevel`, a JTAG probe,
+and a serial cable — which remains the single most valuable piece
+of bring-up equipment.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No output whatsoever</td><td>Console not configured; add <code>earlycon</code> and check <code>stdout-path</code></td></tr>
+<tr><td>Hangs right after "Starting kernel"</td><td>Entry contract violated, or the DTB is wrong</td></tr>
+<tr><td>"Unable to mount root fs on unknown-block(0,0)"</td><td>Storage driver missing, or wrong <code>root=</code></td></tr>
+<tr><td>"Kernel panic - not syncing: No working init found"</td><td>Root mounted but <code>/sbin/init</code> is absent or not executable</td></tr>
+<tr><td>Boots from SD but not eMMC</td><td>Boot-mode straps, or partition/offset differences</td></tr>
+<tr><td>Random crashes under load, boots fine</td><td>Marginal DRAM timing from BL2 — test at temperature</td></tr>
+<tr><td>Multi-second gap in dmesg timestamps</td><td>A probe timeout on a device that is not present</td></tr>
+<tr><td>Only one CPU online</td><td>PSCI not working, or the CPU nodes in the DTB are wrong</td></tr>
+<tr><td>Boot is slow with a serial console attached</td><td>Console output at 115200 dominates; add <code>quiet</code></td></tr>
+<tr><td>Works from a development board, fails on production silicon</td><td>Fuses changed the boot or security configuration</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why boot needs multiple stages rather than one program.</li>
+  <li>Name the ARM boot stages and what each is responsible for.</li>
+  <li>State the ARM64 kernel entry contract and one failure caused by breaking it.</li>
+  <li>Explain what happens between <code>head.S</code> and <code>start_kernel</code>.</li>
+  <li>Explain the initramfs chicken-and-egg problem and how <code>switch_root</code> resolves it.</li>
+  <li>Explain socket activation and why it removes startup ordering.</li>
+  <li>Describe how secondary CPUs are started with PSCI.</li>
+  <li>Give a five-step procedure for diagnosing a silent boot failure.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

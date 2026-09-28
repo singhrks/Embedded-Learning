@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a C2PA capture-attestation driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a C2PA capture-attestation driver</h1>
+<p class="lead">Content Credentials are only as trustworthy as the moment the shutter closed. This project
+puts that moment inside the kernel and the signing key inside the secure world, so that a provenance claim
+is a statement about pixels the hardware actually produced — not about a file someone handed the signer.
+This chapter builds the capture side; <a href="lx-32-project-c2pa-manifest.html">chapter 47</a> builds the
+trusted application and the manifest.</p>
+
+<h2 id="c2pa">What C2PA actually is</h2>
+
+<p>C2PA — the Coalition for Content Provenance and Authenticity — standardises a signed metadata block
+travelling with a media file. Strip away the vocabulary and it is four things.</p>
+
+<pre class="diagram">   A C2PA MANIFEST, from the inside out
+
+   1. ASSERTIONS - statements about the asset
+        c2pa.hash.data   a hash over the asset's bytes, with
+                         exclusions for the manifest itself.
+                         THE HARD BINDING. Everything rests here.
+        c2pa.actions     "created", "edited", "colour adjusted"
+        stds.exif        camera, lens, exposure
+        c2pa.thumbnail   a small preview
+        (and ingredients, referencing parent assets)
+
+   2. CLAIM - a CBOR map that lists the assertions by URI and
+        hash, names the generator, and picks the signature
+        algorithm. The claim is what gets signed.
+
+   3. CLAIM SIGNATURE - a COSE_Sign1 structure over the claim,
+        with an X.509 certificate chain in the protected header.
+
+   4. MANIFEST STORE - all of the above packed into JUMBF boxes
+        and embedded in the file (an APP11 segment in JPEG, an
+        iTXt/eXIf-adjacent box in PNG, a uuid box in BMFF).
+
+   THE CHAIN OF REASONING A VERIFIER FOLLOWS:
+
+     the certificate chains to a trusted root
+       -> so I know who signed
+     the COSE_Sign1 signature is valid over the claim
+       -> so the claim is what the signer said
+     each assertion's hash matches the assertion bytes
+       -> so the assertion list is intact
+     c2pa.hash.data matches the asset's actual bytes
+       -> so THIS FILE is the file that was signed
+
+   Break any link and the credential is invalid. Notice what
+   the chain does NOT establish: that the pixels depict
+   reality. C2PA proves PROVENANCE, not TRUTH.</pre>
+
+<h2 id="problem">The problem hardware solves</h2>
+
+<p>This project is more advanced than the earlier two and solves a real problem: proving that an image came from a particular camera and has not been altered since. Start here, with why software alone cannot do it.</p>
+
+<pre class="diagram">   THE NAIVE CAMERA
+
+   sensor -> kernel -> user space -> signing library -> file
+                          ^
+                          |
+                     an attacker with code execution here
+                     substitutes any image they like, and the
+                     signature over it is PERFECTLY VALID.
+
+   The credential now says "this device produced this image",
+   with a real device key, and it is a lie. The signature is
+   not forged; it is genuine, over forged content.
+
+   THIS IS THE ENTIRE THREAT. A device signing key protects
+   against someone ELSE claiming to be your camera. It does
+   nothing about your camera being told to sign a picture it
+   never took.
+
+   WHAT ACTUALLY HELPS
+
+   sensor -> kernel ----------------+
+               |  hash the frame    |
+               |  HERE, before any  |
+               |  user process can  |
+               |  see it            |
+               v                    |
+        +--------------+            |
+        | attest(hash) |            |
+        +------+-------+            |
+               | SMC                | frame bytes
+               v                    v
+        +-------------------+   user space assembles the
+        | TA remembers the  |   manifest, and asks the TA
+        | hashes it has     |   to sign the claim
+        | witnessed         |
+        |                   |&lt;-- sign(claim)
+        | REFUSES to sign a |
+        | claim whose hard  |    the TA parses out the
+        | binding is not on |    c2pa.hash.data value and
+        | that list         |    checks it against its list
+        +-------------------+
+
+   Now user space can still lie about EXIF, about the title,
+   about anything soft. It cannot get a signature over an image
+   the kernel did not hash.</pre>
+
+<div class="key">
+<b>The design idea worth taking away</b>
+<p>A signing service that signs whatever it is given proves only that the key was available. Binding the
+signature to something the <em>lower</em> layer witnessed is what turns a key into an attestation. The same
+pattern is a TPM quote (<a href="tee-23-project-ftpm-linux.html">OP-TEE chapter 23</a>), a measured-boot PCR,
+and a secure-element camera credential.</p>
+</div>
+
+<div class="warn">
+<b>What this does <em>not</em> defend against</b>
+<p>A compromised <strong>kernel</strong> can attest whatever it likes — the kernel is inside the trust
+boundary by construction, which is why real camera implementations put the hash even lower, in the ISP or the
+sensor package. A compromised <strong>TA</strong> is game over. And nothing here stops someone
+photographing a screen: C2PA never claimed to. State the boundary honestly whenever you describe such a
+system, because the marketing around Content Credentials frequently does not.</p>
+</div>
+
+<h2 id="abi">The ABI</h2>
+
+<p>As always, the interface user space depends on is defined first and separately — and here it matters more than usual, because the whole security property depends on what this interface does and does not allow.</p>
+
+<pre><code>/* include/uapi/linux/c2pa_capture.h
+ *
+ * Shared by the driver, the user-space tool and (via the command
+ * ids at the bottom) the trusted application.
+ */
+
+#ifndef _UAPI_LINUX_C2PA_CAPTURE_H
+#define _UAPI_LINUX_C2PA_CAPTURE_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/ioctl.h&gt;
+
+#define C2PA_ABI_VERSION   1
+#define C2PA_HASH_LEN      32      /* SHA-256                    */
+#define C2PA_SIG_LEN       64      /* ES256: raw r || s          */
+#define C2PA_PUBKEY_LEN    64      /* P-256: X || Y              */
+#define C2PA_MAX_SIGSTRUCT 4096    /* a COSE Sig_structure       */
+
+/* One capture. The driver fills this in; user space never gets
+ * to choose any of it except by asking for another capture.
+ */
+struct c2pa_capture {
+	__u32 version;          /* in:  C2PA_ABI_VERSION            */
+	__u32 frame_len;        /* in:  capacity   out: bytes       */
+	__u64 frame;            /* in:  user pointer to the buffer  */
+
+	__u64 capture_id;       /* out: TA monotonic counter value  */
+	__u64 timestamp_ns;     /* out: CLOCK_MONOTONIC at capture  */
+	__u32 width;            /* out                              */
+	__u32 height;           /* out                              */
+	__u8  hash[C2PA_HASH_LEN];  /* out: SHA-256 of frame bytes  */
+};
+
+/* Ask the TA to sign a COSE Sig_structure. The TA will refuse
+ * unless the claim it contains binds to a hash it witnessed.
+ */
+struct c2pa_sign {
+	__u32 version;
+	__u32 sigstruct_len;
+	__u64 sigstruct;        /* in:  user pointer                */
+	__u8  binding[C2PA_HASH_LEN];  /* in: the c2pa.hash.data
+	                                *     value in this claim   */
+	__u8  signature[C2PA_SIG_LEN]; /* out: raw r || s           */
+};
+
+struct c2pa_pubkey {
+	__u32 version;
+	__u32 reserved;
+	__u8  pubkey[C2PA_PUBKEY_LEN];   /* out: X || Y            */
+};
+
+#define C2PA_IOC_MAGIC   'C'
+#define C2PA_IOC_CAPTURE _IOWR(C2PA_IOC_MAGIC, 1, struct c2pa_capture)
+#define C2PA_IOC_SIGN    _IOWR(C2PA_IOC_MAGIC, 2, struct c2pa_sign)
+#define C2PA_IOC_PUBKEY  _IOWR(C2PA_IOC_MAGIC, 3, struct c2pa_pubkey)
+
+/* Commands on the far side of the SMC. Separate numbering from
+ * the ioctls on purpose: the driver translates, and the two
+ * interfaces version independently.
+ */
+#define TA_CMD_GET_PUBKEY     0
+#define TA_CMD_ATTEST_CAPTURE 1
+#define TA_CMD_SIGN_CLAIM     2
+
+#endif /* _UAPI_LINUX_C2PA_CAPTURE_H */</code></pre>
+
+<div class="note">
+<b>Why <code>binding</code> is a separate field</b>
+<p>The TA could parse the CBOR claim out of the Sig_structure and find <code>c2pa.hash.data</code> itself.
+It deliberately does not: a CBOR parser inside a TA is a large, attacker-reachable piece of code
+(<a href="tee-20-ta-security.html">OP-TEE chapter 20</a>). Instead user space <em>declares</em> the binding,
+the TA checks that declaration against its witnessed list, and — the part that makes it sound —
+<a href="lx-32-project-c2pa-manifest.html">chapter 47</a> shows the TA also verifying that the declared
+binding actually appears in the bytes it is about to sign, with a fixed-offset memcmp rather than a
+parser.</p>
+</div>
+
+<h2 id="driver">The driver</h2>
+
+<p>The driver ties together the character-device work from chapter 22, the TEE client interface, and the crypto path. It is long; the annotations mark the parts that carry the security property.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * c2pa_capture.c - a C2PA capture-attestation test driver.
+ *
+ * Produces synthetic frames, hashes them in the kernel, and has
+ * an OP-TEE trusted application witness each hash before user
+ * space ever sees the pixels.
+ *
+ * On real hardware the frame source is a V4L2 subdev or an ISP
+ * DMA completion; everything else is unchanged.
+ */
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/miscdevice.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/tee_drv.h&gt;
+#include &lt;linux/uuid.h&gt;
+#include &lt;linux/crypto.h&gt;
+#include &lt;crypto/hash.h&gt;
+#include &lt;linux/ktime.h&gt;
+#include &lt;uapi/linux/c2pa_capture.h&gt;
+
+#define DRV_NAME "c2pa-capture"
+
+/* 8b1e4d72-3f5a-4c26-9d80-6a7b2e14f903 */
+#define C2PA_TA_UUID UUID_INIT(0x8b1e4d72, 0x3f5a, 0x4c26, \
+			       0x9d, 0x80, 0x6a, 0x7b, \
+			       0x2e, 0x14, 0xf9, 0x03)
+
+#define FRAME_W   640
+#define FRAME_H   480
+#define FRAME_LEN (FRAME_W * FRAME_H * 3)      /* RGB888        */
+#define SHM_SIZE  8192
+
+struct c2pa_dev {
+	struct miscdevice	misc;
+	struct mutex		lock;		/* one request at a time */
+
+	/* TEE plumbing */
+	struct tee_context	*ctx;
+	u32			session;
+	struct tee_shm		*shm;
+	void			*shm_va;
+
+	/* crypto */
+	struct crypto_shash	*tfm;
+
+	/* frame source */
+	u8			*frame;
+	u32			frame_no;
+};
+
+static struct c2pa_dev *g_dev;
+
+/* ------------------------------------------------------------------
+ * TEE glue
+ * ------------------------------------------------------------------ */
+
+static int optee_match(struct tee_ioctl_version_data *ver, const void *data)
+{
+	return ver-&gt;impl_id == TEE_IMPL_ID_OPTEE;
+}
+
+static int c2pa_tee_init(struct c2pa_dev *d)
+{
+	struct tee_ioctl_open_session_arg arg = { };
+	uuid_t uuid = C2PA_TA_UUID;
+	int rc;
+
+	d-&gt;ctx = tee_client_open_context(NULL, optee_match, NULL, NULL);
+	if (IS_ERR(d-&gt;ctx)) {
+		/* -ENOENT during boot means OP-TEE is not up yet. */
+		rc = PTR_ERR(d-&gt;ctx);
+		d-&gt;ctx = NULL;
+		return rc == -ENOENT ? -EPROBE_DEFER : rc;
+	}
+
+	export_uuid(arg.uuid, &amp;uuid);
+	/*
+	 * REE_KERNEL, not PUBLIC. The TA uses the login type to
+	 * decide who may ATTEST: only the kernel may say "I saw this
+	 * frame". A user-space process opening its own session gets
+	 * LOGIN_USER and is refused (chapter 47).
+	 */
+	arg.clnt_login = TEE_IOCTL_LOGIN_REE_KERNEL;
+	arg.num_params = 0;
+
+	rc = tee_client_open_session(d-&gt;ctx, &amp;arg, NULL);
+	if (rc &lt; 0 || arg.ret != 0) {
+		pr_err(DRV_NAME ": open_session rc=%d ret=0x%08x\n",
+		       rc, arg.ret);
+		tee_client_close_context(d-&gt;ctx);
+		d-&gt;ctx = NULL;
+		return rc &lt; 0 ? rc : -EINVAL;
+	}
+	d-&gt;session = arg.session;
+
+	d-&gt;shm = tee_shm_alloc_kernel_buf(d-&gt;ctx, SHM_SIZE);
+	if (IS_ERR(d-&gt;shm)) {
+		rc = PTR_ERR(d-&gt;shm);
+		d-&gt;shm = NULL;
+		tee_client_close_session(d-&gt;ctx, d-&gt;session);
+		tee_client_close_context(d-&gt;ctx);
+		d-&gt;ctx = NULL;
+		return rc;
+	}
+	d-&gt;shm_va = tee_shm_get_va(d-&gt;shm, 0);
+	if (IS_ERR(d-&gt;shm_va))
+		return PTR_ERR(d-&gt;shm_va);
+
+	return 0;
+}
+
+static void c2pa_tee_exit(struct c2pa_dev *d)
+{
+	/* Reverse order of init, always. */
+	if (d-&gt;shm)
+		tee_shm_free(d-&gt;shm);
+	if (d-&gt;ctx) {
+		tee_client_close_session(d-&gt;ctx, d-&gt;session);
+		tee_client_close_context(d-&gt;ctx);
+	}
+}
+
+/* GlobalPlatform TEE_Result -&gt; errno, in one place. */
+static int tee_result_to_errno(u32 res)
+{
+	switch (res) {
+	case 0xFFFF0004: return -EOPNOTSUPP;	/* NOT_SUPPORTED    */
+	case 0xFFFF0006: return -EINVAL;	/* BAD_PARAMETERS   */
+	case 0xFFFF0008: return -ENOENT;	/* ITEM_NOT_FOUND   */
+	case 0xFFFF000C: return -ENOSPC;	/* SHORT_BUFFER     */
+	case 0xFFFF000F: return -EACCES;	/* ACCESS_DENIED    */
+	case 0xFFFF3024: return -ENOMEM;	/* OUT_OF_MEMORY    */
+	case 0xFFFF3110: return -ENODEV;	/* TARGET_DEAD      */
+	default:         return -EIO;
+	}
+}
+
+/* ------------------------------------------------------------------
+ * The frame source
+ *
+ * A moving test pattern, so successive captures differ and you can
+ * see the hash change. Replace with a V4L2 buffer on real hardware.
+ * ------------------------------------------------------------------ */
+static void c2pa_generate_frame(struct c2pa_dev *d)
+{
+	u32 x, y;
+	u8 *p = d-&gt;frame;
+
+	for (y = 0; y &lt; FRAME_H; y++) {
+		for (x = 0; x &lt; FRAME_W; x++) {
+			*p++ = (u8)(x + d-&gt;frame_no);		/* R */
+			*p++ = (u8)(y + d-&gt;frame_no * 2);	/* G */
+			*p++ = (u8)((x ^ y) + d-&gt;frame_no);	/* B */
+		}
+	}
+	d-&gt;frame_no++;
+}
+
+/* ------------------------------------------------------------------
+ * Hashing, with the kernel crypto API
+ * ------------------------------------------------------------------ */
+static int c2pa_hash_frame(struct c2pa_dev *d, u8 out[C2PA_HASH_LEN])
+{
+	SHASH_DESC_ON_STACK(desc, d-&gt;tfm);
+
+	desc-&gt;tfm = d-&gt;tfm;
+	return crypto_shash_digest(desc, d-&gt;frame, FRAME_LEN, out);
+	/*
+	 * The frame is hashed HERE, from the kernel's own buffer,
+	 * before copy_to_user. That ordering is the whole security
+	 * argument: there is no window in which user space could
+	 * substitute pixels between the hash and the attestation.
+	 */
+}
+
+/* ------------------------------------------------------------------
+ * C2PA_IOC_CAPTURE
+ * ------------------------------------------------------------------ */
+static long c2pa_do_capture(struct c2pa_dev *d, unsigned long arg)
+{
+	struct c2pa_capture req;
+	struct tee_ioctl_invoke_arg inv = { };
+	struct tee_param param[4] = { };
+	u8 hash[C2PA_HASH_LEN];
+	u64 timestamp;
+	int rc;
+
+	if (copy_from_user(&amp;req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.version != C2PA_ABI_VERSION)
+		return -EINVAL;
+	if (req.frame_len &lt; FRAME_LEN)
+		return -ENOSPC;
+
+	mutex_lock(&amp;d-&gt;lock);
+
+	c2pa_generate_frame(d);
+
+	rc = c2pa_hash_frame(d, hash);
+	if (rc)
+		goto out;
+
+	timestamp = ktime_get_ns();
+
+	/*
+	 * Attest: hand the hash to the TA. It records it and returns
+	 * its monotonic counter as a capture id.
+	 *
+	 * param[0] memref in  : the 32-byte hash
+	 * param[1] value out  : a = counter low, b = counter high
+	 */
+	memcpy(d-&gt;shm_va, hash, C2PA_HASH_LEN);
+
+	param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT;
+	param[0].u.memref.shm      = d-&gt;shm;
+	param[0].u.memref.shm_offs = 0;
+	param[0].u.memref.size     = C2PA_HASH_LEN;
+	param[1].attr = TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT;
+
+	inv.func       = TA_CMD_ATTEST_CAPTURE;
+	inv.session    = d-&gt;session;
+	inv.num_params = 4;
+
+	rc = tee_client_invoke_func(d-&gt;ctx, &amp;inv, param);
+	if (rc &lt; 0)
+		goto out;
+	if (inv.ret != 0) {
+		pr_warn(DRV_NAME ": attest returned 0x%08x\n", inv.ret);
+		rc = tee_result_to_errno(inv.ret);
+		goto out;
+	}
+
+	req.capture_id   = (u64)param[1].u.value.a |
+			   ((u64)param[1].u.value.b &lt;&lt; 32);
+	req.timestamp_ns = timestamp;
+	req.width        = FRAME_W;
+	req.height       = FRAME_H;
+	req.frame_len    = FRAME_LEN;
+	memcpy(req.hash, hash, C2PA_HASH_LEN);
+
+	/*
+	 * Only NOW does user space get the pixels - after the TA has
+	 * already committed to their hash.
+	 */
+	if (copy_to_user((void __user *)req.frame, d-&gt;frame, FRAME_LEN)) {
+		rc = -EFAULT;
+		goto out;
+	}
+	if (copy_to_user((void __user *)arg, &amp;req, sizeof(req)))
+		rc = -EFAULT;
+out:
+	mutex_unlock(&amp;d-&gt;lock);
+	return rc;
+}
+
+/* ------------------------------------------------------------------
+ * C2PA_IOC_SIGN
+ * ------------------------------------------------------------------ */
+static long c2pa_do_sign(struct c2pa_dev *d, unsigned long arg)
+{
+	struct c2pa_sign req;
+	struct tee_ioctl_invoke_arg inv = { };
+	struct tee_param param[4] = { };
+	void *sigstruct = NULL;
+	long rc;
+
+	if (copy_from_user(&amp;req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.version != C2PA_ABI_VERSION)
+		return -EINVAL;
+	if (req.sigstruct_len == 0 ||
+	    req.sigstruct_len &gt; C2PA_MAX_SIGSTRUCT)
+		return -EINVAL;
+	/* Leave room for the binding at a fixed offset in the SHM. */
+	if (req.sigstruct_len + C2PA_HASH_LEN &gt; SHM_SIZE)
+		return -EINVAL;
+
+	sigstruct = memdup_user((void __user *)req.sigstruct,
+				req.sigstruct_len);
+	if (IS_ERR(sigstruct))
+		return PTR_ERR(sigstruct);
+
+	mutex_lock(&amp;d-&gt;lock);
+
+	/*
+	 * Shared memory layout for this call:
+	 *   [0                .. sigstruct_len)  the Sig_structure
+	 *   [sigstruct_len    .. +32)            the declared binding
+	 * Two partial memrefs over one buffer (OP-TEE chapter 7).
+	 */
+	memcpy(d-&gt;shm_va, sigstruct, req.sigstruct_len);
+	memcpy((u8 *)d-&gt;shm_va + req.sigstruct_len,
+	       req.binding, C2PA_HASH_LEN);
+
+	param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT;
+	param[0].u.memref.shm      = d-&gt;shm;
+	param[0].u.memref.shm_offs = 0;
+	param[0].u.memref.size     = req.sigstruct_len;
+
+	param[1].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT;
+	param[1].u.memref.shm      = d-&gt;shm;
+	param[1].u.memref.shm_offs = req.sigstruct_len;
+	param[1].u.memref.size     = C2PA_HASH_LEN;
+
+	param[2].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+	param[2].u.memref.shm      = d-&gt;shm;
+	param[2].u.memref.shm_offs = SHM_SIZE - C2PA_SIG_LEN;
+	param[2].u.memref.size     = C2PA_SIG_LEN;
+
+	inv.func       = TA_CMD_SIGN_CLAIM;
+	inv.session    = d-&gt;session;
+	inv.num_params = 4;
+
+	rc = tee_client_invoke_func(d-&gt;ctx, &amp;inv, param);
+	if (rc &lt; 0)
+		goto out;
+	if (inv.ret != 0) {
+		/*
+		 * ACCESS_DENIED here is the interesting one: it means
+		 * the TA refused because the declared binding is not a
+		 * hash it witnessed. That is the system working.
+		 */
+		pr_warn(DRV_NAME ": sign returned 0x%08x\n", inv.ret);
+		rc = tee_result_to_errno(inv.ret);
+		goto out;
+	}
+
+	memcpy(req.signature, (u8 *)d-&gt;shm_va + SHM_SIZE - C2PA_SIG_LEN,
+	       C2PA_SIG_LEN);
+	rc = copy_to_user((void __user *)arg, &amp;req, sizeof(req)) ? -EFAULT : 0;
+out:
+	mutex_unlock(&amp;d-&gt;lock);
+	kfree(sigstruct);
+	return rc;
+}
+
+/* ------------------------------------------------------------------
+ * C2PA_IOC_PUBKEY
+ * ------------------------------------------------------------------ */
+static long c2pa_do_pubkey(struct c2pa_dev *d, unsigned long arg)
+{
+	struct c2pa_pubkey req;
+	struct tee_ioctl_invoke_arg inv = { };
+	struct tee_param param[4] = { };
+	long rc;
+
+	if (copy_from_user(&amp;req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.version != C2PA_ABI_VERSION)
+		return -EINVAL;
+
+	mutex_lock(&amp;d-&gt;lock);
+
+	param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+	param[0].u.memref.shm      = d-&gt;shm;
+	param[0].u.memref.shm_offs = 0;
+	param[0].u.memref.size     = C2PA_PUBKEY_LEN;
+
+	inv.func       = TA_CMD_GET_PUBKEY;
+	inv.session    = d-&gt;session;
+	inv.num_params = 4;
+
+	rc = tee_client_invoke_func(d-&gt;ctx, &amp;inv, param);
+	if (rc &lt; 0)
+		goto out;
+	if (inv.ret != 0) {
+		rc = tee_result_to_errno(inv.ret);
+		goto out;
+	}
+
+	memcpy(req.pubkey, d-&gt;shm_va, C2PA_PUBKEY_LEN);
+	rc = copy_to_user((void __user *)arg, &amp;req, sizeof(req)) ? -EFAULT : 0;
+out:
+	mutex_unlock(&amp;d-&gt;lock);
+	return rc;
+}
+
+/* ------------------------------------------------------------------
+ * File operations
+ * ------------------------------------------------------------------ */
+static long c2pa_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct c2pa_dev *d = g_dev;
+
+	switch (cmd) {
+	case C2PA_IOC_CAPTURE: return c2pa_do_capture(d, arg);
+	case C2PA_IOC_SIGN:    return c2pa_do_sign(d, arg);
+	case C2PA_IOC_PUBKEY:  return c2pa_do_pubkey(d, arg);
+	default:               return -ENOTTY;
+	}
+}
+
+static const struct file_operations c2pa_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= c2pa_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,   /* the structs use __u64
+					       * for pointers, so 32-bit
+					       * user space needs nothing
+					       * more than this           */
+	.llseek		= no_llseek,
+};
+
+/* ------------------------------------------------------------------
+ * Module init / exit
+ * ------------------------------------------------------------------ */
+static int __init c2pa_init(void)
+{
+	struct c2pa_dev *d;
+	int rc;
+
+	d = kzalloc(sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+	mutex_init(&amp;d-&gt;lock);
+
+	d-&gt;frame = vmalloc(FRAME_LEN);
+	if (!d-&gt;frame) {
+		rc = -ENOMEM;
+		goto err_free;
+	}
+
+	d-&gt;tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(d-&gt;tfm)) {
+		rc = PTR_ERR(d-&gt;tfm);
+		pr_err(DRV_NAME ": no sha256 shash: %d\n", rc);
+		goto err_frame;
+	}
+
+	rc = c2pa_tee_init(d);
+	if (rc)
+		goto err_tfm;
+
+	d-&gt;misc.minor = MISC_DYNAMIC_MINOR;
+	d-&gt;misc.name  = "c2pa0";
+	d-&gt;misc.fops  = &amp;c2pa_fops;
+	d-&gt;misc.mode  = 0600;      /* root only: attestation is not
+				    * something every process should be
+				    * able to consume                 */
+
+	rc = misc_register(&amp;d-&gt;misc);
+	if (rc)
+		goto err_tee;
+
+	g_dev = d;
+	pr_info(DRV_NAME ": /dev/c2pa0 ready\n");
+	return 0;
+
+err_tee:
+	c2pa_tee_exit(d);
+err_tfm:
+	crypto_free_shash(d-&gt;tfm);
+err_frame:
+	vfree(d-&gt;frame);
+err_free:
+	kfree(d);
+	return rc;
+}
+
+static void __exit c2pa_exit(void)
+{
+	struct c2pa_dev *d = g_dev;
+
+	misc_deregister(&amp;d-&gt;misc);
+	c2pa_tee_exit(d);
+	crypto_free_shash(d-&gt;tfm);
+	vfree(d-&gt;frame);
+	kfree(d);
+	g_dev = NULL;
+}
+
+module_init(c2pa_init);
+module_exit(c2pa_exit);
+
+MODULE_DESCRIPTION("C2PA capture attestation, backed by OP-TEE");
+MODULE_LICENSE("GPL");</code></pre>
+
+<div class="warn">
+<b>The ordering that carries the whole argument</b>
+<p>In <code>c2pa_do_capture</code>: generate, hash, attest, <em>then</em> <code>copy_to_user</code>. Move the
+copy earlier — which looks harmless, and which a later refactor will be tempted to do — and a second thread
+sharing the buffer could in principle observe or race the pixels before the TA has committed to their hash.
+Comment the ordering in the code, not just in the design document, because that is where the next person
+edits.</p>
+</div>
+
+<h2 id="build">Building and loading</h2>
+
+<p>This project needs more than a kernel: a secure world running alongside it. These are the pieces and the order to bring them up in.</p>
+
+<pre><code># Kbuild
+obj-m += c2pa_capture.o
+ccflags-y += -I$(src)/include
+
+# Build against the OP-TEE QEMU kernel (OP-TEE chapter 4).
+$ cd ~/optee/linux
+$ ./scripts/config --enable TEE --enable OPTEE \
+                   --enable CRYPTO_SHA256 --enable CRYPTO_USER_API_HASH
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules
+
+$ cd ~/c2pa/driver
+$ make -C ~/optee/linux M=$PWD ARCH=arm64 \
+       CROSS_COMPILE=aarch64-linux-gnu- modules
+
+$ cp c2pa_capture.ko ~/optee/out-br/target/root/
+$ cd ~/optee/build &amp;&amp; make buildroot run-only</code></pre>
+
+<pre><code># In the guest:
+# insmod c2pa_capture.ko
+[   14.221408] c2pa-capture: /dev/c2pa0 ready
+
+# The secure console, at the same moment:
+I/TA: c2pa TA loaded
+
+# If instead you see this, the TA is not installed:
+[   14.220110] c2pa-capture: open_session rc=0 ret=0xffff0008
+insmod: ERROR: could not insert module: No such file or directory
+
+# And this means OP-TEE itself is not up:
+[   14.219980] c2pa-capture: probing deferred
+$ dmesg | grep optee</code></pre>
+
+<h2 id="smoke">A smoke test before the manifest work</h2>
+
+<p>Before writing any of the manifest code, confirm the foundation works end to end. Debugging a signature problem is far easier when you already know the plumbing beneath it is sound.</p>
+
+<pre><code>/* tools/c2pa-smoke.c - proves the driver and TA agree before you
+ * go anywhere near CBOR. Build it first, always.
+ */
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include "c2pa_capture.h"
+
+static void hex(const char *label, const unsigned char *p, size_t n)
+{
+	printf("%-12s", label);
+	for (size_t i = 0; i &lt; n; i++)
+		printf("%02x", p[i]);
+	printf("\n");
+}
+
+int main(void)
+{
+	int fd = open("/dev/c2pa0", O_RDWR);
+	if (fd &lt; 0) { perror("/dev/c2pa0"); return 1; }
+
+	/* 1. Who is the camera? */
+	struct c2pa_pubkey pk = { .version = C2PA_ABI_VERSION };
+	if (ioctl(fd, C2PA_IOC_PUBKEY, &amp;pk)) { perror("PUBKEY"); return 1; }
+	hex("pubkey", pk.pubkey, sizeof(pk.pubkey));
+
+	/* 2. Capture. */
+	unsigned char *frame = malloc(640 * 480 * 3);
+	struct c2pa_capture cap = {
+		.version   = C2PA_ABI_VERSION,
+		.frame_len = 640 * 480 * 3,
+		.frame     = (unsigned long long)(uintptr_t)frame,
+	};
+	if (ioctl(fd, C2PA_IOC_CAPTURE, &amp;cap)) { perror("CAPTURE"); return 1; }
+	printf("capture id  %llu  %ux%u\n",
+	       (unsigned long long)cap.capture_id, cap.width, cap.height);
+	hex("frame hash", cap.hash, sizeof(cap.hash));
+
+	/* 3. Sign something that DOES bind to that capture. */
+	unsigned char fake_sigstruct[64];
+	memset(fake_sigstruct, 0xAB, sizeof(fake_sigstruct));
+
+	struct c2pa_sign s = {
+		.version       = C2PA_ABI_VERSION,
+		.sigstruct_len = sizeof(fake_sigstruct),
+		.sigstruct     = (unsigned long long)(uintptr_t)fake_sigstruct,
+	};
+	memcpy(s.binding, cap.hash, C2PA_HASH_LEN);
+
+	if (ioctl(fd, C2PA_IOC_SIGN, &amp;s)) { perror("SIGN (valid)"); return 1; }
+	hex("signature", s.signature, sizeof(s.signature));
+
+	/* 4. And now something that does NOT. This MUST fail. */
+	s.binding[0] ^= 0xff;
+	if (ioctl(fd, C2PA_IOC_SIGN, &amp;s) == 0) {
+		fprintf(stderr, "FAIL: TA signed an unwitnessed binding!\n");
+		return 1;
+	}
+	printf("refused an unwitnessed binding, as it should\n");
+
+	close(fd);
+	return 0;
+}</code></pre>
+
+<pre><code># ./c2pa-smoke
+pubkey      a91f3c...e7b2
+capture id  1  640x480
+frame hash  4d8e2a...7c
+signature   3f81b9...04
+refused an unwitnessed binding, as it should
+
+# That last line is the project. Everything in chapter 47 is
+# packaging around it.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>insmod</code> fails, <code>ret=0xffff0008</code></td><td><code>ITEM_NOT_FOUND</code>: the
+<code>.ta</code> is not in <code>/lib/optee_armtz</code>, or its filename does not match the UUID</td></tr>
+<tr><td>Module load deferred for ever</td><td>OP-TEE driver absent — check <code>CONFIG_OPTEE</code> and
+<code>dmesg | grep optee</code></td></tr>
+<tr><td><code>open_session</code> hangs</td><td><code>tee-supplicant</code> not running; loading a TA needs it
+(<a href="tee-09-rpc-supplicant.html">OP-TEE chapter 9</a>)</td></tr>
+<tr><td><code>crypto_alloc_shash</code> returns <code>-ENOENT</code></td><td><code>CONFIG_CRYPTO_SHA256</code>
+not enabled</td></tr>
+<tr><td>Signing returns <code>-EACCES</code> for a real capture</td><td>The TA's witnessed list was cleared —
+it is bounded, and an old capture ages out (chapter 47)</td></tr>
+<tr><td>Signing succeeds for a tampered binding</td><td><strong>The security property is broken.</strong> The
+TA is not checking, or the driver is passing the wrong buffer</td></tr>
+<tr><td>Every capture has the same hash</td><td>The test pattern is not advancing — <code>frame_no</code> not
+incrementing</td></tr>
+<tr><td>Sporadic <code>-EFAULT</code></td><td>User buffer smaller than <code>frame_len</code> claims, or freed
+while the ioctl runs</td></tr>
+<tr><td>Deadlock under concurrent use</td><td>An error path returning without
+<code>mutex_unlock</code></td></tr>
+<tr><td><code>rmmod</code> oopses</td><td>Teardown order — shared memory freed after the context, or a file
+still open</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four layers of a C2PA manifest and say which one is the hard binding.</li>
+  <li>State what a C2PA credential proves and what it explicitly does not.</li>
+  <li>Explain the attack a device signing key alone does not prevent.</li>
+  <li>Explain why the frame is hashed in the kernel rather than in user space.</li>
+  <li>Say what the TA checks before signing, and why that turns a key into an attestation.</li>
+  <li>Name two things this design still does not defend against.</li>
+  <li>Explain why the driver logs in as <code>REE_KERNEL</code> rather than <code>PUBLIC</code>.</li>
+  <li>Explain why the binding is declared by user space rather than parsed by the TA.</li>
+  <li>Point to the ordering in <code>c2pa_do_capture</code> that the security argument depends on.</li>
+  <li>Describe the shared-memory layout used by the sign command and count the memrefs.</li>
+  <li>Run the smoke test and explain what its final line demonstrates.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

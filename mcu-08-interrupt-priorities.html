@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Priorities, preemption and tail-chaining | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Priorities, preemption and tail-chaining</h1>
+<p class="lead">Interrupt priority on Cortex-M is where three separate confusions meet: lower numbers are more
+urgent, only the top bits of the priority byte are implemented, and the value splits into two fields whose
+boundary you configure. Getting all three right is what makes an RTOS safe.</p>
+
+<h2 id="inverted">Lower is more urgent</h2>
+
+<pre><code>/* Priority 0 is the HIGHEST priority. This is inverted
+   relative to almost every other scheduler you have met,
+   including the RTOS running on top of it - FreeRTOS task
+   priorities run the other way, where higher is more urgent.
+
+   In a FreeRTOS project you therefore hold BOTH conventions
+   in your head at once:
+
+     NVIC priority 0   = most urgent interrupt
+     FreeRTOS priority 0 = least urgent task (the idle task)
+
+   Mixing them up is common enough that FreeRTOS ships an
+   assertion specifically to catch it.                       */
+
+NVIC_SetPriority(TIM2_IRQn,   0);  /* most urgent  */
+NVIC_SetPriority(USART1_IRQn, 5);
+NVIC_SetPriority(EXTI0_IRQn, 15);  /* least urgent */
+
+/* Reset default is 0 for everything, meaning every interrupt
+   starts at maximum urgency and none can preempt another.
+   Leaving the defaults is a real design decision that you
+   should make deliberately rather than by omission.        */
+</code></pre>
+
+<h2 id="bits">Only the top bits exist</h2>
+
+<pre class="diagram">   The priority register is a byte per interrupt, but silicon
+   vendors implement only the top 3, 4 or 5 bits. The rest
+   read as zero and ignore writes.
+
+   A part with 4 implemented bits (STM32, most Cortex-M4):
+
+    bit  7  6  5  4  3  2  1  0
+        +--+--+--+--+--+--+--+--+
+        |  IMPLEMENTED |  ZERO  |
+        +--+--+--+--+--+--+--+--+
+         &lt;- 16 levels -&gt;
+
+   So the usable values are 0x00, 0x10, 0x20 ... 0xF0.
+
+   CMSIS hides this. NVIC_SetPriority(irq, 5) shifts for you:
+
+       IPR[irq] = (5 &lt;&lt; (8 - __NVIC_PRIO_BITS)) &amp; 0xFF
+                = (5 &lt;&lt; 4) = 0x50
+
+   But when you write BASEPRI YOURSELF, nothing shifts for
+   you, and this is the single most common bug in
+   hand-written critical sections:
+
+     __set_BASEPRI(5);        /* WRONG - 5 = 0x05, and with  */
+                              /* 4 bits implemented that is  */
+                              /* priority 0. Blocks nothing  */
+                              /* except... nothing.          */
+
+     __set_BASEPRI(5 &lt;&lt; 4);   /* RIGHT - blocks priority 5   */
+                              /* and numerically higher.     */
+
+   Always write it as (n &lt;&lt; (8 - __NVIC_PRIO_BITS)) so the
+   code survives a move to a part with different bits.</pre>
+
+<div class="warn">
+<b>Check <code>__NVIC_PRIO_BITS</code> for your part before writing any priority code</b>
+<p>It is defined in the vendor's device header. Cortex-M0 has 2 bits (4 levels), most M3/M4 parts have 4 (16
+levels), some have 3 or 5. Code that assumes 4 and runs on a part with 3 silently collapses two of your
+priority levels into one, which turns a carefully designed preemption scheme into an unpredictable one — and
+the symptom is intermittent priority inversion under load, not a clean failure.</p>
+</div>
+
+<h2 id="grouping">Group and sub-priority</h2>
+
+<p>The implemented bits split into two fields. Only the group field decides preemption; the sub-priority field
+breaks ties among simultaneously pending interrupts.</p>
+
+<pre class="diagram">   With 4 implemented bits and PRIGROUP set for 2/2:
+
+    bit   7  6  5  4
+        +----+----+
+        |GRP |SUB |
+        +----+----+
+          ^     ^
+          |     +-- ties only: which of two SIMULTANEOUSLY
+          |         pending interrupts runs first. Does NOT
+          |         allow preemption.
+          |
+          +-- preemption: an interrupt with a lower GROUP
+              value preempts one that is running.
+
+   Example, groups 0-3 and subs 0-3:
+
+     A: group 1, sub 3   ->  priority 0x70
+     B: group 1, sub 0   ->  priority 0x40
+     C: group 0, sub 3   ->  priority 0x30
+
+   B does NOT preempt A - same group. It waits.
+   C DOES preempt both  - lower group.
+   If A and B arrive together, B runs first (lower sub).
+
+   SCB-&gt;AIRCR PRIGROUP field sets the split:
+
+     PRIGROUP  group bits  sub bits   (4-bit part)
+        3          4          0        &lt;- all preemption
+        4          3          1
+        5          2          2
+        6          1          3
+        7          0          4        &lt;- no preemption at all
+
+   NVIC_SetPriorityGrouping(3) - all bits are group, no
+   sub-priority - is the sane default and what most RTOS
+   ports require. FreeRTOS's port assumes it and asserts if
+   you have configured otherwise.</pre>
+
+<h2 id="preemption">Nesting, and what it costs</h2>
+
+<pre><code>/* Preemption is automatic and needs no code. It also costs
+   stack, and that is the part people forget.               */
+
+/* Each nesting level consumes:
+     32 bytes  basic frame (8 registers)
+   + 72 bytes  if the FPU context is stacked too
+   + whatever the handler's own locals need
+
+   With 4 priority groups and FP in use, worst case is
+   4 * (104 + locals) of MSP. If your MSP is 1 kB and each
+   handler uses 100 bytes of locals, you are at 816 bytes
+   before counting the code that was interrupted.
+
+   This is why chapter 20 sizes the main stack from the
+   interrupt nesting depth, not from a guess.               */
+
+/* To FORBID nesting entirely, give every interrupt the same
+   group priority. Simple, predictable, and adequate for
+   most designs:                                            */
+
+NVIC_SetPriorityGrouping(3);           /* 4 group bits      */
+for (int irq = 0; irq &lt; 82; irq++) {
+    NVIC_SetPriority((IRQn_Type) irq, 5);   /* all equal    */
+}
+/* Now nothing preempts anything. Latency for the second
+   interrupt becomes the duration of the first, which you
+   must then bound - the classic trade.                     */
+</code></pre>
+
+<div class="key">
+<b>The RTOS priority boundary</b>
+<p>An RTOS kernel protects its data with <code>BASEPRI</code>, which means interrupts above that threshold run
+<em>through</em> kernel critical sections and therefore must never call a kernel API. This splits your
+interrupts into two populations, and the split is a design decision you make once:</p>
+<pre class="diagram">   priority 0  +---------------------------+
+               |  ZERO-LATENCY interrupts  |  Never blocked.
+               |  Motor commutation, fault |  MUST NOT call
+               |  detection, safety stop.  |  any RTOS API.
+               |  Not blocked by BASEPRI.  |
+   priority 4  +---------------------------+
+               |  KERNEL-AWARE interrupts  |  Blocked during
+               |  UART, SPI, timers, most  |  kernel critical
+               |  peripheral handlers.     |  sections. MAY
+               |  MAY call *FromISR APIs.  |  call FromISR.
+   priority 15 +---------------------------+
+
+   In FreeRTOS the boundary is
+   configMAX_SYSCALL_INTERRUPT_PRIORITY. Calling an API from
+   above the line corrupts kernel state in a way that
+   manifests hours later; configASSERT catches it
+   immediately, which is why you leave it enabled in
+   development.</pre>
+</div>
+
+<h2 id="tailchain">Tail-chaining and late arrival</h2>
+
+<pre class="diagram">   NAIVE MODEL (what you would implement in software)
+
+   IRQ A ----+                    +---- IRQ B
+             v                    v
+   [stack 8][handler A][unstack 8][stack 8][handler B][unstack 8]
+    12 cyc              12 cyc     12 cyc              12 cyc
+
+   ACTUAL HARDWARE - TAIL-CHAINING
+
+   [stack 8][handler A][ 6 cyc ][handler B][unstack 8]
+                        tail-chain: the frame on the stack
+                        is already correct for B, so the
+                        hardware skips unstack+restack.
+
+   LATE ARRIVAL
+
+   IRQ A arrives, hardware begins stacking...
+        ...IRQ B (higher priority) arrives at cycle 4...
+   The hardware does NOT abandon or restart the push. It
+   completes the stacking and then vectors to B instead of
+   A. A remains pending and tail-chains after B.
+
+   Net effect: the expensive part (pushing 8 registers)
+   happens once per BURST of interrupts rather than once
+   per interrupt. Under heavy load a Cortex-M spends far
+   less time on entry/exit than the per-interrupt figure
+   suggests - which is precisely why the profile is used
+   for interrupt-dense control applications.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Critical section protects nothing</td><td><code>BASEPRI</code> written without shifting into the
+implemented bits</td></tr>
+<tr><td>Two priority levels behave as one</td><td>Part implements fewer bits than assumed; check
+<code>__NVIC_PRIO_BITS</code></td></tr>
+<tr><td>A higher-priority interrupt does not preempt</td><td>Same group priority — only sub-priority differs,
+which never preempts</td></tr>
+<tr><td>Nothing preempts anything</td><td>All priorities left at the reset default of 0</td></tr>
+<tr><td>Stack overflow only under interrupt load</td><td>Nesting depth times frame size exceeds MSP; bound the
+depth</td></tr>
+<tr><td>RTOS state corrupts hours into a run</td><td>An API called from an interrupt above the syscall
+threshold</td></tr>
+<tr><td><code>configASSERT</code> fires on an ISR call</td><td>Exactly the above, caught early — fix the
+priority or use the <code>FromISR</code> variant</td></tr>
+<tr><td>Behaviour changes when priorities are renumbered</td><td>Priority grouping is not what you assumed; set
+it explicitly at startup</td></tr>
+<tr><td>Latency fine in isolation, poor in the system</td><td>A lower-priority handler is long and cannot be
+preempted by an equal-group peer</td></tr>
+<tr><td>FreeRTOS asserts at startup about grouping</td><td>Port requires all bits as group priority — call
+<code>NVIC_SetPriorityGrouping(3)</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State which numeric direction is more urgent for NVIC, and for FreeRTOS tasks.</li>
+  <li>Explain why only the top bits of the priority byte are implemented.</li>
+  <li>Write a correct <code>BASEPRI</code> value for priority 5 on a part with 4 priority bits.</li>
+  <li>Distinguish group priority from sub-priority in terms of preemption.</li>
+  <li>Say what <code>NVIC_SetPriorityGrouping(3)</code> configures and why RTOS ports want it.</li>
+  <li>Calculate worst-case MSP usage for 4 nesting levels with FP context stacked.</li>
+  <li>Explain the two interrupt populations an RTOS creates and the rule for each.</li>
+  <li>Describe tail-chaining and give its cycle cost against the naive model.</li>
+  <li>Explain late arrival and what happens to the interrupt that was displaced.</li>
+  <li>Give a way to forbid interrupt nesting entirely, and the cost of doing so.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

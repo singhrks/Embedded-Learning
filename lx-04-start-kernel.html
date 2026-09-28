@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>start_kernel and initcalls | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1><code>start_kernel</code> and initcalls</h1>
+<p class="lead">One function, about a hundred calls, and by the end the kernel is fully alive. Understanding
+its order is what lets you answer the two questions that dominate bring-up: <em>why is my driver probing too
+early</em>, and <em>where exactly did it hang</em>.</p>
+
+<h2 id="order">The order, and why it is that order</h2>
+
+<p><code>start_kernel()</code> is a long, flat list of initialisation calls, and the order is not a matter of taste — each entry depends on the ones above it having already run. Reading it from top to bottom is genuinely the fastest way to understand what a kernel is actually made of.</p>
+
+<pre class="diagram">init/main.c :: start_kernel()
+
+  set_task_stack_end_magic()   a canary on the init stack
+  smp_setup_processor_id()     which CPU am I
+  boot_cpu_init()              mark this CPU online
+  page_address_init()
+  setup_arch(&amp;command_line)    &lt;-- the big one, per-arch
+     |  arch/arm64/kernel/setup.c
+     |    setup_machine_fdt()     parse the DTB
+     |    parse_early_param()     command line, early options
+     |    arm64_memblock_init()   memory map, reserved regions
+     |    paging_init()           REAL page tables
+     |    bootmem_init()          zones, sparsemem, NUMA
+     |    smp_init_cpus()         count CPUs from DT
+     |    hyp_mode_check()        EL2 or EL1?
+     v
+  setup_boot_config()
+  setup_command_line()
+  setup_nr_cpu_ids()
+  setup_per_cpu_areas()        per-CPU variables now usable
+  boot_cpu_hotplug_init()
+
+  build_all_zonelists()        the page allocator's structure
+  page_alloc_init()
+  parse_early_param() / parse_args()   the FULL command line
+  jump_label_init()
+  setup_log_buf()              printk's ring buffer resized
+  vfs_caches_early_init()
+  sort_main_extable()
+  trap_init()
+  mm_core_init()               &lt;-- buddy allocator LIVE.
+                                   alloc_pages() works now.
+  poking_init()
+  ftrace_init()
+  early_irq_init()
+  init_IRQ()                   the GIC driver runs here
+                               (ARM ch. 23-24)
+  tick_init()
+  init_timers()
+  hrtimers_init()
+  softirq_init()
+  timekeeping_init()
+  time_init()                  the arch timer starts
+                               (ARM ch. 32)
+  local_irq_enable()           &lt;-- INTERRUPTS ON. The system
+                                   is now preemptible-ish and
+                                   can actually respond.
+  kmem_cache_init_late()       slab fully up: kmalloc works
+  console_init()               &lt;-- REAL consoles register.
+                                   Everything before this was
+                                   buffered, or earlycon.
+  lockdep_init()
+  ...
+  rcu_init()
+  ...
+  fork_init()
+  proc_caches_init()
+  buffer_init()
+  vfs_caches_init()
+  pagecache_init()
+  signals_init()
+  cgroup_init()
+  ...
+  arch_call_rest_init()
+        |
+        v
+     rest_init()
+        kernel_thread(kernel_init)   -&gt; becomes PID 1
+        kernel_thread(kthreadd)      -&gt; PID 2
+        cpu_startup_entry(CPUHP_ONLINE)  -&gt; CPU0 becomes the
+                                            idle task, forever
+
+  THE INVARIANT that explains the whole ordering:
+  each step may only use facilities set up above it. That is
+  why memory comes before interrupts, interrupts before timers,
+  timers before scheduling, and drivers after all of it.</pre>
+
+<div class="key">
+<b>Three lines to remember</b>
+<ul>
+<li><strong><code>mm_core_init()</code></strong> — before this, no <code>kmalloc</code>. Early code uses
+memblock instead.</li>
+<li><strong><code>local_irq_enable()</code></strong> — before this, nothing is asynchronous. No timers, no
+interrupts, no preemption.</li>
+<li><strong><code>console_init()</code></strong> — before this, <code>printk</code> output goes into a ring
+buffer and is only flushed once a console exists. A crash before it, without
+<code>earlycon</code>, is silent.</li>
+</ul>
+</div>
+
+<h2 id="initcalls">Initcalls: how everything else runs</h2>
+
+<p>A kernel contains thousands of subsystems and drivers, all of which need initialising. Keeping one central list of them would be unmaintainable and would mean every new driver had to edit a shared file, so the kernel uses a neat trick instead: each piece of code registers itself, and the kernel simply walks the registrations.</p>
+
+<pre><code>/* The kernel has thousands of subsystems and drivers to
+   initialise. Rather than a giant list of calls, each one
+   REGISTERS itself into a section of the binary, and the
+   kernel walks those sections in order.                     */
+
+static int __init my_init(void)
+{
+        pr_info("hello\n");
+        return 0;                /* 0 = success. Non-zero is
+                                    logged but boot continues. */
+}
+subsys_initcall(my_init);
+
+/* The macro puts a POINTER to my_init into a section named
+   .initcall4.init. The linker script gathers all such
+   sections in order, and do_initcalls() walks them.        */
+
+/* THE LEVELS, in execution order: */
+
+  early_initcall          before most things; very restricted
+  pure_initcall           0    no dependencies at all
+  core_initcall           1    core subsystems
+  postcore_initcall       2
+  arch_initcall           3    architecture-specific
+  subsys_initcall         4    BUSES register here
+                               (platform, i2c, spi, pci)
+  fs_initcall             5    filesystems
+  rootfs_initcall         rootfs
+  device_initcall         6    &lt;-- MOST DRIVERS. module_init()
+                                   becomes this when built in.
+  late_initcall           7    things needing everything else
+
+  and each has a _sync variant that waits for outstanding
+  asynchronous work before the next level begins.
+
+/* WHY THE LEVELS EXIST: a driver at device_initcall can rely
+   on its bus existing, because buses registered at
+   subsys_initcall. Ordering WITHIN a level is link order -
+   i.e. Makefile order - which you must never depend on.
+
+/* module_init() is level 6 when built in, and simply "when
+   insmod runs" when built as a module. That difference is why
+   a driver can work as a module and fail built-in, or the
+   reverse.                                                 */
+
+/* DO NOT solve ordering problems by changing your initcall
+   level. That is the classic wrong fix - it works on your
+   board and breaks on the next one. Use -EPROBE_DEFER
+   instead (chapter 19).                                    */</code></pre>
+
+<h2 id="watch">Watching it happen</h2>
+
+<p>All of that initialisation is observable. With one command-line option the kernel prints every initcall as it runs, in order, with the time each one took — which turns boot from something you guess about into something you can measure.</p>
+
+<pre><code># initcall_debug on the command line:
+
+    calling  gic_of_init+0x0/0x1a4 @ 1
+    initcall gic_of_init+0x0/0x1a4 returned 0 after 1953 usecs
+    calling  my_driver_init+0x0/0x28 @ 1
+    initcall my_driver_init+0x0/0x28 returned -517 after 12 usecs
+                                              ^^^^
+                                              -EPROBE_DEFER
+
+# READS AS:
+#   "calling" with no matching "initcall ... returned"  -> IT
+#     HUNG HERE. You just found your boot hang, by name.
+#   returned -517  -> EPROBE_DEFER: a dependency was missing;
+#     it will be retried later. Normal, not an error.
+#   returned -19   -> ENODEV: no such device. Usually fine.
+#   a huge "after N usecs" -> your boot-time regression.
+
+# Sort the slow ones:
+    dmesg | grep initcall | \
+      sed 's/.*after \([0-9]*\) usecs/\1 &/' | sort -rn | head -20
+
+# And the graphical version:
+    systemd-analyze plot > boot.svg          # userspace
+    cat /sys/kernel/debug/bootgraph          # with
+                                             # CONFIG_BOOT_PRINTK
+
+# printk timestamps, essential for any of this:
+    printk.time=1        # or CONFIG_PRINTK_TIME=y</code></pre>
+
+<h2 id="pid1">Handing over to user space</h2>
+
+<p>At some point the kernel has finished setting itself up and must start the first user-space program. That transition is more gradual than it sounds: the first process begins life as kernel code and only becomes a normal user program at the very last moment.</p>
+
+<pre><code>/* kernel_init() runs as PID 1, still in kernel mode: */
+
+static int __ref kernel_init(void *unused)
+{
+        kernel_init_freeable();
+             /* wait for async work
+                do_basic_setup():
+                   driver_init()          the device model
+                   init_irq_proc()
+                   do_ctors()
+                   do_initcalls()      &lt;-- ALL levels run here
+                prepare_namespace()       mount the root fs */
+
+        free_initmem();      /* __init code and data FREED.
+                                "Freeing unused kernel memory:
+                                 4096K" in dmesg. This is why
+                                calling an __init function
+                                later crashes.               */
+        mark_readonly();
+
+        /* Then try, in order: */
+        if (execute_command) {          /* init= on cmdline */
+                ret = run_init_process(execute_command);
+                if (!ret) return 0;
+                panic("Requested init %s failed (error %d).",
+                      execute_command, ret);
+        }
+
+        if (!try_to_run_init_process("/sbin/init")  ||
+            !try_to_run_init_process("/etc/init")   ||
+            !try_to_run_init_process("/bin/init")   ||
+            !try_to_run_init_process("/bin/sh"))
+                return 0;
+
+        panic("No working init found.  Try passing init= ...");
+}
+
+/* THE TWO FAMOUS PANICS:
+
+   "Kernel panic - not syncing: VFS: Unable to mount root fs
+    on unknown-block(0,0)"
+        the ROOT FILESYSTEM was not found. Causes: wrong
+        root=, the storage driver not built in (a module in an
+        initramfs you did not supply), the filesystem type not
+        compiled in, or the partition table not read.
+        Look at the "Available partitions:" list the kernel
+        prints just above - if it is empty, the storage driver
+        never probed.
+
+   "No working init found."
+        the root filesystem MOUNTED but has no init. Wrong
+        rootfs image, missing /sbin/init, a dynamically linked
+        init with no libraries, or the wrong architecture
+        binaries.
+        Try init=/bin/sh to get a shell and look around.    */</code></pre>
+
+<div class="tip">
+<b><code>init=/bin/sh</code> is the debugging trapdoor</b>
+<p>It skips the entire init system and drops you at a shell with the root filesystem mounted. From there you
+can check what is present, load modules by hand, and read <code>/proc</code>. If <em>that</em> works, the
+problem is in userspace, not the kernel — which halves the search space in one boot.</p>
+</div>
+
+<h2 id="params">Kernel parameters</h2>
+
+<p>Kernel parameters are the strings on the boot command line — <code>console=ttyS0</code>, <code>root=/dev/mmcblk0p2</code> and so on. There are two separate mechanisms for handling them, they run at very different times, and picking the wrong one gives you a value that is not there yet when you read it.</p>
+
+<pre><code>/* Two mechanisms, easily confused. */
+
+/* 1. early_param - parsed in setup_arch(), very early, for
+      things that must be known before memory is set up:   */
+
+static int __init parse_my_option(char *p)
+{
+        my_value = memparse(p, &amp;p);
+        return 0;
+}
+early_param("my_option", parse_my_option);
+        /* command line:  my_option=64M */
+
+/* 2. module_param - a variable exposed as a parameter,
+      settable at insmod time or via the command line:     */
+
+static int buffer_size = 4096;
+module_param(buffer_size, int, 0644);
+MODULE_PARM_DESC(buffer_size, "Ring buffer size in bytes");
+
+        /* as a module:   insmod mydrv.ko buffer_size=8192
+           built in:      mydrv.buffer_size=8192
+           at runtime:    /sys/module/mydrv/parameters/buffer_size
+                          (because the mode is 0644)        */
+
+/* The permission argument is the sysfs mode. Use 0444 for
+   read-only visibility, 0644 to allow runtime changes - and
+   only if changing it at runtime is actually safe, which for
+   a buffer size it usually is not.                        */
+
+/* SEEING what was passed: */
+        cat /proc/cmdline
+        cat /sys/module/mydrv/parameters/*
+        dmesg | grep "Kernel command line"</code></pre>
+
+<h2 id="ordering">The ordering problem, properly solved</h2>
+
+<p>Here is a problem every driver author eventually hits: your driver needs a clock, a regulator or a GPIO that another driver provides, and that other driver has not started yet. It is tempting to solve this by making your driver start later, and that instinct is wrong in a way worth understanding properly.</p>
+
+<pre><code>/* THE SITUATION: your driver needs a clock, a regulator, a
+   GPIO or a DMA channel that another driver provides - and
+   that driver has not probed yet.
+
+   THE WRONG FIXES:
+     · changing your initcall level          (board-specific)
+     · reordering the Makefile               (fragile, silent)
+     · a retry loop with msleep()            (blocks boot)
+     · initialising in module_init instead of probe (breaks
+       hotplug and unbind)
+
+   THE RIGHT FIX - return -EPROBE_DEFER: */
+
+static int my_probe(struct platform_device *pdev)
+{
+        struct clk *clk;
+
+        clk = devm_clk_get(&amp;pdev-&gt;dev, "core");
+        if (IS_ERR(clk))
+                return dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(clk),
+                                     "failed to get core clock\n");
+        ...
+}
+
+/* dev_err_probe() is the modern idiom: it logs at error level
+   for real errors, at DEBUG level for -EPROBE_DEFER (so you
+   are not spammed by the normal case), and returns the error.
+   Use it for every resource acquisition in probe.
+
+   The driver core keeps a DEFERRED PROBE LIST and retries
+   everything on it whenever any new driver successfully
+   probes. Eventually the dependency appears and you succeed -
+   in any link order, on any board.                         */
+
+/* WHEN IT NEVER RESOLVES: */
+        cat /sys/kernel/debug/devices_deferred
+   lists every device still waiting, and why. If your device is
+   there at the end of boot, the provider driver is missing,
+   not merely late - a missing CONFIG, or a DT node that does
+   not match anything.                                      */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Boot hangs at a named initcall</td><td>That function does not return — <code>initcall_debug</code> found it for you</td></tr>
+<tr><td>Initcall returns <code>-517</code></td><td><code>-EPROBE_DEFER</code>. Normal; check <code>devices_deferred</code> if it never resolves</td></tr>
+<tr><td>Driver works as a module, not built in</td><td>An ordering dependency masked by <code>insmod</code> timing — use deferred probe</td></tr>
+<tr><td>Crash calling a function after boot</td><td>It was <code>__init</code> and the memory was freed</td></tr>
+<tr><td>No output before a certain point</td><td><code>console_init()</code> not reached — use <code>earlycon</code></td></tr>
+<tr><td><code>Unable to mount root fs on unknown-block(0,0)</code></td><td>Storage driver not built in, wrong <code>root=</code>, or missing filesystem support</td></tr>
+<tr><td><code>No working init found</code></td><td>Rootfs mounted but wrong contents — try <code>init=/bin/sh</code></td></tr>
+<tr><td>Parameter has no effect</td><td>Wrong prefix built-in vs module, or parsed too late</td></tr>
+<tr><td>Boot is slow</td><td>Sort initcall durations; usually one driver with a long timeout</td></tr>
+<tr><td>Works on one board, wrong order on another</td><td>Depending on link order — the bug deferred probe exists to remove</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the invariant that determines <code>start_kernel</code>'s ordering.</li>
+  <li>Say what becomes available at <code>mm_core_init</code>, <code>local_irq_enable</code> and
+  <code>console_init</code>.</li>
+  <li>Explain how initcalls are implemented, and name the levels in order.</li>
+  <li>Say what <code>module_init</code> maps to when built in versus as a module.</li>
+  <li>Read <code>initcall_debug</code> output and identify a hang and a deferral.</li>
+  <li>Explain what <code>free_initmem</code> does and the bug it creates for <code>__init</code>
+  functions.</li>
+  <li>Diagnose both classic root-filesystem panics.</li>
+  <li>Distinguish <code>early_param</code> from <code>module_param</code>.</li>
+  <li>Explain why <code>-EPROBE_DEFER</code> is the correct fix for ordering, and use
+  <code>dev_err_probe</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

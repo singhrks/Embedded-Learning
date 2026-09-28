@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache organisation and policies | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Cache organisation and policies</h1>
+<p class="lead">Chapter 13 said caches work. This chapter opens one up: how an address finds its line, why
+associativity exists, what happens on a write, and why two arrays exactly 4 KB apart can destroy your
+performance.</p>
+
+<h2 id="problem">The problem</h2>
+
+<p>A cache holds a small subset of a huge address space. Two questions must be answered on every access, in
+about one cycle:</p>
+<ol>
+  <li>Given an address, <strong>where would that line be</strong> if it were cached?</li>
+  <li><strong>Is it actually there</strong>, or is this a different address that maps to the same place?</li>
+</ol>
+<p>Searching every entry would be correct and far too slow. The answer is to make the location a function of
+the address, and store enough extra bits to confirm identity.</p>
+
+<h2 id="lines">Cache lines</h2>
+
+<p>Caches do not store individual bytes. The unit of transfer and tracking is a <strong>line</strong>,
+almost universally 64 bytes on ARM and x86.</p>
+
+<pre class="diagram">Why 64 bytes and not 4?
+
+  Larger lines:  + exploit spatial locality — fetch neighbours for free
+                 + fewer tags to store (less overhead)
+                 - more wasted bandwidth if you use only part of it
+                 - more false sharing between cores (chapter 15)
+
+  64 bytes is the empirical sweet spot, and it has consequences you
+  can measure:
+
+    · a 64-byte struct fits exactly one line — align it and every
+      access touches one line instead of two
+    · reading 1 byte costs the same as reading 64
+    · two variables in the same line are, for coherency purposes,
+      THE SAME VARIABLE</pre>
+
+<h2 id="mapping">Address decomposition</h2>
+
+<p>An address is split into three fields. This is the whole mechanism.</p>
+
+<pre class="diagram">   ┌──────────────┬────────────┬──────────────┐
+   │     TAG      │    INDEX   │    OFFSET    │
+   └──────────────┴────────────┴──────────────┘
+      identity       which set     byte within
+                     to look in     the line
+
+  OFFSET = log2(line size)          64-byte line  → 6 bits
+  INDEX  = log2(number of sets)
+  TAG    = everything left over
+
+Worked example: 32 KB, 8-way set-associative, 64-byte lines
+
+  lines total = 32768 / 64        = 512
+  sets        = 512 / 8           = 64 sets
+  offset bits = log2(64)          = 6
+  index bits  = log2(64)          = 6
+  tag bits    = 48 - 6 - 6        = 36   (for a 48-bit address)
+
+   47                    12 11    6 5    0
+  ┌────────────────────────┬───────┬──────┐
+  │          TAG           │ INDEX │OFFSET│
+  └────────────────────────┴───────┴──────┘</pre>
+
+<h3>The lookup</h3>
+
+<pre class="diagram">  1. Extract INDEX from the address    → select one set
+  2. Read all N ways of that set in parallel
+  3. Compare each way's stored TAG against the address's TAG,
+     and check its VALID bit
+  4. Any match → HIT. Use OFFSET to pick bytes from that line.
+     No match  → MISS. Choose a victim, evict it, fetch the line.
+
+Steps 2 and 3 happen simultaneously across all ways — that is what
+associativity costs in hardware: N comparators and N tag reads per access.</pre>
+
+<h2 id="associativity">Associativity</h2>
+
+<p>A direct-mapped cache is simple but has an obvious weakness: two addresses that map to the same slot evict each other endlessly, even when the rest of the cache is empty. Associativity is the fix, and it is a spectrum rather than a switch.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Organisation</th><th>Where a line may go</th><th>Cost</th><th>Weakness</th></tr></thead>
+<tbody>
+<tr><td><strong>Direct-mapped</strong> (1-way)</td><td>Exactly one place</td><td>One comparator; fastest, smallest</td><td>Two hot addresses with the same index thrash forever, even with the cache 99% empty</td></tr>
+<tr><td><strong>N-way set-associative</strong></td><td>Any of N ways in one set</td><td>N comparators, a replacement policy</td><td>Still possible to conflict with N+1 hot lines</td></tr>
+<tr><td><strong>Fully associative</strong></td><td>Anywhere</td><td>One comparator per line — only feasible for tiny structures</td><td>Impractical above a few dozen entries; used for TLBs and victim caches</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Direct-mapped thrashing, made concrete
+
+  32 KB direct-mapped, 64-byte lines → 512 sets
+  index = bits [14:6], so addresses 32 KB apart share an index.
+
+  float a[8192], b[8192];        /* 32 KB each, adjacent in memory */
+  for (i = 0; i &lt; 8192; i++)
+          a[i] += b[i];
+
+  a[i] and b[i] are exactly 32768 bytes apart → SAME SET, every i.
+  Each iteration evicts the other. 100% miss rate.
+  Padding b by one line makes the miss rate ~6%.
+
+This is a CONFLICT MISS: the cache is nearly empty and still missing.</pre>
+
+<div class="warn">
+<b>The power-of-two stride trap</b>
+<p>This is not a historical curiosity — it bites constantly in numerical and image code. Any array whose row
+stride is a large power of two makes column traversal land on the same few sets.</p>
+<pre><code>float m[1024][1024];              /* row stride = 4096 bytes */
+for (j = 0; j &lt; 1024; j++)
+        for (i = 0; i &lt; 1024; i++)
+                sum += m[i][j];   /* every access strides 4096 bytes */
+
+/* With a 4096-byte set span, all 1024 accesses in the inner loop map
+   to the same set. An 8-way cache holds 8 of them. Miss rate ≈ 100%.
+
+   Fix: pad the row.  */
+float m[1024][1024 + 16];         /* stride is now 4160 — indices spread */</code></pre>
+<p>The same effect explains why FFT and matrix libraries pad their leading dimensions, and why a benchmark
+can slow down 5× when you round an array size up to a power of two.</p>
+</div>
+
+<h3>How much associativity is enough?</h3>
+
+<p>Empirically, an N-way cache of size S has about the same miss rate as a direct-mapped cache of size 2S,
+with diminishing returns past 8 ways. Typical modern designs: L1 4- or 8-way (latency-sensitive), L2 8- to
+16-way, L3 16-way or more.</p>
+
+<h2 id="replacement">Replacement policy</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Policy</th><th>Idea</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><strong>LRU</strong></td><td>Evict the least recently used way</td><td>Good, but exact LRU needs log2(N!) bits per set — only practical for small N</td></tr>
+<tr><td><strong>Pseudo-LRU</strong></td><td>A binary tree of "which half was used more recently"</td><td>N−1 bits per set; nearly as good. The common real choice.</td></tr>
+<tr><td><strong>Random</strong></td><td>Pick a way at random</td><td>Cheap, and immune to pathological patterns. Used in some ARM L1s.</td></tr>
+<tr><td><strong>RRIP / DRRIP</strong></td><td>Predict re-reference interval; insert streaming data as "evict soon"</td><td>Handles scans that would otherwise flush the whole cache</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>Why LRU fails on scans</b>
+<p>Stream an array larger than the cache and LRU evicts everything useful in favour of data you will never
+touch again. This is why <code>madvise(MADV_DONTNEED)</code>, non-temporal stores (<code>STNP</code> on
+AArch64) and RRIP-style policies exist: they let a bulk copy pass through without destroying the working set
+of everything else.</p>
+</div>
+
+<h2 id="writes">Write policies</h2>
+
+<p>Two independent decisions, giving four combinations — and the choice is directly visible in your page
+tables.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Decision</th><th>Options</th></tr></thead>
+<tbody>
+<tr><td><strong>On a write hit</strong></td><td><strong>Write-back</strong>: update the line, mark it dirty, write to memory only on eviction. <strong>Write-through</strong>: update the line <em>and</em> memory every time.</td></tr>
+<tr><td><strong>On a write miss</strong></td><td><strong>Write-allocate</strong>: fetch the line first, then write into it. <strong>No-write-allocate</strong>: send the write straight to memory.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Write-back + write-allocate   ← the standard pairing, and the default
+                                for Normal memory on ARM
+  + far less memory traffic (repeated writes coalesce in the cache)
+  + a write miss followed by more writes to the same line is cheap
+  - memory is stale until eviction → this is exactly why DMA needs
+    cache maintenance (chapter 15, and the SMMU chapter)
+  - a dirty line must be written out on eviction, adding latency
+
+Write-through + no-write-allocate
+  + memory is always current → simple for DMA and for coherency
+  + no dirty bits to track
+  - every store goes to memory; needs a write buffer to be tolerable
+
+The DIRTY bit is the whole difference. It is why a cache flush is
+sometimes a no-op and sometimes writes megabytes to DRAM.</pre>
+
+<pre><code>/* On ARM this is not a fixed property of the cache — it is chosen
+   per page, via the AttrIndx field of the translation descriptor
+   indexing into MAIR_EL1. See ARM chapters 11 and 14.            */
+
+MAIR slot 0 = 0xFF   /* Normal, Inner+Outer Write-Back, read+write allocate */
+MAIR slot 1 = 0x00   /* Device-nGnRnE — never cached at all                 */
+MAIR slot 2 = 0x44   /* Normal, Non-cacheable                               */
+
+/* So "is this memory write-back cached?" is a software decision made
+   in a page table, not a hardware constant. Getting it wrong for a
+   DMA buffer or an MMIO region is a classic driver bug.            */</code></pre>
+
+<h2 id="indexing">Virtual versus physical indexing</h2>
+
+<p>The cache lookup needs an address — but which one, the virtual address the program used or the physical
+address after translation? Waiting for the MMU adds latency to every access.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Scheme</th><th>Index / Tag</th><th>Property</th></tr></thead>
+<tbody>
+<tr><td><strong>PIPT</strong></td><td>Physical / Physical</td><td>Simplest to reason about; no aliasing. But the TLB lookup is on the critical path.</td></tr>
+<tr><td><strong>VIVT</strong></td><td>Virtual / Virtual</td><td>Fastest, but must be flushed on every context switch and suffers aliasing. Largely abandoned.</td></tr>
+<tr><td><strong>VIPT</strong></td><td>Virtual / Physical</td><td><strong>The standard.</strong> Index with the virtual address (available immediately) while the TLB produces the physical tag in parallel. Both finish together.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Why VIPT works, and its constraint
+
+  Page offset bits are IDENTICAL in the virtual and physical address —
+  translation only changes the page number.
+
+   47                     12 11        0
+  ┌─────────────────────────┬───────────┐
+  │      page number        │  offset   │   ← offset is untranslated
+  └─────────────────────────┴───────────┘
+                             └────┬────┘
+                                  │ if INDEX+OFFSET fit inside here,
+                                  │ indexing with the VA is identical
+                                  │ to indexing with the PA
+
+  Constraint:  (cache size / associativity) ≤ page size
+
+  4 KB pages, 64-byte lines → index+offset ≤ 12 bits
+  32 KB cache: needs 8-way to keep each way at 4 KB.
+
+This is precisely why L1 caches are "32 KB, 8-way" so consistently.
+It is not a tuning choice — it is forced by the 4 KB page size.
+Going to a 64 KB L1 requires 16 ways, or larger pages, or accepting
+aliasing and handling it in software.</pre>
+
+<h2 id="inspect">Inspecting a real machine</h2>
+
+<p>Cache sizes and geometry are not something you have to look up in a datasheet — the machine will tell you, and knowing the actual numbers for the hardware in front of you makes the preceding sections concrete.</p>
+
+<pre><code># Linux exposes the full cache topology
+lscpu -C
+#  NAME ONE-SIZE ALL-SIZE WAYS TYPE        LEVEL SETS
+#  L1d       64K     512K    4 Data            1  256
+#  L1i      128K       1M    4 Instruction     1  512
+#  L2         4M      32M    8 Unified         2 8192
+#  L3        16M      16M   16 Unified         3 16384
+
+# or directly
+cat /sys/devices/system/cpu/cpu0/cache/index0/{level,type,size,ways_of_associativity,coherency_line_size}
+
+getconf -a | grep CACHE
+</code></pre>
+
+<pre><code>/* the constant every performance-sensitive program needs */
+#include &lt;unistd.h&gt;
+long line = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);   /* usually 64 */
+
+/* C++17 gives it portably at compile time */
+#include &lt;new&gt;
+alignas(std::hardware_destructive_interference_size) struct counter { ... };
+
+/* Linux kernel */
+struct foo {
+        int hot;
+} ____cacheline_aligned;</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Rounding an array dimension to a power of two slows things 5×</td><td>Conflict misses from a power-of-two stride; pad the row</td></tr>
+<tr><td>Two arrays are fine separately, terrible together</td><td>They map to the same sets; offset one allocation</td></tr>
+<tr><td>Performance changes when an unrelated global is added</td><td>Alignment shifted, changing which sets your data lands in</td></tr>
+<tr><td>A big <code>memcpy</code> slows down everything afterwards</td><td>The copy evicted the working set; use non-temporal stores</td></tr>
+<tr><td>Aligning a struct to 64 bytes gives a free speedup</td><td>It no longer straddles two lines</td></tr>
+<tr><td>A DMA buffer reads back stale data</td><td>Write-back cache holds the dirty line; memory has not been updated</td></tr>
+<tr><td>Peripheral registers behave erratically</td><td>MMIO mapped as Normal cacheable instead of Device</td></tr>
+<tr><td>L1 is always 32 KB and 8-way on every chip you check</td><td>The VIPT constraint against a 4 KB page</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Split a 48-bit address into tag/index/offset for a 64 KB, 4-way, 64-byte-line cache.</li>
+  <li>Explain a conflict miss and construct two arrays that thrash a direct-mapped cache.</li>
+  <li>Say why associativity helps and why 8-way is a common stopping point.</li>
+  <li>Give the four write-policy combinations and which ARM uses for Normal memory.</li>
+  <li>Explain the dirty bit and connect it to why DMA needs cache maintenance.</li>
+  <li>Derive the VIPT constraint and use it to explain why L1 caches are 32 KB, 8-way.</li>
+  <li>Explain why padding a matrix row can be a large optimisation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

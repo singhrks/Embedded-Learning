@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracing, logging and TCG plugins | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Tracing, logging and TCG plugins</h1>
+<p class="lead">Three separate observation systems ship in QEMU and they answer different questions:
+<code>-d</code> tells you what the guest did, <code>--trace</code> tells you what QEMU did, and plugins let
+you write your own instrumentation over every instruction and memory access. Together they give you
+visibility no real board can match.</p>
+
+<h2 id="three">Which one answers which question</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Tool</th></tr></thead>
+<tbody>
+<tr><td>What instructions did the guest execute?</td><td><code>-d in_asm,exec</code></td></tr>
+<tr><td>What exceptions did it take?</td><td><code>-d int</code></td></tr>
+<tr><td>Why did that access fault?</td><td><code>-d mmu,guest_errors</code></td></tr>
+<tr><td>Is the guest touching something I have not modelled?</td><td><code>-d unimp,guest_errors</code></td></tr>
+<tr><td>What did my device model receive?</td><td><code>--trace 'mydev_*'</code></td></tr>
+<tr><td>Which virtqueue operations happened?</td><td><code>--trace 'virtio_*'</code></td></tr>
+<tr><td>How many times is that register read?</td><td>a TCG plugin</td></tr>
+<tr><td>What is the guest's cache miss rate?</td><td><code>libcache.so</code> plugin</td></tr>
+<tr><td>Which basic blocks are hot?</td><td><code>libhotblocks.so</code> plugin</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="d">-d: guest-side logging</h2>
+
+<pre><code># Always write to a file. -d output to a terminal is unusable.
+$ qemu-system-aarch64 -M virt -nographic -kernel Image \
+    -d guest_errors,unimp,int -D qemu.log
+
+# The four to enable by default during bring-up. They are cheap
+# and they catch real problems:
+#   guest_errors  the guest did something invalid
+#   unimp         you hit an unimplemented feature or register
+#   int           every exception and interrupt taken
+#   mmu           translation faults
+
+$ qemu-system-aarch64 -M virt -nographic -kernel Image \
+    -d int -D int.log
+$ head -20 int.log
+Taking exception 5 [IRQ]
+...from EL1 to EL1
+...with ESR 0x0/0x0
+...with ELR 0xffff800008a41234
+...to EL1 PC 0xffff800008010480 PSTATE 0x3c5
+
+Taking exception 3 [Prefetch Abort]
+...from EL1 to EL1
+...with ESR 0x21/0x86000004
+...with FAR 0x0000000000000000
+
+# That last one is a NULL instruction fetch - the guest jumped
+# through a null function pointer, and you have the ELR to find
+# out from where. -d int is the highest-value flag in QEMU and
+# almost nobody enables it.
+
+# The heavyweight ones - use with a narrow window:
+$ qemu-system-aarch64 ... -d exec,cpu -D trace.log
+# every block execution, plus a full register dump. Gigabytes
+# per second. Combine with a breakpoint:
+#   run under gdb, break where you care, then
+#   (gdb) monitor log exec,cpu
+#   (gdb) stepi 1000
+#   (gdb) monitor log none
+
+# Toggle logging at runtime, which is how you keep it usable:
+(qemu) log int,mmu
+(qemu) log none
+(qemu) logfile /tmp/window.log
+
+# List everything available:
+$ qemu-system-aarch64 -d help</code></pre>
+
+<div class="key">
+<b><code>-d int</code> is the one to remember</b>
+<p>A guest that hangs, resets in a loop, or dies silently is almost always taking an exception it cannot
+handle. <code>-d int</code> prints every exception with its ESR, ELR and FAR — the same three registers you
+would decode by hand — for the entire boot, at negligible cost. Reach for it before anything else.</p>
+</div>
+
+<h2 id="trace">--trace: QEMU-side tracepoints</h2>
+
+<pre><code># QEMU's own code is instrumented with thousands of static
+# tracepoints. They are compiled in but disabled by default.
+
+$ qemu-system-aarch64 -M virt --trace help 2>&amp;1 | wc -l
+4127
+
+$ qemu-system-aarch64 -M virt --trace 'virtio_*' -D trace.log ...
+virtio_queue_notify   vdev 0x5555 n 0 vq 0x5556
+virtio_notify_irqfd   vdev 0x5555 vq 0x5556
+virtblk_handle_write  req 0x5557 sector 2048 nsectors 8
+
+$ qemu-system-aarch64 -M virt \
+    --trace 'pl011_*' --trace 'gicv3_*' -D trace.log ...
+pl011_read      addr 0x18 value 0x90
+pl011_write     addr 0x00 value 0x4b
+gicv3_icc_iar1_read  cpu 0 value 0x21
+gicv3_icc_eoir_write cpu 0 value 0x21
+
+# Many patterns at once, from a file:
+$ cat &gt; events.txt &lt;&lt;'EOF'
+virtio_*
+virtqueue_*
+kvm_run_exit
+memory_region_ops_read
+memory_region_ops_write
+EOF
+$ qemu-system-aarch64 ... --trace events=events.txt -D trace.log
+
+# THE TWO MOST USEFUL, and they work for ANY device including
+# one you just wrote:
+--trace 'memory_region_ops_read'
+--trace 'memory_region_ops_write'
+# Every MMIO access QEMU dispatched, with the region name,
+# offset, value and size. "Is my device being accessed at all?"
+# answered definitively.
+
+# Toggle at runtime:
+(qemu) trace-event virtio_queue_notify on
+(qemu) trace-event pl011_* off
+(qemu) info trace-events | head
+
+# Into the host's ftrace, so guest and host events interleave
+# on one timeline (needs --enable-trace-backends=ftrace):
+$ echo 1 | sudo tee /sys/kernel/debug/tracing/tracing_on
+$ qemu-system-aarch64 ... --trace 'virtio_*'
+$ sudo cat /sys/kernel/debug/tracing/trace</code></pre>
+
+<h2 id="own">Adding a tracepoint to your own device</h2>
+
+<pre><code># If you are writing a device model (chapter 13), instrument it
+# the way QEMU does rather than with printf.
+
+# 1. hw/misc/trace-events
+mydev_read(uint64_t offset, uint64_t value, unsigned size) \
+    "offset 0x%" PRIx64 " value 0x%" PRIx64 " size %u"
+mydev_write(uint64_t offset, uint64_t value, unsigned size) \
+    "offset 0x%" PRIx64 " value 0x%" PRIx64 " size %u"
+mydev_irq(int level) "level %d"
+mydev_reset(void) ""
+
+# 2. In your source:
+#include "trace.h"
+
+static uint64_t mydev_read(void *opaque, hwaddr off, unsigned sz)
+{
+        MyDevState *s = opaque;
+        uint64_t v = do_read(s, off);
+        trace_mydev_read(off, v, sz);
+        return v;
+}
+
+# 3. Use it:
+$ qemu-system-aarch64 ... --trace 'mydev_*' -D mydev.log
+
+# Zero cost when disabled (a branch on a flag), full formatting
+# when enabled, works with every backend, and does not clutter
+# stdout. There is no reason to use printf in a device model.</code></pre>
+
+<h2 id="plugins">TCG plugins: instrumentation you write</h2>
+
+<pre><code># Plugins are shared libraries called back on translation and
+# execution events. They work under TCG only (not KVM), and
+# they see EVERYTHING.
+
+$ ls build/tests/plugin/
+libbb.so  libempty.so  libinsn.so  libmem.so  libhotblocks.so
+libhotpages.so  libhowvec.so  libcache.so  libsyscall.so
+
+# Count instructions - a deterministic "cycle" count for
+# comparing two implementations:
+$ qemu-system-aarch64 ... -plugin build/tests/plugin/libinsn.so \
+    -d plugin -D insn.log
+cpu 0 insns: 148291043
+
+# Hot basic blocks:
+$ qemu-system-aarch64 ... \
+    -plugin build/tests/plugin/libhotblocks.so,count=20 -d plugin
+collected 154321 entries in the hash table
+pc, hits, insns
+0x0000ffff80081234, 4092211, 14
+0x0000ffff80095678, 2881100,  6
+
+# Hot pages - shows the guest's memory access distribution:
+$ qemu-system-aarch64 ... -plugin build/tests/plugin/libhotpages.so \
+    -d plugin
+
+# A real cache model - miss rates for a configuration you
+# choose, on real guest execution:
+$ qemu-system-aarch64 ... -plugin build/tests/plugin/libcache.so,\
+dcachesize=32768,dassoc=4,dblksize=64,icachesize=32768 -d plugin
+core #, data accesses, data misses, dmiss rate, insn accesses, ...
+0       12043221       401223      3.33%       48120311  ...</code></pre>
+
+<pre><code>/* Your own plugin. ~80 lines for something genuinely useful:
+   count every access to one MMIO address.                  */
+
+#include &lt;qemu-plugin.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;inttypes.h&gt;
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+static uint64_t watch_addr = 0;
+static uint64_t reads = 0, writes = 0;
+
+static void mem_cb(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                   uint64_t vaddr, void *udata)
+{
+        if (vaddr &lt; watch_addr || vaddr &gt;= watch_addr + 0x1000)
+                return;
+        if (qemu_plugin_mem_is_store(info))
+                writes++;
+        else
+                reads++;
+}
+
+static void vcpu_tb_trans(qemu_plugin_id_t id,
+                          struct qemu_plugin_tb *tb)
+{
+        size_t n = qemu_plugin_tb_n_insns(tb);
+        for (size_t i = 0; i &lt; n; i++) {
+                struct qemu_plugin_insn *insn =
+                        qemu_plugin_tb_get_insn(tb, i);
+                qemu_plugin_register_vcpu_mem_cb(
+                        insn, mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+                        QEMU_PLUGIN_MEM_RW, NULL);
+        }
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *p)
+{
+        g_autoptr(GString) out = g_string_new(NULL);
+        g_string_printf(out,
+                "region 0x%" PRIx64 ": %" PRIu64 " reads, "
+                "%" PRIu64 " writes\n", watch_addr, reads, writes);
+        qemu_plugin_outs(out-&gt;str);
+}
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_install(
+        qemu_plugin_id_t id, const qemu_info_t *info,
+        int argc, char **argv)
+{
+        for (int i = 0; i &lt; argc; i++)
+                if (g_str_has_prefix(argv[i], "addr="))
+                        watch_addr = strtoull(argv[i] + 5, NULL, 0);
+
+        qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+        qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
+        return 0;
+}</code></pre>
+
+<pre><code>$ gcc -shared -fPIC -o watch.so watch.c \
+      -I/path/to/qemu/include/qemu $(pkg-config --cflags glib-2.0)
+
+$ qemu-system-aarch64 ... -plugin ./watch.so,addr=0x09000000 \
+    -d plugin
+region 0x9000000: 41022 reads, 8813 writes
+
+# "My driver is slow - how much is it touching the hardware?"
+# answered exactly, without modifying the driver, without a
+# logic analyser, and with a number you can put in a commit
+# message.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>-d</code> produces nothing</td><td>Output went to stderr and was swallowed — add
+<code>-D file</code></td></tr>
+<tr><td><code>-d exec</code> fills the disk</td><td>Working as intended. Narrow the window with the monitor's
+<code>log</code> command</td></tr>
+<tr><td>Plugin fails to load</td><td>QEMU built without <code>--enable-plugins</code>, or an ABI mismatch
+between plugin and binary</td></tr>
+<tr><td>Plugin produces no output</td><td><code>-d plugin</code> missing, or the plugin writes with
+<code>qemu_plugin_outs</code> which needs it</td></tr>
+<tr><td>Plugin sees nothing under <code>-accel kvm</code></td><td>Plugins are a TCG feature. There is no
+instruction stream to instrument under KVM</td></tr>
+<tr><td><code>--trace</code> pattern matches nothing</td><td>Check the exact name with <code>--trace
+help</code>; patterns are glob, not regex</td></tr>
+<tr><td>Tracepoint added but never fires</td><td><code>trace-events</code> not in the directory's
+<code>meson.build</code>, or <code>trace.h</code> not included</td></tr>
+<tr><td>Guest behaves differently with tracing on</td><td>Logging slows the guest enough to change timing —
+expected, and sometimes informative</td></tr>
+<tr><td>Instruction counts differ between runs</td><td>Non-determinism from I/O; add <code>-icount</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say which of the three systems answers "what did the guest execute", "what did QEMU do", and "how many
+  times".</li>
+  <li>Name the four <code>-d</code> flags worth enabling by default and what each catches.</li>
+  <li>Read a <code>-d int</code> entry and extract the exception type, ESR, ELR and FAR.</li>
+  <li>Narrow <code>-d exec</code> to a small window using the monitor.</li>
+  <li>Name the two <code>--trace</code> events that work for any device model.</li>
+  <li>Add a tracepoint to a device model and say why it beats <code>printf</code>.</li>
+  <li>Use a stock plugin to find the hottest basic blocks in a guest.</li>
+  <li>Explain why plugins do not work under KVM.</li>
+  <li>Write a plugin that counts accesses to one address range.</li>
+  <li>Explain how to make instruction counts reproducible between runs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

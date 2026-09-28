@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeRTOS in practice | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>FreeRTOS in practice</h1>
+<p class="lead">FreeRTOS is the most widely deployed RTOS in the world, and its whole configuration surface is
+one header file. This chapter covers the settings that matter, the port layer where chapter 18's assembly
+actually lives, and the handful of mistakes that account for most FreeRTOS bugs.</p>
+
+<h2 id="shape">The shape of it</h2>
+
+<pre class="diagram">   FreeRTOS-Kernel/
+     tasks.c        the scheduler, ready lists, TCBs
+     queue.c        queues, semaphores, mutexes - all one
+                    implementation underneath
+     timers.c       software timers, run by a daemon task
+     event_groups.c
+     list.c         the intrusive linked list everything uses
+     portable/
+       GCC/ARM_CM4F/
+         port.c     &lt;- chapter 18's PendSV_Handler lives here
+         portmacro.h   critical sections, BASEPRI, yields
+       MemMang/
+         heap_1.c   allocate only, never free
+         heap_2.c   free, no coalescing (deprecated)
+         heap_3.c   wraps malloc/free
+         heap_4.c   free WITH coalescing  &lt;- the usual choice
+         heap_5.c   heap_4 across several memory regions
+
+   Your project adds exactly one file:
+     FreeRTOSConfig.h
+
+   Reading tasks.c and port.c is genuinely worthwhile - it
+   is a few thousand lines of clear C, and after chapter 18
+   the port layer will look familiar rather than magical.</pre>
+
+<h2 id="config">The settings that matter</h2>
+
+<pre><code>/* FreeRTOSConfig.h - the ones worth understanding. */
+
+#define configCPU_CLOCK_HZ            168000000
+#define configTICK_RATE_HZ            1000    /* 1 ms tick   */
+#define configMAX_PRIORITIES          8
+#define configMINIMAL_STACK_SIZE      128     /* WORDS = 512 B */
+#define configTOTAL_HEAP_SIZE         (24 * 1024)
+
+/* ---- THE TWO THAT CAUSE THE MOST TROUBLE ---------------- */
+
+/* Must match the silicon. Read it from the vendor header;
+   do not assume 4 (chapter 08).                            */
+#define configPRIO_BITS               4
+
+/* The ISR priority ceiling. Interrupts numerically BELOW
+   this value (= higher urgency) must NEVER call an API.
+
+   Note this is the RAW value, shifted into the implemented
+   bits - not the CMSIS-style logical priority.             */
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY  5
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY \
+    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY &lt;&lt; (8 - configPRIO_BITS))
+
+/* ---- KEEP THESE ON IN DEVELOPMENT ----------------------- */
+
+#define configASSERT(x) if ((x) == 0) { taskDISABLE_INTERRUPTS(); \
+                                        for (;;); }
+/* configASSERT catches: API called from a too-high-priority
+   ISR, blocking call from an ISR, invalid priority, and
+   several others - each of which is otherwise a bug that
+   appears hours later in unrelated code. Turning it off to
+   save flash is a false economy until you are shipping.    */
+
+#define configCHECK_FOR_STACK_OVERFLOW   2   /* pattern check */
+#define configUSE_MALLOC_FAILED_HOOK     1
+#define configUSE_MUTEXES                1   /* or mutexes    */
+                                             /* become binary */
+                                             /* semaphores    */
+#define configUSE_TRACE_FACILITY         1
+#define configGENERATE_RUN_TIME_STATS    1
+
+void vApplicationStackOverflowHook(TaskHandle_t t, char *name)
+{
+    /* Record to .noinit and reset - chapter 15. */
+    strncpy(g_crash.task, name, sizeof(g_crash.task));
+    g_crash.magic = CRASH_MAGIC_STACK;
+    NVIC_SystemReset();
+}
+</code></pre>
+
+<div class="warn">
+<b>Three lines that must be in your config, and usually are not</b>
+<p>The FreeRTOS Cortex-M port installs its own SVC, PendSV and SysTick handlers. If your vendor's startup file
+also defines them — and ST's does — you get either a duplicate-symbol error or, worse, the vendor's stubs
+silently winning. The standard fix is these three defines, which redirect the names:</p>
+<pre><code>#define vPortSVCHandler      SVC_Handler
+#define xPortPendSVHandler   PendSV_Handler
+#define xPortSysTickHandler  SysTick_Handler</code></pre>
+<p>Omitting them produces a system that builds cleanly and never switches tasks. It is the most common
+first-time FreeRTOS failure by a wide margin.</p>
+</div>
+
+<h2 id="static">Static allocation</h2>
+
+<pre><code>/* Dynamic creation is convenient and, in a system that must
+   not fail, a liability: xTaskCreate can return failure at
+   run time, and a heap can fragment. Static allocation
+   moves every failure to LINK TIME.                        */
+
+#define configSUPPORT_STATIC_ALLOCATION  1
+#define configSUPPORT_DYNAMIC_ALLOCATION  0   /* no heap at all */
+
+static StaticTask_t  sensor_tcb;
+static StackType_t   sensor_stack[512];
+
+static StaticQueue_t reading_q_buf;
+static uint8_t       reading_q_storage[10 * sizeof(reading_t)];
+
+void app_init(void)
+{
+    TaskHandle_t h = xTaskCreateStatic(
+        sensor_task, "sensor", 512, NULL, 3,
+        sensor_stack, &amp;sensor_tcb);
+    configASSERT(h != NULL);        /* cannot actually fail  */
+
+    QueueHandle_t q = xQueueCreateStatic(
+        10, sizeof(reading_t), reading_q_storage, &amp;reading_q_buf);
+    configASSERT(q != NULL);
+}
+
+/* With dynamic allocation disabled entirely, the linker
+   reports your true RAM usage and there is no heap to
+   exhaust, fragment, or analyse. Safety-critical and
+   certified projects require this; ordinary projects
+   benefit from it and rarely bother.
+
+   The cost: everything must be sized at compile time, which
+   is a constraint you would want anyway on a part with
+   64 kB of RAM.                                            */
+</code></pre>
+
+<h2 id="idle">The idle task and tickless sleep</h2>
+
+<pre><code>/* The idle hook runs whenever nothing else is ready. It is
+   where a battery-powered product sleeps.                  */
+
+void vApplicationIdleHook(void)
+{
+    __WFI();       /* wake on the next interrupt or tick    */
+}
+
+/* But a 1 kHz tick wakes the core a thousand times a second
+   whether or not there is work - which on a battery product
+   dominates the current budget (chapter 13).
+
+   TICKLESS IDLE fixes this: the kernel computes how long
+   until the next task is due, programs a wake-up timer for
+   exactly that, sleeps deeply, and then CORRECTS the tick
+   count on waking so time still adds up.                   */
+
+#define configUSE_TICKLESS_IDLE            1
+#define configEXPECTED_IDLE_TIME_BEFORE_SLEEP  5   /* ticks   */
+
+/* The generic implementation uses SysTick, which does not
+   run in STOP mode. For real low power you supply
+   portSUPPRESS_TICKS_AND_SLEEP() yourself, using the RTC as
+   the wake source. Vendor ports usually provide one - check
+   before writing it.
+
+   Verify with an ammeter, not by reading the code. The
+   difference between "tickless is enabled" and "tickless is
+   working" is a factor of a hundred in average current, and
+   only a current trace tells you which you have.           */
+</code></pre>
+
+<h2 id="debug">Debugging aids worth enabling</h2>
+
+<pre><code>/* 1. RUN-TIME STATS - where the CPU actually goes. */
+vTaskGetRunTimeStats(buf);
+/*   Task        Abs Time      % Time
+     IDLE        14893921      89%
+     sensor        892134       5%
+     comms         721002       4%
+     display       201883       1%
+
+   Needs a timer 10-100x faster than the tick, wired up via
+   portCONFIGURE_TIMER_FOR_RUN_TIME_STATS. Worth the effort:
+   it answers "is there headroom" definitively, and the idle
+   percentage is your real margin.                          */
+
+/* 2. HIGH WATER MARKS - chapter 20's measurement. */
+UBaseType_t free_words = uxTaskGetStackHighWaterMark(handle);
+
+/* 3. TASK LIST */
+vTaskList(buf);
+/*   Name      State  Prio  Stack  Num
+     sensor    B      3     412    1      B = Blocked
+     comms     R      2     288    2      R = Ready
+     display   B      1     501    3      S = Suspended
+
+   A task stuck in R that never becomes X (running) is a
+   priority problem. A task in B forever is a lost signal.  */
+
+/* 4. TRACEALYZER / SystemView
+   Instrumented trace showing every switch, block and ISR on
+   a timeline. This is how you SEE priority inversion rather
+   than infer it, and it is worth the licence cost on any
+   project where timing is the difficulty.                  */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Scheduler starts, no task ever runs</td><td>Handler name defines missing; the vendor's stub handlers
+won</td></tr>
+<tr><td>Hard fault as soon as the scheduler starts</td><td>Interrupt priority grouping not all-preemption; call
+<code>NVIC_SetPriorityGrouping(3)</code></td></tr>
+<tr><td><code>configASSERT</code> fires in <code>port.c</code></td><td>Usually an ISR priority above the
+syscall ceiling — read the line, it is precise</td></tr>
+<tr><td>Mutexes give no priority inheritance</td><td><code>configUSE_MUTEXES</code> is 0</td></tr>
+<tr><td><code>xTaskCreate</code> returns failure</td><td>Heap exhausted — raise
+<code>configTOTAL_HEAP_SIZE</code> or go static</td></tr>
+<tr><td>Random corruption, no pattern</td><td>Stack overflow — enable
+<code>configCHECK_FOR_STACK_OVERFLOW</code> 2</td></tr>
+<tr><td>Tickless enabled but current unchanged</td><td>Generic implementation using SysTick, which stops in
+deep sleep</td></tr>
+<tr><td>Timings wrong by a constant factor</td><td><code>configCPU_CLOCK_HZ</code> does not match the actual
+clock</td></tr>
+<tr><td>Software timer callbacks are late</td><td>The timer daemon task's priority is too low</td></tr>
+<tr><td>Everything works until heap fragments</td><td><code>heap_2</code> in use — switch to
+<code>heap_4</code> or static</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five heap implementations and say which is the usual choice.</li>
+  <li>Explain what the three handler-name defines do and what happens without them.</li>
+  <li>Explain the difference between the logical and raw forms of the syscall priority.</li>
+  <li>Give four things <code>configASSERT</code> catches.</li>
+  <li>Explain why <code>configUSE_MUTEXES</code> being 0 is dangerous rather than merely limiting.</li>
+  <li>State two advantages of static allocation over dynamic.</li>
+  <li>Explain what tickless idle does and why it needs tick correction.</li>
+  <li>Say why enabling tickless idle may not reduce current, and how to check.</li>
+  <li>Describe what run-time stats tell you that stack watermarks do not.</li>
+  <li>Interpret a task shown as Blocked forever in <code>vTaskList</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recipes: one command line per track | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Recipes: one command line per track</h1>
+<p class="lead">A reference card. Each recipe is a complete, working command line for one kind of work on this
+site, with the reason for every non-obvious option. Copy, adjust the paths, run.</p>
+
+<div class="note">
+<b>Assumptions</b>
+<p>All recipes assume <code>qemu-system-aarch64</code> 8.x or newer, a cross toolchain, and an
+<code>Image</code> plus <code>initramfs.cpio.gz</code> built as in
+<a href="qemu-05-direct-boot.html">chapter 5</a> and <a href="qemu-06-rootfs.html">chapter 6</a>. Add
+<code>-accel kvm -cpu host -M virt,gic-version=host</code> on an arm64 host to any of them.</p>
+</div>
+
+<h2 id="arm">ARM architecture track: exception levels and system registers</h2>
+
+<pre><code>#!/bin/sh
+# Bare-metal payload, all exception levels available, stopped
+# for the debugger.
+qemu-system-aarch64 \
+  -M virt,secure=on,virtualization=on,gic-version=3 \
+  -cpu max \
+  -smp 1 -m 512M -nographic \
+  -kernel payload.elf \
+  -d int,mmu,guest_errors,unimp -D qemu.log \
+  -s -S
+
+#   secure=on         EL3 exists -> you can write monitor code
+#   virtualization=on EL2 exists -> you can write hypervisor code
+#   -cpu max          every architectural feature: SVE, MTE,
+#                     pointer auth, FEAT_NV2, S-EL2
+#   -d int            EVERY exception, with ESR/ELR/FAR. This is
+#                     the flag that makes this track teachable.
+#   -s -S             stopped, GDB on :1234
+
+# then:
+$ aarch64-none-elf-gdb payload.elf \
+    -ex 'target remote :1234' -ex 'layout regs' -ex 'break _start'</code></pre>
+
+<h2 id="linux">Linux kernel and driver track</h2>
+
+<pre><code>#!/bin/sh
+# Kernel plus initramfs, module loading, GDB, and a shared
+# directory so you can rebuild a module without repacking.
+KDIR=${KDIR:-$HOME/work/linux}
+
+qemu-system-aarch64 \
+  -M virt -cpu cortex-a57 -smp 2 -m 1G -nographic \
+  -kernel $KDIR/arch/arm64/boot/Image \
+  -initrd initramfs.cpio.gz \
+  -append "console=ttyAMA0 earlycon nokaslr root=/dev/ram0 rw" \
+  -fsdev local,id=fs0,path=$PWD/share,security_model=none \
+  -device virtio-9p-device,fsdev=fs0,mount_tag=share \
+  -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+  -device virtio-net-device,netdev=n0 \
+  -object rng-random,filename=/dev/urandom,id=rng0 \
+  -device virtio-rng-device,rng=rng0 \
+  -d guest_errors,unimp -D qemu.log \
+  -s
+
+#   nokaslr           so GDB symbols match (chapter 11)
+#   9p share          rebuild a module on the host, insmod it in
+#                     the guest, no repacking
+#   virtio-rng        without it, early boot blocks on entropy
+
+# In the guest:
+#   mount -t 9p -o trans=virtio,version=9p2000.L share /mnt
+#   insmod /mnt/mydriver.ko
+# On the host:
+#   gdb-multiarch $KDIR/vmlinux -ex 'target remote :1234' \
+#     -ex "source $KDIR/vmlinux-gdb.py" -ex 'lx-symbols'</code></pre>
+
+<h2 id="virt">Virtualisation track: nested, with everything visible</h2>
+
+<pre><code>#!/bin/sh
+# A guest that can itself run KVM, under TCG so that every
+# instruction is traceable.
+qemu-system-aarch64 \
+  -M virt,virtualization=on,gic-version=3,its=on \
+  -cpu max \
+  -smp 4 -m 4G -nographic \
+  -kernel Image \
+  -append "console=ttyAMA0 earlycon kvm-arm.mode=nested" \
+  -drive file=rootfs.ext4,if=none,format=raw,id=hd0 \
+  -device virtio-blk-device,drive=hd0 \
+  -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+  -device virtio-net-device,netdev=n0 \
+  --trace 'kvm_*' --trace 'virtio_*' -D trace.log
+
+#   -cpu max provides FEAT_NV2 even though no laptop has it
+#   its=on   needed for PCIe MSI-X inside the guest
+
+# On an arm64 host, the fast version:
+#   -M virt,virtualization=on,gic-version=host \
+#   -cpu host,el2=on -accel kvm</code></pre>
+
+<h2 id="tee">OP-TEE and TrustZone track</h2>
+
+<pre><code>#!/bin/sh
+# TF-A at EL3, OP-TEE at S-EL1, Linux at EL1, with the secure
+# world's console on a second UART.
+qemu-system-aarch64 \
+  -M virt,secure=on,virtualization=on,gic-version=3 \
+  -cpu max -smp 2 -m 1G -nographic \
+  -bios bl1.bin \
+  -device loader,file=fip.bin,addr=0x40100000 \
+  -semihosting-config enable=on,target=native \
+  -serial mon:stdio \
+  -serial file:secure-world.log \
+  -netdev user,id=n0 -device virtio-net-device,netdev=n0
+
+#   -bios bl1.bin     TF-A's first stage. NOT -kernel: we are
+#                     the firmware now (chapter 5)
+#   fip.bin           the Firmware Image Package: BL2, BL31,
+#                     BL32 (OP-TEE) and BL33 (U-Boot/Linux)
+#   semihosting       TF-A on QEMU uses it to load the FIP
+#   two -serial       first = ttyAMA0 = normal world
+#                     second = the SECURE world's console. Every
+#                     TA panic and trace line lands there.
+
+# The OP-TEE build system generates this for you:
+#   cd optee/build &amp;&amp; make run
+# and the two consoles appear in separate windows. See the
+# OP-TEE track's chapter 4 for the full build.</code></pre>
+
+<h2 id="dev">Device-model development</h2>
+
+<pre><code>#!/bin/sh
+# Your own QEMU build, your own device, full tracing on both
+# sides of the boundary.
+QEMU=$HOME/opt/qemu/bin/qemu-system-aarch64
+
+$QEMU \
+  -M virt -cpu cortex-a57 -m 512M -nographic \
+  -kernel Image -initrd initramfs.cpio.gz \
+  -append "console=ttyAMA0 earlycon" \
+  -device acme-widget \
+  --trace 'acme_widget_*' \
+  --trace 'memory_region_ops_read' \
+  --trace 'memory_region_ops_write' \
+  -d guest_errors,unimp -D dev.log \
+  -s
+
+#   memory_region_ops_* traces EVERY MMIO access QEMU
+#   dispatched, for every device - so "is my device being
+#   touched at all" is answered without any device-specific
+#   instrumentation (chapter 12).</code></pre>
+
+<h2 id="fast">Fast iteration: overlay plus snapshot</h2>
+
+<pre><code>#!/bin/sh
+# Golden image untouched; every run disposable; snapshot before
+# the expensive setup.
+[ -f work.qcow2 ] || \
+  qemu-img create -f qcow2 -b golden.qcow2 -F qcow2 work.qcow2
+
+qemu-system-aarch64 \
+  -M virt -cpu cortex-a57 -smp 4 -m 2G -nographic \
+  -kernel Image \
+  -drive file=work.qcow2,if=none,id=hd0,cache=unsafe \
+  -device virtio-blk-device,drive=hd0 \
+  -append "console=ttyAMA0 root=/dev/vda rw" \
+  -monitor unix:/tmp/hmp.sock,server=on,wait=off \
+  -qmp unix:/tmp/qmp.sock,server=on,wait=off
+
+#   cache=unsafe   10x faster and safe HERE because the overlay
+#                  is disposable. Never on anything you keep.
+
+# Reset to pristine:  rm work.qcow2 &amp;&amp; rerun
+# Snapshot:  echo savevm ready | socat - UNIX-CONNECT:/tmp/hmp.sock
+# Restore:   echo loadvm ready | socat - UNIX-CONNECT:/tmp/hmp.sock</code></pre>
+
+<h2 id="ci">CI: boot, run a test, exit with a status</h2>
+
+<pre><code>#!/bin/sh
+# Headless, bounded, detects panics, returns a real exit code.
+set -e
+timeout 300 qemu-system-aarch64 \
+  -M virt -cpu cortex-a57 -smp 2 -m 1G \
+  -nographic -no-reboot \
+  -kernel Image -initrd test-initramfs.cpio.gz \
+  -append "console=ttyAMA0 panic=-1 rdinit=/run-tests.sh" \
+  -device pvpanic-pci \
+  -serial mon:stdio \
+  | tee test.log
+
+grep -q "ALL TESTS PASSED" test.log || { echo "FAIL"; exit 1; }
+grep -q "Kernel panic"     test.log &amp;&amp; { echo "PANIC"; exit 1; }
+echo OK
+
+#   -no-reboot      a reset ends the run instead of looping
+#   panic=-1        panic reboots immediately -> with -no-reboot,
+#                   QEMU exits. A panic becomes a fast failure
+#                   rather than a 300-second timeout.
+#   pvpanic-pci     QEMU emits a GUEST_PANICKED QMP event too
+#   timeout 300     the outer bound. Always have one.
+
+# The test script inside the initramfs ends with:
+#   echo "ALL TESTS PASSED"
+#   poweroff -f</code></pre>
+
+<h2 id="user">User-mode: run one cross-compiled binary</h2>
+
+<pre><code># No VM, no kernel, no rootfs. The fastest way to run an
+# aarch64 test suite on an x86 machine.
+
+$ qemu-aarch64 -L /usr/aarch64-linux-gnu ./my-test
+
+# Transparently, via binfmt:
+$ sudo apt install qemu-user-static binfmt-support
+$ ./my-test              # the kernel routes it to qemu-aarch64
+
+# Under GDB:
+$ qemu-aarch64 -g 1234 -L /usr/aarch64-linux-gnu ./my-test &amp;
+$ gdb-multiarch ./my-test -ex 'target remote :1234'
+
+# With instruction counting, to compare two implementations
+# deterministically:
+$ qemu-aarch64 -plugin libinsn.so -d plugin ./my-test
+
+# Emulate a CPU with features your host lacks:
+$ qemu-aarch64 -cpu max ./sve-test</code></pre>
+
+<h2 id="cheat">The flag cheat sheet</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Reach for it when</th></tr></thead>
+<tbody>
+<tr><td><code>-nographic</code></td><td>Always, for headless work. Ctrl-A c for the monitor, Ctrl-A x to
+quit</td></tr>
+<tr><td><code>-s -S</code></td><td>You want to debug from instruction zero</td></tr>
+<tr><td><code>-d int</code></td><td>The guest hangs, resets, or dies silently. <em>Start here</em></td></tr>
+<tr><td><code>-d guest_errors,unimp</code></td><td>Always, during bring-up</td></tr>
+<tr><td><code>-D file</code></td><td>Every time you use <code>-d</code></td></tr>
+<tr><td><code>--trace 'memory_region_ops_*'</code></td><td>"Is my device being accessed?"</td></tr>
+<tr><td><code>-M virt,dumpdtb=x.dtb</code></td><td>"Why is my device not probing?"</td></tr>
+<tr><td><code>-monitor stdio</code> / Ctrl-A c</td><td>Anything is wrong and you want
+<code>info registers</code></td></tr>
+<tr><td><code>-snapshot</code></td><td>You are about to break the disk image</td></tr>
+<tr><td><code>-icount shift=5</code></td><td>A race that will not reproduce</td></tr>
+<tr><td><code>-no-reboot -no-shutdown</code></td><td>You need to inspect the machine after it dies</td></tr>
+<tr><td><code>-nodefaults</code></td><td>You want exactly the machine you specified and nothing more</td></tr>
+<tr><td><code>-accel kvm -cpu host</code></td><td>Same architecture and you want speed</td></tr>
+<tr><td><code>-cpu max</code></td><td>You need a feature no hardware you own has</td></tr>
+<tr><td><code>-semihosting-config enable=on</code></td><td>Bare-metal code that wants host file or console
+access</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>First thing to try</th></tr></thead>
+<tbody>
+<tr><td>No output at all</td><td>Add <code>earlycon</code>; check <code>console=ttyAMA0</code> and
+<code>-nographic</code></td></tr>
+<tr><td>Hangs somewhere in boot</td><td><code>-d int -D log</code> and read the last exception</td></tr>
+<tr><td>Device not probing</td><td><code>dumpdtb</code> and check the <code>compatible</code> and
+<code>reg</code></td></tr>
+<tr><td>Cannot quit QEMU</td><td>Ctrl-A x; if the terminal eats Ctrl-A, add <code>-echr 0x05</code></td></tr>
+<tr><td>Guest dies and takes the evidence with it</td><td><code>-no-reboot -no-shutdown</code>, then
+<code>info registers</code></td></tr>
+<tr><td>Breakpoints never hit</td><td><code>nokaslr</code>, and check the symbols match the running
+build</td></tr>
+<tr><td>Painfully slow</td><td>You are on TCG. Expected on a foreign architecture</td></tr>
+<tr><td>Works today, not tomorrow</td><td>Unversioned machine type or an unpinned QEMU; pin both</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write, from memory, the command line for a Linux kernel plus initramfs with GDB attached.</li>
+  <li>Give the two machine options that provide EL3 and EL2, and say which track needs each.</li>
+  <li>Explain why the OP-TEE recipe uses <code>-bios</code> rather than <code>-kernel</code>.</li>
+  <li>Explain what the second <code>-serial</code> is for in the OP-TEE recipe.</li>
+  <li>Give the three flags that turn a hung CI job into a fast failure.</li>
+  <li>Explain why <code>cache=unsafe</code> is correct in the overlay recipe and nowhere else.</li>
+  <li>Name the first flag to reach for when a guest hangs, and why.</li>
+  <li>Set up a 9p share and use it to iterate on a kernel module without repacking.</li>
+  <li>Run a cross-compiled binary under user-mode emulation, with a debugger.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

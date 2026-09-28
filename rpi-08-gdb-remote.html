@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging on the target: gdbserver and core dumps | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging on the target: gdbserver and core dumps</h1>
+<p class="lead">The program runs on the Pi; the debugger, the symbols and the source live on your laptop.
+Getting that split right is the difference between a two-minute investigation and reading printf output for an
+afternoon.</p>
+
+<h2 id="native">The simple case first</h2>
+
+<pre><code># GDB is on the Pi and works exactly as you expect. For a
+# small program this is the fastest route and needs no setup.
+
+$ sudo apt install gdb
+$ gcc -Og -g3 -fno-omit-frame-pointer -o app app.c
+$ gdb ./app
+
+# -Og   optimise but keep the code debuggable. Better than
+#       -O0 (which hides optimiser bugs) and far better than
+#       -O2 (where variables are "optimized out").
+# -g3   include macro definitions too.
+# -fno-omit-frame-pointer  makes backtraces reliable, and
+#       costs one register. On AArch64 you have 31; spend it.
+
+# The catch: a full GDB session over SSH on a serial-console
+# day is painful, and you have no source-level IDE. Hence
+# remote debugging.
+</code></pre>
+
+<h2 id="gdbserver">Remote: gdbserver on the Pi, GDB on the host</h2>
+
+<pre class="diagram">   HOST (x86 laptop)                 TARGET (Pi)
+
+   gdb-multiarch                     gdbserver
+     - reads YOUR source              - runs the process
+     - reads the symbols              - stops/steps it
+     - shows the UI          &lt;--TCP--&gt;- reports registers
+                                        and memory
+
+   THE BINARY MUST EXIST ON BOTH SIDES, and be IDENTICAL.
+   The host copy supplies symbols; the target copy runs.
+   A mismatch gives you plausible-looking nonsense:
+   breakpoints in the wrong place, garbage locals, a
+   backtrace that makes no sense. This is the single most
+   common remote-GDB failure and it never announces itself.
+
+   Keep them in step by making "deploy" copy the binary you
+   just built, never rebuilding on the target separately.</pre>
+
+<pre><code># --- ON THE PI ---
+$ sudo apt install gdbserver
+$ gdbserver :2345 ./app arg1 arg2
+Process ./app created; pid = 1234
+Listening on port 2345
+
+# --- ON THE HOST ---
+$ sudo apt install gdb-multiarch
+$ gdb-multiarch ./app                 # the SAME binary
+(gdb) set architecture aarch64
+(gdb) set sysroot /home/me/pi-sysroot  # chapter 06
+(gdb) target remote pidev.local:2345
+(gdb) break main
+(gdb) continue
+
+# TUNNEL IT OVER SSH instead of exposing the port. gdbserver
+# has no authentication whatsoever - anyone who can reach
+# that port can run code as your user:
+$ ssh -L 2345:localhost:2345 pi
+(gdb) target remote localhost:2345
+
+# ATTACH TO SOMETHING ALREADY RUNNING - the usual case for a
+# daemon that misbehaves after an hour:
+$ ssh pi 'sudo gdbserver --attach :2345 $(pidof myapp)'
+
+# A .gdbinit in the project so you never retype it:
+set architecture aarch64
+set sysroot /home/me/pi-sysroot
+set substitute-path /home/myuser/proj /home/me/proj
+target extended-remote localhost:2345
+
+# substitute-path is what makes the SOURCE display work: the
+# binary records the path it was compiled at (on the Pi),
+# and your source is somewhere else. Without it GDB says
+# "No such file or directory" for every frame and you debug
+# blind at the assembly level.
+</code></pre>
+
+<div class="key">
+<b>Use <code>target extended-remote</code>, not <code>target remote</code></b>
+<p>With <code>gdbserver --multi :2345</code> on the Pi and <code>extended-remote</code> on the host, the
+connection survives the program exiting. You can then <code>run</code> again, change arguments, and restart —
+all without touching the board. With plain <code>remote</code>, gdbserver exits when your program does and you
+must go back and start it again by hand, which turns a debugging session into a chore and is why people give
+up on remote GDB.</p>
+</div>
+
+<h2 id="cores">Core dumps: debugging what already crashed</h2>
+
+<pre><code># The best debugging technique for an intermittent crash is
+# not to catch it live - it is to have it leave a corpse.
+
+# --- ON THE PI ---
+$ ulimit -c unlimited                    # per shell
+# permanently, in /etc/security/limits.conf:
+#   *  soft  core  unlimited
+
+# Where they land, and a name that includes the pid and
+# executable:
+$ sudo sysctl -w kernel.core_pattern=/var/crash/core.%e.%p.%t
+$ sudo mkdir -p /var/crash
+
+# With systemd, coredumpctl does the bookkeeping for you and
+# is the better route on Raspberry Pi OS:
+$ coredumpctl list
+$ coredumpctl info myapp
+$ coredumpctl dump myapp &gt; core.myapp    # extract it
+
+# For a SERVICE, the unit needs:
+#   [Service]
+#   LimitCORE=infinity
+
+# --- ANALYSE ON THE HOST ---
+$ scp pi:/var/crash/core.myapp.1234.* .
+$ gdb-multiarch ./app core.myapp.1234.1724...
+(gdb) bt full
+(gdb) info registers
+(gdb) frame 2
+(gdb) print *some_struct
+
+# THE CORE MUST MATCH THE BINARY AND ITS LIBRARIES. If the
+# Pi has been updated since, the shared libraries differ and
+# the backtrace through libc will be wrong. Either analyse
+# on the Pi, or keep the sysroot in sync (chapter 06).
+</code></pre>
+
+<h2 id="sanitizers">Sanitizers catch what GDB only watches</h2>
+
+<pre><code># A debugger shows you the crash. A sanitizer shows you the
+# BUG, which is usually earlier and elsewhere. On a Pi both
+# work and both are worth the rebuild.
+
+# ADDRESS SANITIZER - buffer overflows, use-after-free,
+# double-free, leaks. ~2x slower, ~3x more memory.
+$ gcc -Og -g -fsanitize=address -fno-omit-frame-pointer \
+      -o app app.c
+$ ./app
+# =================================================================
+# ==1234==ERROR: AddressSanitizer: heap-use-after-free
+#     #0 0x... in process_reading sensor.c:88
+#     freed by thread T0 here:
+#     #1 0x... in cleanup sensor.c:142
+
+# That output names the line that freed it AND the line that
+# used it. No debugger session gets you there as fast.
+
+# UNDEFINED BEHAVIOUR SANITIZER - the one that matters most
+# for embedded C, because the code is full of shifts, casts
+# and alignment assumptions:
+$ gcc -Og -g -fsanitize=undefined \
+      -fsanitize=alignment,shift,integer-divide-by-zero \
+      -fno-sanitize-recover=all -o app app.c
+
+# ALIGNMENT is the one that bites on ARM. x86 tolerates
+# unaligned access; AArch64 tolerates it for normal memory
+# but NOT for device memory, so a cast that "works on the
+# laptop" faults on the Pi when pointed at MMIO. UBSan finds
+# it before the hardware does.
+
+# THREAD SANITIZER - data races. ~10x slower, needs lots of
+# RAM, so a 4 GB+ board:
+$ gcc -Og -g -fsanitize=thread -o app app.c
+
+# THE WORKFLOW: run the test suite under ASan+UBSan by
+# default in development, and only reach for GDB when a
+# sanitizer says nothing. Most bugs never reach the
+# debugger.
+
+# VALGRIND also works on aarch64 and needs no rebuild, which
+# makes it right for a binary you cannot recompile:
+$ valgrind --leak-check=full --track-origins=yes ./app
+# It is ~20x slower than ASan's 2x, so prefer ASan when you
+# can rebuild.
+</code></pre>
+
+<h2 id="strace">When the bug is at the boundary</h2>
+
+<pre><code># A great many embedded bugs are not in your logic but at
+# the interface with the kernel: a wrong ioctl, an EAGAIN
+# you ignored, a device that is not there.
+
+$ strace -f -e trace=ioctl,openat,read,write ./app
+openat(AT_FDCWD, "/dev/i2c-1", O_RDWR)  = 3
+ioctl(3, I2C_SLAVE, 0x76)               = 0
+ioctl(3, I2C_RDWR, 0x7ffc...)           = -1 EREMOTEIO
+#                                          ^^^^^^^^^^
+# EREMOTEIO from an I2C transfer is a NACK - the device did
+# not acknowledge (bus chapter 06). That single line points
+# at wiring or an address, not at your code.
+
+# Timing, to find where the wall-clock time actually goes:
+$ strace -c -f ./app             # summary by syscall
+$ strace -T -f ./app             # time in each call
+$ strace -r -f ./app             # relative timestamps
+
+# ltrace for library calls; perf for CPU profiles:
+$ perf record -g ./app &amp;&amp; perf report
+$ perf stat -e cache-misses,branch-misses ./app
+
+# perf needs permission, and on a Pi you usually must lower
+# the restriction to profile as a normal user:
+$ sudo sysctl -w kernel.perf_event_paranoid=1
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Breakpoints hit the wrong lines</td><td>Host and target binaries differ</td></tr>
+<tr><td>Locals show as "optimized out"</td><td>Built with <code>-O2</code>; use <code>-Og</code></td></tr>
+<tr><td>GDB cannot find any source</td><td><code>substitute-path</code> not set — the binary records the Pi's
+paths</td></tr>
+<tr><td>Backtrace stops after one frame</td><td>Frame pointers omitted; add
+<code>-fno-omit-frame-pointer</code></td></tr>
+<tr><td>gdbserver exits when the program does</td><td>Use <code>--multi</code> and
+<code>extended-remote</code></td></tr>
+<tr><td>Backtrace through libc is nonsense</td><td>Sysroot does not match the Pi's libraries</td></tr>
+<tr><td>No core file after a crash</td><td><code>ulimit -c</code> is 0, or the service lacks
+<code>LimitCORE</code></td></tr>
+<tr><td>Crash only in release builds</td><td>Undefined behaviour — run UBSan before guessing</td></tr>
+<tr><td>Works on x86, faults on the Pi</td><td>Unaligned access or a signed-char assumption; UBSan finds
+both</td></tr>
+<tr><td><code>EREMOTEIO</code> from an I2C ioctl</td><td>Device did not ACK — address or wiring, not
+software</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why <code>-Og</code> is preferable to both <code>-O0</code> and <code>-O2</code>.</li>
+  <li>Say which side of a remote session holds the symbols and which runs the process.</li>
+  <li>Describe the failure caused by mismatched host and target binaries.</li>
+  <li>Explain what <code>substitute-path</code> fixes.</li>
+  <li>Give two reasons to tunnel gdbserver over SSH.</li>
+  <li>State the advantage of <code>extended-remote</code> with <code>--multi</code>.</li>
+  <li>Explain what must match for a core dump to give a correct backtrace.</li>
+  <li>Say which sanitizer matters most on ARM and give the specific hazard.</li>
+  <li>Contrast ASan and Valgrind on cost and on when each is the right tool.</li>
+  <li>Interpret <code>EREMOTEIO</code> from an I2C ioctl.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

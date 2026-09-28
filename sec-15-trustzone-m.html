@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustZone-M for microcontrollers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TrustZone-M for microcontrollers</h1>
+<p class="lead">The same idea on a chip with no MMU, no exception levels, and a 20-cycle interrupt latency
+budget. TrustZone for Armv8-M drops the monitor entirely and puts the boundary in the address map — which
+changes everything about how you use it.</p>
+
+<h2 id="diff">What is different</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>TrustZone-A</th><th>TrustZone-M</th></tr></thead>
+<tbody>
+<tr><td>Security state determined by</td><td><code>SCR_EL3.NS</code> — a register</td><td><strong>The address being executed</strong></td></tr>
+<tr><td>Transition</td><td><code>SMC</code> into EL3, which switches contexts</td><td>Direct call to a valid entry point — <em>no monitor</em></td></tr>
+<tr><td>Transition cost</td><td>~1000–4000 cycles</td><td><strong>A few cycles</strong></td></tr>
+<tr><td>Exception levels</td><td>EL0–EL3</td><td>Thread/Handler mode, privileged/unprivileged, in each state</td></tr>
+<tr><td>Address translation</td><td>MMU, two stages</td><td>MPU only — no translation, just permissions</td></tr>
+<tr><td>Region control</td><td>TZASC, TZPC, SMMU</td><td>SAU and IDAU, plus separate secure/non-secure MPUs</td></tr>
+<tr><td>Stacks</td><td>Per exception level</td><td><strong>Four</strong> — MSP/PSP in each state</td></tr>
+<tr><td>Vector table</td><td>One <code>VBAR</code> per EL</td><td>Two — <code>VTOR_S</code> and <code>VTOR_NS</code></td></tr>
+<tr><td>Typical software</td><td>Linux + OP-TEE</td><td>Bare metal or an RTOS on each side</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The core idea: security is a property of the address</b>
+<p>On Armv8-M there is no bit in a register that says "we are secure now". The processor is in Secure state
+<em>because it is executing from a Secure address</em>. Fetch an instruction from a Non-secure address and
+the state changes with it. This is why the transition is nearly free — and why the address map <em>is</em>
+the security policy.</p>
+</div>
+
+<h2 id="map">The address map</h2>
+
+<p>TrustZone for microcontrollers shares a name and very little else with the version on application processors. The mechanism is address-based rather than mode-based, which changes nearly everything about how it is used.</p>
+
+<pre class="diagram">Every address is one of three types:
+
+  SECURE (S)
+      accessible only from Secure state.
+      code and data for the trusted side.
+
+  NON-SECURE (NS)
+      accessible from either state.
+      the application side.
+
+  NON-SECURE CALLABLE (NSC)
+      SECURE memory, but Non-secure code may BRANCH into it -
+      and only to an SG instruction. This is the doorway.
+
+  Two units decide which is which:
+
+    IDAU  Implementation Defined Attribution Unit.
+          Fixed by the silicon vendor, coarse, cannot be
+          changed. Often splits the whole map by an address bit.
+
+    SAU   Security Attribution Unit.
+          8 or so programmable regions, configured by SECURE
+          software at boot.
+
+  The result is the MORE SECURE of the two:
+
+    IDAU says NS, SAU says S   -&gt; Secure
+    IDAU says S,  SAU says NS  -&gt; Secure
+    both say NS                -&gt; Non-secure
+
+  So the SAU can never make something less secure than the
+  silicon says it is. Fail-closed, in hardware.
+
+  Typical layout on a part with 1 MB flash / 256 KB RAM:
+
+    0x0C00_0000  +----------------+
+                 | Secure flash   |  S    bootloader, secure lib
+    0x0C03_0000  +----------------+
+                 | veneers        |  NSC  the SG entry points
+    0x0C03_1000  +----------------+
+    0x0803_1000  | NS flash       |  NS   the application
+    0x0810_0000  +----------------+
+
+    0x3000_0000  +----------------+
+                 | Secure RAM     |  S    keys, secure stacks
+    0x3000_8000  +----------------+
+    0x2000_8000  | NS RAM         |  NS   application RAM
+    0x2004_0000  +----------------+
+
+  Note the aliasing: 0x0C00_0000 and 0x0800_0000 are the SAME
+  physical flash, seen through a Secure and a Non-secure alias.
+  Bit 28 is the security alias bit on many parts. That is the
+  IDAU doing its coarse split.</pre>
+
+<h2 id="sg">Crossing the boundary</h2>
+
+<p>Because the boundary is defined by address ranges, calling into the secure world means branching to a specially marked instruction in a specially marked region — there is no monitor and no world switch in the A-profile sense.</p>
+
+<pre><code>/* NS -&gt; S: the SG instruction */
+
+   Non-secure code does:   BL   secure_function
+
+   The target must be:
+      · in an NSC region, and
+      · the FIRST instruction there must be SG
+
+   If either fails -&gt; SecureFault. No exceptions, no
+   negotiation. This is what stops Non-secure code jumping into
+   the MIDDLE of a secure function to skip its checks.
+
+/* S -&gt; NS: the BXNS / BLXNS instructions */
+
+   BXNS  r0       branch, switching to Non-secure
+   BLXNS r0       call Non-secure, and come back
+
+   Secure code must use these EXPLICITLY. A plain BX to a
+   Non-secure address faults - so you cannot leave the secure
+   state by accident.
+
+/* The compiler writes the glue. Two attributes: */
+
+/* An entry point, callable from Non-secure: */
+__attribute__((cmse_nonsecure_entry))
+int secure_add(int a, int b)
+{
+        return a + b;
+}
+/* generates:
+        secure_add:
+                SG                      ; the required gateway
+                B   secure_add_impl     ; jump to the real body
+   and on return, clears the caller-saved registers and issues
+   BXNS lr.                                                 */
+
+/* A pointer TO Non-secure code, called from Secure: */
+typedef void __attribute__((cmse_nonsecure_call)) (*ns_fn)(void);
+
+   ...  ((ns_fn)ns_reset_handler)();   /* compiles to BLXNS */
+
+/* Build with -mcmse. The linker produces an IMPORT LIBRARY: */
+
+   arm-none-eabi-gcc -mcmse ... \
+        -Wl,--cmse-implib -Wl,--out-implib=secure_impl.o
+
+/* secure_impl.o contains only the veneer addresses. Link it
+   into the NON-SECURE project and its calls resolve to the
+   right NSC addresses. Rebuild the secure side and you must
+   re-link the non-secure side too - or ship a stable veneer
+   table that never moves.                                  */</code></pre>
+
+<h2 id="args">Validating arguments, without an MMU</h2>
+
+<p>Passing arguments across this boundary has its own rules, and the secure side must validate every pointer it receives exactly as a kernel validates a user pointer.</p>
+
+<pre><code>/* Same problem as chapter 12, harder: there is no separate
+   address space to copy from. A pointer from Non-secure code
+   is just a number, and it might point at SECURE memory. If
+   your secure function dereferences it, it reads or writes
+   secure memory ON BEHALF OF the attacker - the classic
+   confused deputy.                                          */
+
+#include &lt;arm_cmse.h&gt;
+
+__attribute__((cmse_nonsecure_entry))
+int secure_hash(const uint8_t *buf, size_t len, uint8_t *out)
+{
+        const uint8_t *ok_in;
+        uint8_t *ok_out;
+
+        /* does the CALLER have read access to this range? */
+        ok_in = cmse_check_address_range((void *)buf, len,
+                                         CMSE_NONSECURE | CMSE_MPU_READ);
+        if (!ok_in)
+                return -1;
+
+        ok_out = cmse_check_address_range(out, 32,
+                                          CMSE_NONSECURE | CMSE_MPU_READWRITE);
+        if (!ok_out)
+                return -1;
+
+        /* now safe - but STILL copy in, because Non-secure code
+           on an interrupt, or a DMA engine, can change the
+           buffer under you (chapter 09's TOCTOU)            */
+        sha256(ok_in, len, ok_out);
+        return 0;
+}
+
+/* cmse_check_address_range() consults the SAU, IDAU and the
+   NON-SECURE MPU, and asks: could the caller have done this
+   access itself? If not, refuse - do not do it for them.
+
+   Also available:
+     cmse_TT(p)             query the attributes of an address
+     cmse_TTA(p)            ...using the alternate domain
+     cmse_check_pointed_object(p, flags)   for a single object
+
+/* AND the overflow trap: */
+        if (len &gt; MAX_LEN || buf + len &lt; buf)
+                return -1;
+   cmse_check_address_range handles wraparound itself, but any
+   arithmetic YOU do on len does not.                       */</code></pre>
+
+<div class="danger">
+<b>Three ways secure functions leak</b>
+<ul>
+<li><strong>Unchecked pointers.</strong> The caller passes a secure address and your function reads or writes
+it. Every pointer argument needs <code>cmse_check_address_range</code>.</li>
+<li><strong>Registers left dirty on return.</strong> The compiler clears caller-saved registers for
+<code>cmse_nonsecure_entry</code> functions — but not your own local buffers on the secure stack, and not
+the FPU registers unless configured.</li>
+<li><strong>The secure stack.</strong> Values left there are not readable by Non-secure code directly, but
+they are the raw material for any subsequent bug. Zero secrets before returning.</li>
+</ul>
+</div>
+
+<h2 id="irq">Interrupts and stacking</h2>
+
+<p>Interrupts are partitioned between the states, and the transition handling must ensure that secure register contents do not leak when a non-secure handler runs.</p>
+
+<pre class="diagram">Interrupts are assigned per-interrupt to a security state, in
+NVIC_ITNS (Interrupt Target Non-Secure). Secure by default -
+non-secure only if a bit is set, by secure code.
+
+  AIRCR.PRIS      makes all Non-secure priorities the lower half
+                  of the range, so a Non-secure interrupt can
+                  never preempt a Secure one.
+  AIRCR.BFHFNMINS puts HardFault/NMI in the Non-secure state
+                  (usually left Secure).
+
+  THE STACKING PROBLEM:
+
+  Secure code is running. A Non-secure interrupt fires. The
+  hardware must save the Secure registers - but it cannot push
+  them where Non-secure code can read them.
+
+  So the hardware does it FOR you:
+
+     · pushes the secure context onto the SECURE stack
+     · ZEROES the registers before entering the NS handler
+     · pushes an integrity signature onto the secure stack
+     · on return, checks that signature
+
+  This is automatic and free. You do not write it, and you
+  cannot get it wrong - which is a large part of why
+  TrustZone-M is usable at all in an interrupt-latency budget.
+
+  FOUR STACKS, and each needs its own limit register:
+        MSP_S  PSP_S   MSPLIM_S  PSPLIM_S
+        MSP_NS PSP_NS  MSPLIM_NS PSPLIM_NS
+
+  SET THE SECURE STACK LIMITS. On Armv8-M a stack overflow with
+  a limit register set is a fault; without one it is silent
+  corruption of whatever lies below - which on the secure side
+  may be your key material.</pre>
+
+<h2 id="boot">Boot flow</h2>
+
+<p>The secure side boots first and configures the partition before the non-secure side exists, which is what makes the configuration itself trustworthy.</p>
+
+<pre><code>/* Reset always enters the SECURE state, at VTOR_S. Secure code
+   sets everything up and then hands over - once, and
+   irreversibly for that boot.                              */
+
+void secure_main(void)
+{
+        /* 1. configure the SAU - which regions are NS and NSC */
+        SAU->RNR  = 0;
+        SAU->RBAR = (NS_FLASH_START &amp; SAU_RBAR_BADDR_Msk);
+        SAU->RLAR = (NS_FLASH_END   &amp; SAU_RLAR_LADDR_Msk)
+                  | SAU_RLAR_ENABLE_Msk;
+
+        SAU->RNR  = 1;
+        SAU->RBAR = (NSC_START &amp; SAU_RBAR_BADDR_Msk);
+        SAU->RLAR = (NSC_END   &amp; SAU_RLAR_LADDR_Msk)
+                  | SAU_RLAR_NSC_Msk        /* callable */
+                  | SAU_RLAR_ENABLE_Msk;
+
+        /* ... regions for NS RAM and NS peripherals ... */
+        SAU->CTRL = SAU_CTRL_ENABLE_Msk;
+
+        /* 2. vendor peripheral security - the M-profile
+              equivalent of the TZPC (chapter 10)           */
+        vendor_set_peripheral_ns(UART0);
+        vendor_set_peripheral_ns(TIMER1);
+        /* crypto, RNG, flash controller stay SECURE */
+
+        /* 3. interrupt targets */
+        NVIC_SetTargetState(UART0_IRQn);      /* -> NS */
+        /* everything else stays Secure       */
+
+        /* 4. the secure MPU, for privilege separation INSIDE
+              the secure state                              */
+        secure_mpu_init();
+
+        /* 5. stack limits - on both sides */
+        __set_MSPLIM(SECURE_STACK_BOTTOM);
+
+        /* 6. init the secure services: keys, storage, crypto */
+        secure_services_init();
+
+        /* 7. VERIFY the non-secure image before running it
+              (chapter 14 - the chain does not stop here)   */
+        if (!verify_ns_image())
+                fatal();
+
+        /* 8. set up the NS vector table and jump */
+        SCB_NS->VTOR = NS_IMAGE_START;
+
+        __TZ_set_MSP_NS(*(uint32_t *)NS_IMAGE_START);
+        ns_fn ns_reset = (ns_fn)(*(uint32_t *)(NS_IMAGE_START + 4));
+
+        ns_reset();          /* BLXNS - never returns */
+}
+
+/* AFTER THE HANDOVER the SAU should be locked if the part
+   supports it, and the secure code that remains is only what
+   is reachable through the NSC veneers.                    */</code></pre>
+
+<h2 id="tfm">TF-M — the reference implementation</h2>
+
+<p>The reference implementation for microcontrollers provides the standard services — storage, crypto, attestation — so that products do not each implement them from scratch.</p>
+
+<pre><code>/* Trusted Firmware-M is to Cortex-M what TF-A is to Cortex-A.
+   You almost certainly want to use it rather than build this
+   yourself.                                                 */
+
+   BL2                 MCUboot - verified boot (chapter 14)
+   SPM                 Secure Partition Manager - schedules the
+                       secure services, isolates them
+   Secure partitions   each service in its own MPU region
+
+   Standard services, all with PSA APIs:
+     Crypto            psa_import_key, psa_sign_hash, ...
+     Internal Trusted Storage    small, on-chip
+     Protected Storage           larger, encrypted, off-chip
+     Initial Attestation         signed token about the device
+     Firmware Update
+
+/* PSA ISOLATION LEVELS:
+
+   Level 1  Secure / Non-secure split only. One secure blob.
+   Level 2  ...plus the secure services are isolated from the
+            secure "root of trust" using the secure MPU.
+   Level 3  ...plus each secure partition is isolated from
+            every other one.
+
+   Level 3 costs context switches and RAM; Level 1 means one
+   bug in any secure service is total compromise. Most
+   certified products target 2 or 3.                        */
+
+/* PSA Certified is the certification scheme built on this. If
+   a datasheet says "PSA Certified Level 2", that is what it is
+   referring to.                                            */</code></pre>
+
+<div class="note">
+<b>When TrustZone-M earns its keep</b>
+<p>On an MCU there is no second processor and no room for a separate secure MCU. TrustZone-M gives you a
+place to put a device identity key that survives a bug in 200 KB of application firmware — the firmware
+that parses BLE packets, runs a filesystem, and was written under schedule pressure. That is the realistic
+use: <em>a small, auditable secure side holding the keys and the update path</em>, and everything else
+outside it.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>SecureFault on the first call into secure code</td><td>Target not in an NSC region, or no <code>SG</code> at the entry — check the linker script</td></tr>
+<tr><td>SecureFault immediately after handover</td><td>SAU region for NS flash wrong, or <code>VTOR_NS</code> set to the wrong address</td></tr>
+<tr><td>Non-secure code hangs at reset</td><td><code>MSP_NS</code> not initialised from the NS vector table</td></tr>
+<tr><td>Undefined instruction on <code>BXNS</code></td><td>Built without <code>-mcmse</code></td></tr>
+<tr><td>Link error: undefined reference to a secure function</td><td>Import library not linked into the non-secure project</td></tr>
+<tr><td>Worked, then broke after rebuilding the secure side</td><td>Veneer addresses moved — re-link, or fix the NSC region layout</td></tr>
+<tr><td>Peripheral unreachable from the application</td><td>Still assigned Secure by the vendor's peripheral protection unit</td></tr>
+<tr><td>Non-secure interrupt never fires</td><td><code>NVIC_ITNS</code> bit not set — interrupts default to Secure</td></tr>
+<tr><td>Secure code corrupts itself under load</td><td>Secure stack overflow — <code>MSPLIM_S</code> not set</td></tr>
+<tr><td>Non-secure code reads secure data through a service</td><td>Missing <code>cmse_check_address_range</code> — a real vulnerability</td></tr>
+<tr><td>Return from a secure call faults</td><td>Secure stack integrity signature check failed — the secure stack was corrupted</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the fundamental difference between TrustZone-A and TrustZone-M.</li>
+  <li>Explain S, NS and NSC memory, and how the SAU and IDAU combine.</li>
+  <li>Explain why <code>SG</code> must be the first instruction at an entry point.</li>
+  <li>Write a secure entry point that validates a caller-supplied buffer.</li>
+  <li>Explain why checking the pointer is still not enough on its own.</li>
+  <li>Describe what the hardware does when a Non-secure interrupt preempts secure code.</li>
+  <li>Name the four stacks and say why the secure limit registers matter.</li>
+  <li>Write the boot sequence from reset to the non-secure reset handler.</li>
+  <li>Explain the three PSA isolation levels and their trade-offs.</li>
+  <li>Say what belongs on the secure side of an MCU and what does not.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

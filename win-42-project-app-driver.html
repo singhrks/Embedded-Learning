@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the application and the KMDF driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the application and the KMDF driver</h1>
+<p class="lead">Layers 1 and 2 in full: the IOCTL contract that never changes, the application that uses it,
+and the KMDF driver that decides who may sign and then — because it cannot call the enclave itself — hands the
+work out to user mode using the inverted call model.</p>
+
+<h2 id="contract">The IOCTL contract</h2>
+
+<p>This header is seam A, and it outlives every other file in the project: once an application is shipped
+against it, the layout of these structures is frozen. Three decisions in it are worth dwelling on before the
+code that uses them.</p>
+
+<pre><code>/* inc/winsign_ioctl.h  -  SEAM A
+   Shared by the app (layer 1), the driver (layer 2) and,
+   for the two host IOCTLs only, the host service.        */
+
+#pragma once
+
+#define WINSIGN_DEVICE_TYPE     42000
+#define WINSIGN_MAX_DATA        (1024 * 1024)
+#define WINSIGN_SIG_LEN         64          /* P-256 r||s */
+#define WINSIGN_PUBKEY_LEN      64          /* P-256 x||y */
+
+/* --- the application's two calls ------------------------ */
+
+#define IOCTL_WINSIGN_SIGN \
+    CTL_CODE(WINSIGN_DEVICE_TYPE, 0x800, METHOD_BUFFERED, \
+             FILE_READ_DATA | FILE_WRITE_DATA)
+
+#define IOCTL_WINSIGN_PUBKEY \
+    CTL_CODE(WINSIGN_DEVICE_TYPE, 0x801, METHOD_BUFFERED, \
+             FILE_READ_DATA)
+
+/* --- the host service's three calls --------------------- */
+
+#define IOCTL_WINSIGN_HOST_REGISTER \
+    CTL_CODE(WINSIGN_DEVICE_TYPE, 0x900, METHOD_BUFFERED, \
+             FILE_WRITE_DATA)
+
+#define IOCTL_WINSIGN_HOST_WAIT \
+    CTL_CODE(WINSIGN_DEVICE_TYPE, 0x901, METHOD_BUFFERED, \
+             FILE_WRITE_DATA)
+
+#define IOCTL_WINSIGN_HOST_RESULT \
+    CTL_CODE(WINSIGN_DEVICE_TYPE, 0x902, METHOD_BUFFERED, \
+             FILE_WRITE_DATA)
+
+/* Work handed OUT to the host by HOST_WAIT.               */
+typedef struct _WINSIGN_WORK {
+    unsigned __int64 RequestId;
+    unsigned __int32 Op;          /* 0 = sign, 1 = pubkey  */
+    unsigned __int32 DataLen;
+    unsigned char    Data[WINSIGN_MAX_DATA];
+} WINSIGN_WORK;
+
+/* The answer posted back by HOST_RESULT.                  */
+typedef struct _WINSIGN_RESULT {
+    unsigned __int64 RequestId;
+    __int32          Status;      /* 0 = ok                */
+    unsigned __int32 OutLen;
+    unsigned char    Out[WINSIGN_SIG_LEN];
+} WINSIGN_RESULT;
+
+/* {8f0a4d31-2c7e-4b19-9f55-6ad3e2b71c40} */
+DEFINE_GUID(GUID_DEVINTERFACE_WINSIGN,
+    0x8f0a4d31, 0x2c7e, 0x4b19,
+    0x9f, 0x55, 0x6a, 0xd3, 0xe2, 0xb7, 0x1c, 0x40);</code></pre>
+
+<div class="key">
+<b>Three decisions frozen into that header</b>
+<p><strong>METHOD_BUFFERED, not METHOD_NEITHER.</strong> The I/O manager copies the input into a kernel buffer
+before the driver ever runs, so there is no user pointer to probe and no window in which the caller can change
+the data underneath you. That is a whole class of driver bug removed by one word in a macro, and it costs a
+copy of at most a megabyte. <strong>Fixed-size output arrays.</strong> <code>Out[64]</code> rather than a
+pointer means the structure is self-contained and its layout is identical in 32- and 64-bit builds — a variable
+tail would require a second contract about how to find it. <strong>An explicit request id.</strong> The driver
+serves many clients through one host; without an id the driver would have to assume results come back in order,
+and a buggy or hostile host would then answer one client with another's signature.</p>
+</div>
+
+<h2 id="app">Layer 1: the application</h2>
+
+<p>Nothing clever here on purpose — it opens the interface, fills the structure and calls. The only part worth
+reading closely is how it finds the device, because a device interface GUID is not a path and this is the
+Windows idiom for turning one into the other.</p>
+
+<pre><code>// app/winsign.cpp  -  LAYER 1
+#include &lt;windows.h&gt;
+#include &lt;setupapi.h&gt;
+#include &lt;cfgmgr32.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;vector&gt;
+#include &lt;string&gt;
+#include "../inc/winsign_ioctl.h"
+
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+
+/* A device interface GUID is not a path. CM_Get_Device_
+   Interface_List turns it into one - and returns a LIST,
+   because in general there can be several instances.     */
+static HANDLE OpenWinsign(void)
+{
+    ULONG len = 0;
+    CONFIGRET cr = CM_Get_Device_Interface_List_SizeW(
+        &amp;len, (LPGUID)&amp;GUID_DEVINTERFACE_WINSIGN, NULL,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (cr != CR_SUCCESS || len &lt;= 1) {
+        fprintf(stderr, "winsign: device not present\n");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    std::vector&lt;wchar_t&gt; buf(len);
+    cr = CM_Get_Device_Interface_ListW(
+        (LPGUID)&amp;GUID_DEVINTERFACE_WINSIGN, NULL,
+        buf.data(), len,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (cr != CR_SUCCESS)
+        return INVALID_HANDLE_VALUE;
+
+    /* The list is a multi-sz; the first entry is enough.  */
+    HANDLE h = CreateFileW(buf.data(),
+                           GENERIC_READ | GENERIC_WRITE,
+                           0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        fprintf(stderr, "winsign: CreateFile %lu\n",
+                GetLastError());
+    return h;
+}
+
+static int DoSign(HANDLE h, const wchar_t *path)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "open input: %lu\n", GetLastError());
+        return 1;
+    }
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(f, &amp;size) || size.QuadPart == 0 ||
+        size.QuadPart &gt; WINSIGN_MAX_DATA) {
+        fprintf(stderr, "input must be 1..%d bytes\n",
+                WINSIGN_MAX_DATA);
+        CloseHandle(f);
+        return 1;
+    }
+
+    std::vector&lt;unsigned char&gt; data((size_t)size.QuadPart);
+    DWORD got = 0, total = 0;
+    /* ReadFile can return short. Loop. (C track, chapter 16) */
+    while (total &lt; data.size()) {
+        if (!ReadFile(f, data.data() + total,
+                      (DWORD)(data.size() - total),
+                      &amp;got, NULL) || got == 0) {
+            fprintf(stderr, "read: %lu\n", GetLastError());
+            CloseHandle(f);
+            return 1;
+        }
+        total += got;
+    }
+    CloseHandle(f);
+
+    unsigned char sig[WINSIGN_SIG_LEN];
+    DWORD out = 0;
+    if (!DeviceIoControl(h, IOCTL_WINSIGN_SIGN,
+                         data.data(), (DWORD)data.size(),
+                         sig, sizeof(sig), &amp;out, NULL)) {
+        fprintf(stderr, "sign: %lu\n", GetLastError());
+        return 1;
+    }
+    if (out != sizeof(sig)) {
+        fprintf(stderr, "sign: short result %lu\n", out);
+        return 1;
+    }
+
+    std::wstring outPath(path);
+    outPath += L".sig";
+    HANDLE o = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0,
+                           NULL, CREATE_ALWAYS, 0, NULL);
+    if (o == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "create sig: %lu\n", GetLastError());
+        return 1;
+    }
+    DWORD wrote = 0;
+    WriteFile(o, sig, sizeof(sig), &amp;wrote, NULL);
+    CloseHandle(o);
+    wprintf(L"wrote %s (%u bytes)\n", outPath.c_str(), wrote);
+    return 0;
+}
+
+static int DoPubkey(HANDLE h)
+{
+    unsigned char pub[WINSIGN_PUBKEY_LEN];
+    DWORD out = 0;
+    if (!DeviceIoControl(h, IOCTL_WINSIGN_PUBKEY, NULL, 0,
+                         pub, sizeof(pub), &amp;out, NULL)) {
+        fprintf(stderr, "pubkey: %lu\n", GetLastError());
+        return 1;
+    }
+    for (DWORD i = 0; i &lt; out; i++)
+        printf("%02x", pub[i]);
+    printf("\n");
+    return 0;
+}
+
+int wmain(int argc, wchar_t **argv)
+{
+    if (argc &lt; 2) {
+        fprintf(stderr,
+                "usage: winsign sign &lt;file&gt; | winsign pubkey\n");
+        return 2;
+    }
+
+    HANDLE h = OpenWinsign();
+    if (h == INVALID_HANDLE_VALUE)
+        return 1;
+
+    int rc;
+    if (!wcscmp(argv[1], L"sign") &amp;&amp; argc == 3)
+        rc = DoSign(h, argv[2]);
+    else if (!wcscmp(argv[1], L"pubkey"))
+        rc = DoPubkey(h);
+    else {
+        fprintf(stderr, "unknown command\n");
+        rc = 2;
+    }
+
+    CloseHandle(h);
+    return rc;
+}</code></pre>
+
+<h2 id="driver">Layer 2: the KMDF driver</h2>
+
+<p>The driver holds three things: a policy about who may sign, a queue of client requests waiting for an
+answer, and a queue of host requests waiting for work. Almost all of its length is the machinery for matching
+those two queues up safely.</p>
+
+<pre><code>// sys/winsign.c  -  LAYER 2
+#include &lt;ntddk.h&gt;
+#include &lt;wdf.h&gt;
+#include &lt;initguid.h&gt;
+#include "../inc/winsign_ioctl.h"
+
+/* Per-device state.                                       */
+typedef struct _DEVICE_CONTEXT {
+    WDFQUEUE  ClientQueue;   /* client reqs awaiting answer */
+    WDFQUEUE  HostQueue;     /* host reqs awaiting work     */
+    WDFFILEOBJECT HostFile;  /* the registered host, or NULL*/
+    WDFSPINLOCK Lock;        /* guards HostFile             */
+    LONG64    NextId;
+} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetCtx)
+
+/* Per-request state: the id we assigned it.               */
+typedef struct _REQUEST_CONTEXT {
+    unsigned __int64 RequestId;
+} REQUEST_CONTEXT, *PREQUEST_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(REQUEST_CONTEXT, ReqGetCtx)
+
+DRIVER_INITIALIZE                      DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD              WsEvtDeviceAdd;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL     WsEvtIoDeviceControl;
+EVT_WDF_FILE_CLOSE                     WsEvtFileClose;
+
+/* ---------------------------------------------------------
+   Matching a client request to a waiting host request
+   --------------------------------------------------------- */
+
+/* Hand one client request out to a waiting host IOCTL, if
+   there is one. Called with a client request already parked
+   on ClientQueue.                                          */
+static VOID WsTryDispatch(PDEVICE_CONTEXT ctx)
+{
+    WDFREQUEST hostReq, clientReq;
+    PREQUEST_CONTEXT rc;
+    WINSIGN_WORK *work;
+    void *inBuf;
+    size_t inLen, workLen;
+    NTSTATUS status;
+
+    for (;;) {
+        /* A host IOCTL waiting for work?                  */
+        status = WdfIoQueueRetrieveNextRequest(ctx-&gt;HostQueue,
+                                               &amp;hostReq);
+        if (!NT_SUCCESS(status))
+            return;                 /* nobody is waiting   */
+
+        /* A client request waiting for an answer?         */
+        status = WdfIoQueueRetrieveNextRequest(ctx-&gt;ClientQueue,
+                                               &amp;clientReq);
+        if (!NT_SUCCESS(status)) {
+            /* No work. Put the host request back so it
+               keeps waiting rather than returning empty. */
+            WdfRequestForwardToIoQueue(hostReq, ctx-&gt;HostQueue);
+            return;
+        }
+
+        rc = ReqGetCtx(clientReq);
+
+        status = WdfRequestRetrieveOutputBuffer(hostReq,
+                     sizeof(WINSIGN_WORK), (PVOID *)&amp;work,
+                     &amp;workLen);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(hostReq, status);
+            WdfRequestForwardToIoQueue(clientReq,
+                                       ctx-&gt;ClientQueue);
+            continue;
+        }
+
+        RtlZeroMemory(work, sizeof(*work));
+        work-&gt;RequestId = rc-&gt;RequestId;
+
+        /* Input length zero means this was a PUBKEY call. */
+        status = WdfRequestRetrieveInputBuffer(clientReq, 1,
+                                               &amp;inBuf, &amp;inLen);
+        if (NT_SUCCESS(status) &amp;&amp; inLen &gt; 0) {
+            work-&gt;Op = 0;
+            work-&gt;DataLen = (unsigned __int32)inLen;
+            RtlCopyMemory(work-&gt;Data, inBuf, inLen);
+        } else {
+            work-&gt;Op = 1;
+            work-&gt;DataLen = 0;
+        }
+
+        /* Park the client request again - it is answered by
+           HOST_RESULT, not here.                          */
+        status = WdfRequestForwardToIoQueue(clientReq,
+                                            ctx-&gt;ClientQueue);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(clientReq, status);
+            WdfRequestComplete(hostReq, STATUS_CANCELLED);
+            continue;
+        }
+
+        WdfRequestCompleteWithInformation(hostReq,
+            STATUS_SUCCESS, sizeof(WINSIGN_WORK));
+        return;
+    }
+}
+
+/* Find the parked client request with this id and answer it. */
+static NTSTATUS WsDeliverResult(PDEVICE_CONTEXT ctx,
+                                const WINSIGN_RESULT *res)
+{
+    WDFREQUEST req = NULL;
+    WDFREQUEST found = NULL;
+    PREQUEST_CONTEXT rc;
+    NTSTATUS status;
+    void *out;
+    size_t outLen;
+
+    /* Walk the parked requests looking for our id. KMDF's
+       find/retrieve pair exists exactly for this.         */
+    while (NT_SUCCESS(WdfIoQueueFindRequest(ctx-&gt;ClientQueue,
+               req, NULL, NULL, &amp;found))) {
+        rc = ReqGetCtx(found);
+        if (rc-&gt;RequestId == res-&gt;RequestId) {
+            status = WdfIoQueueRetrieveFoundRequest(
+                         ctx-&gt;ClientQueue, found, &amp;req);
+            if (!NT_SUCCESS(status))
+                return status;   /* it was cancelled       */
+            goto answer;
+        }
+        if (req != NULL)
+            WdfObjectDereference(req);
+        req = found;
+    }
+    if (req != NULL)
+        WdfObjectDereference(req);
+
+    /* No such id. A correct host never does this; a hostile
+       one does, which is why we simply drop it.           */
+    return STATUS_NOT_FOUND;
+
+answer:
+    if (res-&gt;Status != 0) {
+        WdfRequestComplete(req, STATUS_UNSUCCESSFUL);
+        return STATUS_SUCCESS;
+    }
+
+    if (res-&gt;OutLen == 0 || res-&gt;OutLen &gt; sizeof(res-&gt;Out)) {
+        WdfRequestComplete(req, STATUS_INVALID_PARAMETER);
+        return STATUS_SUCCESS;
+    }
+
+    status = WdfRequestRetrieveOutputBuffer(req, res-&gt;OutLen,
+                                            &amp;out, &amp;outLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(req, status);
+        return STATUS_SUCCESS;
+    }
+
+    RtlCopyMemory(out, res-&gt;Out, res-&gt;OutLen);
+    WdfRequestCompleteWithInformation(req, STATUS_SUCCESS,
+                                      res-&gt;OutLen);
+    return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------
+   The IOCTL entry point
+   --------------------------------------------------------- */
+
+VOID WsEvtIoDeviceControl(_In_ WDFQUEUE Queue,
+                          _In_ WDFREQUEST Request,
+                          _In_ size_t OutputBufferLength,
+                          _In_ size_t InputBufferLength,
+                          _In_ ULONG IoControlCode)
+{
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    PDEVICE_CONTEXT ctx = DeviceGetCtx(device);
+    PREQUEST_CONTEXT rc;
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WINSIGN_RESULT *res;
+    size_t len;
+    NTSTATUS status;
+    BOOLEAN isHost;
+
+    /* Is this caller the registered host? One comparison,
+       under the lock, and never trusted for anything more
+       than routing.                                       */
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    isHost = (ctx-&gt;HostFile != NULL &amp;&amp;
+              ctx-&gt;HostFile == WdfRequestGetFileObject(Request));
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    switch (IoControlCode) {
+
+    case IOCTL_WINSIGN_HOST_REGISTER:
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        if (ctx-&gt;HostFile != NULL) {
+            WdfSpinLockRelease(ctx-&gt;Lock);
+            /* One host. A second would be able to answer
+               requests it did not receive.                */
+            WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+            return;
+        }
+        ctx-&gt;HostFile = WdfRequestGetFileObject(Request);
+        WdfSpinLockRelease(ctx-&gt;Lock);
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+
+    case IOCTL_WINSIGN_HOST_WAIT:
+        if (!isHost) {
+            WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
+            return;
+        }
+        if (OutputBufferLength &lt; sizeof(WINSIGN_WORK)) {
+            WdfRequestComplete(Request,
+                               STATUS_BUFFER_TOO_SMALL);
+            return;
+        }
+        status = WdfRequestForwardToIoQueue(Request,
+                                            ctx-&gt;HostQueue);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
+        WsTryDispatch(ctx);
+        return;
+
+    case IOCTL_WINSIGN_HOST_RESULT:
+        if (!isHost) {
+            WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
+            return;
+        }
+        status = WdfRequestRetrieveInputBuffer(Request,
+                     sizeof(WINSIGN_RESULT), (PVOID *)&amp;res,
+                     &amp;len);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
+        WsDeliverResult(ctx, res);
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+
+    case IOCTL_WINSIGN_SIGN:
+        if (InputBufferLength == 0 ||
+            InputBufferLength &gt; WINSIGN_MAX_DATA) {
+            WdfRequestComplete(Request,
+                               STATUS_INVALID_PARAMETER);
+            return;
+        }
+        if (OutputBufferLength &lt; WINSIGN_SIG_LEN) {
+            WdfRequestComplete(Request,
+                               STATUS_BUFFER_TOO_SMALL);
+            return;
+        }
+        break;
+
+    case IOCTL_WINSIGN_PUBKEY:
+        if (OutputBufferLength &lt; WINSIGN_PUBKEY_LEN) {
+            WdfRequestComplete(Request,
+                               STATUS_BUFFER_TOO_SMALL);
+            return;
+        }
+        break;
+
+    default:
+        WdfRequestComplete(Request,
+                           STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+
+    /* A client request. Refuse early if no host is running -
+       far better than hanging until the user gives up.    */
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    isHost = (ctx-&gt;HostFile != NULL);
+    WdfSpinLockRelease(ctx-&gt;Lock);
+    if (!isHost) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attrs,
+                                            REQUEST_CONTEXT);
+    status = WdfObjectAllocateContext(Request, &amp;attrs,
+                                      (PVOID *)&amp;rc);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    rc-&gt;RequestId = (unsigned __int64)
+        InterlockedIncrement64(&amp;ctx-&gt;NextId);
+
+    status = WdfRequestForwardToIoQueue(Request,
+                                        ctx-&gt;ClientQueue);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    WsTryDispatch(ctx);
+}
+
+/* If the host dies, every parked client request would wait
+   forever. Purge them instead.                            */
+VOID WsEvtFileClose(_In_ WDFFILEOBJECT FileObject)
+{
+    WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+    PDEVICE_CONTEXT ctx = DeviceGetCtx(device);
+    BOOLEAN wasHost;
+
+    WdfSpinLockAcquire(ctx-&gt;Lock);
+    wasHost = (ctx-&gt;HostFile == FileObject);
+    if (wasHost)
+        ctx-&gt;HostFile = NULL;
+    WdfSpinLockRelease(ctx-&gt;Lock);
+
+    if (wasHost) {
+        WdfIoQueuePurgeSynchronously(ctx-&gt;ClientQueue);
+        WdfIoQueueStart(ctx-&gt;ClientQueue);
+    }
+}
+
+/* ---------------------------------------------------------
+   Setup
+   --------------------------------------------------------- */
+
+NTSTATUS WsEvtDeviceAdd(_In_ WDFDRIVER Driver,
+                        _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_FILEOBJECT_CONFIG fileConfig;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDFDEVICE device;
+    PDEVICE_CONTEXT ctx;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(Driver);
+
+    WDF_FILEOBJECT_CONFIG_INIT(&amp;fileConfig, NULL,
+                               WDF_NO_EVENT_CALLBACK,
+                               WsEvtFileClose);
+    WdfDeviceInitSetFileObjectConfig(DeviceInit, &amp;fileConfig,
+                                     WDF_NO_OBJECT_ATTRIBUTES);
+
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attrs,
+                                            DEVICE_CONTEXT);
+    status = WdfDeviceCreate(&amp;DeviceInit, &amp;attrs, &amp;device);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    ctx = DeviceGetCtx(device);
+    RtlZeroMemory(ctx, sizeof(*ctx));
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&amp;attrs);
+    attrs.ParentObject = device;
+    status = WdfSpinLockCreate(&amp;attrs, &amp;ctx-&gt;Lock);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    /* The default queue takes the IOCTLs.                 */
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                                       WdfIoQueueDispatchParallel);
+    queueConfig.EvtIoDeviceControl = WsEvtIoDeviceControl;
+    status = WdfIoQueueCreate(device, &amp;queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES, NULL);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    /* Two MANUAL queues: KMDF never dispatches from these,
+       which is exactly what "parked" means.               */
+    WDF_IO_QUEUE_CONFIG_INIT(&amp;queueConfig,
+                             WdfIoQueueDispatchManual);
+    status = WdfIoQueueCreate(device, &amp;queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES,
+                              &amp;ctx-&gt;ClientQueue);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    WDF_IO_QUEUE_CONFIG_INIT(&amp;queueConfig,
+                             WdfIoQueueDispatchManual);
+    status = WdfIoQueueCreate(device, &amp;queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES,
+                              &amp;ctx-&gt;HostQueue);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    return WdfDeviceCreateDeviceInterface(device,
+               &amp;GUID_DEVINTERFACE_WINSIGN, NULL);
+}
+
+NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
+                     _In_ PUNICODE_STRING RegistryPath)
+{
+    WDF_DRIVER_CONFIG config;
+
+    WDF_DRIVER_CONFIG_INIT(&amp;config, WsEvtDeviceAdd);
+    return WdfDriverCreate(DriverObject, RegistryPath,
+                           WDF_NO_OBJECT_ATTRIBUTES,
+                           &amp;config, WDF_NO_HANDLE);
+}</code></pre>
+
+<h2 id="policy">Where the access decision actually lives</h2>
+
+<p>There is no token check in the code above, and that is deliberate rather than an omission. The instinct is
+to call something like a privilege check inside <code>EvtIoDeviceControl</code> — and on Windows that instinct
+is usually wrong.</p>
+
+<pre class="diagram">   WHY NOT CHECK THE TOKEN IN EvtIoDeviceControl:
+
+     · the callback is not guaranteed to run in the calling
+       thread's context, so "the current token" may not be
+       the caller's token at all
+     · by IOCTL time the handle already exists; a check here
+       is later than it needed to be
+     · you would be reimplementing, imperfectly, an access
+       check the I/O manager already performs
+
+   WHERE IT BELONGS: a security descriptor on the device
+   interface, evaluated by the I/O manager at CreateFile
+   time, declared in the INF:
+
+     [winsign_Device.NT.HW]
+     AddReg = winsign_SecurityAddReg
+
+     [winsign_SecurityAddReg]
+     HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+   READ THE SDDL: D:P is a protected DACL that does not
+   inherit. (A;;GA;;;SY) grants all access to SYSTEM,
+   (A;;GA;;;BA) to the Builtin Administrators group. Nobody
+   else is mentioned, so nobody else gets in.
+
+   THE HOST runs as SYSTEM and matches the first ACE. To let
+   ordinary users sign, add an ACE for them - and note that
+   is a POLICY change in one string, not a code change.</pre>
+
+<div class="warn">
+<b>This is the weakest of the four checks, and knowing that is the point</b>
+<p>An SDDL string stops an unprivileged user. It does not stop an administrator, and it certainly does not stop
+someone who already has kernel code execution — they can rewrite the descriptor, or simply call the driver from
+kernel mode. That is not a flaw to fix here; it is the reason layers 3 and 4 exist. Every check at layer 2 is a
+convenience against ordinary misuse, and the design deliberately does not depend on any of them for the
+property it actually claims.</p>
+</div>
+
+<h2 id="build">Building, signing and installing</h2>
+
+<p>Two build systems again — the driver needs the WDK and a test-signing certificate, the application needs
+neither. The certificate steps are once per machine, not once per build.</p>
+
+<pre><code># --- once per test machine, from an elevated prompt -------
+bcdedit /set testsigning on
+shutdown /r /t 0
+
+# --- once per project -------------------------------------
+# Visual Studio's "Kernel Mode Driver, Empty (KMDF)" template
+# generates a test certificate and signs on build. To do it
+# by hand:
+makecert -r -pe -ss PrivateCertStore -n "CN=WinsignTest" ^
+         winsign.cer
+signtool sign /v /s PrivateCertStore /n WinsignTest ^
+         /fd sha256 /t http://timestamp.digicert.com ^
+         winsign.sys
+certmgr -add winsign.cer -s -r localMachine root
+certmgr -add winsign.cer -s -r localMachine trustedpublisher
+
+# --- install ----------------------------------------------
+# winsign.sys is a software-only device, so it needs a root-
+# enumerated device to attach to. devcon creates one:
+devcon install winsign.inf ROOT\WINSIGN
+
+# --- confirm it came up -----------------------------------
+pnputil /enum-devices /class System /connected
+# and in WinDbg:
+!wdfkd.wdfldr</code></pre>
+
+<div class="note">
+<b>Check VBS before going any further</b>
+<p>Everything in chapters 42 and 43 fails in confusing ways if virtualisation-based security is not actually
+running, and nothing tells you so directly. <code>msinfo32</code> reports it under "Virtualization-based
+security", or from PowerShell:
+<code>Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard</code> — you
+want <code>VirtualizationBasedSecurityStatus</code> to be 2, meaning running. If it is 0 or 1, fix that first;
+no amount of debugging the enclave will help.</p>
+</div>
+
+<h2 id="prove">Proving layers 1 and 2 before the enclave exists</h2>
+
+<p>The whole point of the build order in chapter 40 is that this half can be finished and tested on its own.
+Twenty lines of fake host give you a working end-to-end system with a stub signature.</p>
+
+<pre><code>/* tools/fakehost.cpp - a host that signs nothing.
+   It proves seams A and B and nothing else.            */
+HANDLE h = OpenWinsign();
+DeviceIoControl(h, IOCTL_WINSIGN_HOST_REGISTER,
+                NULL, 0, NULL, 0, &amp;out, NULL);
+
+for (;;) {
+    WINSIGN_WORK work;
+    if (!DeviceIoControl(h, IOCTL_WINSIGN_HOST_WAIT,
+                         NULL, 0, &amp;work, sizeof(work),
+                         &amp;out, NULL))
+        break;
+
+    WINSIGN_RESULT res = {};
+    res.RequestId = work.RequestId;
+    res.Status    = 0;
+    res.OutLen    = WINSIGN_SIG_LEN;
+    memset(res.Out, 0xAB, sizeof(res.Out));   /* a stub */
+
+    DeviceIoControl(h, IOCTL_WINSIGN_HOST_RESULT,
+                    &amp;res, sizeof(res), NULL, 0, &amp;out, NULL);
+}
+
+/* THE TEST:
+     winsign sign C:\test.txt
+     certutil -dump C:\test.txt.sig
+   should show 64 bytes of 0xAB. If it does, seams A and B
+   are correct and every remaining bug is in the enclave. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>CM_Get_Device_Interface_List</code> returns nothing</td><td>The driver did not load, or
+<code>WdfDeviceCreateDeviceInterface</code> failed</td></tr>
+<tr><td><code>CreateFile</code> fails with access denied</td><td>The SDDL in the INF, working as
+designed</td></tr>
+<tr><td><code>DeviceIoControl</code> returns <code>ERROR_NOT_READY</code></td><td>No host has registered — the
+early refusal in the IOCTL handler</td></tr>
+<tr><td>The signing call never returns</td><td>The host registered and then stopped issuing HOST_WAIT</td></tr>
+<tr><td>One client gets another client's signature</td><td>The request id is being ignored somewhere — the
+exact bug the id exists to prevent</td></tr>
+<tr><td>Bugcheck in <code>WdfRequestComplete</code></td><td>A request completed twice; usually an error path
+that completes and then also forwards</td></tr>
+<tr><td>Requests pile up and nothing is dispatched</td><td><code>WsTryDispatch</code> not called after parking
+a request on either queue</td></tr>
+<tr><td>Machine hangs at shutdown</td><td>Requests still parked on a manual queue with no purge</td></tr>
+<tr><td>Driver fails to load, event log mentions signature</td><td>Test signing off, or the certificate not in
+both the root and trusted-publisher stores</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what METHOD_BUFFERED removes, and which bug class it removes it from.</li>
+  <li>Say why the work structure carries a request id, and what breaks without one.</li>
+  <li>Describe the inverted call model in three sentences, naming the two queues.</li>
+  <li>Explain why <code>HOST_WAIT</code> is put back on its queue when there is no work.</li>
+  <li>Say what happens to parked client requests when the host process exits, and why.</li>
+  <li>Explain why a manual queue, rather than a parallel one, holds the parked requests.</li>
+  <li>Read the SDDL string aloud and say who it admits.</li>
+  <li>Explain why the access decision is not made inside <code>EvtIoDeviceControl</code>.</li>
+  <li>Say why layer 2's checks are the weakest of the four, and why that is acceptable.</li>
+  <li>Build the fake host and confirm 64 bytes of <code>0xAB</code> come back.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

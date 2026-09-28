@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPIO the modern way: the character device | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>GPIO the modern way: the character device</h1>
+<p class="lead">Almost every GPIO example you will find online uses one of two obsolete interfaces. Both still
+appear in tutorials, one has been removed from modern kernels, and the other stopped working entirely on the
+Pi 5. This chapter is the interface that will still be there in ten years.</p>
+
+<h2 id="three">Three generations</h2>
+
+<pre class="diagram">   1. DIRECT REGISTER ACCESS  (mmap /dev/mem)
+      bcm2835 library, wiringPi, pigpio's fast paths,
+      "poke 0xFE200000".
+      Fast, requires root, no locking against kernel
+      drivers, and DEAD ON THE PI 5 because the peripherals
+      moved to RP1 across PCIe (chapter 14).
+      -&gt; Do not start here.
+
+   2. SYSFS  (/sys/class/gpio, export/unexport)
+      The classic "echo 17 > /sys/class/gpio/export".
+      DEPRECATED since Linux 4.8 and removed from recent
+      kernels. No way to know who owns a pin, leaks state
+      when a process dies, cannot do accurate timestamps,
+      and races between the export and the direction write.
+      -&gt; Everywhere in tutorials. Do not start here either.
+
+   3. THE GPIO CHARACTER DEVICE  (/dev/gpiochipN)
+      Since Linux 4.8, hardened in 5.10, v2 API since 5.5.
+      - lines are OWNED by the process that requested them,
+        and released automatically when it exits
+      - multiple lines set atomically in one ioctl
+      - hardware-timestamped edge events
+      - bias, drive, debounce as first-class settings
+      - works identically on Pi 4 and Pi 5
+      -&gt; This one.
+
+   Userspace talks to it through libgpiod, or by ioctl
+   directly if you enjoy that.</pre>
+
+<div class="warn">
+<b>The library version split is a real trap</b>
+<p>libgpiod v1 and v2 have <em>completely different</em> APIs — different types, different function names,
+different headers. Debian Bookworm ships v1.6; Trixie and later ship v2.x. Code and tutorials for one will not
+compile against the other, and the error messages are unhelpful because the symbols simply do not exist. Check
+before you write anything: <code>pkg-config --modversion libgpiod</code>. The command-line tools changed too
+— v2's <code>gpioget</code> requires a <code>-c</code> chip argument where v1 took it positionally.</p>
+</div>
+
+<h2 id="cli">The command-line tools</h2>
+
+<pre><code># Install: apt install gpiod libgpiod-dev
+
+# WHAT CHIPS EXIST - never hardcode the number (chapter 02)
+$ gpiodetect
+gpiochip0 [gpio-brcmstb@107d508500] (32 lines)
+gpiochip4 [rp1] (54 lines)              # &lt;-- Pi 5 header
+
+# FIND A LINE BY NAME rather than guessing the chip
+$ gpiofind GPIO17
+gpiochip4 17
+
+# WHAT IS EACH LINE DOING - and crucially, WHO OWNS IT
+$ gpioinfo gpiochip4 | head
+gpiochip4 - 54 lines:
+    line   0:  "ID_SDA"   unused   input  active-high
+    line   2:  "GPIO2"    "i2c1"   unused input  [used]
+    line  17:  "GPIO17"   unused   input  active-high
+
+# "[used]" and a consumer name means a driver holds it. That
+# is the answer to "why can I not set this pin" - and sysfs
+# could never tell you this.
+
+# READ
+$ gpioget -c gpiochip4 17            # libgpiod v2
+$ gpioget gpiochip4 17               # libgpiod v1
+
+# WRITE - note the value only persists while the tool runs,
+# because the line is RELEASED on exit. This is the feature
+# that surprises people coming from sysfs:
+$ gpioset -c gpiochip4 17=1          # v2: exits, line freed
+$ gpioset -t0 -c gpiochip4 17=1      # hold until Ctrl-C
+$ gpioset --mode=wait gpiochip4 17=1 # v1 equivalent
+
+# WATCH FOR EDGES, with hardware timestamps
+$ gpiomon -c gpiochip4 17
+17914.442156371  rising   gpiochip4 17
+17916.883211042  falling  gpiochip4 17
+
+# The timestamp comes from the kernel at interrupt time, not
+# from when your process was scheduled - which is why this
+# is usable for measuring a pulse and a userspace poll loop
+# is not.
+</code></pre>
+
+<h2 id="c">In C, with libgpiod v2</h2>
+
+<pre><code>/* Blink an LED and wait for a button, the correct way. */
+#include &lt;gpiod.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+    /* Resolve the chip by iterating, not by hardcoding a
+       number - chapter 02's lesson in code form.          */
+    struct gpiod_chip *chip = gpiod_chip_open("/dev/gpiochip4");
+    if (!chip) { perror("open chip"); return 1; }
+
+    /* --- request GPIO17 as an output --- */
+    struct gpiod_line_settings *s = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(s, GPIOD_LINE_DIRECTION_OUTPUT);
+
+    struct gpiod_line_config *lc = gpiod_line_config_new();
+    unsigned int offs[] = { 17 };
+    gpiod_line_config_add_line_settings(lc, offs, 1, s);
+
+    struct gpiod_request_config *rc = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(rc, "blink");
+    /* The consumer string is what shows up in gpioinfo. Set
+       something meaningful; future-you will be grateful.  */
+
+    struct gpiod_line_request *req =
+        gpiod_chip_request_lines(chip, rc, lc);
+    if (!req) { perror("request"); return 1; }
+
+    for (int i = 0; i &lt; 10; i++) {
+        gpiod_line_request_set_value(req, 17,
+            i &amp; 1 ? GPIOD_LINE_VALUE_ACTIVE
+                  : GPIOD_LINE_VALUE_INACTIVE);
+        usleep(200000);
+    }
+
+    /* Releasing is what frees the line. If the process is
+       killed, the kernel does it for you - the single
+       biggest improvement over sysfs, which leaked pins
+       until reboot.                                        */
+    gpiod_line_request_release(req);
+    gpiod_request_config_free(rc);
+    gpiod_line_config_free(lc);
+    gpiod_line_settings_free(s);
+    gpiod_chip_close(chip);
+    return 0;
+}
+/* build: gcc -O2 -o blink blink.c $(pkg-config --libs --cflags libgpiod) */
+</code></pre>
+
+<h2 id="events">Edge events, done right</h2>
+
+<pre><code>/* A button, debounced in the KERNEL, with real timestamps.
+   Compare with the bus track's discussion of debouncing in
+   an ISR - here the kernel does it for you.               */
+
+struct gpiod_line_settings *s = gpiod_line_settings_new();
+gpiod_line_settings_set_direction(s, GPIOD_LINE_DIRECTION_INPUT);
+gpiod_line_settings_set_edge_detection(s, GPIOD_LINE_EDGE_BOTH);
+gpiod_line_settings_set_bias(s, GPIOD_LINE_BIAS_PULL_UP);
+gpiod_line_settings_set_debounce_period_us(s, 10000);  /* 10ms */
+
+/* ... request as above ... */
+
+struct gpiod_edge_event_buffer *buf =
+    gpiod_edge_event_buffer_new(16);
+
+for (;;) {
+    /* Blocks in the kernel. No polling, no CPU burned, and
+       the process can sleep - which is what lets the board
+       idle at low power.                                   */
+    int rv = gpiod_line_request_wait_edge_events(req, -1);
+    if (rv &lt; 0) { perror("wait"); break; }
+
+    int n = gpiod_line_request_read_edge_events(req, buf, 16);
+    for (int i = 0; i &lt; n; i++) {
+        struct gpiod_edge_event *e =
+            gpiod_edge_event_buffer_get_event(buf, i);
+        printf("%s at %llu ns\n",
+            gpiod_edge_event_get_event_type(e) ==
+                GPIOD_LINE_EDGE_RISING ? "rising" : "falling",
+            (unsigned long long) gpiod_edge_event_get_timestamp_ns(e));
+    }
+}
+
+/* THREE THINGS THIS GIVES YOU that a poll loop cannot:
+   1. the timestamp is taken in the interrupt handler, so it
+      is accurate even if your process is descheduled for
+      milliseconds afterwards;
+   2. debouncing happens in the kernel, so bounces never
+      reach userspace at all (bus chapter 10's problem,
+      solved by configuration);
+   3. events are BUFFERED, so a burst that arrives while you
+      were busy is not lost - read them all at once.       */
+</code></pre>
+
+<div class="key">
+<b>What userspace GPIO still cannot do</b>
+<p>Even with the character device, you are at the mercy of the scheduler for anything you drive. Toggling a pin
+from a userspace loop gives you roughly 1–4 MHz on a good day and a 10 ms stall on a bad one, because a page
+fault or a timer interrupt can land anywhere. For a protocol with timing requirements, use the hardware
+peripheral (<a href="rpi-12-i2c-spi-uart.html">chapter 12</a>), the PWM block
+(<a href="rpi-13-pwm-clocks.html">chapter 13</a>), RP1's PIO on a Pi 5, or a microcontroller. This is the same
+conclusion <a href="rpi-01-why-the-pi.html">chapter 01</a> reached, and it is worth internalising rather than
+fighting.</p>
+</div>
+
+<h2 id="python">Python, for quick work</h2>
+
+<pre><code># python3-libgpiod, v2 API
+import gpiod
+from gpiod.line import Direction, Value, Edge, Bias
+
+with gpiod.request_lines(
+        "/dev/gpiochip4",
+        consumer="blink-py",
+        config={17: gpiod.LineSettings(
+                    direction=Direction.OUTPUT)}) as req:
+    for i in range(10):
+        req.set_value(17, Value.ACTIVE if i % 2 else Value.INACTIVE)
+        time.sleep(0.2)
+
+# gpiozero is friendlier still and now sits on top of
+# libgpiod, so it works on a Pi 5 where the old RPi.GPIO
+# does not:
+from gpiozero import LED, Button
+led = LED(17)          # BCM numbering
+button = Button(27)
+button.when_pressed = led.on
+
+# RPi.GPIO is the library in most tutorials. It pokes
+# registers directly, so it does NOT work on a Pi 5. If you
+# find an example importing RPi.GPIO, translate it to
+# gpiozero rather than trying to make it work.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Code compiles on one Pi, not another</td><td>libgpiod v1 versus v2 — check
+<code>pkg-config --modversion</code></td></tr>
+<tr><td><code>RPi.GPIO</code> does nothing on a Pi 5</td><td>It pokes SoC registers; use gpiozero</td></tr>
+<tr><td><code>/sys/class/gpio</code> does not exist</td><td>Removed from modern kernels — use the character
+device</td></tr>
+<tr><td>Pin returns to its old state immediately</td><td><code>gpioset</code> released the line on exit — hold
+it</td></tr>
+<tr><td>"Device or resource busy"</td><td>A driver owns the line; <code>gpioinfo</code> names the
+consumer</td></tr>
+<tr><td>Pin stuck after a crash, needs reboot</td><td>Symptom of sysfs; the character device cannot do
+this</td></tr>
+<tr><td>One button press registers several times</td><td>No debounce configured — set it in line
+settings</td></tr>
+<tr><td>Edge timestamps jitter by milliseconds</td><td>Reading the clock in userspace instead of using the
+event timestamp</td></tr>
+<tr><td>Events lost during a burst</td><td>Buffer too small, or polling instead of waiting</td></tr>
+<tr><td>Bit-banged waveform has glitches</td><td>Scheduler — use hardware, not userspace</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three generations of GPIO interface and why the first two are dead ends.</li>
+  <li>Give two concrete problems with the sysfs interface.</li>
+  <li>Explain why line ownership matters and what happens when a process dies.</li>
+  <li>Say how to discover which chip carries the 40-pin header.</li>
+  <li>Explain what <code>[used]</code> in <code>gpioinfo</code> tells you.</li>
+  <li>Explain why <code>gpioset</code> appears not to work, and the fix.</li>
+  <li>Give three advantages of kernel edge events over a userspace poll loop.</li>
+  <li>Say where the edge timestamp is taken and why that matters.</li>
+  <li>State the realistic limits of userspace bit-banging on a Pi.</li>
+  <li>Explain why <code>RPi.GPIO</code> fails on a Pi 5 and what to use instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

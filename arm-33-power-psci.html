@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power states, WFI/WFE and PSCI | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Power states, WFI/WFE and PSCI</h1>
+<p class="lead">Two instructions to stop a core, and a standard firmware interface to turn one off entirely.
+Between them they cover the whole range from an idle loop to booting a secondary CPU — and PSCI is why one
+kernel image works across every ARM SoC.</p>
+
+<h2 id="wfi">WFI and WFE</h2>
+
+<p>Both instructions stop the core executing until something wakes it, but they answer different questions and
+are used in genuinely different places in real code. <code>WFI</code> asks "has something happened that
+requires attention" and is the instruction behind every idle loop — a core with nothing to do executes it and
+draws a fraction of its running power until an interrupt arrives, and crucially it wakes even if that
+interrupt is currently masked by <code>PSTATE.I</code>, because the point is to resume execution so the
+software can decide what to do next, not to actually take the interrupt while asleep. <code>WFE</code> asks
+"has some other core signalled an event" and exists specifically to make spinlocks power-efficient: instead of
+a core burning cycles in a tight retry loop waiting for a lock, it can sleep on <code>WFE</code> and be woken
+the instant the lock holder executes <code>SEV</code> or releases an exclusive-access monitor.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>WFI</code></th><th><code>WFE</code></th></tr></thead>
+<tbody>
+<tr><td>Waits for</td><td>An <strong>interrupt</strong> (or another wake-up event)</td><td>An <strong>event</strong>: <code>SEV</code>, an exclusive-monitor release, the event stream, or an interrupt</td></tr>
+<tr><td>Wakes on a MASKED interrupt?</td><td><strong>Yes</strong> — even with <code>PSTATE.I</code> set</td><td>Yes</td></tr>
+<tr><td>Event register</td><td>Not used</td><td>Consumes it if already set, and does not sleep</td></tr>
+<tr><td>Used for</td><td>The idle loop</td><td>Spinlocks, polling loops</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The property that makes <code>WFI</code> usable</b>
+<p>It wakes on an interrupt <em>even if that interrupt is masked</em>. So the idle loop can mask interrupts,
+check whether there is work, and <code>WFI</code> — without a race where an interrupt arrives between the
+check and the sleep. Unmask after waking and the interrupt is then taken normally.</p>
+<p>Without that property, every idle loop would have a lost-wakeup window.</p>
+</div>
+
+<pre><code>/* The correct idle loop */
+static void cpu_idle(void)
+{
+        for (;;) {
+                local_irq_disable();            /* mask */
+                if (need_resched()) {
+                        local_irq_enable();
+                        schedule();
+                        continue;
+                }
+                dsb(sy);                        /* outstanding
+                                                   transactions must
+                                                   complete first  */
+                wfi();                          /* sleep           */
+                local_irq_enable();             /* now take it     */
+        }
+}
+
+/* The DSB matters: a memory transaction still in flight when the
+   core enters a low-power state may never complete, hanging the
+   interconnect. Chapter 21.                                */
+
+/* WFE, in a spinlock (chapter 22) */
+1:      ldaxr   w1, [x0]
+        cbnz    w1, 2f                  /* held? wait              */
+        stxr    w2, w3, [x0]
+        cbnz    w2, 1b
+        b       3f
+2:      wfe                             /* sleep in low power      */
+        b       1b
+3:      /* acquired */
+
+/* The unlock's STLR to the monitored address generates the event
+   automatically — no explicit SEV is needed. And the timer's
+   EVENT STREAM (chapter 32) guarantees a wake within ~100 µs
+   even if the event is missed entirely.                    */</code></pre>
+
+<h2 id="hints">Both are hints</h2>
+
+<div class="warn">
+<b>Neither instruction guarantees anything about power</b>
+<p><code>WFI</code> and <code>WFE</code> are <em>architectural hints</em>. A conforming implementation may
+treat them as <code>NOP</code>. What actually happens — clock gating, retention, or nothing at all — is
+entirely implementation defined.</p>
+<p>What <em>is</em> architected is the wake-up condition. So the correctness of your idle loop does not depend
+on the power behaviour, which is the right split: software expresses intent, hardware decides the mechanism.
+Deeper states than the core can enter by itself require firmware, which is what PSCI is for.</p>
+</div>
+
+<h2 id="states">The state hierarchy</h2>
+
+<p>Power management is a hierarchy rather than an on/off switch: a core, a cluster and the whole system each have states, and a deeper state can only be entered when everything inside it agrees.</p>
+
+<pre class="diagram">   RUNNING
+     │
+     │ WFI — the core requests a low-power state
+     ▼
+   STANDBY / retention            wake: ~ns to µs
+     · clocks gated, state PRESERVED in registers and caches
+     · the core resumes exactly where it stopped
+     · entered directly by WFI; no firmware needed
+     │
+     │ PSCI CPU_SUSPEND with a deeper state ID
+     ▼
+   POWER DOWN                     wake: ~10s-100s of µs
+     · the core's power domain is turned OFF
+     · ALL state is lost: registers, caches, MMU config, GIC
+       CPU interface
+     · software must SAVE everything before, and RESTORE after
+     · the core restarts at a firmware entry point and works its
+       way back
+     │
+     │ all cores in a cluster down
+     ▼
+   CLUSTER POWER DOWN
+     · the shared L2 must be cleaned and invalidated first
+     · the cluster's GIC redistributor state saved
+     │
+     ▼
+   SYSTEM SUSPEND                 wake: ms
+     · everything except an always-on domain
+     · DRAM in self-refresh
+     · wake sources configured in the always-on power controller
+
+  Each level saves more power and costs more to leave. The
+  BREAK-EVEN calculation from CA chapter 20 governs which one an
+  OS governor picks.</pre>
+
+<h2 id="psci">PSCI</h2>
+
+<div class="key">
+<b>Power State Coordination Interface</b>
+<p>A standard SMC-based API implemented by EL3 firmware. It abstracts every SoC-specific power controller
+behind one interface, so a single kernel image can boot secondary cores, idle, suspend and reboot on any
+platform. Before PSCI, every SoC needed its own <code>smp_ops</code> in the kernel — which is why old ARM32
+Linux had dozens of platform-specific power drivers and ARM64 has none.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Function</th><th>ID (SMC64)</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>PSCI_VERSION</code></td><td><code>0x84000000</code></td><td>Returns the implemented version</td></tr>
+<tr><td><code>CPU_SUSPEND</code></td><td><code>0xC4000001</code></td><td>Enter a low-power state, with a resume entry point</td></tr>
+<tr><td><code>CPU_OFF</code></td><td><code>0x84000002</code></td><td>Power this core down; does not return</td></tr>
+<tr><td><code>CPU_ON</code></td><td><code>0xC4000003</code></td><td><strong>Start another core</strong> at a given address</td></tr>
+<tr><td><code>AFFINITY_INFO</code></td><td><code>0xC4000004</code></td><td>Is that core on, off, or transitioning?</td></tr>
+<tr><td><code>SYSTEM_OFF</code></td><td><code>0x84000008</code></td><td>Shut down</td></tr>
+<tr><td><code>SYSTEM_RESET</code></td><td><code>0x84000009</code></td><td>Reboot</td></tr>
+<tr><td><code>SYSTEM_SUSPEND</code></td><td><code>0xC400000E</code></td><td>Suspend to RAM</td></tr>
+<tr><td><code>FEATURES</code></td><td><code>0x8400000A</code></td><td>Query support for a function</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Starting a secondary CPU — this is how every ARM64 SMP kernel
+   brings up its cores (OS chapter 18):                     */
+
+#include &lt;linux/arm-smccc.h&gt;
+
+static int cpu_on(u64 mpidr, u64 entry_point, u64 context_id)
+{
+        struct arm_smccc_res res;
+
+        arm_smccc_smc(0xC4000003,       /* PSCI_CPU_ON, SMC64 */
+                      mpidr,            /* which core         */
+                      entry_point,      /* PHYSICAL address   */
+                      context_id,       /* passed back in x0  */
+                      0, 0, 0, 0, &amp;res);
+
+        return (int)res.a0;             /* 0 = success        */
+}
+
+/* The target core comes out of reset at entry_point with:
+     · the MMU OFF
+     · caches OFF
+     · at the same EL the caller was at
+     · x0 = context_id
+
+   In other words, exactly the same contract as the primary CPU's
+   boot entry (OS chapter 18) — which is why the secondary path
+   in head.S shares most of its code with the primary path. */
+
+/* PSCI error codes worth recognising: */
+   0   SUCCESS
+  -1   NOT_SUPPORTED
+  -2   INVALID_PARAMETERS
+  -3   DENIED
+  -4   ALREADY_ON          ← a common bring-up result
+  -5   ON_PENDING
+  -6   INTERNAL_FAILURE
+  -7   NOT_PRESENT
+  -8   DISABLED
+  -9   INVALID_ADDRESS</code></pre>
+
+<h2 id="suspend">CPU_SUSPEND and the power state ID</h2>
+
+<p>Requesting a low-power state means describing which state you want in an encoded parameter, and the encoding is the part most people get wrong first.</p>
+
+<pre><code>/* CPU_SUSPEND takes a platform-specific state ID describing HOW
+   deep to go, and where to resume.                          */
+
+        arm_smccc_smc(0xC4000001,       /* CPU_SUSPEND        */
+                      power_state,      /* the state ID       */
+                      resume_entry,     /* physical address   */
+                      context_id,
+                      0, 0, 0, 0, &amp;res);
+
+/* The power_state encoding (extended format, PSCI 1.0+):
+     [3:0]   state ID — platform specific
+     [16]    0 = standby (state preserved)
+             1 = POWERDOWN (state LOST)
+     [25:24] affinity level: 0 = core, 1 = cluster, 2 = system
+
+   The state IDs come from the DEVICE TREE, so the kernel does
+   not need platform knowledge:                             */
+
+cpus {
+        idle-states {
+                entry-method = "psci";
+
+                cpu_sleep_0: cpu-sleep-0 {
+                        compatible = "arm,idle-state";
+                        arm,psci-suspend-param = &lt;0x0010000&gt;;
+                        entry-latency-us = &lt;300&gt;;
+                        exit-latency-us = &lt;1200&gt;;
+                        min-residency-us = &lt;2000&gt;;
+                        local-timer-stop;    /* ← the timer STOPS  */
+                };
+        };
+        cpu@0 {
+                cpu-idle-states = &lt;&amp;cpu_sleep_0&gt;;
+        };
+};
+
+/* The kernel's cpuidle governor uses entry/exit latency and
+   min-residency to decide whether the expected idle duration
+   justifies this state — the break-even calculation from
+   CA chapter 20, driven entirely by device tree data.     */</code></pre>
+
+<div class="warn">
+<b><code>local-timer-stop</code> matters</b>
+<p>In deep states the per-core generic timer loses power and stops. If the kernel programmed it to wake the
+core, that wake-up never happens. The fix is a <strong>broadcast timer</strong> in the always-on domain: the
+kernel switches to it before entering such a state, and one core stays awake (or the always-on timer fires) to
+wake the others. Getting this wrong produces a core that goes idle and never returns — a hang that only
+appears when the system is quiet.</p>
+</div>
+
+<h2 id="save">What must be saved before power-down</h2>
+
+<p>A powered-down core loses state, and exactly which state is lost determines what software must save first. Missing one register produces a system that resumes into nonsense.</p>
+
+<pre class="diagram">A POWERDOWN state loses everything. The full sequence:
+
+  1. save all system registers that are not restored by firmware:
+        SCTLR_EL1, TCR_EL1, TTBR0/1_EL1, MAIR_EL1, VBAR_EL1,
+        TPIDR_EL0/EL1, CPACR_EL1, and the debug registers
+
+  2. save the GIC CPU interface and redistributor state
+        ICC_PMR_EL1, ICC_CTLR_EL1, ICC_IGRPEN1_EL1,
+        pending SGIs, the redistributor's enable and priority
+        state (chapter 23)
+
+  3. CLEAN AND INVALIDATE the caches to the Point of Coherency
+        · this is the ONE legitimate use of the set/way
+          operations (chapter 18)
+        · for a cluster power-down, the shared L2 too
+        · and it must be the LAST thing, because anything after
+          it may dirty a line again
+
+  4. DSB, then issue PSCI CPU_SUSPEND
+
+  On resume, the core enters at resume_entry with the MMU off and
+  must rebuild everything: page tables, MMU, caches, GIC, timers,
+  then restore the saved state and return into the idle loop as
+  though WFI had simply returned.
+
+  Linux does this in cpu_suspend() / cpu_resume(), and the
+  saved-register set is arch/arm64/mm/proc.S's cpu_do_suspend.
+
+  A missing register in that list gives a system that resumes and
+  then behaves subtly wrongly — the hardest class of power bug.</pre>
+
+<h2 id="hotplug">CPU hotplug</h2>
+
+<p>Bringing cores online and offline at runtime uses the same firmware interface, and it is how a kernel actually starts its secondary processors in the first place.</p>
+
+<pre><code># Offlining a core uses PSCI CPU_OFF underneath
+echo 0 &gt; /sys/devices/system/cpu/cpu3/online
+echo 1 &gt; /sys/devices/system/cpu/cpu3/online
+
+cat /sys/devices/system/cpu/online
+cat /sys/devices/system/cpu/offline
+
+/* What the kernel does on offline:
+     1. migrate all tasks off that core
+     2. migrate all interrupts (set_affinity) off it
+     3. migrate timers and hrtimers
+     4. run CPU_DYING notifiers in every subsystem
+     5. call PSCI CPU_OFF — which does not return
+
+   And on online:
+     1. PSCI CPU_ON with the secondary entry point
+     2. the core runs head.S's secondary path: MMU, caches, GIC
+        redistributor, timer
+     3. CPU_STARTING notifiers
+     4. mark it online; the scheduler starts using it
+
+   Used for: thermal management, power saving, taking a core out
+   of service after a fault, and testing SMP code paths.   */</code></pre>
+
+<h2 id="idle-linux">The Linux idle path</h2>
+
+<p>All of this is reached through the kernel's idle framework rather than called directly, and seeing how the layers connect explains where a latency problem in idle actually comes from.</p>
+
+<pre><code>/* cpuidle chooses a state, then PSCI enters it: */
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name
+#   WFI
+#   cpu-sleep
+#   cluster-sleep
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/{latency,residency,usage,time}
+#   latency    exit latency in µs
+#   residency  minimum time that justifies entering
+#   usage      how many times it was entered
+#   time       total µs spent in it
+
+cpupower monitor
+cpupower idle-info
+
+/* If a state's `usage` is zero, the governor never considers it
+   worthwhile — usually because the workload wakes too often
+   (OS chapter 17: count WAKEUPS, not CPU percentage).
+
+   powertop shows what is causing the wakeups.            */
+sudo powertop</code></pre>
+
+<h2 id="spintable">The spin-table alternative</h2>
+
+<p>Before the firmware interface existed, secondary cores were started by having them spin on a memory location. You will still meet it on older platforms, and it explains some otherwise odd device-tree properties.</p>
+
+<pre><code>/* Before PSCI, and still on some simple platforms, secondaries
+   are released with a SPIN TABLE: each parked core polls a
+   memory location until the primary writes an address.     */
+
+cpu@1 {
+        device_type = "cpu";
+        compatible = "arm,cortex-a53";
+        reg = &lt;0x1&gt;;
+        enable-method = "spin-table";
+        cpu-release-addr = &lt;0x0 0x8000fff8&gt;;
+};
+
+/* The parked core runs, from firmware:
+        1:      ldr     x0, [release_addr]
+                cbz     x0, 1b
+                wfe                     ← so it does not burn power
+                br      x0
+
+   The primary writes the entry point and issues SEV.
+
+   Why PSCI is better:
+     · it also handles CPU_OFF, SUSPEND and SYSTEM_RESET, which
+       a spin table cannot
+     · the parked core consumes power and holds memory
+     · the release address must be reserved from the kernel's
+       memory map, which is error-prone
+     · no way to power the core down at all
+
+   Use PSCI unless the platform genuinely has no EL3 firmware. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Only one CPU comes online</td><td>PSCI not working, wrong MPIDR in the device tree, or firmware returning an error</td></tr>
+<tr><td>Secondary CPU hangs on start</td><td>Entry point not physically addressed, or MMU/cache state assumed</td></tr>
+<tr><td>Core goes idle and never wakes</td><td>Timer stopped in a deep state with no broadcast timer</td></tr>
+<tr><td>System resumes but behaves subtly wrongly</td><td>A system register not in the save/restore list</td></tr>
+<tr><td>Interrupts lost after resume</td><td>GIC redistributor state not restored</td></tr>
+<tr><td>Corruption after cluster power-down</td><td>L2 not cleaned to PoC before power was removed</td></tr>
+<tr><td>Idle states show zero usage</td><td>Wakeups too frequent to justify entry — find them with <code>powertop</code></td></tr>
+<tr><td>Core hangs entering <code>WFI</code></td><td>No <code>DSB</code>; an outstanding transaction never completed</td></tr>
+<tr><td>Spinlock spins burn power</td><td>No <code>WFE</code>, or the event stream is disabled</td></tr>
+<tr><td>Reboot does not work</td><td><code>SYSTEM_RESET</code> unimplemented; falls back to a watchdog</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the difference between <code>WFI</code> and <code>WFE</code> and what each is used for.</li>
+  <li>Explain why <code>WFI</code> wakes on a masked interrupt, and the race that prevents.</li>
+  <li>Explain why both are hints, and what <em>is</em> architected about them.</li>
+  <li>Name the power state levels and what is lost at each.</li>
+  <li>Say what PSCI is and why it removed platform code from the kernel.</li>
+  <li>Show how a secondary CPU is started, and state the entry contract.</li>
+  <li>List the three things that must be saved before a power-down state.</li>
+  <li>Explain <code>local-timer-stop</code> and the broadcast timer it requires.</li>
+  <li>Give two reasons PSCI is preferable to a spin table.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

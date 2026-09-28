@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver models: WDM, KMDF and UMDF | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Driver models: WDM, KMDF and UMDF</h1>
+<p class="lead">Three ways to write a Windows driver, with a clear answer about which to choose. This
+chapter explains what each is, what WDF actually does for you, and the narrow cases where the older model is
+still required.</p>
+
+<h2 id="three">The three models</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>WDM</th><th>KMDF</th><th>UMDF</th></tr></thead>
+<tbody>
+<tr><td>Runs in</td><td>Kernel</td><td>Kernel</td><td><strong>User mode</strong></td></tr>
+<tr><td>Introduced</td><td>1999</td><td>2005</td><td>2006 (v2 in 2013)</td></tr>
+<tr><td>A bug means</td><td>Bugcheck</td><td>Bugcheck</td><td><strong>A crashed process</strong></td></tr>
+<tr><td>Lines for a simple driver</td><td>~2000</td><td>~600</td><td>~600</td></tr>
+<tr><td>PnP/power state machine</td><td><strong>You write it</strong></td><td>Framework</td><td>Framework</td></tr>
+<tr><td>Request cancellation</td><td><strong>You write it</strong></td><td>Framework</td><td>Framework</td></tr>
+<tr><td>Direct hardware access</td><td>Yes</td><td>Yes</td><td>Limited</td></tr>
+<tr><td>Interrupts</td><td>Yes</td><td>Yes</td><td>Yes (passive only)</td></tr>
+<tr><td>DMA</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td></tr>
+<tr><td>Debuggable with</td><td>WinDbg (kernel)</td><td>WinDbg (kernel)</td><td><strong>Visual Studio</strong></td></tr>
+<tr><td>Language</td><td>C</td><td>C</td><td>C++ (COM-based)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The decision, in order</b>
+<ol>
+<li><strong>Can it be UMDF?</strong> If your device needs no DMA, no DIRQL interrupt handling, and no
+kernel-only API, write it in user mode. A bug becomes a restarted service, not a blue screen — and you debug
+it in Visual Studio with a normal debugger.</li>
+<li><strong>Otherwise, KMDF.</strong> This is the answer for essentially every kernel driver written
+today.</li>
+<li><strong>WDM only if forced.</strong> Some device classes have their own port/miniport models that are
+WDM-based, and some filter positions are not expressible in WDF. Those are the real exceptions; "we have
+always used WDM" is not one.</li>
+</ol>
+</div>
+
+<h2 id="wdf">What WDF actually gives you</h2>
+
+<p>The previous chapters showed what raw WDM costs. This is what you get for adopting the framework instead — and the honest summary is that WDF does not hide the hardware, it hides the <em>protocol</em>: the sequencing, the races and the bookkeeping that are identical in every driver and easy to get wrong in each one.</p>
+
+<pre class="diagram">   THE WDM DRIVER MUST IMPLEMENT:
+
+     · ~25 PnP minor functions, each with its own forwarding
+       and completion rules (chapter 06)
+     · a PnP state machine with roughly 15 states, including
+       surprise removal, query-remove veto, and resource
+       rebalance
+     · power IRP handling, correctly serialised, including
+       the notorious rule that power IRPs must not be
+       completed out of order
+     · queue management for pending requests
+     · cancellation, with the cancel-routine ownership race
+       (chapter 05)
+     · request stalling across power transitions
+     · per-file-object request tracking, for cleanup
+     · reference counting for safe removal
+     · synchronisation between all of the above
+
+   ALL OF THAT IS THE FRAMEWORK'S JOB IN WDF. What remains
+   yours:
+
+     · EvtDriverDeviceAdd            create the device
+     · EvtDevicePrepareHardware      map registers
+     · EvtDeviceD0Entry / D0Exit     power the device
+     · EvtDeviceReleaseHardware      unmap
+     · EvtIoRead / Write / DeviceControl   the actual work
+     · EvtInterruptIsr / Dpc         the interrupt
+
+   That is why a KMDF driver is roughly a third the size, and
+   why the parts that shrink are exactly the parts that were
+   historically buggy. The framework is not hiding the
+   hardware from you - it is hiding the OS protocol.</pre>
+
+<h2 id="objects">The WDF object model in outline</h2>
+
+<p>Everything in WDF is an object with a handle, a parent and a lifetime, which makes the whole framework learnable as one idea rather than as a list of APIs. This is the outline; chapter 14 covers it properly.</p>
+
+<pre><code>/* Everything is a WDF object, with a handle, a parent, an
+   optional context, and cleanup callbacks. Covered fully in
+   chapter 14; the shape:                                   */
+
+   WDFDRIVER          one per driver
+     WDFDEVICE        one per device
+       WDFQUEUE       request queues
+       WDFINTERRUPT
+       WDFDMAENABLER
+       WDFTIMER, WDFDPC, WDFWORKITEM
+       WDFSPINLOCK, WDFWAITLOCK
+       WDFMEMORY
+       WDFREQUEST     one per in-flight request
+       WDFFILEOBJECT  one per open handle
+
+/* PARENTING IS THE KEY IDEA: destroying a parent destroys its
+   children, in order. Set ParentObject and most of your
+   cleanup disappears - the Windows counterpart of Linux's
+   devm_ (ch. 38).                                          */
+
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = device;      /* dies with it */
+        WdfSpinLockCreate(&amp;attr, &amp;lock);</code></pre>
+
+<h2 id="skeleton">A KMDF driver, complete</h2>
+
+<p>Here is a complete KMDF driver with nothing omitted. It is startlingly short compared with the WDM equivalent in chapter 06 — read it once for shape, and note how much of what you saw there simply is not present.</p>
+
+<pre><code>#include &lt;ntddk.h&gt;
+#include &lt;wdf.h&gt;
+
+typedef struct _MY_CONTEXT {
+        WDFDEVICE     Device;
+        WDFQUEUE      DefaultQueue;
+        WDFINTERRUPT  Interrupt;
+        PUCHAR        RegBase;
+        ULONG         RegLength;
+        ULONG         LastStatus;
+} MY_CONTEXT, *PMY_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MY_CONTEXT, MyGetContext)
+/* generates the accessor MyGetContext(WDFDEVICE) */
+
+DRIVER_INITIALIZE DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD MyEvtDeviceAdd;
+EVT_WDF_DEVICE_PREPARE_HARDWARE MyPrepareHardware;
+EVT_WDF_DEVICE_RELEASE_HARDWARE MyReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY MyD0Entry;
+EVT_WDF_DEVICE_D0_EXIT MyD0Exit;
+EVT_WDF_IO_QUEUE_IO_READ MyEvtIoRead;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL MyEvtIoDeviceControl;
+
+#pragma alloc_text(INIT, DriverEntry)
+#pragma alloc_text(PAGE, MyEvtDeviceAdd)
+#pragma alloc_text(PAGE, MyPrepareHardware)
+#pragma alloc_text(PAGE, MyReleaseHardware)
+
+/* ---- DriverEntry ---------------------------------------- */
+
+NTSTATUS
+DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
+            _In_ PUNICODE_STRING RegistryPath)
+{
+        WDF_DRIVER_CONFIG config;
+        NTSTATUS status;
+
+        WDF_DRIVER_CONFIG_INIT(&amp;config, MyEvtDeviceAdd);
+
+        status = WdfDriverCreate(DriverObject, RegistryPath,
+                                 WDF_NO_OBJECT_ATTRIBUTES,
+                                 &amp;config,
+                                 WDF_NO_HANDLE);
+        if (!NT_SUCCESS(status))
+                KdPrint(("WdfDriverCreate failed 0x%x\n", status));
+
+        return status;
+}
+
+/* THAT IS THE WHOLE DriverEntry. Compare the WDM version:
+   creating device objects, filling a 28-entry MajorFunction
+   table, setting DriverUnload, AddDevice, and unwinding all
+   of it on failure.                                        */
+
+/* ---- EvtDeviceAdd: once per device ---------------------- */
+
+NTSTATUS
+MyEvtDeviceAdd(_In_ WDFDRIVER Driver,
+               _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+        WDF_PNPPOWER_EVENT_CALLBACKS pnpPower;
+        WDF_OBJECT_ATTRIBUTES attributes;
+        WDF_IO_QUEUE_CONFIG queueConfig;
+        WDF_INTERRUPT_CONFIG interruptConfig;
+        WDFDEVICE device;
+        PMY_CONTEXT ctx;
+        NTSTATUS status;
+
+        UNREFERENCED_PARAMETER(Driver);
+        PAGED_CODE();
+
+        /* 1. PnP/power callbacks */
+        WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&amp;pnpPower);
+        pnpPower.EvtDevicePrepareHardware = MyPrepareHardware;
+        pnpPower.EvtDeviceReleaseHardware = MyReleaseHardware;
+        pnpPower.EvtDeviceD0Entry         = MyD0Entry;
+        pnpPower.EvtDeviceD0Exit          = MyD0Exit;
+        WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit,
+                                               &amp;pnpPower);
+
+        /* 2. how user buffers arrive (chapter 08) */
+        WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+
+        /* 3. who may open it (chapter 04) */
+        DECLARE_CONST_UNICODE_STRING(sddl,
+                L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        WdfDeviceInitAssignSDDLString(DeviceInit, &amp;sddl);
+
+        /* 4. create the device, with our context */
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attributes,
+                                                MY_CONTEXT);
+        status = WdfDeviceCreate(&amp;DeviceInit, &amp;attributes,
+                                 &amp;device);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        ctx = MyGetContext(device);
+        ctx-&gt;Device = device;
+
+        /* 5. publish an interface so user mode can find us */
+        status = WdfDeviceCreateDeviceInterface(device,
+                        &amp;GUID_DEVINTERFACE_MYDEVICE, NULL);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* 6. a default queue for requests (chapter 16) */
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                        WdfIoQueueDispatchParallel);
+        queueConfig.EvtIoRead          = MyEvtIoRead;
+        queueConfig.EvtIoDeviceControl = MyEvtIoDeviceControl;
+
+        status = WdfIoQueueCreate(device, &amp;queueConfig,
+                                  WDF_NO_OBJECT_ATTRIBUTES,
+                                  &amp;ctx-&gt;DefaultQueue);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* 7. the interrupt (chapter 18) */
+        WDF_INTERRUPT_CONFIG_INIT(&amp;interruptConfig,
+                                  MyEvtInterruptIsr,
+                                  MyEvtInterruptDpc);
+        status = WdfInterruptCreate(device, &amp;interruptConfig,
+                                    WDF_NO_OBJECT_ATTRIBUTES,
+                                    &amp;ctx-&gt;Interrupt);
+        return status;
+}
+
+/* NOTE: NO CLEANUP CODE ANYWHERE. Every object is parented to
+   the device; when the device goes away, they all go with it,
+   in reverse order. If EvtDeviceAdd returns a failure, the
+   framework destroys the partially-built device for you.
+
+   That is the same guarantee Linux's devm_ gives (ch. 33),
+   and it removes the same class of bug.                    */</code></pre>
+
+<h2 id="umdf">UMDF</h2>
+
+<p>Some drivers do not need to be in the kernel at all. Running in user mode means a crash takes down a service rather than the machine, which is a large enough safety win that it is the right default for any device that can tolerate it.</p>
+
+<pre><code>/* Same object model, same callback names, C++ and COM instead
+   of C. A UMDF v2 driver's EvtDeviceAdd looks almost
+   identical: */
+
+NTSTATUS
+MyEvtDeviceAdd(_In_ WDFDRIVER Driver,
+               _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+        WDFDEVICE device;
+        NTSTATUS status;
+
+        status = WdfDeviceCreate(&amp;DeviceInit,
+                                 WDF_NO_OBJECT_ATTRIBUTES,
+                                 &amp;device);
+        ...
+}
+
+/* WHAT UMDF CAN DO:
+     · USB devices (through WinUSB)
+     · HID devices
+     · serial, sensors, biometrics
+     · anything reachable through another driver's interface
+     · MMIO, on modern versions, with restrictions
+     · interrupts, at passive level only
+
+   WHAT IT CANNOT:
+     · DMA
+     · DIRQL interrupt handling
+     · kernel-only APIs
+     · being anything other than a leaf or near-leaf in the
+       stack
+
+   HOW IT RUNS: the driver is a DLL hosted in
+   WUDFHost.exe, a service process. The reflector - a small
+   kernel component - forwards IRPs to it.
+
+   THE PAYOFF is large and worth taking seriously:
+     · a bug crashes WUDFHost, which RESTARTS. No blue screen,
+       no lost user work.
+     · debug it in Visual Studio, with breakpoints, watch
+       windows and edit-and-continue - not WinDbg on a second
+       machine.
+     · it runs with restricted privileges, so a compromised
+       driver is far less valuable to an attacker.
+     · the whole class of IRQL and paged-pool bugs simply does
+       not exist.
+
+   IF YOUR DEVICE QUALIFIES, USE IT. The reflexive assumption
+   that "real drivers are kernel drivers" costs teams months
+   of debugging that user-mode development would not have
+   required.                                              */</code></pre>
+
+<h2 id="versions">Framework versions</h2>
+
+<p>The framework ships as a versioned library that your driver binds to, which is what allows a driver built years ago to keep working. Knowing which version you target — and what that costs you in available features — is part of setting a project up.</p>
+
+<pre><code>; The framework ships as a library BOUND INTO your driver's
+; INF, not as a fixed OS component. You target a version.
+
+    [MyDriver_Install.Wdf]
+    KmdfService = MyDriver, MyDriver_wdfsect
+
+    [MyDriver_wdfsect]
+    KmdfLibraryVersion = 1.15
+
+; VERSION -> MINIMUM WINDOWS:
+;   1.9   Windows 7
+;   1.11  Windows 8
+;   1.13  Windows 8.1
+;   1.15  Windows 10 1507
+;   1.17  Windows 10 1607
+;   1.21  Windows 10 1809
+;   1.31  Windows 10 2004
+;   1.33  Windows 11
+
+; PICK THE LOWEST VERSION that has the features you need -
+; it maximises the range of systems your driver installs on.
+; The build knows, and Code Analysis will tell you if you call
+; an API newer than your declared version:
+
+;   in the project properties, or the .vcxproj:
+;     &lt;KMDF_VERSION_MAJOR&gt;1&lt;/KMDF_VERSION_MAJOR&gt;
+;     &lt;KMDF_VERSION_MINOR&gt;15&lt;/KMDF_VERSION_MINOR&gt;
+
+/* AND IN CODE, for a feature that may not be present: */
+        if (WdfDriverIsVersionAvailable(driver, &amp;versionInfo)) {
+                ...
+        }</code></pre>
+
+<h2 id="migrate">Reading a WDM driver</h2>
+
+<p>KMDF is not a different driver model from WDM — it is a library built <em>on top of</em> WDM that
+implements the boilerplate every WDM driver used to write by hand: creating the device object and attaching it
+to the stack, dispatching IRPs by major function code, managing a cancel-safe request queue, and correctly
+sequencing power and PnP state machines that are notoriously easy to get wrong. This table exists so that when
+you are reading an older WDM driver — and a great deal of production and sample code still is WDM — you can
+recognise which hand-written pattern corresponds to which KMDF call, rather than treating WDM as a foreign
+model. Every row on the left is real, working code that KMDF replaced with a single function call because the
+pattern was common enough, and error-prone enough, to be worth abstracting once.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>WDM</th><th>KMDF</th></tr></thead>
+<tbody>
+<tr><td><code>IoCreateDevice</code> + <code>IoAttachDeviceToDeviceStack</code></td><td><code>WdfDeviceCreate</code></td></tr>
+<tr><td><code>DeviceExtension</code></td><td>A context, via <code>WDF_DECLARE_CONTEXT_TYPE</code></td></tr>
+<tr><td><code>MajorFunction[IRP_MJ_READ]</code></td><td><code>EvtIoRead</code> on a queue</td></tr>
+<tr><td><code>IRP_MN_START_DEVICE</code></td><td><code>EvtDevicePrepareHardware</code> + <code>EvtDeviceD0Entry</code></td></tr>
+<tr><td><code>IRP_MN_REMOVE_DEVICE</code></td><td><code>EvtDeviceD0Exit</code> + <code>EvtDeviceReleaseHardware</code></td></tr>
+<tr><td>Hand-written queue + cancel routine</td><td><code>WDFQUEUE</code></td></tr>
+<tr><td><code>IoCompleteRequest</code></td><td><code>WdfRequestComplete</code></td></tr>
+<tr><td><code>IoConnectInterrupt</code></td><td><code>WdfInterruptCreate</code></td></tr>
+<tr><td><code>KeInitializeDpc</code> + <code>KeInsertQueueDpc</code></td><td><code>WdfDpcCreate</code> + <code>WdfDpcEnqueue</code></td></tr>
+<tr><td><code>IoAllocateMdl</code> + <code>MmProbeAndLockPages</code></td><td><code>WdfRequestRetrieveOutputBuffer</code></td></tr>
+<tr><td><code>KSPIN_LOCK</code></td><td><code>WDFSPINLOCK</code></td></tr>
+<tr><td>Manual cleanup on every path</td><td>Object parenting</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Driver installs but never starts</td><td>KMDF version in the INF is newer than the OS supports</td></tr>
+<tr><td><code>WdfDriverCreate</code> fails</td><td>Called twice, or the co-installer/INF section is wrong</td></tr>
+<tr><td>Bugcheck on removal in a WDM driver</td><td>PnP state machine implemented incorrectly — the reason WDF exists</td></tr>
+<tr><td>Requests never complete after resume</td><td>Queue not restarted — WDF does this for you</td></tr>
+<tr><td>Cancellation races</td><td>Hand-written queue instead of a WDFQUEUE</td></tr>
+<tr><td>Context accessor returns garbage</td><td><code>WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE</code> not used at creation</td></tr>
+<tr><td>Objects leak across device removal</td><td><code>ParentObject</code> not set</td></tr>
+<tr><td>UMDF driver cannot do DMA</td><td>By design — it needs to be KMDF</td></tr>
+<tr><td>Code Analysis flags an unavailable API</td><td>Calling something newer than your declared framework version</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compare the three models across ten dimensions.</li>
+  <li>State the decision order and the real reasons to choose WDM.</li>
+  <li>List nine things WDF implements that WDM leaves to you.</li>
+  <li>Write a complete <code>DriverEntry</code> and <code>EvtDeviceAdd</code> from memory.</li>
+  <li>Explain object parenting and its Linux counterpart.</li>
+  <li>Say what UMDF can and cannot do, and list four benefits of using it.</li>
+  <li>Explain how framework versioning works and how to choose a version.</li>
+  <li>Translate ten WDM constructs into their KMDF equivalents.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

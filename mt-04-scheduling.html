@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the scheduler decides who runs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>How the scheduler decides who runs</h1>
+<p class="lead">You do not control when your threads run. Understanding the policy that does — and the four
+or five knobs you are actually allowed to turn — is the difference between tuning a system and superstitiously
+adding <code>sleep(0)</code> until the symptom moves.</p>
+
+<h2 id="states">The state machine</h2>
+
+<p>A thread is not simply running or not running. The distinctions within "not running" are exactly what you need when diagnosing something that appears stuck, because each state implies a different cause.</p>
+
+<pre class="diagram">                    +-------------+
+        create ---> |   READY     | &lt;--------------+
+                    +------+------+                |
+                           | scheduler picks it    | timeslice
+                           v                       | expires, or
+                    +-------------+                | preempted by
+                    |   RUNNING   | ---------------+ a higher
+                    +--+-------+--+                  priority
+                       |       |
+        blocks on I/O, |       | exits
+        a mutex, a     |       v
+        condvar, sleep |    +--------+
+                       |    | DEAD   |
+                       v    +--------+
+                +-------------+
+                |   BLOCKED   |
+                +------+------+
+                       | the thing it waited for happened
+                       +--------------------------> READY
+
+   THE ONLY TRANSITION YOU CONTROL is RUNNING -> BLOCKED, and
+   you control it by calling something that blocks. Everything
+   else is the scheduler's decision.
+
+   A thread in BLOCKED costs nothing. A thread spinning in
+   READY/RUNNING costs a whole core. That is the entire
+   argument for blocking primitives over spinning ones in
+   general-purpose code (chapter 6).</pre>
+
+<h2 id="policies">Policies you can actually choose</h2>
+
+<p>Most threads use the default policy and should. The alternatives exist for work with genuine timing requirements, and reaching for them without that requirement usually makes the whole system worse.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Policy</th><th>Behaviour</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><code>SCHED_OTHER</code> / CFS</td><td>Fair-share by weight. Every runnable thread makes progress;
+<code>nice</code> adjusts the share</td><td>Default. Almost always right</td></tr>
+<tr><td><code>SCHED_FIFO</code></td><td>Real-time. Runs until it blocks or yields. A higher-priority FIFO
+thread preempts instantly and <strong>never</strong> gives the CPU back on its own</td><td>Hard deadlines, and
+only with a bounded work loop</td></tr>
+<tr><td><code>SCHED_RR</code></td><td>FIFO plus a timeslice among equal priorities</td><td>Several
+equal-priority real-time threads</td></tr>
+<tr><td><code>SCHED_DEADLINE</code></td><td>You declare (runtime, deadline, period); the kernel admits you or
+refuses</td><td>Periodic real-time work where you can state the budget</td></tr>
+<tr><td><code>SCHED_IDLE</code></td><td>Runs only when nothing else wants the CPU</td><td>Background scrubbing,
+prefetch</td></tr>
+<tr><td><code>SCHED_BATCH</code></td><td>CFS, but assumed non-interactive; fewer preemptions</td><td>Long
+compute jobs where throughput beats latency</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Setting a real-time policy. Needs CAP_SYS_NICE or root, and
+   a rlimit (RLIMIT_RTPRIO) that allows it.                   */
+
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+
+int make_realtime(pthread_t t, int prio)
+{
+        struct sched_param p = { .sched_priority = prio };
+        /* prio 1..99 for FIFO/RR; higher number = higher
+           priority, the opposite of `nice`.                  */
+        return pthread_setschedparam(t, SCHED_FIFO, &amp;p);
+}
+
+/* THE FOOTGUN, and it is a big one:
+
+   A SCHED_FIFO thread that busy-loops on a single-core system
+   locks the machine. Nothing else - not your shell, not the
+   watchdog - will ever run. Linux ships a safety valve:
+
+     /proc/sys/kernel/sched_rt_runtime_us  = 950000
+     /proc/sys/kernel/sched_rt_period_us   = 1000000
+
+   which caps all real-time threads at 95% of each second so
+   you can still get a shell. Turn that off (set runtime to -1)
+   only if you are certain, and keep a serial console.
+
+   THE RULE FOR SCHED_FIFO: the loop body must be bounded and
+   must end in a blocking call. If it can spin, it will.     */</code></pre>
+
+<div class="warn">
+<b>Priority is not urgency</b>
+<p>Raising a thread's priority does not make it faster; it makes it <em>starve everything below it</em>. On a
+loaded system that is usually how you turn a latency problem into an unresponsive machine. Before reaching for
+priorities, check whether the thread is actually runnable — a thread blocked on I/O gains nothing from being
+important. And a high-priority thread that takes a lock a low-priority thread holds gets
+<a href="mt-15-priority-inversion.html">priority inversion</a>, which is worse than the original
+problem.</p>
+</div>
+
+<h2 id="affinity">Affinity, and why the scheduler moves you</h2>
+
+<p>Pinning a thread to specific cores trades the scheduler's flexibility for predictability. It is occasionally exactly right and more often a way to make things slower in a manner that is hard to attribute.</p>
+
+<pre><code>/* By default a thread may run on any CPU, and the scheduler
+   WILL move it to balance load. That migration costs you:
+   cold L1, cold L2, cold TLB, and possibly a different NUMA
+   node from your memory.                                    */
+
+#define _GNU_SOURCE
+#include &lt;sched.h&gt;
+
+void pin_to(int cpu)
+{
+        cpu_set_t set;
+        CPU_ZERO(&amp;set);
+        CPU_SET(cpu, &amp;set);
+        sched_setaffinity(0, sizeof set, &amp;set);   /* 0 = self  */
+}
+
+# From the shell:
+$ taskset -c 2,3 ./myapp          # start pinned
+$ taskset -cp 2 1234              # pin a running thread
+$ numactl --cpunodebind=0 --membind=0 ./myapp
+
+# See where threads actually ran:
+$ ps -eLo pid,tid,psr,comm | grep myapp
+$ perf stat -e migrations,context-switches ./myapp
+
+/* WHEN PINNING HELPS
+     - real-time threads that must not be migrated
+     - one thread per core, no oversubscription, cache-heavy
+     - NUMA: keeping a thread on the node holding its memory
+     - isolating a latency-critical thread with isolcpus /
+       nohz_full so the kernel stops interrupting it
+
+   WHEN IT HURTS
+     - you pinned two hot threads to SMT siblings of one core
+       and they now fight over one L1
+     - you pinned everything and the scheduler can no longer
+       balance a load you did not predict
+     - a pinned thread blocks and its core idles while another
+       core has a run queue three deep
+
+   Measure. Pinning is one of the few tuning knobs that is
+   just as likely to hurt as help.                           */</code></pre>
+
+<h2 id="yield">Yielding, sleeping, and spinning</h2>
+
+<p>Voluntarily giving up the processor sounds like a polite way to share, and is almost always the wrong tool — it is a hint with no defined effect, and code that depends on it is depending on luck.</p>
+
+<pre><code>/* Four ways to give up the CPU, and only two are usually right. */
+
+  sched_yield()           "I am still ready; run someone else."
+                          Under CFS this often means the
+                          scheduler picks YOU again immediately,
+                          because you still have the most
+                          credit. As a synchronisation tool it
+                          is a coin flip. Legitimate use: a
+                          spin-wait's back-off path, and little
+                          else.
+
+  nanosleep(1ms)          Genuinely blocks. Precise to the
+                          timer resolution, which under CFS
+                          means "at least 1ms, possibly 4ms".
+                          Fine for polling something slow.
+                          Terrible inside a lock.
+
+  a blocking wait         futex / condvar / poll. The thread
+                          leaves the run queue entirely and is
+                          woken by the event itself. THIS IS
+                          THE RIGHT ANSWER for waiting on
+                          another thread.
+
+  a spin loop             Burns a core to save a few hundred
+                          nanoseconds of wake-up latency. Right
+                          only when the wait is provably shorter
+                          than a context switch (~1-5 us), and
+                          only with a pause instruction:
+
+                              while (locked)
+                                      __builtin_ia32_pause();  /* x86 */
+                              /* or on ARM: */
+                              __asm__ volatile("yield");
+                              /* or WFE, which actually sleeps
+                                 the core until an event       */
+
+/* The pause/yield hint matters more than it looks: it stops
+   the core speculating down the loop, frees the SMT sibling's
+   execution units, and cuts the power draw of the spin by a
+   large factor.                                              */</code></pre>
+
+<div class="key">
+<b>The scheduler is not your synchronisation primitive</b>
+<p>Code that works because "thread A is higher priority so it runs first" is not synchronised; it is lucky.
+Add a core, change a kernel version, run under a hypervisor where your vCPU is descheduled
+(<a href="virt-08-vcpu-switch.html">virtualisation chapter 08</a>), and the assumption evaporates. If order
+matters, express it with a primitive that guarantees it.</p>
+</div>
+
+<h2 id="observe">Watching it happen</h2>
+
+<p>Scheduler behaviour is fully observable, which turns "my thread isn't running often enough" from a complaint into a measurement showing exactly when it ran and what preempted it.</p>
+
+<pre><code># Is my thread running, blocked, or fighting for a core?
+$ ps -eLo pid,tid,stat,psr,pcpu,comm | grep myapp
+#   R = running/ready   S = interruptible sleep
+#   D = uninterruptible (usually disk)   T = stopped
+
+# How often is it being switched out, and voluntarily?
+$ cat /proc/$(pidof myapp)/status | grep ctxt_switches
+voluntary_ctxt_switches:     4821    # it blocked - good
+nonvoluntary_ctxt_switches:  91024   # it was preempted - it
+                                     # wants more CPU than it
+                                     # is getting
+
+# Where did the time actually go?
+$ perf sched record -- ./myapp
+$ perf sched latency --sort max
+# per-task: runtime, number of switches, and worst-case delay
+# between "became runnable" and "actually ran"
+
+# Scheduling latency for a real-time thread:
+$ cyclictest -t1 -p 80 -i 1000 -l 100000 -m
+T: 0 (1234) P:80 I:1000 C: 100000 Min: 8 Act: 12 Avg: 14 Max: 71
+
+# A high nonvoluntary count plus high `perf sched latency` max
+# means oversubscription: you have more runnable threads than
+# cores. No amount of priority tuning fixes that - reduce the
+# thread count.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Machine locks up entirely</td><td>A <code>SCHED_FIFO</code> thread spinning, with the RT throttle
+disabled</td></tr>
+<tr><td>Raising priority made latency worse</td><td>Priority inversion, or starving the thread that produces
+the work</td></tr>
+<tr><td>Huge <code>nonvoluntary_ctxt_switches</code></td><td>More runnable threads than cores</td></tr>
+<tr><td>Throughput drops when you add threads</td><td>Oversubscription plus cache thrash from
+migration</td></tr>
+<tr><td>Latency spikes every few hundred milliseconds</td><td>Migration, or a timer tick on a core you did not
+isolate</td></tr>
+<tr><td>Pinning made it slower</td><td>Two hot threads on SMT siblings sharing one L1</td></tr>
+<tr><td><code>sched_yield</code> loop burns a core and never progresses</td><td>CFS re-picks the yielding
+thread; it is not a handoff</td></tr>
+<tr><td>Works on bare metal, misses deadlines in a VM</td><td>The vCPU is a thread on the host and gets
+descheduled</td></tr>
+<tr><td><code>pthread_setschedparam</code> returns EPERM</td><td>No <code>CAP_SYS_NICE</code>, or
+<code>RLIMIT_RTPRIO</code> is zero</td></tr>
+<tr><td>Timing changes completely under a debugger</td><td>The debugger is a scheduling event; the original
+timing was never guaranteed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the thread state machine and say which transition you control.</li>
+  <li>Explain why a blocked thread is free and a spinning one is not.</li>
+  <li>Name four scheduling policies and when each is appropriate.</li>
+  <li>Explain what the RT throttle protects you from and why disabling it is dangerous.</li>
+  <li>State the rule a <code>SCHED_FIFO</code> loop body must obey.</li>
+  <li>Give two cases where pinning helps and two where it hurts.</li>
+  <li>Explain why <code>sched_yield</code> is unreliable as a synchronisation mechanism.</li>
+  <li>Say when a spin loop is justified, and what instruction belongs in it.</li>
+  <li>Interpret a high <code>nonvoluntary_ctxt_switches</code> count.</li>
+  <li>Explain why "higher priority so it runs first" is not synchronisation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

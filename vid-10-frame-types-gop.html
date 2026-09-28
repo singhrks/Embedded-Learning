@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frame types, GOPs and reference management | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Frame types, GOPs and reference management</h1>
+<p class="lead">Once frames predict from other frames, order matters — and the order they are stored in is
+not the order they are shown. Every seeking bug, every "the first two seconds are broken" streaming
+complaint, and the whole design of adaptive streaming comes out of this chapter.</p>
+
+<h2 id="types">The frame types</h2>
+
+<pre class="diagram">   I-FRAME   Intra. Coded from itself alone, like a JPEG.
+             Large - 5 to 20x a P-frame. Decodable with no
+             other frame.
+
+   P-FRAME   Predicted. References EARLIER frames.
+             Small. Useless without its references.
+
+   B-FRAME   Bi-predicted. References earlier AND later
+             frames, and can average the two.
+             Smallest - often half a P-frame.
+
+   AND THE ONE THAT MATTERS OPERATIONALLY:
+
+   IDR       Instantaneous Decoder Refresh. An I-frame that
+             also RESETS the reference list - nothing after
+             it may reference anything before it.
+
+   A PLAIN I-FRAME IS NOT A SEEK POINT. Later frames may
+   still reference frames from before it, so starting there
+   gives you garbage. Only an IDR (or an HEVC CRA/BLA, or an
+   AV1 keyframe) is a guaranteed entry point.
+
+   This distinction is the source of a great many bugs. When
+   someone says "I set keyint=250 but seeking is still
+   broken", they emitted I-frames and not IDRs.
+
+     $ ffmpeg ... -x264-params "keyint=48:min-keyint=48:\
+       scenecut=0:open-gop=0"
+                                        ^^^^^^^^^^^ closed GOP
+                                        forces IDR</pre>
+
+<h2 id="order">Display order versus decode order</h2>
+
+<pre class="diagram">   A B-frame needs a FUTURE frame, so that future frame must
+   be DECODED FIRST. The bitstream is reordered.
+
+   DISPLAY ORDER (what the viewer sees)
+     I0   B1   B2   P3   B4   B5   P6
+      |    ^    ^   ^     ^    ^    ^
+      |    |    |   |     |    |    |
+      +----+----+---+     +----+----+
+        B1,B2 need I0 AND P3
+
+   DECODE ORDER (what is in the file)
+     I0   P3   B1   B2   P6   B4   B5
+
+   P3 arrives before the B-frames that need it.
+
+   THE CONSEQUENCES
+
+   1. TWO TIMESTAMPS PER FRAME
+        PTS  Presentation Time Stamp - when to show it
+        DTS  Decode Time Stamp       - when to decode it
+      For B-frames, PTS != DTS, and DTS can even be negative
+      at the start of a stream. Container muxers must carry
+      both (chapter 15).
+
+   2. LATENCY. The decoder cannot output frame B1 until it
+      has decoded P3. With 3 B-frames that is 4 frames of
+      structural delay - 133 ms at 30 fps. THIS IS WHY
+      VIDEOCONFERENCING DISABLES B-FRAMES ENTIRELY.
+
+   3. A REORDER BUFFER is required, sized by
+      max_num_reorder_frames in the stream. Getting it wrong
+      gives you frames displayed out of order - a stutter
+      that looks like dropped frames but is not.
+
+   4. Seeking must land on an IDR and decode forward to the
+      target, discarding output until the PTS matches.</pre>
+
+<div class="key">
+<b>Why B-frames are so cheap</b>
+<p>Two reasons, and the second is the underrated one. First, occlusion: something hidden in the past frame
+may be visible in the future one, so bi-prediction finds a match where forward prediction cannot. Second,
+<em>averaging two references halves the noise</em> — the prediction is closer to the truth than either
+reference alone, so the residual is smaller. That is why a B-frame is often half the size of a P-frame even
+on content with simple motion.</p>
+</div>
+
+<h2 id="gop">GOP structure</h2>
+
+<pre><code>/* A Group Of Pictures runs from one keyframe to the next. */
+
+  IBBPBBPBBPBBI...           classic MPEG-2, GOP of 12
+  IBBBPBBBPBBBP...           H.264, 3 B-frames
+  I P P P P P P P...         low latency, no B-frames
+
+/* CLOSED vs OPEN GOP
+
+     CLOSED  no frame references across the boundary. Every
+             GOP is independently decodable. Slightly less
+             efficient; MANDATORY for adaptive streaming,
+             because you must be able to splice segments.
+
+     OPEN    B-frames at the start of a GOP may reference the
+             previous GOP's last P-frame. A little more
+             efficient, and it breaks clean splicing.
+
+   Streaming: ALWAYS closed, with the GOP length equal to the
+   segment length.
+
+/* GOP LENGTH is a three-way trade:
+
+     SHORT (1-2 s)     fast seeking, quick channel change,
+                       fast recovery from packet loss, and
+                       cheap ABR switching.
+                       COSTS BITS - I-frames are expensive.
+
+     LONG (5-10 s)     better compression, 10-20% smaller at
+                       the same quality.
+                       Slow seek, slow start, and a lost
+                       packet corrupts until the next
+                       keyframe.
+
+   TYPICAL CHOICES
+     streaming VOD        2 s, matching the segment
+     live streaming       1-2 s (latency)
+     broadcast            0.5-1 s (channel change)
+     videoconference      infinite, with periodic refresh
+                          instead (see below)
+     archival             10 s+, or all-intra for editing
+
+/* SCENE-CUT DETECTION: a good encoder inserts a keyframe at a
+   cut anyway, because prediction across a cut is useless.
+   Forcing a fixed interval AND allowing scene cuts gives you
+   both - but for segmented streaming you must disable scene
+   cuts so segment boundaries stay aligned:
+     -x264-params "keyint=48:min-keyint=48:scenecut=0"        */</code></pre>
+
+<h2 id="refs">Reference management</h2>
+
+<pre class="diagram">   H.264 onward keep a DECODED PICTURE BUFFER of several
+   frames, and each block chooses which one to predict from.
+
+     DPB, up to 16 frames:
+       [ I0 ] [ P3 ] [ P6 ] [ P9 ] ...
+
+     block A -> reference index 0 (the most recent)
+     block B -> reference index 2 (three frames back)
+
+   WHY MULTIPLE REFERENCES HELP
+     * periodic motion - a walking figure, a rotating fan -
+       matches a frame several back better than the last one
+     * occlusion - something briefly hidden reappears
+     * noise - an older, cleaner frame may match better
+     * a flash or a dropped frame is skipped over
+
+   Typical gain: 5-10% for 4 references over 1. Diminishing
+   returns beyond that, and the DPB costs MEMORY -
+   16 references at 4K 10-bit is about 400 MB, which is why
+   levels cap it.
+
+   HIERARCHICAL B-FRAMES / PYRAMID - the modern structure:
+
+     display:  I0  b1  B2  b3  P4
+     decode:   I0  P4  B2  b1  b3
+
+     temporal layer 0:  I0 ........... P4     never discarded
+     temporal layer 1:        B2             references L0
+     temporal layer 2:    b1     b3          references L0,L1
+                          ^^     ^^
+                     lowercase b = NOT used as a reference
+
+   THIS GIVES YOU TEMPORAL SCALABILITY FOR FREE: drop layer 2
+   and you have a valid 15 fps stream. Drop layer 1 too and
+   you have 7.5 fps. Used by:
+     * videoconferencing, to shed frame rate under congestion
+       (SVC), without re-encoding
+     * streaming, for trick modes
+     * and it compresses BETTER than a flat IBBP structure,
+       because the layer-0 frames are coded at higher quality
+       and everything else predicts from them.
+
+   LONG-TERM REFERENCES: pin a frame in the DPB indefinitely -
+   a clean background, or the last known-good frame. WebRTC
+   uses these to recover from loss without a full keyframe.</pre>
+
+<h2 id="lowdelay">Low latency, and intra refresh</h2>
+
+<pre><code>/* Videoconferencing cannot afford B-frames (reordering
+   latency) or periodic I-frames (a bitrate spike that blows
+   the buffer and causes a stall).
+
+   INTRA REFRESH solves the second: instead of one huge
+   I-frame, refresh a COLUMN of blocks each frame. After N
+   frames the whole picture has been refreshed.             */
+
+     frame 0:  [I][ ][ ][ ][ ]     I = intra column
+     frame 1:  [ ][I][ ][ ][ ]
+     frame 2:  [ ][ ][I][ ][ ]
+     frame 3:  [ ][ ][ ][I][ ]
+     frame 4:  [ ][ ][ ][ ][I]     fully refreshed
+
+   Plus a constraint: blocks may not predict from the
+   not-yet-refreshed region, or the refresh is undone.
+
+   RESULT: every frame is roughly the same size - no spikes,
+   no buffer stalls - and a decoder joining at any point has
+   a correct picture after N frames.
+
+$ ffmpeg ... -c:v libx264 -tune zerolatency \
+    -x264-params "intra-refresh=1:bframes=0:sliced-threads=1"
+
+/* -tune zerolatency sets, among other things:
+     bframes=0            no reorder delay
+     sync-lookahead=0     no lookahead buffering
+     sliced-threads=1     threads work within a frame, not
+                          across frames - frame-level
+                          threading adds N frames of latency
+     rc-lookahead=0
+
+   THE COST: roughly 10-20% worse compression. That is the
+   price of the latency, and it is not negotiable.        */</code></pre>
+
+<div class="warn">
+<b>Frame-threading is a hidden source of latency</b>
+<p>By default <code>x264</code> and <code>x265</code> use frame-level threading: thread N works on frame N
+while thread N+1 works on frame N+1. With 8 threads that is up to 8 frames of encoder delay — a third of a
+second at 25 fps — before a single byte emerges. Any real-time use needs <code>sliced-threads</code> or an
+explicit thread limit. This surprises people who have already disabled B-frames and cannot work out where the
+latency is coming from.</p>
+</div>
+
+<h2 id="inspect">Inspecting structure</h2>
+
+<pre><code># Frame types and sizes in decode order:
+$ ffprobe -select_streams v -show_entries \
+    frame=pict_type,key_frame,pkt_pts_time,pkt_dts_time,pkt_size \
+    -of csv=p=0 input.mp4 | head
+1,I,0.000000,-0.083333,142883      # note DTS < PTS: B-frames
+0,P,0.133333,-0.050000,8214        # present
+0,B,0.033333,-0.016667,3102
+0,B,0.066667,0.016667,2894
+
+# Just the keyframe positions - what you can seek to:
+$ ffprobe -select_streams v -skip_frame nokey \
+    -show_entries frame=pkt_pts_time -of csv=p=0 input.mp4
+0.000000
+2.000000
+4.000000          # a clean 2-second GOP
+
+# Are they real IDRs? Look at the NAL types:
+$ ffmpeg -i input.mp4 -c copy -bsf:v trace_headers -f null - 2&gt;&amp;1 \
+    | grep -E 'nal_unit_type' | sort | uniq -c
+   1500 nal_unit_type = 1     # non-IDR slice
+     50 nal_unit_type = 5     # IDR slice          &lt;-- these
+     51 nal_unit_type = 7     # SPS
+     51 nal_unit_type = 8     # PPS
+
+# NOTE the SPS/PPS repeated before every IDR - that is
+# repeat-headers, and without it a player that tunes in
+# mid-stream has no parameter sets and cannot start.
+
+# GOP structure at a glance:
+$ ffprobe -select_streams v -show_entries frame=pict_type \
+    -of csv=p=0 input.mp4 | head -30 | tr '\n' ' '
+I B B P B B P B B P B B P I B B P ...</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Seeking lands on a broken frame</td><td>I-frames but not IDRs — use a closed GOP</td></tr>
+<tr><td>First seconds of a stream are garbage</td><td>SPS/PPS not repeated before each
+keyframe</td></tr>
+<tr><td>Frames displayed out of order</td><td>Reorder buffer too small, or PTS/DTS mishandled</td></tr>
+<tr><td>Video and audio drift apart</td><td>PTS used where DTS was needed, or vice versa
+(<a href="vid-15-containers-sync.html">chapter 15</a>)</td></tr>
+<tr><td>133 ms of unexplained latency</td><td>B-frames — disable them for real-time</td></tr>
+<tr><td>Latency persists after disabling B-frames</td><td>Frame-level threading; use
+<code>sliced-threads</code></td></tr>
+<tr><td>Bitrate spikes every GOP, buffer stalls</td><td>Periodic I-frames; use intra refresh</td></tr>
+<tr><td>ABR switching produces a glitch</td><td>GOP boundaries not aligned across renditions, or an open
+GOP</td></tr>
+<tr><td>Packet loss corrupts several seconds</td><td>Long GOP — nothing recovers until the next
+keyframe</td></tr>
+<tr><td>4K decode runs out of memory</td><td>DPB size — 16 references at 4K is hundreds of
+megabytes</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish I, P and B frames by what they reference and their typical relative sizes.</li>
+  <li>Explain why an I-frame is not necessarily a seek point, and what is.</li>
+  <li>Write a display order and its corresponding decode order for an IBBP structure.</li>
+  <li>Explain why PTS and DTS differ and where DTS can be negative.</li>
+  <li>Give two reasons B-frames compress so well.</li>
+  <li>Explain closed versus open GOP and why streaming requires closed.</li>
+  <li>State the three-way trade in GOP length with a typical value for two use cases.</li>
+  <li>Explain hierarchical B-frames and the temporal scalability they provide free.</li>
+  <li>Describe intra refresh and the problem it solves.</li>
+  <li>Name two sources of encoder latency beyond B-frames.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

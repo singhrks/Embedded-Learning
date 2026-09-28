@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Client API in depth | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The Client API in depth</h1>
+<p class="lead">Eleven functions, defined by GlobalPlatform, implemented by <code>libteec</code>, and
+identical across every compliant TEE. Learn them here and your client code moves to Kinibi or QSEE
+unchanged. This chapter is the complete surface, with the lifecycle rules that the specification states and
+everyone violates anyway.</p>
+
+<h2 id="surface">The whole API</h2>
+
+<p>The whole API is small enough to hold in your head, which is unusual and deliberate: a small interface is easier to implement consistently across TEE vendors.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Function</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>TEEC_InitializeContext</code></td><td>Connect to a TEE. Opens <code>/dev/tee0</code></td></tr>
+<tr><td><code>TEEC_FinalizeContext</code></td><td>Disconnect</td></tr>
+<tr><td><code>TEEC_OpenSession</code></td><td>Start talking to a TA, identified by UUID</td></tr>
+<tr><td><code>TEEC_CloseSession</code></td><td>Stop</td></tr>
+<tr><td><code>TEEC_InvokeCommand</code></td><td>Ask the TA to do something</td></tr>
+<tr><td><code>TEEC_RequestCancellation</code></td><td>Ask for an in-flight operation to stop</td></tr>
+<tr><td><code>TEEC_RegisterSharedMemory</code></td><td>Give the TEE memory you already own</td></tr>
+<tr><td><code>TEEC_AllocateSharedMemory</code></td><td>Have the TEE allocate it</td></tr>
+<tr><td><code>TEEC_ReleaseSharedMemory</code></td><td>Give it back</td></tr>
+<tr><td><code>TEEC_RegisterSharedMemoryFileDescriptor</code></td><td>OP-TEE extension: share a dmabuf</td></tr>
+<tr><td><code>TEEC_PARAM_TYPES</code></td><td>A macro that packs four parameter types into one word</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="lifecycle">The lifecycle, and what it costs</h2>
+
+<p>The client API has a strict object lifecycle — context, session, operation — and each level must be opened and closed in order. Most client-side bugs are a mismatch in that nesting.</p>
+
+<pre class="diagram">   TEEC_InitializeContext
+      opens /dev/tee0, queries the driver
+      COST: an open() and an ioctl. Cheap-ish.
+      |
+      v
+   TEEC_OpenSession
+      -> SMC -> OP-TEE looks up the UUID
+      -> if the TA is not resident: RPC to tee-supplicant to
+         read the .ta file, then VERIFY ITS SIGNATURE, then
+         allocate TA_RAM, map it, run TA_CreateEntryPoint
+      -> then TA_OpenSessionEntryPoint
+      COST: THE EXPENSIVE ONE. Several milliseconds the first
+      time - signature verification of a 100 KB binary is real
+      work.
+      |
+      v
+   TEEC_InvokeCommand    (many times)
+      -> SMC -> TA_InvokeCommandEntryPoint
+      COST: two world switches plus your TA's work. Tens of
+      microseconds of overhead.
+      |
+      v
+   TEEC_CloseSession
+      -> TA_CloseSessionEntryPoint
+      -> if this was the LAST session: TA_DestroyEntryPoint,
+         and the TA is unloaded from TA_RAM (unless it is a
+         singleton that keeps its instance alive)
+      |
+      v
+   TEEC_FinalizeContext
+
+   THE PERFORMANCE RULE THAT FOLLOWS:
+
+     open the session ONCE, at start-up, and keep it.
+
+   A client that opens and closes a session around every
+   operation pays the load-and-verify cost every time. This is
+   the single most common OP-TEE performance mistake, and it
+   can be a 100x difference.</pre>
+
+<h2 id="complete">A complete, correct client</h2>
+
+<p>A complete client program, short enough to read in one pass, showing the lifecycle applied end to end.</p>
+
+<pre><code>/* keystore_client.c - the error handling and cleanup are the
+   point. Copy this shape.                                    */
+
+#include &lt;err.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;tee_client_api.h&gt;
+
+#define TA_UUID { 0x8aaaf200, 0x2450, 0x11e4, \
+        { 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }
+
+#define CMD_SIGN   0
+
+struct tee_ctx {
+        TEEC_Context      ctx;
+        TEEC_Session      sess;
+        TEEC_SharedMemory io;
+        int               have_ctx, have_sess, have_shm;
+};
+
+static const char *origin_str(uint32_t o)
+{
+        switch (o) {
+        case TEEC_ORIGIN_API:         return "API";
+        case TEEC_ORIGIN_COMMS:       return "COMMS";
+        case TEEC_ORIGIN_TEE:         return "TEE";
+        case TEEC_ORIGIN_TRUSTED_APP: return "TA";
+        default:                      return "?";
+        }
+}
+
+static void tee_fini(struct tee_ctx *t)
+{
+        if (t-&gt;have_shm)  TEEC_ReleaseSharedMemory(&amp;t-&gt;io);
+        if (t-&gt;have_sess) TEEC_CloseSession(&amp;t-&gt;sess);
+        if (t-&gt;have_ctx)  TEEC_FinalizeContext(&amp;t-&gt;ctx);
+        memset(t, 0, sizeof *t);
+}
+
+static int tee_init(struct tee_ctx *t, size_t bufsz)
+{
+        TEEC_UUID   uuid = TA_UUID;
+        uint32_t    origin;
+        TEEC_Result res;
+
+        memset(t, 0, sizeof *t);
+
+        res = TEEC_InitializeContext(NULL, &amp;t-&gt;ctx);
+        if (res != TEEC_SUCCESS) {
+                warnx("InitializeContext: 0x%08x", res);
+                return -1;
+        }
+        t-&gt;have_ctx = 1;
+
+        res = TEEC_OpenSession(&amp;t-&gt;ctx, &amp;t-&gt;sess, &amp;uuid,
+                               TEEC_LOGIN_PUBLIC, NULL, NULL,
+                               &amp;origin);
+        if (res != TEEC_SUCCESS) {
+                warnx("OpenSession: 0x%08x origin %s",
+                      res, origin_str(origin));
+                goto fail;
+        }
+        t-&gt;have_sess = 1;
+
+        /* Allocate ONCE and reuse - see the note below. */
+        t-&gt;io.size  = bufsz;
+        t-&gt;io.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
+        res = TEEC_AllocateSharedMemory(&amp;t-&gt;ctx, &amp;t-&gt;io);
+        if (res != TEEC_SUCCESS) {
+                warnx("AllocateSharedMemory: 0x%08x", res);
+                goto fail;
+        }
+        t-&gt;have_shm = 1;
+        return 0;
+fail:
+        tee_fini(t);
+        return -1;
+}
+
+static int tee_sign(struct tee_ctx *t, const void *msg, size_t len,
+                    void *sig, size_t *siglen)
+{
+        TEEC_Operation op;
+        uint32_t       origin;
+        TEEC_Result    res;
+
+        if (len &gt; t-&gt;io.size)
+                return -1;
+        memcpy(t-&gt;io.buffer, msg, len);
+
+        memset(&amp;op, 0, sizeof op);
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT,
+                                         TEEC_MEMREF_PARTIAL_OUTPUT,
+                                         TEEC_NONE, TEEC_NONE);
+        op.params[0].memref.parent = &amp;t-&gt;io;
+        op.params[0].memref.offset = 0;
+        op.params[0].memref.size   = len;
+        op.params[1].memref.parent = &amp;t-&gt;io;
+        op.params[1].memref.offset = 2048;      /* second half   */
+        op.params[1].memref.size   = *siglen;
+
+        res = TEEC_InvokeCommand(&amp;t-&gt;sess, CMD_SIGN, &amp;op, &amp;origin);
+
+        /* THE SHORT-BUFFER RETRY. Every real client needs it. */
+        if (res == TEEC_ERROR_SHORT_BUFFER) {
+                warnx("need %u bytes, had %zu",
+                      op.params[1].memref.size, *siglen);
+                *siglen = op.params[1].memref.size;
+                return -2;      /* caller reallocates, retries  */
+        }
+        if (res != TEEC_SUCCESS) {
+                warnx("InvokeCommand: 0x%08x origin %s",
+                      res, origin_str(origin));
+                return -1;
+        }
+
+        *siglen = op.params[1].memref.size;
+        memcpy(sig, (char *)t-&gt;io.buffer + 2048, *siglen);
+        return 0;
+}
+
+int main(void)
+{
+        struct tee_ctx t;
+        uint8_t sig[512];
+        size_t  siglen = sizeof sig;
+
+        if (tee_init(&amp;t, 4096))
+                return 1;
+
+        /* Many invocations, ONE session. */
+        for (int i = 0; i &lt; 1000; i++) {
+                if (tee_sign(&amp;t, "hello", 5, sig, &amp;siglen) &lt; 0)
+                        break;
+                siglen = sizeof sig;
+        }
+
+        tee_fini(&amp;t);
+        return 0;
+}</code></pre>
+
+<div class="key">
+<b>Allocate shared memory once</b>
+<p><code>TEEC_AllocateSharedMemory</code> is not free — it goes to the kernel and possibly to OP-TEE.
+Allocating a buffer per invocation, in a loop, doubles your overhead for no benefit. Allocate one buffer at
+start-up, big enough for your largest transfer, and use
+<code>TEEC_MEMREF_PARTIAL_INPUT</code>/<code>OUTPUT</code> with offsets to carve it up.</p>
+</div>
+
+<h2 id="login">Login types and connection data</h2>
+
+<p>The TEE can be told something about who is calling, which lets a trusted application distinguish a request from the kernel from one from an arbitrary user process.</p>
+
+<pre><code>/* The fifth argument to TEEC_OpenSession says WHO is calling.
+   The TA can see it, and OP-TEE derives per-caller storage
+   keys from it (chapter 15).                                */
+
+  TEEC_LOGIN_PUBLIC        no identity claimed. Anyone.
+  TEEC_LOGIN_USER          the caller's uid, hashed in by the
+                           kernel driver - the client CANNOT
+                           forge it
+  TEEC_LOGIN_GROUP         a gid, supplied in connectionData
+  TEEC_LOGIN_APPLICATION   an application identity
+  TEEC_LOGIN_USER_APPLICATION
+  TEEC_LOGIN_GROUP_APPLICATION
+  TEEC_LOGIN_REE_KERNEL    the caller is the kernel (ch. 10)
+
+    uint32_t gid = 1000;
+    res = TEEC_OpenSession(&amp;ctx, &amp;sess, &amp;uuid,
+                           TEEC_LOGIN_GROUP, &amp;gid,
+                           NULL, &amp;origin);
+
+/* Why it matters: with LOGIN_USER, two different users opening
+   sessions to the same TA get DIFFERENT secure storage. The
+   TA writes to "my key" and each caller gets their own. That
+   separation is enforced by OP-TEE, using an identity the
+   client cannot choose.
+
+   With LOGIN_PUBLIC there is one shared storage space for
+   everyone. For a multi-user or multi-app system that is
+   almost certainly wrong.                                   */</code></pre>
+
+<h2 id="cancel">Cancellation</h2>
+
+<p>A long-running secure operation may need to be cancelled, and doing so is cooperative rather than forced — the trusted application must be written to notice.</p>
+
+<pre><code>/* A long-running TA operation can be asked to stop. It is
+   COOPERATIVE - the TA must check.                          */
+
+/* Client, from another thread: */
+    TEEC_RequestCancellation(&amp;op);
+
+/* TA side: */
+    if (TEE_GetCancellationFlag()) {
+            cleanup();
+            return TEE_ERROR_CANCEL;
+    }
+
+    /* A TA can also mask cancellation while in a critical
+       section, and must restore it: */
+    bool old = TEE_MaskCancellation();
+    do_something_uninterruptible();
+    if (old) TEE_MaskCancellation(); else TEE_UnmaskCancellation();
+
+/* Uses:
+     a watchdog thread that cancels after a timeout
+     a UI "cancel" button on a slow key generation
+     shutdown
+
+   Limits:
+     the TA must poll the flag. A TA blocked in an RPC will
+     not see it until the RPC returns.
+     There is NO way to forcibly kill a TA invocation. If your
+     TA can loop for ever, you have created an unkillable
+     thread (chapter 5).                                     */</code></pre>
+
+<h2 id="threads">Thread safety</h2>
+
+<p>Because the secure world has a limited number of contexts, a multi-threaded client can exhaust them. The rules about concurrent sessions follow from that limit.</p>
+
+<pre><code>/* The GlobalPlatform rules, which OP-TEE follows:
+
+   TEEC_Context   may be shared between threads.
+   TEEC_Session   may be shared, BUT concurrent
+                  TEEC_InvokeCommand calls on ONE session are
+                  serialised by the TA's own instance/session
+                  flags (chapter 13). Whether they run
+                  concurrently depends on TA_FLAG_*.
+   TEEC_Operation must NOT be shared. One per in-flight call.
+   TEEC_SharedMemory may be shared, but you are responsible
+                  for not having two calls write the same
+                  region.
+
+   The practical pattern for a multithreaded client:
+
+     one TEEC_Context           process-wide
+     one TEEC_Session           process-wide, if the TA is
+                                multi-session capable
+     one TEEC_Operation         per call, on the stack
+     one TEEC_SharedMemory      per thread, allocated once
+
+   If the TA is TA_FLAG_SINGLE_INSTANCE without
+   TA_FLAG_MULTI_SESSION, your threads will serialise inside
+   OP-TEE no matter what the client does. Know which your TA
+   is.                                                        */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Every operation takes milliseconds</td><td>Session opened and closed per call — the TA is being loaded
+and verified each time</td></tr>
+<tr><td><code>TEEC_ERROR_ITEM_NOT_FOUND</code> on <code>OpenSession</code></td><td>TA not installed, or
+<code>tee-supplicant</code> not running</td></tr>
+<tr><td><code>TEEC_ERROR_BUSY</code> intermittently</td><td>Thread pool exhausted; libteec retries but
+concurrency is capped</td></tr>
+<tr><td>Corruption with multiple threads</td><td>A <code>TEEC_Operation</code> or a shared buffer used by two
+calls at once</td></tr>
+<tr><td>Client cannot cancel a stuck TA</td><td>Cancellation is cooperative; the TA is not polling the
+flag</td></tr>
+<tr><td>Two users see each other's stored data</td><td><code>TEEC_LOGIN_PUBLIC</code> where
+<code>LOGIN_USER</code> was needed</td></tr>
+<tr><td>Retry loop on <code>SHORT_BUFFER</code> never ends</td><td>The TA does not set
+<code>memref.size</code> to the required length</td></tr>
+<tr><td>Memory grows over time</td><td>Shared memory or sessions not released on the error path</td></tr>
+<tr><td>Works alone, fails under concurrency</td><td>TA flags serialise sessions; see
+<a href="tee-13-ta-lifecycle.html">chapter 13</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the eleven Client API functions and what each does.</li>
+  <li>Describe the lifecycle and identify the expensive step.</li>
+  <li>State the performance rule about sessions and quantify why.</li>
+  <li>Explain why shared memory should be allocated once and carved with partial memrefs.</li>
+  <li>Write a client with correct cleanup on every error path.</li>
+  <li>Implement the short-buffer retry.</li>
+  <li>Name the login types and explain what changes with <code>LOGIN_USER</code>.</li>
+  <li>Explain why the client cannot forge its uid.</li>
+  <li>Describe cancellation, what the TA must do, and its two limits.</li>
+  <li>State which Client API objects may be shared between threads and which may not.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

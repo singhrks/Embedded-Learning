@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool use and agents | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Tool use and agents</h1>
+<p class="lead">A model that can only emit text can only ever tell you things. Give it a way to call functions
+and it can look things up, compute, and change the world — which is a much more useful system and a much more
+dangerous one. The mechanism underneath is far simpler than the vocabulary suggests.</p>
+
+<h2 id="mechanism">What tool calling actually is</h2>
+
+<p>The word "agent" carries a great deal of implication. Strip it away and what remains is a loop around a
+model that is still, at every step, only predicting tokens.</p>
+
+<pre class="diagram">   THE MODEL DOES NOT CALL ANYTHING. It emits text. Your
+   program reads that text, calls the function, and puts the
+   result back into the context. That is the entire trick.
+
+     1. You describe the available tools in the context,
+        with names, parameters and types.
+     2. The model emits something structured that names a
+        tool and its arguments.
+     3. YOUR CODE parses it and executes the function.
+        The model has no execution privileges whatsoever.
+     4. You append the result to the conversation.
+     5. The model continues, now conditioned on the result.
+
+   ---------------------------------------------------------
+
+   WHY THIS WORKS AT ALL: emitting a tool call is just
+   next-token prediction in a format the model was trained
+   to produce. Training on many examples of "given these
+   tool descriptions and this request, the right
+   continuation is this call" is what makes it reliable.
+
+   WHICH MEANS IT IS NOT GUARANTEED. It can emit a call to a
+   tool that does not exist, arguments of the wrong type, or
+   a perfectly-formed call in a situation that did not need
+   one. Every one of those is a case YOUR CODE must handle.
+
+   ---------------------------------------------------------
+
+   AN "AGENT" IS THAT LOOP, RUN MORE THAN ONCE:
+
+     while (not done) {
+         response = model(context)
+         if (response has tool calls) {
+             results = execute(response.tool_calls)
+             context += response + results
+         } else {
+             return response
+         }
+     }
+
+   THAT IS ALL AN AGENT IS. A loop, a model, a set of tools,
+   and a termination condition. Everything else described as
+   an agent framework is ergonomics around those four
+   things.</pre>
+
+<div class="danger">
+<b>Step 3 is a trust boundary, and it is the most under-defended one in the field</b>
+<p>The arguments to that function call are attacker-influenced. Not hypothetically — if any part of the context
+came from a web page, a document, an email, or another user's input, then text in that data can steer what the
+model asks your code to do. The model is not a security control and cannot be made into one. Your executor must
+validate arguments, enforce permissions, and refuse dangerous operations exactly as if the call had arrived from
+an unauthenticated network client — because in effect it has. This is the same reasoning as
+<a href="win-42-project-app-driver.html">the driver IOCTL boundary</a>: the caller may be more privileged than
+you and is still not trusted. <a href="ai-33-safety-failures.html">Chapter 32</a> covers the attack in
+detail.</p>
+</div>
+
+<h2 id="design">Designing tools the model can actually use</h2>
+
+<p>Most tool-calling failures are not model failures — they are interface design failures. The model sees only
+your names, descriptions and types, and it fails in exactly the ways a new engineer handed the same API would.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Rule</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Few tools, clearly distinct</strong></td><td>Twenty overlapping tools produce wrong choices;
+the model cannot pick between two plausible options any better than you could from the descriptions
+alone</td></tr>
+<tr><td><strong>Describe <em>when to use it</em>, not just what it does</strong></td><td>The description is
+the only selection signal there is</td></tr>
+<tr><td><strong>Name parameters unambiguously</strong></td><td><code>date</code> invites three formats;
+<code>start_date_iso8601</code> invites one</td></tr>
+<tr><td><strong>Constrain types in the schema</strong></td><td>An enum removes a whole class of invalid
+argument before it is generated</td></tr>
+<tr><td><strong>Return errors as readable text</strong></td><td>The error goes back into the context —
+"start_date must be ISO-8601, got 'next tuesday'" gets corrected; <code>ERR_22</code> does not</td></tr>
+<tr><td><strong>Return little</strong></td><td>Every token of output is context the model must read and you
+must pay for; 4,000 rows of JSON crowds out the actual task</td></tr>
+<tr><td><strong>Make them idempotent where you can</strong></td><td>Retries happen — on parse failures,
+timeouts and loops. A non-idempotent tool turns a retry into a duplicate order</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The most useful design check is to hand your tool descriptions, with nothing else, to a colleague and ask
+which one they would use for a given task. If they hesitate, the model will do worse — it has strictly less
+context than they do.</p>
+
+<h2 id="loop">The loop, written honestly</h2>
+
+<p>The five-line version above is the idea. This is what it has to become before it can run unattended, and
+every addition is there because of a specific failure.</p>
+
+<pre><code>def run_agent(task, tools, max_steps=10, budget_usd=0.50):
+    context = [system_prompt(tools), user(task)]
+    spent = 0.0
+
+    for step in range(max_steps):
+        response, cost = model(context)
+        spent += cost
+
+        # A BUDGET, not just a step limit. A loop that makes
+        # ten cheap calls and one enormous one is not caught
+        # by a step count.
+        if spent &gt; budget_usd:
+            return "stopped: budget exceeded", context
+
+        if not response.tool_calls:
+            return response.text, context          # done
+
+        context.append(response)
+
+        for call in response.tool_calls:
+            # 1. DOES IT EXIST? Models hallucinate tools.
+            if call.name not in tools:
+                context.append(tool_error(call,
+                    f"No such tool. Available: {list(tools)}"))
+                continue
+
+            # 2. ARE THE ARGUMENTS VALID? Validate against
+            #    the schema before anything executes.
+            ok, err = validate(tools[call.name].schema, call.args)
+            if not ok:
+                context.append(tool_error(call, err))
+                continue
+
+            # 3. IS IT PERMITTED? The security decision, made
+            #    here, in code - never by the model.
+            if not authorised(call, task.principal):
+                context.append(tool_error(call, "Not permitted."))
+                continue
+
+            # 4. EXECUTE, and never let a tool exception kill
+            #    the loop - hand the failure back as text so
+            #    the model can react to it.
+            try:
+                result = tools[call.name].run(**call.args,
+                                              timeout=30)
+            except Exception as e:
+                result = f"Tool failed: {e}"
+
+            context.append(tool_result(call, truncate(result)))
+
+    return "stopped: step limit reached", context
+
+# THE TWO LIMITS ARE NOT OPTIONAL. Without them the standard
+# failure is an agent that calls the same failing tool
+# forever, cheerfully, until someone notices the bill.</code></pre>
+
+<h2 id="when">When an agent is the wrong answer</h2>
+
+<p>Agents are genuinely useful and are reached for far more often than they are warranted. The question worth
+asking is whether the sequence of steps is actually unknown.</p>
+
+<pre class="diagram">   THE DECIDING QUESTION:
+
+     Do you know the steps in advance?
+
+       YES -> WRITE THE STEPS. A pipeline of three model
+              calls in a fixed order is cheaper, faster,
+              testable, debuggable, and cannot loop.
+       NO  -> an agent may be justified.
+
+   ---------------------------------------------------------
+
+   HOW RELIABILITY COMPOUNDS, which is the argument nobody
+   makes early enough:
+
+     per-step success   steps   end-to-end
+        95%               3        86%
+        95%               5        77%
+        95%              10        60%
+        95%              20        36%
+
+   A 95% STEP IS A GOOD STEP. Twenty of them is a coin flip.
+   This arithmetic is why long autonomous chains disappoint
+   in ways that each individual step's quality does not
+   predict.
+
+   THE RESPONSES THAT WORK:
+     · FEWER STEPS. The largest single improvement
+       available, and almost always achievable.
+     · CHECKPOINTS - verify the intermediate result, with
+       code, and stop early when it is wrong.
+     · A HUMAN IN THE LOOP before anything irreversible.
+     · IDEMPOTENT TOOLS, so a retry is free.
+
+   ---------------------------------------------------------
+
+   AND THE RULE THAT MATTERS MOST IN PRODUCTION:
+
+     THE AGENT MAY PROPOSE AN IRREVERSIBLE ACTION.
+     A HUMAN APPROVES IT.
+
+   Sending email, moving money, deleting data, merging code,
+   posting publicly. The cost of a mistake is not symmetric
+   with the cost of a confirmation prompt, and no measured
+   success rate changes that asymmetry.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>The model calls a tool that does not exist</td><td>Expected behaviour — handle it by returning the
+valid list as an error</td></tr>
+<tr><td>The same tool is called repeatedly with the same arguments</td><td>The result is not answering the
+question; the model has no other move. Improve the tool's output or stop the loop</td></tr>
+<tr><td>Arguments in the wrong format</td><td>Ambiguous parameter name or an unconstrained type in the
+schema</td></tr>
+<tr><td>The right tool exists and is never chosen</td><td>The description says what it does, not when to use
+it</td></tr>
+<tr><td>Works with three tools, degrades with fifteen</td><td>Overlapping tools — the choice is genuinely
+ambiguous</td></tr>
+<tr><td>Agent forgets the original task</td><td>Tool outputs flooded the context; truncate results</td></tr>
+<tr><td>Enormous bill from one request</td><td>No budget limit, only a step limit</td></tr>
+<tr><td>Duplicate side effects after a retry</td><td>A non-idempotent tool</td></tr>
+<tr><td>Agent does something it should not have been able to do</td><td>Authorisation was implied by the
+prompt rather than enforced in the executor</td></tr>
+<tr><td>Demo works, real use fails at step 8</td><td>Compounding reliability — do the arithmetic above</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the five steps of a tool call, and say which one your code performs.</li>
+  <li>Explain why the model has no execution privileges, and where the privilege actually is.</li>
+  <li>State why tool arguments must be treated as untrusted input.</li>
+  <li>Write an agent loop in five lines, then name four things the real one must add.</li>
+  <li>Give three reasons a tool's error message should be readable prose.</li>
+  <li>Explain why tools should be idempotent.</li>
+  <li>Give the question that decides between a pipeline and an agent.</li>
+  <li>Compute end-to-end reliability for ten steps at 95% each.</li>
+  <li>Name four ways to raise that number.</li>
+  <li>State the rule about irreversible actions, and why success rate does not change it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

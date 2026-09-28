@@ -1,0 +1,831 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the ring-buffer character driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the ring-buffer character driver</h1>
+<p class="lead">A complete, working Linux driver you build, load and break yourself. No hardware needed — it
+runs on QEMU or any Linux machine. It exercises character devices, blocking I/O, poll, ioctl, locking,
+sysfs and correct teardown: nearly everything in the last twenty chapters.</p>
+
+<h2 id="what">What you are building</h2>
+
+<p>This is the first project, and it deliberately uses almost everything from the preceding chapters at once. Read this section before writing anything: knowing what the finished thing does makes the code that follows far easier to hold in your head.</p>
+
+<pre class="diagram">   /dev/ringbuf         a character device
+
+   write(fd, data, n)   -&gt; push bytes into a circular buffer
+   read(fd, buf, n)     -&gt; pop bytes out; BLOCKS if empty
+   poll(fd, POLLIN)     -&gt; wakes when data arrives
+   ioctl(RB_GET_STATS)  -&gt; how many bytes, drops, wakeups
+   ioctl(RB_RESET)      -&gt; empty it
+   /sys/class/ringbuf/ringbuf/size     -&gt; capacity, read-only
+   /sys/class/ringbuf/ringbuf/used     -&gt; bytes in it now
+
+  THE POINT is not the ring buffer - it is everything around
+  it: the concurrency between a reader that sleeps and a writer
+  that wakes it, the teardown that must not race, the ioctl
+  ABI, the error paths. That is what a real driver is made of;
+  the hardware part is usually the easy half.</pre>
+
+<h2 id="files">The files</h2>
+
+<p>A driver is rarely one file. This layout separates the interface user space depends on from the implementation that may change freely, which is the same distinction chapter 02 drew between a permanent ABI and an internal API.</p>
+
+<pre><code>ringbuf/
+  ringbuf.c          the driver
+  ringbuf.h          the UAPI header, shared with userspace
+  Makefile
+  test/
+    rbtest.c         a userspace exerciser
+    Makefile</code></pre>
+
+<h2 id="header">ringbuf.h — the ABI</h2>
+
+<p>Start with the header, because it is the part you can never change once someone is using it. Everything else in this project can be rewritten; these definitions are a promise.</p>
+
+<pre><code>/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _UAPI_RINGBUF_H
+#define _UAPI_RINGBUF_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/ioctl.h&gt;
+
+struct rb_stats {
+        __u32 capacity;         /* total bytes                */
+        __u32 used;             /* bytes currently held       */
+        __u64 bytes_written;    /* since load                 */
+        __u64 bytes_read;
+        __u64 drops;            /* bytes discarded when full  */
+        __u64 wakeups;          /* reader wakeups             */
+        __u32 reserved[8];      /* MUST be zero (chapter 23)  */
+};
+
+#define RB_IOC_MAGIC    'R'
+#define RB_GET_STATS    _IOR(RB_IOC_MAGIC, 1, struct rb_stats)
+#define RB_RESET        _IO (RB_IOC_MAGIC, 2)
+
+#endif /* _UAPI_RINGBUF_H */</code></pre>
+
+<h2 id="driver">ringbuf.c</h2>
+
+<p>Here is the driver in full. It is long, but every part of it has appeared in an earlier chapter — read it once for shape, then again against the review checklist at the end of this chapter.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * ringbuf - a teaching character driver.
+ *
+ * Locking: rb->lock (spinlock, irqsave) protects head, tail
+ * and every counter. It is never held across a copy to or
+ * from user space - see rb_read()/rb_write() for how the
+ * copy is staged outside the lock.
+ */
+
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/device.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/poll.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;
+
+#include "ringbuf.h"
+
+#define RB_DEFAULT_SIZE  4096
+#define RB_CHUNK         1024        /* staging buffer size */
+
+static unsigned int bufsize = RB_DEFAULT_SIZE;
+module_param(bufsize, uint, 0444);
+MODULE_PARM_DESC(bufsize, "Ring capacity in bytes (power of 2)");
+
+static bool overwrite;
+module_param(overwrite, bool, 0644);
+MODULE_PARM_DESC(overwrite,
+                 "Drop oldest data instead of blocking when full");
+
+struct rb_dev {
+        struct cdev        cdev;
+        struct device     *dev;
+        dev_t              devt;
+
+        u8                *buf;
+        u32                capacity;     /* power of two   */
+        u32                head;          /* write index    */
+        u32                tail;          /* read index     */
+
+        spinlock_t         lock;
+        wait_queue_head_t  readq;
+        wait_queue_head_t  writeq;
+
+        u64                bytes_written;
+        u64                bytes_read;
+        u64                drops;
+        u64                wakeups;
+};
+
+static struct rb_dev  *rb_device;
+static struct class   *rb_class;
+
+/* ---- buffer maths, callers hold rb->lock ---------------- */
+
+static inline u32 rb_used(struct rb_dev *rb)
+{
+        return rb-&gt;head - rb-&gt;tail;      /* unsigned wrap is
+                                            well-defined and
+                                            is the trick that
+                                            makes this simple */
+}
+
+static inline u32 rb_space(struct rb_dev *rb)
+{
+        return rb-&gt;capacity - rb_used(rb);
+}
+
+static inline bool rb_empty(struct rb_dev *rb)
+{
+        return rb-&gt;head == rb-&gt;tail;
+}
+
+/* Note: head and tail are FREE-RUNNING counters, masked only
+   when indexing. That removes the classic "is it full or
+   empty?" ambiguity of a wrapped-index ring entirely. */
+
+/* ---- copy in, caller holds the lock --------------------- */
+
+static u32 rb_push(struct rb_dev *rb, const u8 *src, u32 len)
+{
+        u32 n, first;
+
+        if (overwrite) {
+                if (len &gt; rb-&gt;capacity) {       /* keep the tail */
+                        src += len - rb-&gt;capacity;
+                        rb-&gt;drops += len - rb-&gt;capacity;
+                        len = rb-&gt;capacity;
+                }
+                if (len &gt; rb_space(rb)) {
+                        u32 discard = len - rb_space(rb);
+
+                        rb-&gt;tail += discard;    /* drop oldest */
+                        rb-&gt;drops += discard;
+                }
+                n = len;
+        } else {
+                n = min(len, rb_space(rb));
+        }
+
+        /* the ring wraps: up to two memcpys */
+        first = min(n, rb-&gt;capacity - (rb-&gt;head &amp; (rb-&gt;capacity - 1)));
+        memcpy(rb-&gt;buf + (rb-&gt;head &amp; (rb-&gt;capacity - 1)), src, first);
+        if (n &gt; first)
+                memcpy(rb-&gt;buf, src + first, n - first);
+
+        rb-&gt;head += n;
+        rb-&gt;bytes_written += n;
+        return n;
+}
+
+static u32 rb_pop(struct rb_dev *rb, u8 *dst, u32 len)
+{
+        u32 n, first;
+
+        n = min(len, rb_used(rb));
+
+        first = min(n, rb-&gt;capacity - (rb-&gt;tail &amp; (rb-&gt;capacity - 1)));
+        memcpy(dst, rb-&gt;buf + (rb-&gt;tail &amp; (rb-&gt;capacity - 1)), first);
+        if (n &gt; first)
+                memcpy(dst + first, rb-&gt;buf, n - first);
+
+        rb-&gt;tail += n;
+        rb-&gt;bytes_read += n;
+        return n;
+}
+
+/* ---- file operations ------------------------------------ */
+
+static int rb_open(struct inode *inode, struct file *file)
+{
+        struct rb_dev *rb = container_of(inode-&gt;i_cdev,
+                                         struct rb_dev, cdev);
+
+        file-&gt;private_data = rb;
+        return 0;
+}
+
+static ssize_t rb_read(struct file *file, char __user *ubuf,
+                       size_t count, loff_t *ppos)
+{
+        struct rb_dev *rb = file-&gt;private_data;
+        u8 *stage;
+        size_t done = 0;
+        unsigned long flags;
+        int ret = 0;
+
+        if (!count)
+                return 0;
+
+        stage = kmalloc(RB_CHUNK, GFP_KERNEL);
+        if (!stage)
+                return -ENOMEM;
+
+        while (done &lt; count) {
+                u32 n;
+
+                spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+                n = rb_pop(rb, stage, min_t(size_t,
+                                            count - done, RB_CHUNK));
+                spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+                if (n) {
+                        /* copy OUTSIDE the lock - copy_to_user
+                           can sleep on a page fault, which is
+                           illegal under a spinlock (ch. 07) */
+                        if (copy_to_user(ubuf + done, stage, n)) {
+                                ret = -EFAULT;
+                                goto out;
+                        }
+                        done += n;
+                        wake_up_interruptible(&amp;rb-&gt;writeq);
+                        continue;
+                }
+
+                /* nothing available */
+                if (done)
+                        break;          /* return what we have */
+
+                if (file-&gt;f_flags &amp; O_NONBLOCK) {
+                        ret = -EAGAIN;
+                        goto out;
+                }
+
+                ret = wait_event_interruptible(rb-&gt;readq,
+                                               !rb_empty(rb));
+                if (ret) {
+                        ret = -ERESTARTSYS;   /* no progress yet */
+                        goto out;
+                }
+        }
+
+        ret = done;
+out:
+        kfree(stage);
+        return ret;
+}
+
+static ssize_t rb_write(struct file *file, const char __user *ubuf,
+                        size_t count, loff_t *ppos)
+{
+        struct rb_dev *rb = file-&gt;private_data;
+        u8 *stage;
+        size_t done = 0;
+        unsigned long flags;
+        int ret = 0;
+
+        if (!count)
+                return 0;
+
+        stage = kmalloc(RB_CHUNK, GFP_KERNEL);
+        if (!stage)
+                return -ENOMEM;
+
+        while (done &lt; count) {
+                size_t chunk = min_t(size_t, count - done, RB_CHUNK);
+                u32 n;
+
+                if (copy_from_user(stage, ubuf + done, chunk)) {
+                        ret = -EFAULT;
+                        goto out;
+                }
+
+                spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+                n = rb_push(rb, stage, chunk);
+                if (n)
+                        rb-&gt;wakeups++;
+                spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+                if (n) {
+                        done += n;
+                        wake_up_interruptible(&amp;rb-&gt;readq);
+                        continue;
+                }
+
+                /* full, and not overwriting */
+                if (done)
+                        break;
+
+                if (file-&gt;f_flags &amp; O_NONBLOCK) {
+                        ret = -EAGAIN;
+                        goto out;
+                }
+
+                ret = wait_event_interruptible(rb-&gt;writeq,
+                                               rb_space(rb) &gt; 0);
+                if (ret) {
+                        ret = -ERESTARTSYS;
+                        goto out;
+                }
+        }
+
+        ret = done;
+out:
+        kfree(stage);
+        return ret;
+}
+
+static __poll_t rb_poll(struct file *file, poll_table *wait)
+{
+        struct rb_dev *rb = file-&gt;private_data;
+        __poll_t mask = 0;
+        unsigned long flags;
+
+        /* register on BOTH queues BEFORE checking (ch. 22) */
+        poll_wait(file, &amp;rb-&gt;readq,  wait);
+        poll_wait(file, &amp;rb-&gt;writeq, wait);
+
+        spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+        if (!rb_empty(rb))
+                mask |= EPOLLIN | EPOLLRDNORM;
+        if (rb_space(rb) &gt; 0)
+                mask |= EPOLLOUT | EPOLLWRNORM;
+        spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+        return mask;
+}
+
+static long rb_ioctl(struct file *file, unsigned int cmd,
+                     unsigned long arg)
+{
+        struct rb_dev *rb = file-&gt;private_data;
+        void __user *uarg = (void __user *)arg;
+        struct rb_stats st;
+        unsigned long flags;
+
+        switch (cmd) {
+        case RB_GET_STATS:
+                memset(&amp;st, 0, sizeof(st));   /* zero the
+                                                 reserved
+                                                 fields too   */
+                spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+                st.capacity      = rb-&gt;capacity;
+                st.used          = rb_used(rb);
+                st.bytes_written = rb-&gt;bytes_written;
+                st.bytes_read    = rb-&gt;bytes_read;
+                st.drops         = rb-&gt;drops;
+                st.wakeups       = rb-&gt;wakeups;
+                spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+                if (copy_to_user(uarg, &amp;st, sizeof(st)))
+                        return -EFAULT;
+                return 0;
+
+        case RB_RESET:
+                if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                        return -EBADF;      /* chapter 23 */
+
+                spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+                rb-&gt;head = rb-&gt;tail = 0;
+                spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+                wake_up_interruptible(&amp;rb-&gt;writeq);
+                return 0;
+
+        default:
+                return -ENOTTY;
+        }
+}
+
+static const struct file_operations rb_fops = {
+        .owner          = THIS_MODULE,
+        .open           = rb_open,
+        .read           = rb_read,
+        .write          = rb_write,
+        .poll           = rb_poll,
+        .unlocked_ioctl = rb_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,
+        .llseek         = no_llseek,
+};
+
+/* ---- sysfs ---------------------------------------------- */
+
+static ssize_t size_show(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+        struct rb_dev *rb = dev_get_drvdata(dev);
+
+        return sysfs_emit(buf, "%u\n", rb-&gt;capacity);
+}
+static DEVICE_ATTR_RO(size);
+
+static ssize_t used_show(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+        struct rb_dev *rb = dev_get_drvdata(dev);
+        unsigned long flags;
+        u32 used;
+
+        spin_lock_irqsave(&amp;rb-&gt;lock, flags);
+        used = rb_used(rb);
+        spin_unlock_irqrestore(&amp;rb-&gt;lock, flags);
+
+        return sysfs_emit(buf, "%u\n", used);
+}
+static DEVICE_ATTR_RO(used);
+
+static struct attribute *rb_attrs[] = {
+        &amp;dev_attr_size.attr,
+        &amp;dev_attr_used.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(rb);
+
+/* ---- module init / exit --------------------------------- */
+
+static int __init rb_init(void)
+{
+        struct rb_dev *rb;
+        int ret;
+
+        if (!is_power_of_2(bufsize) || bufsize &lt; 64) {
+                pr_err("ringbuf: bufsize must be a power of 2, &gt;= 64\n");
+                return -EINVAL;
+        }
+
+        rb = kzalloc(sizeof(*rb), GFP_KERNEL);
+        if (!rb)
+                return -ENOMEM;
+
+        rb-&gt;capacity = bufsize;
+        rb-&gt;buf = kzalloc(bufsize, GFP_KERNEL);
+        if (!rb-&gt;buf) {
+                ret = -ENOMEM;
+                goto err_free_dev;
+        }
+
+        spin_lock_init(&amp;rb-&gt;lock);
+        init_waitqueue_head(&amp;rb-&gt;readq);
+        init_waitqueue_head(&amp;rb-&gt;writeq);
+
+        ret = alloc_chrdev_region(&amp;rb-&gt;devt, 0, 1, "ringbuf");
+        if (ret)
+                goto err_free_buf;
+
+        rb_class = class_create("ringbuf");
+        if (IS_ERR(rb_class)) {
+                ret = PTR_ERR(rb_class);
+                goto err_region;
+        }
+        rb_class-&gt;dev_groups = rb_groups;
+
+        cdev_init(&amp;rb-&gt;cdev, &amp;rb_fops);
+        rb-&gt;cdev.owner = THIS_MODULE;
+
+        /* everything above must be ready: cdev_add publishes
+           it and open() can arrive immediately (chapter 22) */
+        ret = cdev_add(&amp;rb-&gt;cdev, rb-&gt;devt, 1);
+        if (ret)
+                goto err_class;
+
+        rb-&gt;dev = device_create(rb_class, NULL, rb-&gt;devt, rb,
+                                "ringbuf");
+        if (IS_ERR(rb-&gt;dev)) {
+                ret = PTR_ERR(rb-&gt;dev);
+                goto err_cdev;
+        }
+
+        rb_device = rb;
+        pr_info("ringbuf: ready, %u bytes, major %d\n",
+                rb-&gt;capacity, MAJOR(rb-&gt;devt));
+        return 0;
+
+err_cdev:
+        cdev_del(&amp;rb-&gt;cdev);
+err_class:
+        class_destroy(rb_class);
+err_region:
+        unregister_chrdev_region(rb-&gt;devt, 1);
+err_free_buf:
+        kfree(rb-&gt;buf);
+err_free_dev:
+        kfree(rb);
+        return ret;
+}
+
+static void __exit rb_exit(void)
+{
+        struct rb_dev *rb = rb_device;
+
+        /* exact reverse. cdev_del first: no new opens.
+           .owner = THIS_MODULE means existing opens already
+           hold a module reference, so rmmod cannot even reach
+           here while an fd is open (chapter 17).           */
+        device_destroy(rb_class, rb-&gt;devt);
+        cdev_del(&amp;rb-&gt;cdev);
+        class_destroy(rb_class);
+        unregister_chrdev_region(rb-&gt;devt, 1);
+        kfree(rb-&gt;buf);
+        kfree(rb);
+
+        pr_info("ringbuf: unloaded\n");
+}
+
+module_init(rb_init);
+module_exit(rb_exit);
+
+MODULE_DESCRIPTION("Teaching ring-buffer character device");
+MODULE_AUTHOR("Embedded Learning Hub");
+MODULE_LICENSE("GPL");</code></pre>
+
+<h2 id="makefile">Makefile</h2>
+
+<p>The build is the same three-line pattern every out-of-tree module uses, with the cross-compilation variables filled in.</p>
+
+<pre><code>obj-m += ringbuf.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+# cross-compile for an arm64 target:
+arm64:
+	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 \
+		CROSS_COMPILE=aarch64-linux-gnu- modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+check:
+	$(KDIR)/scripts/checkpatch.pl --no-tree -f ringbuf.c
+
+.PHONY: all arm64 clean check</code></pre>
+
+<h2 id="test">The exerciser</h2>
+
+<p>A driver without a test program is a driver you are guessing about. This exerciser drives every path — including the ones that are supposed to fail — which is what makes the error handling worth having.</p>
+
+<pre><code>/* test/rbtest.c - build with: gcc -O2 -o rbtest rbtest.c -lpthread */
+#include &lt;errno.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;unistd.h&gt;
+#include "../ringbuf.h"
+
+#define DEV "/dev/ringbuf"
+
+static void show_stats(int fd)
+{
+        struct rb_stats st;
+
+        if (ioctl(fd, RB_GET_STATS, &amp;st) &lt; 0) {
+                perror("RB_GET_STATS");
+                return;
+        }
+        printf("cap=%u used=%u written=%llu read=%llu drops=%llu\n",
+               st.capacity, st.used,
+               (unsigned long long)st.bytes_written,
+               (unsigned long long)st.bytes_read,
+               (unsigned long long)st.drops);
+}
+
+/* --- test 1: round trip --------------------------------- */
+static void test_roundtrip(void)
+{
+        char out[256], in[256];
+        int fd = open(DEV, O_RDWR);
+        ssize_t n;
+
+        memset(out, 'A', sizeof(out));
+        n = write(fd, out, sizeof(out));
+        printf("wrote %zd\n", n);
+
+        n = read(fd, in, sizeof(in));
+        printf("read  %zd, match=%s\n", n,
+               memcmp(out, in, n) == 0 ? "yes" : "NO");
+
+        show_stats(fd);
+        close(fd);
+}
+
+/* --- test 2: non-blocking on empty ---------------------- */
+static void test_nonblock(void)
+{
+        char buf[16];
+        int fd = open(DEV, O_RDWR | O_NONBLOCK);
+        ssize_t n = read(fd, buf, sizeof(buf));
+
+        printf("nonblock read: %zd errno=%d (%s) - expect EAGAIN\n",
+               n, errno, strerror(errno));
+        close(fd);
+}
+
+/* --- test 3: producer/consumer with poll ---------------- */
+static void *producer(void *arg)
+{
+        int fd = open(DEV, O_WRONLY);
+        char buf[64];
+        int i;
+
+        for (i = 0; i &lt; 100; i++) {
+                int len = snprintf(buf, sizeof(buf),
+                                   "message %d\n", i);
+                if (write(fd, buf, len) &lt; 0) {
+                        perror("write");
+                        break;
+                }
+                usleep(1000);
+        }
+        close(fd);
+        return NULL;
+}
+
+static void test_poll(void)
+{
+        pthread_t th;
+        struct pollfd pfd;
+        char buf[128];
+        int fd = open(DEV, O_RDONLY);
+        int total = 0;
+
+        pthread_create(&amp;th, NULL, producer, NULL);
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+
+        for (;;) {
+                int ret = poll(&amp;pfd, 1, 500);
+
+                if (ret &lt;= 0)
+                        break;                  /* timeout: done */
+
+                ret = read(fd, buf, sizeof(buf));
+                if (ret &lt;= 0)
+                        break;
+                total += ret;
+        }
+        printf("poll test: received %d bytes\n", total);
+
+        pthread_join(th, NULL);
+        close(fd);
+}
+
+/* --- test 4: bad ioctl ---------------------------------- */
+static void test_bad_ioctl(void)
+{
+        int fd = open(DEV, O_RDWR);
+        int ret = ioctl(fd, _IO('Z', 99));
+
+        printf("bad ioctl: %d errno=%d (%s) - expect ENOTTY\n",
+               ret, errno, strerror(errno));
+
+        /* RESET on a read-only fd must be refused */
+        close(fd);
+        fd = open(DEV, O_RDONLY);
+        ret = ioctl(fd, RB_RESET);
+        printf("reset on O_RDONLY: %d errno=%d - expect EBADF\n",
+               ret, errno);
+        close(fd);
+}
+
+int main(void)
+{
+        printf("--- roundtrip ---\n");   test_roundtrip();
+        printf("--- nonblock ---\n");    test_nonblock();
+        printf("--- poll ---\n");        test_poll();
+        printf("--- bad ioctl ---\n");   test_bad_ioctl();
+        return 0;
+}</code></pre>
+
+<h2 id="run">Building and running it</h2>
+
+<p>With everything written, this is the loop you will repeat dozens of times. Getting it fast matters more than it seems: the difference between a ten-second and a two-minute cycle changes how you work.</p>
+
+<pre><code># On the machine you will run it on (or cross-compile):
+    cd ringbuf
+    make
+    sudo insmod ringbuf.ko
+    dmesg | tail -2
+      ringbuf: ready, 4096 bytes, major 241
+
+    ls -l /dev/ringbuf
+    cat /sys/class/ringbuf/ringbuf/size
+      4096
+
+# The shell can drive it directly:
+    sudo sh -c 'echo hello > /dev/ringbuf'
+    cat /sys/class/ringbuf/ringbuf/used
+      6
+    sudo cat /dev/ringbuf        # blocks after "hello" - Ctrl-C
+
+# Run the exerciser:
+    cd test &amp;&amp; make &amp;&amp; sudo ./rbtest
+
+# Try the parameters:
+    sudo rmmod ringbuf
+    sudo insmod ringbuf.ko bufsize=65536
+    echo 1 | sudo tee /sys/module/ringbuf/parameters/overwrite</code></pre>
+
+<h2 id="exercises">Exercises — where the learning is</h2>
+
+<div class="key">
+<b>Do these in order. Each one breaks something you must then diagnose.</b>
+<ol>
+<li><strong>Prove the lock matters.</strong> Delete the <code>spin_lock_irqsave</code> pairs. Run two
+writers and a reader concurrently. Watch the counters drift from reality. Then put it back.</li>
+<li><strong>Break the copy-outside-the-lock rule.</strong> Move <code>copy_to_user</code> inside the
+spinlock. Build with <code>CONFIG_DEBUG_ATOMIC_SLEEP=y</code> and read the BUG message.</li>
+<li><strong>Create a lost wakeup.</strong> Replace <code>wait_event_interruptible</code> with a manual
+<code>set_current_state</code>/<code>schedule</code> that checks the condition <em>before</em> queueing.
+Reproduce the hang.</li>
+<li><strong>Remove <code>.poll</code>.</strong> Run <code>rbtest</code> and watch it spin at 100% CPU.</li>
+<li><strong>Remove <code>poll_wait</code> on <code>writeq</code>.</strong> Fill the buffer, then poll for
+<code>POLLOUT</code>. Observe that it never fires.</li>
+<li><strong>Leak the buffer.</strong> Delete <code>kfree(rb-&gt;buf)</code> from
+<code>rb_exit</code>. Load and unload 50 times with <code>CONFIG_DEBUG_KMEMLEAK=y</code>, then
+<code>echo scan &gt; /sys/kernel/debug/kmemleak</code>.</li>
+<li><strong>Use after free.</strong> Move <code>kfree(rb)</code> before <code>cdev_del</code>. Hold an fd
+open, unload, and read. With KASAN you get a report naming both sites.</li>
+<li><strong>Drop the <code>f_mode</code> check</strong> in <code>RB_RESET</code> and confirm a read-only fd
+can now clear the buffer — a real privilege bug, in four lines.</li>
+<li><strong>Add a feature:</strong> a <code>RB_SET_SIZE</code> ioctl that reallocates the buffer. Think
+carefully about what must be locked, what happens to data in flight, and what a concurrent blocked reader
+sees. This is harder than it looks, which is the point.</li>
+<li><strong>Add a second minor</strong> so <code>/dev/ringbuf0</code> and <code>/dev/ringbuf1</code> are
+independent buffers. This converts the module-global design into a per-device one — the shape every real
+driver needs.</li>
+</ol>
+</div>
+
+<h2 id="review">Reviewing your own work</h2>
+
+<p>Before considering it finished, read your own code as a maintainer would. These are the questions a reviewer will actually ask, and finding the answers yourself is considerably less painful than being told.</p>
+
+<pre><code># Run all of these before you consider it finished:
+
+# 1. Style
+    make check                       # checkpatch.pl
+
+# 2. Sparse - __user annotations, endianness
+    make C=1 M=$PWD
+
+# 3. Load/unload 100 times under KASAN
+    for i in $(seq 100); do
+      sudo insmod ringbuf.ko &amp;&amp; sudo rmmod ringbuf || break
+    done
+    dmesg | grep -i -e kasan -e bug -e warn
+
+# 4. Concurrency: several writers and readers at once
+    for i in 1 2 3 4; do
+      (sudo dd if=/dev/urandom of=/dev/ringbuf bs=512 \
+           count=1000 2>/dev/null) &amp;
+    done
+    sudo dd if=/dev/ringbuf of=/dev/null bs=512 count=4000
+
+# 5. Fault injection on the allocations
+    echo 10  | sudo tee /sys/kernel/debug/failslab/probability
+    echo 100 | sudo tee /sys/kernel/debug/failslab/times
+    # load repeatedly; nothing should crash
+
+# 6. rmmod while an fd is open - must return EBUSY
+    exec 3&lt;/dev/ringbuf
+    sudo rmmod ringbuf            # expect: Device or resource busy
+    exec 3&lt;&amp;-
+
+# THE ONES THAT USUALLY FIND SOMETHING are 3, 4 and 5.</code></pre>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why free-running head and tail counters avoid the full/empty ambiguity.</li>
+  <li>Say why the user copy happens outside the spinlock, and what happens if it does not.</li>
+  <li>Explain why <code>poll</code> registers on both wait queues before checking anything.</li>
+  <li>Explain the partial-read rule: why <code>done &gt; 0</code> returns rather than blocking again.</li>
+  <li>Justify the order of every step in <code>rb_init</code> and <code>rb_exit</code>.</li>
+  <li>Say what <code>.owner = THIS_MODULE</code> prevents, and demonstrate it.</li>
+  <li>Complete exercises 1 through 8 and describe the symptom each produced.</li>
+  <li>Implement exercise 9 or 10 and defend your locking.</li>
+  <li>Run the full six-step review with no findings.</li>
+</ul>
+
+<div class="tip">
+<b>Next</b>
+<p><a href="lx-29-project-platform.html">Chapter 37</a> takes the same driver and attaches it to real
+hardware description — a device tree node, MMIO registers, an interrupt and DMA — turning it from a
+software toy into the shape of a shipping driver.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

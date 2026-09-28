@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Key derivation and password hashing | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Key derivation and password hashing</h1>
+<p class="lead">Turning one secret into many, and turning a low-entropy password into something that
+survives an offline attack. Two problems that look similar and need completely different tools.</p>
+
+<h2 id="two">Two different problems</h2>
+
+<p>Two problems are both called key derivation and have opposite requirements: one must be fast, the other must be deliberately slow. Using the function for one problem on the other is a serious error.</p>
+
+<pre class="diagram">   PROBLEM 1: KEY DERIVATION (KDF)
+     input:  a HIGH-ENTROPY secret
+             - a Diffie-Hellman shared secret
+             - a master key from a fuse or an OTP region
+             - a random 256-bit key
+     want:   several independent keys, each bound to a
+             purpose
+     cost:   SHOULD BE FAST. There is no offline guessing
+             attack on 256 bits of entropy, so slowing down
+             derivation buys nothing and costs you boot time.
+     tool:   HKDF
+
+   PROBLEM 2: PASSWORD HASHING (PBKDF)
+     input:  a LOW-ENTROPY secret
+             - "hunter2", a 6-digit PIN, a passphrase
+             - maybe 20-40 bits of real entropy
+     want:   a key, and resistance to an attacker who has
+             stolen the stored value and can guess offline
+     cost:   MUST BE DELIBERATELY EXPENSIVE. That is the
+             entire mechanism. If verification takes 100 ms
+             on your hardware, an attacker's GPU farm gets
+             far fewer guesses per second.
+     tool:   Argon2id, scrypt, or PBKDF2
+
+   USING THE WRONG ONE:
+     HKDF on a password   -> a GPU tries billions of guesses
+                             per second; the password falls
+                             in minutes
+     Argon2 on a DH secret -> 100 ms and 64 MB of RAM wasted
+                             per handshake, for no security
+                             gain at all
+
+   AND THE WORST OPTION, still common in shipped firmware:
+     SHA256(password) -> a rainbow table, or a GPU doing
+     10^10 guesses/second. Not a password hash. Never.</pre>
+
+<h2 id="hkdf">HKDF</h2>
+
+<p>The standard way to turn one good key into several, or to turn a shared secret into usable key material. Its two-stage structure separates two jobs that are easy to conflate.</p>
+
+<pre><code>/* RFC 5869. Two steps, and the separation is deliberate. */
+
+/* --- EXTRACT: concentrate whatever entropy exists into a
+       uniform pseudorandom key --- */
+    PRK = HMAC(salt, input_key_material)
+
+    /* The salt is NOT secret and MAY be absent (a string of
+       zeros). Its job is to make the extraction independent
+       across contexts, not to hide anything.
+
+       This step matters when the input is not uniform - a
+       raw Diffie-Hellman output, for instance, is a group
+       element with structure, not 256 uniform bits.       */
+
+/* --- EXPAND: stretch the PRK into as much keying material
+       as needed, each piece bound to a label --- */
+    T(1) = HMAC(PRK, info ‖ 0x01)
+    T(2) = HMAC(PRK, T(1) ‖ info ‖ 0x02)
+    ...
+    OKM  = first L bytes of T(1) ‖ T(2) ‖ ...
+
+/* THE `info` PARAMETER IS THE IMPORTANT ONE and the one
+   people leave empty. It is a CONTEXT STRING that makes each
+   derived key independent. Compromise of one key tells you
+   nothing about the others.                                */
+
+    #include &lt;mbedtls/hkdf.h&gt;
+
+    uint8_t k_enc[32], k_mac[32], k_iv[12];
+    const mbedtls_md_info_t *sha256 =
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
+    mbedtls_hkdf(sha256,
+                 salt, salt_len,
+                 shared_secret, secret_len,
+                 (const uint8_t *)"fw-update v1 encryption", 23,
+                 k_enc, sizeof k_enc);
+
+    mbedtls_hkdf(sha256, salt, salt_len,
+                 shared_secret, secret_len,
+                 (const uint8_t *)"fw-update v1 mac", 16,
+                 k_mac, sizeof k_mac);
+
+/* OR, MORE EFFICIENTLY, ONE EXTRACT AND SEVERAL EXPANDS: */
+    uint8_t prk[32];
+    mbedtls_hkdf_extract(sha256, salt, salt_len,
+                         ikm, ikm_len, prk);
+
+    mbedtls_hkdf_expand(sha256, prk, 32,
+                        (const uint8_t *)"c2s enc", 7,
+                        k_c2s_enc, 32);
+    mbedtls_hkdf_expand(sha256, prk, 32,
+                        (const uint8_t *)"s2c enc", 7,
+                        k_s2c_enc, 32);
+    /* ... and so on for each direction and purpose      */
+
+/* GOOD CONTEXT STRINGS INCLUDE:
+     · the protocol name and VERSION
+     · the purpose ("encryption", "mac", "iv")
+     · the DIRECTION ("client-to-server")
+     · the session or device identifier, where it exists
+
+   "myapp v2 device-4711 client-to-server encryption"
+
+   INCLUDING THE VERSION MEANS a protocol upgrade derives
+   entirely different keys, so a downgrade attack cannot
+   reuse material across versions.                        */</code></pre>
+
+<div class="key">
+<b>One master key, many derived keys</b>
+<p>A device with a single hardware root key should never use that key directly for anything. Derive:
+one key for firmware decryption, one for attestation, one for storage, one per peer session. Each has a
+distinct <code>info</code> string. Compromise of the storage key then tells an attacker nothing about the
+firmware key, and the root key never leaves the key-derivation step — which is exactly what a hardware
+key store enforces for you (<a href="cr-18-key-management.html">chapter 18</a>).</p>
+</div>
+
+<h2 id="password">Password hashing</h2>
+
+<p>Passwords have far too little entropy to be used as keys directly, so the derivation must be made expensive enough that guessing is impractical. Which costs an attacker faces — time, memory, or parallelism — is the design question.</p>
+
+<pre><code>/* THE THREAT: your database or flash image is stolen. The
+   attacker now guesses offline, as fast as their hardware
+   allows. Your only defence is making each guess expensive.
+
+/* --- ARGON2id: the current recommendation --- */
+    Winner of the Password Hashing Competition, 2015.
+    THREE cost parameters:
+
+      m  MEMORY, in KiB    - the important one
+      t  TIME (iterations)
+      p  PARALLELISM (lanes)
+
+    MEMORY-HARDNESS IS THE POINT. A GPU has thousands of
+    cores but limited memory bandwidth and per-core memory.
+    Requiring 64 MiB per guess reduces a GPU's advantage from
+    ~1000x to single digits, and makes a dedicated ASIC
+    expensive rather than trivial.
+
+    THE THREE VARIANTS:
+      Argon2d   data-dependent addressing - fastest, but
+                side-channel exposed (chapter 19)
+      Argon2i   data-independent - side-channel resistant,
+                weaker against time-memory tradeoffs
+      Argon2id  HYBRID: first pass independent, rest
+                dependent. USE THIS ONE.
+
+    /* libsodium */
+    #include &lt;sodium.h&gt;
+
+    char hashed[crypto_pwhash_STRBYTES];
+    if (crypto_pwhash_str(
+            hashed, password, password_len,
+            crypto_pwhash_OPSLIMIT_MODERATE,   /* t */
+            crypto_pwhash_MEMLIMIT_MODERATE)   /* 256 MiB */
+        != 0)
+            return OUT_OF_MEMORY;
+
+    /* `hashed` is a self-describing string containing the
+       algorithm, the parameters and the SALT. Store it as
+       is. */
+
+    /* verify - constant time internally */
+    if (crypto_pwhash_str_verify(hashed, password,
+                                 password_len) != 0)
+            return AUTH_FAILED;
+
+    /* AND: derive a KEY from a password */
+    uint8_t key[32];
+    crypto_pwhash(key, sizeof key, password, password_len,
+                  salt,                    /* 16 random bytes,
+                                              STORED */
+                  opslimit, memlimit,
+                  crypto_pwhash_ALG_ARGON2ID13);
+
+/* --- SCRYPT: memory-hard, older, widely available --- */
+    N  cost (a power of two; 2^15 = 32768 is reasonable)
+    r  block size (8)
+    p  parallelism (1)
+    memory used ~= 128 * N * r bytes
+
+/* --- PBKDF2: only when a standard requires it --- */
+    HMAC repeated a large number of times. NOT memory-hard,
+    so GPUs and ASICs get their full advantage. Still
+    infinitely better than a bare hash.
+
+    mbedtls_pkcs5_pbkdf2_hmac_ext(
+            MBEDTLS_MD_SHA256,
+            password, password_len,
+            salt, 16,
+            600000,               /* OWASP 2023 minimum for
+                                     SHA-256 */
+            32, key);
+
+    USE IT WHEN: FIPS compliance demands it, a file format
+    specifies it, or the device genuinely cannot spare the
+    RAM for Argon2.                                       */</code></pre>
+
+<h2 id="params">Choosing parameters</h2>
+
+<p>These functions are only as strong as their parameters, and the right values change as hardware improves. This is how to choose them and how to keep that choice current.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Setting</th><th>Argon2id</th><th>PBKDF2-SHA256</th></tr></thead>
+<tbody>
+<tr><td>Server login</td><td>m=64 MiB, t=3, p=4</td><td>600 000 iterations</td></tr>
+<tr><td>Disk encryption</td><td>m=1 GiB, t=4, p=4</td><td>—</td></tr>
+<tr><td>Phone / tablet</td><td>m=64 MiB, t=3, p=2</td><td>210 000</td></tr>
+<tr><td>Linux-class embedded (256 MB RAM)</td><td>m=32 MiB, t=4, p=1</td><td>310 000</td></tr>
+<tr><td>MCU (256 KB RAM)</td><td>m=16 KiB, t=32 (weak)</td><td>100 000, or a rate limit instead</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE METHOD, not the table: MEASURE ON YOUR HARDWARE and
+   pick the largest parameters that fit your latency budget.
+
+     interactive login        ~100 ms  is the usual target
+     disk unlock at boot      ~1 s     is acceptable
+     a background operation   several seconds
+
+/* AND FOR CONSTRAINED DEVICES, THE HONEST ANSWER: a 4-digit
+   PIN has 13 bits of entropy. NO KDF SAVES IT. 10,000
+   guesses is nothing, whatever the per-guess cost. The
+   defence must be elsewhere:
+
+     · A HARDWARE-BACKED ATTEMPT COUNTER that wipes the key
+       after N failures - which is exactly what a secure
+       element or TPM provides, and what phone secure
+       enclaves do (chapter 18)
+     · A DEVICE-UNIQUE SECRET mixed into the derivation, so
+       the attacker must have the physical device:
+           key = Argon2id(PIN ‖ device_secret, salt, ...)
+       where device_secret comes from fuses or a PUF and
+       never leaves the secure world (the isolation track)
+     · RATE LIMITING with exponential backoff
+
+   THE KDF BUYS TIME. IT DOES NOT CREATE ENTROPY.        */</code></pre>
+
+<h2 id="salt">Salts, peppers, and upgrades</h2>
+
+<p>A salt does not need to be secret, and it prevents an entire class of precomputation attack. The rules about it are simple and frequently broken in exactly the same way.</p>
+
+<pre><code>/* --- SALT: unique per password, stored alongside it --- */
+    · 16 random bytes, from the CSPRNG (chapter 02)
+    · NOT SECRET
+    · UNIQUE PER USER, generated fresh each time the
+      password is set
+
+    WHY: without a salt, identical passwords hash
+    identically. An attacker sees which users share a
+    password, and precomputes ONE table that breaks every
+    account at once - the rainbow table. With per-user salts,
+    each password must be attacked separately.
+
+/* --- PEPPER: a site-wide secret, NOT in the database --- */
+    stored_hash = Argon2id(password ‖ pepper, salt, ...)
+
+    Keep the pepper in an HSM, a secure element, or an
+    environment variable outside the database. A stolen
+    DATABASE alone is then useless. It defends against
+    exactly one thing - database-only compromise - and it is
+    cheap, so it is usually worth having.
+
+/* --- REHASHING ON LOGIN, the migration pattern --- */
+    if (verify(stored, password) == OK) {
+            if (needs_rehash(stored, current_params)) {
+                    /* we have the plaintext password RIGHT
+                       NOW and only right now */
+                    new_hash = hash(password, current_params);
+                    store(new_hash);
+            }
+            grant_access();
+    }
+
+    This is how you raise cost parameters over time, or
+    migrate from PBKDF2 to Argon2id, without asking anyone to
+    reset a password.
+
+/* --- AND THE VERIFICATION DISCIPLINE --- */
+    · compare in constant time (the library does this)
+    · take the SAME TIME for an unknown username as a known
+      one - otherwise you have a user-enumeration oracle.
+      Hash a dummy value when the user does not exist.
+    · never log the password, and never put it in an error
+      message or a crash dump
+    · zero the plaintext buffer as soon as it is consumed
+      (chapter 19 - and note the compiler may remove a
+      plain memset; use explicit_bzero or
+      mbedtls_platform_zeroize)                          */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Stolen database cracked in hours</td><td>A bare hash, or an unsalted one, instead of a password KDF</td></tr>
+<tr><td>Identical hashes for different users</td><td>No salt, or a constant salt</td></tr>
+<tr><td>Handshake takes 100 ms per connection</td><td>Argon2 used where HKDF belongs</td></tr>
+<tr><td>Compromising one key exposes others</td><td>No <code>info</code> context separation in HKDF</td></tr>
+<tr><td>Login timing reveals valid usernames</td><td>No dummy hash on the unknown-user path</td></tr>
+<tr><td>Argon2 fails on the device</td><td>Memory parameter exceeds available RAM</td></tr>
+<tr><td>PIN brute-forced despite a strong KDF</td><td>Low entropy — needs a hardware attempt counter</td></tr>
+<tr><td>Password recoverable from a core dump</td><td>Buffer not zeroed, or the memset optimised away</td></tr>
+<tr><td>Cannot raise cost parameters</td><td>No rehash-on-login path</td></tr>
+<tr><td>Downgrade attack reuses old session keys</td><td>Protocol version not in the KDF context string</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the two problems and why one tool must be fast and the other slow.</li>
+  <li>Explain HKDF's extract and expand steps and what each is for.</li>
+  <li>Write a good <code>info</code> string and say what each component prevents.</li>
+  <li>Explain why memory-hardness defeats GPUs, and pick between Argon2i, 2d and 2id.</li>
+  <li>Choose parameters for a server, a phone and a 256 KB MCU, and justify the method.</li>
+  <li>Explain why no KDF can save a 4-digit PIN, and name three things that can.</li>
+  <li>Explain what a salt prevents and what a pepper adds.</li>
+  <li>Describe rehash-on-login and why it is the only practical migration path.</li>
+  <li>Explain the user-enumeration timing oracle and its fix.</li>
+  <li>Say why a plain <code>memset</code> may not clear a password buffer.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

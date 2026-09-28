@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux driver development | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 09</p>
+<h1>Linux driver development</h1>
+<p class="lead">A driver is the translator between a hardware register block and a kernel subsystem. This
+chapter covers the device model that binds them, the four driver types you will meet, and every mechanism
+a driver uses: MMIO, interrupts, DMA, sysfs, and the user-space interface.</p>
+
+<h2 id="model">The device model</h2>
+
+<p>Linux separates <em>what hardware exists</em> from <em>what code drives it</em>, and matches them at
+runtime. Three objects:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Object</th><th>Represents</th><th>Comes from</th></tr></thead>
+<tbody>
+<tr><td><code>struct bus_type</code></td><td>A kind of connection: platform, PCI, I2C, SPI, USB</td><td>The subsystem; you rarely create one</td></tr>
+<tr><td><code>struct device</code></td><td>One piece of hardware that exists</td><td>Device tree, ACPI, or bus enumeration</td></tr>
+<tr><td><code>struct device_driver</code></td><td>Code that can drive some devices</td><td>Your module, when it registers</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure>
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Device model matching flow from device tree and driver registration through bus match to probe">
+  <rect class="svg-box-g" x="20" y="20" width="220" height="70" rx="7"/>
+  <text class="svg-tb" x="34" y="42">Device tree / ACPI / bus scan</text>
+  <text class="svg-tm" x="34" y="62">compatible = "acme,widget"</text>
+  <text class="svg-tm" x="34" y="80">reg, interrupts, clocks...</text>
+
+  <rect class="svg-box-a" x="520" y="20" width="220" height="70" rx="7"/>
+  <text class="svg-tb" x="534" y="42">Your module loads</text>
+  <text class="svg-tm" x="534" y="62">platform_driver_register()</text>
+  <text class="svg-tm" x="534" y="80">of_match_table lists ids</text>
+
+  <rect class="svg-box" x="20" y="112" width="220" height="52" rx="7"/>
+  <text class="svg-tb" x="34" y="134">struct device created</text>
+  <text class="svg-tm" x="34" y="152">added to the bus's device list</text>
+
+  <rect class="svg-box" x="520" y="112" width="220" height="52" rx="7"/>
+  <text class="svg-tb" x="534" y="134">struct device_driver added</text>
+  <text class="svg-tm" x="534" y="152">to the bus's driver list</text>
+
+  <rect class="svg-box-w" x="270" y="112" width="220" height="76" rx="7"/>
+  <text class="svg-tb" x="284" y="134">bus-&gt;match(dev, drv)</text>
+  <text class="svg-tm" x="284" y="156">compare compatible strings,</text>
+  <text class="svg-tm" x="284" y="174">PCI vendor/device IDs, etc.</text>
+
+  <rect class="svg-box-a" x="230" y="210" width="300" height="52" rx="7"/>
+  <text class="svg-tb" x="244" y="232">match -&gt; driver-&gt;probe(dev)</text>
+  <text class="svg-tm" x="244" y="250">your code runs; the device is now bound</text>
+
+  <rect class="svg-box-d" x="230" y="278" width="300" height="34" rx="6"/>
+  <text class="svg-tm" x="244" y="300">unbind / module unload -&gt; driver-&gt;remove(dev)</text>
+
+  <path class="svg-line" d="M130 90 L130 112 M630 90 L630 112 M240 145 L270 145 M490 145 L520 145 M380 188 L380 210 M380 262 L380 278"/>
+</svg>
+<figcaption>Matching. Neither side knows about the other until the bus pairs them — which is what makes one driver work on many boards.</figcaption>
+</figure>
+
+<div class="key">
+<b>Probe is the whole job</b>
+<p>Almost all driver work happens in <code>probe()</code>: get resources, map registers, request the IRQ,
+initialise the hardware, register with a subsystem. <code>remove()</code> undoes it in reverse. Everything
+else is the operational callbacks.</p>
+</div>
+
+<h2 id="types">The four driver shapes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Hardware</th><th>Discovery</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><strong>Character</strong></td><td>Anything with a byte-stream or ioctl interface</td><td>You create the device node</td><td>/dev/ttyS0, /dev/random, your custom device</td></tr>
+<tr><td><strong>Platform</strong></td><td>On-SoC, not self-describing</td><td>Device tree or ACPI</td><td>UART, I2C controller, GPIO block, your IP block</td></tr>
+<tr><td><strong>Discoverable bus</strong></td><td>PCI, USB</td><td>The bus enumerates and reports IDs</td><td>Network cards, storage controllers</td></tr>
+<tr><td><strong>Client bus</strong></td><td>I2C, SPI slaves</td><td>Device tree describes them (not discoverable)</td><td>Sensors, EEPROMs, touch controllers</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Most real drivers combine them: a platform driver that also registers a character device, or a PCI
+driver that registers with the network subsystem.</p>
+
+<h2 id="dt">Device tree</h2>
+
+<p>SoC peripherals cannot be probed — there is no way to ask an address whether a UART lives there. The
+device tree is a data structure, passed by the bootloader, that describes the hardware so that one kernel
+binary can support many boards.</p>
+
+<pre><code>/ {
+    compatible = "acme,eval-board", "acme,soc9000";
+    #address-cells = &lt;2&gt;;      /* addresses are 2 cells (64-bit) */
+    #size-cells = &lt;2&gt;;
+
+    soc {
+        compatible = "simple-bus";
+        ranges;                /* child addresses map 1:1 to parent */
+
+        uart0: serial@40000000 {
+            compatible = "acme,uart-v2", "ns16550a";
+            reg = &lt;0x0 0x40000000 0x0 0x1000&gt;;      /* base, size */
+            interrupts = &lt;GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH&gt;;
+            clocks = &lt;&amp;clk_uart&gt;;
+            clock-names = "baud";
+            status = "okay";
+        };
+
+        widget0: widget@40010000 {
+            compatible = "acme,widget-v1";
+            reg = &lt;0x0 0x40010000 0x0 0x100&gt;;
+            interrupts = &lt;GIC_SPI 45 IRQ_TYPE_EDGE_RISING&gt;;
+            clocks = &lt;&amp;clk_widget&gt;;
+            resets = &lt;&amp;rst 12&gt;;
+            dmas = &lt;&amp;dma0 5&gt;;
+            dma-names = "rx";
+            acme,fifo-depth = &lt;64&gt;;                 /* custom property */
+            acme,enable-turbo;                      /* boolean property */
+            reset-gpios = &lt;&amp;gpio1 7 GPIO_ACTIVE_LOW&gt;;
+        };
+    };
+};</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>Meaning</th><th>Read with</th></tr></thead>
+<tbody>
+<tr><td><code>compatible</code></td><td>Matching key, most specific first</td><td>The <code>of_match_table</code></td></tr>
+<tr><td><code>reg</code></td><td>Register block address and size</td><td><code>devm_platform_ioremap_resource()</code></td></tr>
+<tr><td><code>interrupts</code></td><td>Interrupt specifier</td><td><code>platform_get_irq()</code></td></tr>
+<tr><td><code>clocks</code>/<code>clock-names</code></td><td>Clock inputs</td><td><code>devm_clk_get()</code></td></tr>
+<tr><td><code>status</code></td><td><code>"okay"</code> or <code>"disabled"</code></td><td>Handled by the core</td></tr>
+<tr><td><code>vendor,property</code></td><td>Driver-specific config</td><td><code>device_property_read_u32()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># inspect the device tree on a running system
+ls /proc/device-tree/
+hexdump -C /proc/device-tree/soc/widget@40010000/reg
+dtc -I fs -O dts /proc/device-tree &gt; running.dts   # decompile the live tree
+
+# compile a .dts by hand
+dtc -I dts -O dtb -o board.dtb board.dts</code></pre>
+
+<div class="note">
+<b>Bindings are documentation with teeth</b>
+<p>Every <code>compatible</code> string needs a binding in
+<code>Documentation/devicetree/bindings/</code>, written as a YAML schema. <code>make dt_binding_check</code>
+and <code>make dtbs_check</code> validate your tree against it. Upstream will not accept a driver without one.</p>
+</div>
+
+<h2 id="platform">Anatomy of a platform driver</h2>
+
+<div class="codewrap"><div class="code-title">the complete skeleton — this is the shape of thousands of real drivers</div>
+<pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+#define REG_ID        0x00
+#define REG_CTRL      0x04
+#define REG_STATUS    0x08
+#define   STATUS_IRQ  BIT(0)
+
+struct widget {
+        struct device   *dev;
+        void __iomem    *regs;      /* mapped registers */
+        struct clk      *clk;
+        int              irq;
+        u32              fifo_depth;
+        spinlock_t       lock;
+};
+
+static irqreturn_t widget_isr(int irq, void *data)
+{
+        struct widget *w = data;
+        u32 status = readl(w-&gt;regs + REG_STATUS);
+
+        if (!(status &amp; STATUS_IRQ))
+                return IRQ_NONE;               /* shared IRQ: not ours */
+
+        writel(STATUS_IRQ, w-&gt;regs + REG_STATUS);   /* W1C: clear at source */
+        /* ... handle ... */
+        return IRQ_HANDLED;
+}
+
+static int widget_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct widget *w;
+        int ret;
+
+        w = devm_kzalloc(dev, sizeof(*w), GFP_KERNEL);
+        if (!w)
+                return -ENOMEM;
+        w-&gt;dev = dev;
+        spin_lock_init(&amp;w-&gt;lock);
+
+        /* 1. map the register block described by "reg" */
+        w-&gt;regs = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(w-&gt;regs))
+                return PTR_ERR(w-&gt;regs);
+
+        /* 2. clocks: the block is dead until it is clocked */
+        w-&gt;clk = devm_clk_get(dev, NULL);
+        if (IS_ERR(w-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(w-&gt;clk), "no clock\n");
+        ret = clk_prepare_enable(w-&gt;clk);
+        if (ret)
+                return ret;
+
+        /* 3. optional properties with sane defaults */
+        if (device_property_read_u32(dev, "acme,fifo-depth", &amp;w-&gt;fifo_depth))
+                w-&gt;fifo_depth = 32;
+
+        /* 4. interrupt */
+        w-&gt;irq = platform_get_irq(pdev, 0);
+        if (w-&gt;irq &lt; 0) {
+                ret = w-&gt;irq;
+                goto err_clk;
+        }
+        ret = devm_request_irq(dev, w-&gt;irq, widget_isr, 0, dev_name(dev), w);
+        if (ret)
+                goto err_clk;
+
+        /* 5. sanity-check the hardware is really there */
+        dev_info(dev, "widget id 0x%08x, fifo %u\n",
+                 readl(w-&gt;regs + REG_ID), w-&gt;fifo_depth);
+
+        platform_set_drvdata(pdev, w);
+        return 0;
+
+err_clk:
+        clk_disable_unprepare(w-&gt;clk);
+        return ret;
+}
+
+static void widget_remove(struct platform_device *pdev)
+{
+        struct widget *w = platform_get_drvdata(pdev);
+
+        writel(0, w-&gt;regs + REG_CTRL);       /* quiesce the hardware FIRST */
+        clk_disable_unprepare(w-&gt;clk);
+        /* devm_ resources are released automatically after this returns */
+}
+
+static const struct of_device_id widget_of_match[] = {
+        { .compatible = "acme,widget-v1" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, widget_of_match);
+
+static struct platform_driver widget_driver = {
+        .probe  = widget_probe,
+        .remove = widget_remove,
+        .driver = {
+                .name           = "acme-widget",
+                .of_match_table = widget_of_match,
+        },
+};
+module_platform_driver(widget_driver);
+
+MODULE_LICENSE("GPL");</code></pre></div>
+
+<div class="tip">
+<b>Two idioms worth copying forever</b>
+<ul>
+<li><code>devm_*</code> — resources are freed automatically when the device unbinds, even on an error path.
+This eliminates the most common class of driver leak.</li>
+<li><code>dev_err_probe()</code> — returns the error, logs it, and stays quiet if the error is
+<code>-EPROBE_DEFER</code>. Use it for every resource acquisition in probe.</li>
+</ul>
+</div>
+
+<h3>Deferred probe</h3>
+<p>Your driver may probe before the clock controller it depends on exists. Returning
+<code>-EPROBE_DEFER</code> tells the core "not yet, try me again later", and it will re-run probe once more
+drivers have loaded. This is how Linux resolves arbitrary dependency graphs without any explicit ordering.</p>
+
+<h2 id="mmio">Register access</h2>
+
+<pre><code>void __iomem *base = devm_platform_ioremap_resource(pdev, 0);
+
+u32 v = readl(base + REG_STATUS);     /* 32-bit read,  with a barrier  */
+writel(v | ENABLE, base + REG_CTRL);  /* 32-bit write, with a barrier  */
+readb/readw/readq   writeb/writew/writeq
+
+/* relaxed variants: no barrier, faster, use only when ordering does not matter */
+readl_relaxed()  writel_relaxed()
+
+/* poll a register until a condition holds, with a timeout */
+ret = readl_poll_timeout(base + REG_STATUS, val,
+                         val &amp; STATUS_READY,   /* condition */
+                         10,                   /* sleep 10 us between polls */
+                         1000);                /* give up after 1000 us */
+if (ret)
+        return -ETIMEDOUT;</code></pre>
+
+<div class="warn">
+<b>Why not just dereference the pointer?</b>
+<p><code>void __iomem *</code> is deliberately a distinct type that sparse checks. <code>readl()</code>/
+<code>writel()</code> add the memory barriers required by the ARM memory model
+(<a href="arm-architecture.html#barriers">chapter 03</a>) and handle endianness. A direct dereference gives
+you neither, and the resulting bug appears only under load on multi-core systems.</p>
+</div>
+
+<h3>Regmap</h3>
+<p>When a device is behind I2C or SPI, or has many registers, <code>regmap</code> gives a uniform API plus
+register caching and debugfs register dumps for free:</p>
+<pre><code>static const struct regmap_config widget_regmap = {
+        .reg_bits = 32, .val_bits = 32, .reg_stride = 4,
+        .max_register = 0xFF,
+        .cache_type = REGCACHE_RBTREE,
+};
+w-&gt;map = devm_regmap_init_mmio(dev, w-&gt;regs, &amp;widget_regmap);
+regmap_read(w-&gt;map, REG_STATUS, &amp;val);
+regmap_update_bits(w-&gt;map, REG_CTRL, ENABLE_MASK, ENABLE_MASK);</code></pre>
+
+<h2 id="chardev">Character devices — the user-space interface</h2>
+
+<p>A character device gives your driver a node in <code>/dev</code> that user space can
+<code>open</code>, <code>read</code>, <code>write</code>, <code>ioctl</code> and <code>poll</code>.</p>
+
+<pre class="diagram">   user: open("/dev/widget0", O_RDWR)
+        |
+        v
+   VFS looks up the inode -> sees a char device with major:minor
+        |
+        v
+   finds the registered cdev for that major
+        |
+        v
+   file-&gt;f_op = your struct file_operations
+        |
+        v
+   calls your .open()   — typically stashes your device struct in
+                          file-&gt;private_data so every later call can find it
+        |
+   read()  -> .read
+   write() -> .write
+   ioctl() -> .unlocked_ioctl
+   poll()  -> .poll
+   close() -> .release</pre>
+
+<div class="codewrap"><div class="code-title">registering a character device the modern way</div>
+<pre><code>static const struct file_operations widget_fops = {
+        .owner          = THIS_MODULE,
+        .open           = widget_open,
+        .release        = widget_release,
+        .read           = widget_read,
+        .write          = widget_write,
+        .unlocked_ioctl = widget_ioctl,
+        .poll           = widget_poll,
+        .llseek         = no_llseek,
+};
+
+/* in probe() */
+        ret = alloc_chrdev_region(&amp;w-&gt;devt, 0, 1, "widget");
+        if (ret)
+                return ret;
+
+        cdev_init(&amp;w-&gt;cdev, &amp;widget_fops);
+        w-&gt;cdev.owner = THIS_MODULE;
+        ret = cdev_add(&amp;w-&gt;cdev, w-&gt;devt, 1);
+        if (ret)
+                goto err_region;
+
+        /* the class makes udev create /dev/widget0 automatically */
+        w-&gt;class = class_create("widget");
+        device_create(w-&gt;class, dev, w-&gt;devt, w, "widget%d", 0);</code></pre></div>
+
+<h3>ioctl — defining a command interface</h3>
+<pre><code>/* put this in a header shared with user space */
+#define WIDGET_IOC_MAGIC  'W'
+#define WIDGET_RESET      _IO(WIDGET_IOC_MAGIC,  0)
+#define WIDGET_GET_STATS  _IOR(WIDGET_IOC_MAGIC, 1, struct widget_stats)
+#define WIDGET_SET_MODE   _IOW(WIDGET_IOC_MAGIC, 2, __u32)
+#define WIDGET_XCHG       _IOWR(WIDGET_IOC_MAGIC, 3, struct widget_xfer)
+
+static long widget_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+        struct widget *w = f-&gt;private_data;
+        void __user *up = (void __user *)arg;
+        struct widget_stats st;
+
+        if (_IOC_TYPE(cmd) != WIDGET_IOC_MAGIC)
+                return -ENOTTY;
+
+        switch (cmd) {
+        case WIDGET_RESET:
+                return widget_do_reset(w);
+
+        case WIDGET_GET_STATS:
+                widget_fill_stats(w, &amp;st);
+                if (copy_to_user(up, &amp;st, sizeof(st)))
+                        return -EFAULT;
+                return 0;
+
+        default:
+                return -ENOTTY;      /* the correct errno for an unknown ioctl */
+        }
+}</code></pre>
+
+<div class="warn">
+<b>ioctl struct design rules</b>
+<p>The structure is a permanent ABI. Use fixed-width types (<code>__u32</code>, not <code>int</code>), avoid
+pointers inside structs (or use <code>__u64</code> and cast, so 32-bit user space on a 64-bit kernel works),
+add explicit padding so the layout is identical on both, and include a version or size field so you can
+extend it later. Getting this wrong means a compat layer forever.</p>
+</div>
+
+<h2 id="sysfs">sysfs and debugfs</h2>
+
+<p>Not everything needs an ioctl. For simple values, an attribute file is far nicer — scriptable, greppable,
+self-documenting.</p>
+
+<pre><code>static ssize_t fifo_depth_show(struct device *dev,
+                               struct device_attribute *attr, char *buf)
+{
+        struct widget *w = dev_get_drvdata(dev);
+        return sysfs_emit(buf, "%u\n", w-&gt;fifo_depth);
+}
+static DEVICE_ATTR_RO(fifo_depth);
+
+static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
+                          const char *buf, size_t count)
+{
+        struct widget *w = dev_get_drvdata(dev);
+        u32 val;
+        int ret = kstrtou32(buf, 0, &amp;val);
+        if (ret)
+                return ret;
+        widget_set_mode(w, val);
+        return count;                     /* return the bytes consumed */
+}
+static DEVICE_ATTR_RW(mode);
+
+static struct attribute *widget_attrs[] = {
+        &amp;dev_attr_fifo_depth.attr,
+        &amp;dev_attr_mode.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(widget);
+/* then in the driver struct: .dev_groups = widget_groups  */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>sysfs</th><th>debugfs</th><th>procfs</th></tr></thead>
+<tbody>
+<tr><td>Rule</td><td>One value per file</td><td>Anything goes</td><td>Legacy; do not add new files</td></tr>
+<tr><td>Stability</td><td>It is ABI — must not break</td><td>No guarantees at all</td><td>ABI</td></tr>
+<tr><td>Use for</td><td>Configuration and status users depend on</td><td>Development, dumps, register views</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="irq">Interrupt handling in practice</h2>
+
+<pre><code>/* simple handler */
+ret = devm_request_irq(dev, irq, my_isr,
+                       IRQF_SHARED,        /* if the line is shared */
+                       dev_name(dev), w);
+
+/* threaded — preferred for anything non-trivial */
+ret = devm_request_threaded_irq(dev, irq, my_hard_isr, my_thread_fn,
+                                IRQF_ONESHOT, dev_name(dev), w);</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Return value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>IRQ_HANDLED</code></td><td>This was my device and I dealt with it</td></tr>
+<tr><td><code>IRQ_NONE</code></td><td>Not mine — essential on shared lines, or the core cannot detect a stuck interrupt</td></tr>
+<tr><td><code>IRQ_WAKE_THREAD</code></td><td>Wake the threaded handler</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Rules for handlers</h3>
+<ul>
+  <li><strong>Clear the interrupt at the device</strong>, not just at the GIC, or a level-triggered line
+  re-fires immediately (see <a href="arm-architecture.html#interrupts">chapter 03</a>).</li>
+  <li><strong>Cannot sleep.</strong> No mutex, no <code>GFP_KERNEL</code>, no <code>copy_to_user</code>,
+  no <code>msleep</code>.</li>
+  <li><strong>Keep it short.</strong> Acknowledge and defer. Long handlers destroy system latency.</li>
+  <li><strong>Use <code>spin_lock_irqsave</code></strong> in process context for data shared with the handler.</li>
+  <li><strong>Free the IRQ before the device can still raise one.</strong> In <code>remove()</code>, disable
+  interrupts at the device first, then release. <code>devm_</code> gets the order right for you.</li>
+</ul>
+
+<pre><code># is your handler actually being called?
+cat /proc/interrupts | grep widget
+# if the count never increases: wrong IRQ number, wrong trigger type in DT,
+# the device is not generating it, or the GIC has it masked</code></pre>
+
+<h2 id="dma">DMA in a driver</h2>
+
+<p>The full model is in <a href="smmu.html">chapter 05</a>. The driver-side summary:</p>
+
+<pre><code>/* 1. declare what your device can address */
+ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(48));
+
+/* 2a. coherent: long-lived structures like descriptor rings */
+w-&gt;ring = dma_alloc_coherent(dev, RING_SZ, &amp;w-&gt;ring_dma, GFP_KERNEL);
+
+/* 2b. streaming: one transfer, then hand the buffer back */
+dma_addr_t da = dma_map_single(dev, buf, len, DMA_FROM_DEVICE);
+if (dma_mapping_error(dev, da))
+        return -ENOMEM;
+
+writel(lower_32_bits(da), w-&gt;regs + REG_DMA_LO);
+writel(upper_32_bits(da), w-&gt;regs + REG_DMA_HI);
+writel(len,               w-&gt;regs + REG_DMA_LEN);
+writel(DMA_GO,            w-&gt;regs + REG_CTRL);
+/* ... wait for the completion interrupt ... */
+
+dma_unmap_single(dev, da, len, DMA_FROM_DEVICE);   /* now the CPU may read buf */
+
+/* scatter-gather for multi-page transfers */
+nents = dma_map_sg(dev, sgl, orig_nents, DMA_TO_DEVICE);
+for_each_sg(sgl, sg, nents, i)
+        program_descriptor(sg_dma_address(sg), sg_dma_len(sg));</code></pre>
+
+<div class="danger">
+<b>The four DMA rules</b>
+<ol>
+<li>Program the device with the <code>dma_addr_t</code>, never a virtual or physical address.</li>
+<li>Never DMA to stack memory or to <code>vmalloc</code> memory.</li>
+<li>Between map and unmap, the buffer belongs to the device. Use <code>dma_sync_single_for_cpu()</code> if
+you must peek.</li>
+<li>Stop the device before you unmap, on every path including error paths and <code>remove()</code>.</li>
+</ol>
+</div>
+
+<h2 id="pm">Power management</h2>
+
+<pre><code>static int widget_runtime_suspend(struct device *dev)
+{
+        struct widget *w = dev_get_drvdata(dev);
+        clk_disable_unprepare(w-&gt;clk);
+        return 0;
+}
+static int widget_runtime_resume(struct device *dev)
+{
+        struct widget *w = dev_get_drvdata(dev);
+        return clk_prepare_enable(w-&gt;clk);
+}
+
+static const struct dev_pm_ops widget_pm_ops = {
+        SET_RUNTIME_PM_OPS(widget_runtime_suspend, widget_runtime_resume, NULL)
+        SET_SYSTEM_SLEEP_PM_OPS(widget_suspend, widget_resume)
+};
+/* .driver.pm = &amp;widget_pm_ops */
+
+/* in your I/O paths */
+pm_runtime_get_sync(dev);      /* wake it up, refcount++ */
+   ... do the work ...
+pm_runtime_put_autosuspend(dev);   /* refcount--, idle after a delay */</code></pre>
+
+<p>Runtime PM is refcounted: the device sleeps when the count reaches zero. Getting the get/put pairing
+wrong gives you a device that either never sleeps (wasting power) or sleeps mid-transaction (aborts).</p>
+
+<h2 id="errors">Error handling patterns</h2>
+
+<pre><code>/* the classic goto ladder — idiomatic in the kernel */
+static int probe(struct platform_device *pdev)
+{
+        ret = step_one();
+        if (ret)
+                return ret;
+
+        ret = step_two();
+        if (ret)
+                goto err_one;
+
+        ret = step_three();
+        if (ret)
+                goto err_two;
+
+        return 0;
+
+err_two:
+        undo_two();
+err_one:
+        undo_one();
+        return ret;
+}
+
+/* ...or avoid the ladder entirely with devm_ */
+static int probe(struct platform_device *pdev)
+{
+        w-&gt;regs = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(w-&gt;regs))
+                return PTR_ERR(w-&gt;regs);
+        ret = devm_request_irq(dev, irq, isr, 0, name, w);
+        if (ret)
+                return ret;          /* the ioremap is released automatically */
+        return 0;
+}</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>errno</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>-ENOMEM</code></td><td>Allocation failed</td></tr>
+<tr><td><code>-EINVAL</code></td><td>Bad argument from user space or a bad DT property</td></tr>
+<tr><td><code>-ENODEV</code></td><td>Hardware not present or not responding</td></tr>
+<tr><td><code>-EPROBE_DEFER</code></td><td>A dependency is not ready; retry me later</td></tr>
+<tr><td><code>-EBUSY</code></td><td>Resource in use</td></tr>
+<tr><td><code>-ETIMEDOUT</code></td><td>The hardware did not respond in time</td></tr>
+<tr><td><code>-EFAULT</code></td><td><code>copy_to_user</code>/<code>copy_from_user</code> failed</td></tr>
+<tr><td><code>-ENOTTY</code></td><td>Unknown ioctl command</td></tr>
+<tr><td><code>-ERESTARTSYS</code></td><td>Interrupted by a signal while sleeping</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="checklist">Driver review checklist</h2>
+<ul class="checklist">
+  <li>Every <code>probe()</code> failure path releases what it acquired (or uses <code>devm_</code>).</li>
+  <li><code>remove()</code> quiesces the hardware <em>before</em> freeing anything.</li>
+  <li>No sleeping calls in interrupt context or under a spinlock.</li>
+  <li>All user pointers go through <code>copy_to_user</code>/<code>copy_from_user</code>.</li>
+  <li>All ioctl inputs are validated — lengths, indices, enum ranges.</li>
+  <li>Register access uses <code>readl</code>/<code>writel</code>, and MMIO is not mapped cacheable.</li>
+  <li>DMA uses <code>dma_addr_t</code> and the mapping API; buffers are never on the stack.</li>
+  <li>Shared IRQ handlers return <code>IRQ_NONE</code> when the interrupt was not theirs.</li>
+  <li><code>checkpatch.pl --strict</code> is clean, and <code>make C=1</code> (sparse) reports nothing.</li>
+  <li>Tested with lockdep, KASAN and <code>CONFIG_DEBUG_ATOMIC_SLEEP</code> enabled.</li>
+</ul>
+
+<p>Next: put all of it together in a driver you build and run —
+<a href="linux-project.html">Chapter 10, the Linux driver project</a>.</p>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

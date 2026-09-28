@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTOS primitives: queues, semaphores and ISR-safe APIs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>RTOS primitives: queues, semaphores and ISR-safe APIs</h1>
+<p class="lead">The <a href="track.html?t=mt">concurrency track</a> covers mutexes and condition variables in
+general. What is different on a microcontroller is that half your concurrency is with interrupts rather than
+tasks — and an interrupt cannot block, which changes every API it touches.</p>
+
+<h2 id="why">Why ISRs need their own API</h2>
+
+<pre class="diagram">   A TASK that cannot proceed BLOCKS: the kernel removes it
+   from the ready list and switches to someone else. It
+   resumes later, where it left off.
+
+   AN ISR CANNOT DO THIS. There is nothing to switch to -
+   an interrupt is not a schedulable entity, it has no TCB
+   and no stack of its own to preserve. Blocking in an ISR
+   would suspend whatever task happened to be interrupted,
+   which is not the ISR and has done nothing wrong.
+
+   So every kernel splits its API:
+
+     xQueueSend(q, &amp;item, portMAX_DELAY)
+        may block. TASK ONLY.
+
+     xQueueSendFromISR(q, &amp;item, &amp;woken)
+        never blocks; returns pdFAIL if full. ISR ONLY.
+
+   And the FromISR variants have an extra job: reporting
+   whether they made a higher-priority task ready, so the
+   ISR can request a context switch on the way out.
+
+     void UART_IRQHandler(void)
+     {
+         BaseType_t woken = pdFALSE;
+         xQueueSendFromISR(q, &amp;byte, &amp;woken);
+         portYIELD_FROM_ISR(woken);   /* sets PendSV if so  */
+     }
+
+   Omit that last line and the woken task waits until the
+   next tick - up to a full millisecond of latency, for no
+   reason, and only under some timings. It is a classic
+   intermittent-latency bug.</pre>
+
+<div class="danger">
+<b>The priority ceiling for ISR calls</b>
+<p>An ISR may only call kernel APIs if its priority is at or below <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code>
+(<a href="mcu-08-interrupt-priorities.html">chapter 08</a>). Above that line the kernel's
+<code>BASEPRI</code> critical sections do not block it, so it can interrupt the kernel mid-update and corrupt
+a list. The damage appears much later, in unrelated code. Keep <code>configASSERT</code> enabled in
+development — FreeRTOS checks this on every ISR API call and catches the mistake immediately rather than three
+weeks later.</p>
+</div>
+
+<h2 id="queue">The queue is the primitive you want</h2>
+
+<pre><code>/* A queue copies data and handles the blocking, the
+   waking, and the mutual exclusion in one object. Prefer
+   it over a shared buffer plus a semaphore almost always. */
+
+QueueHandle_t sensor_q;
+
+void app_init(void)
+{
+    sensor_q = xQueueCreate(10, sizeof(sensor_reading_t));
+}
+
+/* PRODUCER - an ISR. */
+void ADC_IRQHandler(void)
+{
+    BaseType_t woken = pdFALSE;
+    sensor_reading_t r = { .ts = g_ticks, .value = ADC1-&gt;DR };
+
+    /* Never blocks. If the queue is full the reading is
+       dropped, and that is a DESIGN DECISION you should
+       make explicitly - count the drops.                  */
+    if (xQueueSendFromISR(sensor_q, &amp;r, &amp;woken) != pdTRUE) {
+        g_dropped++;
+    }
+    portYIELD_FROM_ISR(woken);
+}
+
+/* CONSUMER - a task. */
+void sensor_task(void *arg)
+{
+    sensor_reading_t r;
+    for (;;) {
+        if (xQueueReceive(sensor_q, &amp;r, pdMS_TO_TICKS(100))) {
+            process(&amp;r);
+        } else {
+            handle_sensor_timeout();     /* the timeout is  */
+        }                                /* not optional    */
+    }
+}
+
+/* WHY A QUEUE BEATS A SHARED BUFFER:
+   - it COPIES, so there is no lifetime question about the
+     producer's data;
+   - the blocking receive means the consumer uses zero CPU
+     while waiting, which is what lets the system sleep;
+   - full and empty are handled once, correctly, rather
+     than in every caller;
+   - a timeout is available, so a stuck producer becomes a
+     reported error rather than a hang.
+
+   THE COST IS THE COPY. For large items, queue a POINTER
+   to a buffer from a pool instead - but then you own the
+   lifetime again, and the pool needs its own discipline. */
+</code></pre>
+
+<h2 id="semaphores">Semaphores, mutexes, and the difference that matters</h2>
+
+<pre><code>/* BINARY SEMAPHORE - signalling. No owner.
+   Use for: ISR says "something happened" to a task.        */
+SemaphoreHandle_t data_ready;
+
+void DMA1_IRQHandler(void) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(data_ready, &amp;woken);
+    portYIELD_FROM_ISR(woken);
+}
+void consumer(void *a) {
+    for (;;) {
+        xSemaphoreTake(data_ready, portMAX_DELAY);
+        process_buffer();
+    }
+}
+
+/* COUNTING SEMAPHORE - resource pools, or counting events
+   that may arrive faster than they are consumed.          */
+SemaphoreHandle_t slots = xSemaphoreCreateCounting(5, 5);
+
+/* MUTEX - mutual exclusion. HAS AN OWNER, and that is the
+   whole difference.                                       */
+SemaphoreHandle_t spi_lock = xSemaphoreCreateMutex();
+
+void use_spi(void) {
+    xSemaphoreTake(spi_lock, portMAX_DELAY);
+    spi_transfer(...);
+    xSemaphoreGive(spi_lock);
+}
+
+/* BECAUSE A MUTEX HAS AN OWNER IT CAN DO TWO THINGS A
+   SEMAPHORE CANNOT:
+
+   1. PRIORITY INHERITANCE. While a low-priority task holds
+      a mutex a high-priority task wants, the holder is
+      temporarily raised to the waiter's priority. This
+      bounds priority inversion - the failure that reset
+      Mars Pathfinder (see the concurrency track, chapter
+      15). A binary semaphore has no owner, so it cannot
+      do this, and using one for mutual exclusion silently
+      gives up the protection.
+
+   2. RECURSION. xSemaphoreCreateRecursiveMutex lets the
+      owner take it again without deadlocking.
+
+   THE RULE:
+     mutual exclusion -> MUTEX, always.
+     signalling       -> BINARY SEMAPHORE.
+   Using a semaphore as a lock is the single most common
+   RTOS design error, and it works fine until the day a
+   priority inversion costs you a deadline.
+
+   NEVER take a mutex from an ISR. There is no owner to
+   record, no priority to inherit, and no way to block.
+   There is deliberately no xSemaphoreTakeFromISR.         */
+</code></pre>
+
+<h2 id="notifications">Task notifications: the cheap path</h2>
+
+<pre><code>/* A direct-to-task signal with no separate kernel object.
+   Roughly 45x faster than a semaphore and it costs no RAM
+   beyond a word already in the TCB.                       */
+
+void DMA1_IRQHandler(void)
+{
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(dma_task_handle, &amp;woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+void dma_task(void *arg)
+{
+    for (;;) {
+        /* pdTRUE = clear the count on exit, i.e. act as a
+           binary semaphore.                                */
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500))) {
+            process_buffer();
+        } else {
+            dma_timeout_recovery();
+        }
+    }
+}
+
+/* THE LIMITATION that decides whether you can use it: a
+   notification targets ONE SPECIFIC TASK. There is no
+   broadcast and no queueing of senders. If two tasks might
+   wait for the same event, or the sender does not know the
+   receiver, use a semaphore or queue.
+
+   For the extremely common ISR-to-one-task pattern -
+   which is most of embedded signalling - notifications are
+   strictly better and under-used.                         */
+</code></pre>
+
+<h2 id="choosing">Choosing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Not</th></tr></thead>
+<tbody>
+<tr><td>ISR hands data to one task</td><td>Queue, or notification if the data fits in a word</td><td>A global
+plus a flag</td></tr>
+<tr><td>ISR signals one known task</td><td>Task notification</td><td>Semaphore — slower, more RAM</td></tr>
+<tr><td>ISR signals whichever task is waiting</td><td>Binary semaphore</td><td>Notification — it needs a
+specific target</td></tr>
+<tr><td>Protect a shared peripheral</td><td>Mutex</td><td>Binary semaphore — no priority inheritance</td></tr>
+<tr><td>Limit concurrent users of a pool</td><td>Counting semaphore</td><td>A hand-rolled counter</td></tr>
+<tr><td>Wait for several conditions</td><td>Event group</td><td>Several semaphores and polling</td></tr>
+<tr><td>Producer/consumer of large buffers</td><td>Queue of pointers plus a pool</td><td>Queue of the buffers
+themselves — the copy cost</td></tr>
+<tr><td>Mutual exclusion inside an ISR</td><td>Disable interrupts briefly</td><td>Any kernel object — ISRs
+cannot block</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Latency sometimes a full tick longer than expected</td><td><code>portYIELD_FROM_ISR</code> omitted
+after a <code>FromISR</code> call</td></tr>
+<tr><td>Kernel lists corrupt after hours of running</td><td>An ISR above the syscall priority called a kernel
+API</td></tr>
+<tr><td><code>configASSERT</code> fires on an ISR API call</td><td>Exactly that, caught early — fix the
+priority</td></tr>
+<tr><td>System hangs when a task holds a lock</td><td>Blocking API called from an ISR, or a mutex taken
+recursively without the recursive variant</td></tr>
+<tr><td>A high-priority task misses deadlines under load</td><td>Binary semaphore used for mutual exclusion —
+no priority inheritance</td></tr>
+<tr><td>Queue sends fail silently under burst load</td><td>Queue full and the return value ignored — count the
+drops</td></tr>
+<tr><td>Task waits forever</td><td><code>portMAX_DELAY</code> with no timeout path; a lost signal is
+unrecoverable</td></tr>
+<tr><td>Data corrupt when queueing pointers</td><td>Producer freed or reused the buffer before the consumer
+finished</td></tr>
+<tr><td>Notification lost when two tasks wait</td><td>Notifications target one task only</td></tr>
+<tr><td>Everything works until a third task is added</td><td>An implicit assumption about who runs when —
+usually a missing lock</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why an ISR cannot block, in terms of what blocking actually does.</li>
+  <li>Say what the extra out-parameter of a <code>FromISR</code> call is for.</li>
+  <li>Describe the bug caused by omitting <code>portYIELD_FROM_ISR</code>.</li>
+  <li>State the priority rule for ISRs that call kernel APIs, and why.</li>
+  <li>Give three reasons a queue beats a shared buffer plus a flag.</li>
+  <li>State the two capabilities a mutex has that a binary semaphore lacks.</li>
+  <li>Explain why there is no <code>xSemaphoreTakeFromISR</code>.</li>
+  <li>Say when a task notification is the right choice and when it is not.</li>
+  <li>Explain the risk of queueing pointers rather than data.</li>
+  <li>Give the correct mutual-exclusion mechanism inside an ISR.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

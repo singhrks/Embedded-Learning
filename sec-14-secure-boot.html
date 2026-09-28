@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secure boot and the chain of trust | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Secure boot and the chain of trust</h1>
+<p class="lead">Every protection in this track assumes the right software is running. Secure boot is what
+makes that assumption true — a chain from immutable silicon to the kernel, where each link verifies the next
+before giving it control.</p>
+
+<h2 id="why">Why it comes first</h2>
+
+<p>Every protection in this track assumes the software enforcing it is the software you intended to run. Secure boot is what makes that assumption true, and without it everything above rests on nothing.</p>
+
+<pre class="diagram">TrustZone, the SMMU, the TZASC, the XPU - every one of them is
+CONFIGURED BY SOFTWARE at boot.
+
+  So an attacker who controls the first instruction controls
+  everything after it. They can:
+        set SCR_EL3.NS = 0 and run their own code as "secure"
+        leave the TZASC default region wide open
+        skip the SMMU setup entirely
+        never lock the configuration registers
+        assert the debug signals
+        load a trusted OS of their own
+
+  and every mechanism in chapters 01-13 evaporates.
+
+  The chain of trust exists to make "the first instruction is
+  the one the vendor intended" a property of the SILICON rather
+  than a hope.</pre>
+
+<h2 id="chain">The chain</h2>
+
+<p>Each stage verifies the next before handing over control, so that trust extends from something immutable up to the operating system. A single unverified link breaks the entire chain.</p>
+
+<pre class="diagram">  +---------------------------------------------------------+
+  |  BL1 - BOOT ROM                    IMMUTABLE, in silicon |
+  |  the Root of Trust. Cannot be changed, ever.             |
+  |  Holds, or reads from fuses, the ROTPK hash.             |
+  +----------------------+----------------------------------+
+                         | verifies signature of
+                         v
+  +---------------------------------------------------------+
+  |  BL2 - trusted boot firmware                             |
+  |  sets up DRAM, the TZASC carve-outs, loads the rest      |
+  +------+---------------+---------------+------------------+
+         | verifies      | verifies      | verifies
+         v               v               v
+  +-------------+ +---------------+ +-------------------+
+  | BL31   EL3  | | BL32   S-EL1  | | BL33  normal world|
+  | the monitor | | OP-TEE        | | U-Boot / UEFI     |
+  +-------------+ +---------------+ +---------+---------+
+                                              | verifies
+                                              v
+                                    +-------------------+
+                                    | Linux kernel +    |
+                                    | initramfs + DTB   |
+                                    +---------+---------+
+                                              | verifies
+                                              v
+                                    +-------------------+
+                                    | dm-verity rootfs  |
+                                    | IMA, signed       |
+                                    | modules           |
+                                    +-------------------+
+
+  THE RULE, at every link:
+        VERIFY, THEN EXECUTE.
+  Never the other way round, and never partially.</pre>
+
+<div class="key">
+<b>The chain is only as strong as its weakest link — and its anchor</b>
+<p>A chain that verifies BL2, BL31 and BL32 perfectly but loads BL33 unverified is not a chain of trust; it
+is a chain of trust that ends early, and everything the normal world does afterwards is unconstrained. The
+value comes from it being <em>unbroken</em>, from an anchor that cannot be replaced.</p>
+</div>
+
+<h2 id="root">The root of trust</h2>
+
+<p>The chain has to start somewhere that cannot be modified, which in practice means mask ROM and fuses. What exactly is immutable, and what merely looks it, is worth establishing precisely for any given platform.</p>
+
+<pre><code>/* Two things must be immutable, or the whole structure is
+   circular:
+
+   1. THE FIRST CODE - the boot ROM. Mask ROM, fixed at
+      fabrication. It cannot be patched, which means a bug in
+      it is unfixable in the field - which is why boot ROMs are
+      tiny and are formally reviewed.
+
+   2. THE ROOT KEY - or rather its hash. Full public keys are
+      large; fuses are scarce. So the fuses hold
+
+           ROTPK_HASH = SHA-256(root public key)
+
+      typically 256 bits. At boot:
+           read the root public key from the image header
+           hash it
+           compare with the fuses
+           if they differ, STOP
+           otherwise use it to verify the next stage's signature
+
+      Storing only the hash means the key itself can be large
+      (RSA-4096, or an ECDSA P-384 point) while costing 32 bytes
+      of OTP.                                                */
+
+/* WHY FUSES and not flash: fuses are one-time-programmable.
+   Blowing them is physical and irreversible. Flash can be
+   rewritten by anything that can write flash - which is
+   exactly the attacker you are defending against.          */
+
+/* LIFECYCLE: parts ship BLANK (no ROTPK, secure boot off) so
+   they can be developed on, and are moved to SECURED during
+   manufacturing by blowing the ROTPK and the enable fuse. That
+   transition is one-way. Get the key wrong and the part is
+   scrap - which is why key provisioning is done by a small
+   number of very careful people.                           */</code></pre>
+
+<h2 id="verify">What "verify" means</h2>
+
+<p>Each verification is a signature check, and the details — which key, over what exactly, and what happens on failure — are where real implementations differ and where real vulnerabilities have been found.</p>
+
+<pre><code>/* Signature verification, at each link: */
+
+   1. parse the image header - WITHOUT trusting its contents
+   2. extract the certificate / public key
+   3. hash that key, compare against the trusted anchor
+        (the ROTPK for BL2; a key delegated by it thereafter)
+   4. hash the image payload
+   5. verify signature(hash, public key)
+   6. check the ROLLBACK COUNTER in the header against the
+      fused monotonic counter
+   7. only now: map it executable and branch to it
+
+/* STEP 1 IS WHERE BUGS LIVE. The header is attacker-controlled
+   data being parsed by the most privileged code in the system,
+   before any verification has happened. Every field is
+   hostile:
+
+        length fields          -> integer overflow, then a
+                                  buffer overflow in the ROM
+        offsets                -> read or write out of bounds
+        counts                 -> unbounded loops
+        algorithm identifiers  -> "algorithm: none"
+        key sizes              -> a 1-bit RSA key
+
+   Real boot ROM exploits - across several vendors, on hundreds
+   of millions of devices - have almost all been header parsing
+   bugs, not cryptographic breaks.                          */
+
+/* And the classic logic bug:
+
+        if (verify_signature(img) == 0)      /* WRONG WAY UP  */
+                boot(img);                   /* 0 = failure?  */
+
+   or a verify function that returns success on an error path,
+   or one whose result is never checked at all. Fail closed
+   (chapter 01): the ONLY path to boot() should be through a
+   positive confirmation.                                   */</code></pre>
+
+<h2 id="rollback">Rollback protection</h2>
+
+<p>Verifying a signature proves an image is authentic, not that it is current. Without anti-rollback, an attacker installs a genuine but vulnerable old version — which is a signed, valid image.</p>
+
+<pre class="diagram">Version 1.0 has a remote-code-execution bug. You ship 1.1.
+The attacker installs 1.0 again. It is CORRECTLY SIGNED - your
+signature check happily accepts it.
+
+  Signatures prove authenticity, never freshness. You need a
+  MONOTONIC COUNTER.
+
+     fuses hold:   nv_counter = 3
+     image header: nv_version = 3     -> accept
+     image header: nv_version = 2     -> REJECT, too old
+     image header: nv_version = 4     -> accept, and BURN the
+                                         counter to 4
+
+  Counters are usually implemented as a fuse bank blown one bit
+  at a time - 32 fuses give 32 increments. They are FINITE, so:
+
+     · do not increment for every release. Increment only when
+       a fixed vulnerability makes the old version dangerous.
+     · burn the counter only after the new image has proven it
+       BOOTS. Burn first and a failed update bricks the device.
+     · a device that skipped several versions must still accept
+       the newest; compare >= , never == .
+
+  Same problem, same shape as secure storage freshness
+  (chapter 13). Cryptography cannot solve it; monotonic
+  hardware state can.</pre>
+
+<h2 id="tfa">Trusted Board Boot in TF-A</h2>
+
+<p>The reference firmware implementation for ARM systems provides most of this chain, and knowing which of its stages does what is necessary to configure it correctly.</p>
+
+<pre><code># Arm's reference implementation. Build with verification on:
+
+make PLAT=qemu \
+     TRUSTED_BOARD_BOOT=1 \
+     GENERATE_COT=1 \
+     ARM_ROTPK_LOCATION=devel_rsa \
+     ROT_KEY=plat/arm/board/common/rotpk/arm_rotprivk_rsa.pem \
+     BL33=u-boot.bin \
+     all fip
+
+# TRUSTED_BOARD_BOOT=1   turn on verification
+# GENERATE_COT=1         build the certificate chain
+# ARM_ROTPK_LOCATION     where the ROTPK hash comes from
+# ROT_KEY                the private root key (an HSM in
+#                        production - never a file in the tree)
+
+# The output FIP (Firmware Image Package) contains the images
+# AND the certificates:
+
+   fiptool info fip.bin
+
+   Trusted Boot Firmware BL2: offset=0x...
+   Trusted key certificate: offset=0x...
+   SoC Firmware key certificate: offset=0x...
+   SoC Firmware BL31: offset=0x...
+   Trusted OS key certificate: offset=0x...
+   Trusted OS BL32: offset=0x...
+   Non-Trusted Firmware key certificate: offset=0x...
+   Non-Trusted Firmware BL33: offset=0x...
+
+# The CHAIN OF TRUST is expressed as X.509 certificates: the
+# root key signs a "trusted key certificate" containing two
+# delegated keys, those sign per-image key certificates, and
+# those sign content certificates carrying the image HASHES.
+
+# WHY THE INDIRECTION: the root key can stay in a vault and be
+# used once. Day-to-day signing uses the delegated keys, which
+# can be rotated without touching fuses.</code></pre>
+
+<h2 id="uboot">Handing off to Linux</h2>
+
+<p>The normal-world bootloader continues the chain into the operating system, and its verification must be enabled deliberately — the default configuration usually does not verify anything.</p>
+
+<pre><code># U-Boot verifies the kernel using FIT images and a public key
+# compiled into its own device tree - which was itself verified
+# by BL2, which was verified by the ROM.
+
+# 1. describe what to sign:
+/dts-v1/;
+/ {
+    images {
+        kernel {
+            data = /incbin/("Image.gz");
+            type = "kernel";  arch = "arm64";  os = "linux";
+            compression = "gzip";
+            load = &lt;0x40080000&gt;;  entry = &lt;0x40080000&gt;;
+            hash { algo = "sha256"; };
+        };
+        fdt {
+            data = /incbin/("board.dtb");
+            type = "flat_dt";  arch = "arm64";
+            compression = "none";
+            hash { algo = "sha256"; };
+        };
+    };
+    configurations {
+        default = "conf";
+        conf {
+            kernel = "kernel";  fdt = "fdt";
+            signature {
+                algo = "sha256,rsa2048";
+                key-name-hint = "prod";
+                sign-images = "kernel", "fdt";
+            };
+        };
+    };
+};
+
+# 2. sign, embedding the public key into U-Boot's control DTB:
+mkimage -f kernel.its -k keys/ -K u-boot.dtb -r kernel.itb
+
+# 3. U-Boot must be built with CONFIG_FIT_SIGNATURE=y and
+#    CONFIG_LEGACY_IMAGE_FORMAT=n - otherwise it will happily
+#    boot an unsigned legacy image and the chain ends here.
+
+# NOTE sign-images includes the FDT. An attacker who can change
+# the device tree can add "init=/bin/sh" via bootargs, remap
+# memory, or disable the SMMU node. The DTB is as security
+# critical as the kernel.</code></pre>
+
+<div class="warn">
+<b>The chain usually breaks at the last link</b>
+<p>Verified firmware, verified U-Boot, verified kernel — and then an unverified root filesystem, an
+unsigned kernel module, an attacker-editable <code>bootargs</code>, or a debug U-Boot console that accepts
+<code>tftpboot</code>. All of the effort upstream buys nothing if the kernel then loads whatever is on
+<code>/dev/mmcblk0p5</code>.</p>
+</div>
+
+<h2 id="rootfs">Extending it into Linux</h2>
+
+<p>Verification that stops at the kernel leaves the entire filesystem unprotected. Extending it further requires a mechanism that can verify data lazily, as it is read, rather than all at once.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Protects</th><th>How</th></tr></thead>
+<tbody>
+<tr><td><strong>dm-verity</strong></td><td>A read-only rootfs</td><td>Merkle tree over the block device; the root hash is on the verified kernel command line. Every block is checked <em>when read</em>, so tampering is caught even after boot.</td></tr>
+<tr><td><strong>fs-verity</strong></td><td>Individual files on a writable fs</td><td>Per-file Merkle tree; good for APKs and large read-only assets.</td></tr>
+<tr><td><strong>IMA / EVM</strong></td><td>Arbitrary files</td><td>Measures or appraises on open, against signatures in xattrs.</td></tr>
+<tr><td><strong>Module signing</strong></td><td>Kernel modules</td><td><code>CONFIG_MODULE_SIG_FORCE=y</code>; otherwise a module <em>is</em> arbitrary kernel code.</td></tr>
+<tr><td><strong>Kernel lockdown</strong></td><td>The running kernel</td><td>Blocks <code>/dev/mem</code>, kexec of unsigned images, some BPF, raw MSR/port access.</td></tr>
+<tr><td><strong>Encrypted or authenticated <code>/data</code></strong></td><td>Mutable state</td><td>dm-crypt with a key from the TEE, so it is device-bound (<a href="sec-13-trusted-apps.html">ch. 13</a>).</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># dm-verity, put together:
+
+veritysetup format rootfs.img hash.img
+  # prints: Root hash: a1b2c3...
+
+# the root hash goes on the KERNEL COMMAND LINE, which is
+# signed as part of the FIT configuration - so the hash itself
+# is anchored to the ROM:
+
+  dm-mod.create="vroot,,,ro,0 &lt;sectors&gt; verity 1 \
+        /dev/mmcblk0p3 /dev/mmcblk0p4 4096 4096 \
+        &lt;datablocks&gt; 1 sha256 &lt;roothash&gt; &lt;salt&gt;" \
+  root=/dev/dm-0 ro
+
+# Now every block read from the rootfs is verified against the
+# tree, whose root is verified by the kernel, which was
+# verified by U-Boot, which was verified by BL2, which was
+# verified by the ROM against a hash in a fuse.
+
+# THE CHAIN IS COMPLETE. Any single byte changed anywhere on
+# that path is detected.</code></pre>
+
+<h2 id="measured">Measured boot: the other kind</h2>
+
+<p>An alternative to refusing to boot: record what was actually loaded, so that a remote party can decide whether to trust the device. The two approaches answer different questions and are often combined.</p>
+
+<pre class="diagram">VERIFIED boot   refuses to run software that is not signed.
+                Enforcement is local and immediate.
+
+MEASURED boot   runs anything, but RECORDS what it ran into a
+                tamper-evident log, so a remote party can decide
+                whether to trust the result.
+
+  Each stage extends a hash into a PCR before executing:
+
+        PCR[n] = SHA256( PCR[n] || SHA256(next_stage) )
+
+  Extend-only, so the sequence cannot be rewritten - only
+  appended to, and any different software produces a different
+  final value.
+
+  Then ATTESTATION: a remote server sends a nonce, the device
+  returns the PCR values plus the log, signed by a key that
+  only genuine hardware holds. The server decides whether that
+  configuration may access the service.
+
+  Stored in a TPM (PCRs 0-23) on PC-class hardware, or in the
+  TEE on Arm - which is one of the best reasons to have a TEE
+  at all (chapter 13's attestation key, used here).
+
+  Most real products want BOTH: verified boot to stop local
+  tampering, measured boot so the back end can tell what it is
+  talking to.</pre>
+
+<h2 id="dev">Living with it during development</h2>
+
+<div class="tip">
+<b>Keep a development path, and make it obviously different</b>
+<ul>
+<li>Use <strong>development keys</strong> on dev boards, production keys only in the factory. Never let a
+production private key exist outside an HSM.</li>
+<li>Support <strong>unlocking</strong> — a signed token, tied to the device ID, that permits unsigned images.
+Wipe the device keys when it is used, so unlocking cannot expose user data.</li>
+<li>Make the state <strong>visible</strong>: a boot message, a screen, an API. Android's yellow/orange boot
+warnings exist for this.</li>
+<li>Never ship a build that <em>skips</em> verification on a flag — that flag will be found. Ship a build
+whose verification uses a different key.</li>
+<li>Test the <strong>negative cases</strong> in CI: flip one bit in each image and assert that boot stops at
+the right stage. An unexercised check is an unknown check.</li>
+</ul>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device is silent, no UART output at all</td><td>ROM rejected BL2 — signature, ROTPK mismatch, or a corrupt header</td></tr>
+<tr><td><code>Failed to verify</code> then reset loop</td><td>Wrong signing key, or the image changed after signing</td></tr>
+<tr><td>Boots after signing but not after a rebuild</td><td>Signing not wired into the build — the FIP contains the old certificate</td></tr>
+<tr><td>Boots on one board, not another</td><td>Different ROTPK fused; boards from different production runs</td></tr>
+<tr><td>Older, valid firmware refuses to boot</td><td>Rollback counter already burned — working as designed</td></tr>
+<tr><td>Update bricks the device</td><td>Counter burned before the new image was known to boot</td></tr>
+<tr><td>Firmware verified, but any rootfs boots</td><td>Chain ends at the kernel — no dm-verity</td></tr>
+<tr><td>Verified boot bypassed via the command line</td><td><code>bootargs</code> or the DTB not covered by the signature</td></tr>
+<tr><td>Attacker loads a module</td><td><code>MODULE_SIG_FORCE</code> not set</td></tr>
+<tr><td>Signature check passes on a corrupted image</td><td>Return value inverted or unchecked — audit that code path by hand</td></tr>
+<tr><td>Part accepts unsigned images in the field</td><td>Lifecycle state never advanced to SECURED in manufacturing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why secure boot is a precondition for every other mechanism in this track.</li>
+  <li>Draw the chain from boot ROM to root filesystem, naming what verifies what.</li>
+  <li>Explain why the fuses hold a hash of the root key rather than the key.</li>
+  <li>List the steps of one verification and say which one attackers target most.</li>
+  <li>Explain why signatures alone cannot stop a downgrade, and how counters fix it.</li>
+  <li>State the two rules for burning a rollback counter safely.</li>
+  <li>Describe TF-A's certificate chain and why the root key is delegated.</li>
+  <li>Explain why the device tree must be covered by the signature.</li>
+  <li>Set up dm-verity and say where its root hash is anchored.</li>
+  <li>Contrast verified boot with measured boot, and say why products want both.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>I/O, buses and interconnects | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>I/O, buses and interconnects</h1>
+<p class="lead">A CPU that cannot talk to the world is a heater. This chapter covers how software reaches a
+device, the three ways data moves, and what actually travels on the wires between blocks — which turns out
+to matter enormously for security.</p>
+
+<h2 id="mmio">How software reaches a device</h2>
+
+<p>Two historical approaches. Only one survives in modern designs.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Port-mapped I/O</th><th>Memory-mapped I/O</th></tr></thead>
+<tbody>
+<tr><td>Address space</td><td>Separate, small (x86: 64 KB)</td><td>Shared with memory</td></tr>
+<tr><td>Instructions</td><td>Dedicated: <code>IN</code>, <code>OUT</code></td><td>Ordinary <code>LDR</code>/<code>STR</code></td></tr>
+<tr><td>Protection</td><td>A separate permission mechanism</td><td>The MMU, for free</td></tr>
+<tr><td>Used by</td><td>Legacy x86 only</td><td><strong>ARM, RISC-V, and everything modern</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Memory-mapped I/O</b>
+<p>Peripheral registers are assigned addresses in the same physical address space as DRAM. Writing to a UART
+is the same instruction as writing to RAM; only the address differs. Everything follows from this: device
+access is protected by page tables, translated by the MMU, and subject to the same memory-attribute rules as
+any other access.</p>
+</div>
+
+<pre class="diagram">A physical memory map is a static, chip-designer decision
+
+  0x0000_0000  +--------------------------+
+               |  Boot ROM                |
+  0x1000_0000  +--------------------------+
+               |  On-chip SRAM            |
+  0x4000_0000  +--------------------------+
+               |  Peripheral region       |
+               |    0x4000_0000  UART0    |   each block usually gets
+               |    0x4000_1000  UART1    |   at least one 4 KB page,
+               |    0x4000_2000  I2C0     |   so it can be mapped and
+               |    0x4800_0000  GIC      |   protected independently
+  0x8000_0000  +--------------------------+
+               |  DRAM                    |
+               +--------------------------+
+
+The 4 KB granularity is not an accident: it is the page size, so that
+one driver can be given exactly one peripheral and nothing else.</pre>
+
+<h3>Why MMIO must not be cached</h3>
+
+<pre><code>/* Device registers are not memory. They have SIDE EFFECTS. */
+
+status = regs-&gt;FIFO;    /* reading POPS a byte from the FIFO      */
+regs-&gt;CTRL = START;     /* writing STARTS a physical operation    */
+n = regs-&gt;COUNT;        /* the value changes without any write    */
+
+/* If this region were cached and speculatable:
+     - a speculative read could drain a FIFO nobody asked to read
+     - a cached read would return a stale count forever
+     - a write could sit in a dirty line and never reach the device
+     - two writes could be merged, or reordered
+
+   Hence a distinct memory TYPE (ARM: Device-nGnRnE), not merely
+   "uncached". See ARM chapter 11.                                */
+
+/* And hence: never dereference an MMIO pointer directly. */
+u32 v = readl(base + STATUS);       /* Linux                       */
+writel(v | ENABLE, base + CTRL);    /* includes the right barriers */</code></pre>
+
+<h2 id="three-ways">The three ways data moves</h2>
+
+<p>Getting data between a processor and a device is not one mechanism but three, and they differ enormously in how much processor time they consume. Choosing correctly is one of the central decisions in driver design.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Polling</th><th>Interrupts</th><th>DMA</th></tr></thead>
+<tbody>
+<tr><td>Mechanism</td><td>CPU spins reading a status bit</td><td>Device signals; CPU takes an exception</td><td>Device moves data to/from memory itself</td></tr>
+<tr><td>CPU cost</td><td>100% while waiting</td><td>Only on events, plus entry/exit overhead</td><td>Near zero; one interrupt on completion</td></tr>
+<tr><td>Latency</td><td>Lowest and most deterministic</td><td>Interrupt latency, typically µs</td><td>Setup cost amortised over a large transfer</td></tr>
+<tr><td>Best for</td><td>Very short waits; early boot before interrupts exist; hard real-time</td><td>Most peripherals</td><td>Bulk: network, storage, display, cameras</td></tr>
+<tr><td>Hazard</td><td>Wastes power; can hang forever — always bound the loop</td><td>Storms if you fail to clear at the source</td><td>Coherency and address translation</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* polling, done correctly - ALWAYS with a timeout */
+ret = readl_poll_timeout(base + STATUS, val,
+                         val &amp; STATUS_READY,   /* condition            */
+                         10,                   /* µs between polls     */
+                         1000);                /* µs before giving up  */
+if (ret)
+        return -ETIMEDOUT;      /* the device is wedged; say so
+                                   rather than hanging the kernel */</code></pre>
+
+<h3>Why DMA changes everything</h3>
+
+<pre class="diagram">Without DMA                      With DMA
+
+  device -> CPU register           device -> memory, directly
+         -> memory                 CPU is not involved at all
+
+  every byte costs instructions    one setup + one interrupt
+
+But now a SECOND entity issues addresses onto the interconnect, and
+it never passed through the CPU's MMU. Two consequences:
+
+  1. COHERENCY. The device sees DRAM; the CPU sees its cache.
+     (chapter 15)
+
+  2. PROTECTION. Every isolation guarantee built with page tables
+     has a hole in it, because the device's transactions were never
+     checked. This is why the IOMMU/SMMU exists.
+     (security track, chapters 02-07)</pre>
+
+<h2 id="topology">Bus topologies</h2>
+
+<p>How devices are physically connected determines who can talk to whom, how bandwidth is shared and what happens when one device misbehaves. The industry has moved decisively in one direction here, and knowing why explains most modern bus design.</p>
+
+<pre class="diagram">Shared bus            one set of wires, arbitration decides who drives
+                      + simple, cheap, easy to snoop
+                      - one transaction at a time; does not scale
+                      e.g. classic AHB, I2C, older PCI
+
+Crossbar              every master connected to every slave
+                      + full parallelism between disjoint pairs
+                      - area grows as N x M
+                      e.g. small AXI interconnects
+
+Network on chip       routers and links, packets find their way
+  (NoC / mesh)        + scales to dozens of masters
+                      - variable latency, needs flow control
+                      e.g. ARM CMN, CHI-based fabrics
+
+Point to point        dedicated serial links, switched
+  (serial)            + very high bandwidth per pin, hot-pluggable
+                      - protocol complexity, serialisation latency
+                      e.g. PCIe, USB, Ethernet</pre>
+
+<h3>Parallel gave way to serial</h3>
+
+<p>Counter-intuitively, one differential pair beats 64 parallel wires. Parallel buses are limited by
+<em>skew</em> — bits on different wires arrive at slightly different times, and the clock period must exceed
+the worst skew. Serial links embed the clock in the data, eliminating skew entirely, and then use equalisation
+and error correction to push the rate far higher. This is why PCIe replaced PCI, SATA replaced PATA, and
+USB replaced the parallel port.</p>
+
+<h2 id="amba">AMBA: the ARM family</h2>
+
+<p>Inside an ARM system-on-chip the connections between blocks follow one family of standards. You will meet these names constantly in datasheets and device trees, and knowing which is used where tells you what performance to expect.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Protocol</th><th>Character</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><strong>APB</strong></td><td>Simple, no bursts, one transfer at a time, low power</td><td>Slow peripheral registers: UART, I2C, GPIO, timers</td></tr>
+<tr><td><strong>AHB</strong></td><td>Single shared bus, pipelined, supports bursts</td><td>Simpler SoCs, Cortex-M systems</td></tr>
+<tr><td><strong>AXI</strong></td><td>Five independent channels, out-of-order via IDs, high throughput</td><td>The workhorse: memory controllers, DMA, GPU</td></tr>
+<tr><td><strong>ACE</strong></td><td>AXI plus coherency snooping</td><td>Coherent CPU clusters</td></tr>
+<tr><td><strong>ACE-Lite</strong></td><td>Can snoop others but is not snooped</td><td>I/O-coherent DMA masters</td></tr>
+<tr><td><strong>CHI</strong></td><td>Packet-based, scalable mesh, credit flow control</td><td>Large multi-core and server-class SoCs</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">AXI's five channels are independent, which is the whole point
+
+  master                                          slave
+    |--- AW: write address ------------------------->|
+    |--- W:  write data ---------------------------->|
+    |<-- B:  write response -------------------------|
+    |--- AR: read address -------------------------->|
+    |<-- R:  read data ------------------------------|
+
+Because address and data are separate channels, a master can issue
+many addresses before any data returns - OUTSTANDING TRANSACTIONS.
+Because responses carry an ID, they may return OUT OF ORDER.
+
+This is how a memory system hides 200-cycle DRAM latency: keep
+dozens of requests in flight rather than waiting for each.</pre>
+
+<h3>What travels besides address and data</h3>
+
+<div class="danger">
+<b>This list is the foundation of the entire security track</b>
+<p>An AXI transaction carries far more than an address:</p>
+<ul>
+<li><code>AxADDR</code> — the physical address.</li>
+<li><code>AxID</code> — the master's transaction ID, from which the SoC derives a <strong>master ID</strong>
+or <strong>StreamID</strong>: <em>who is asking</em>.</li>
+<li><code>AxPROT[1]</code> — the <strong>NS bit</strong>: Secure or Non-secure. One wire, and it is the
+entirety of TrustZone's bus-level enforcement.</li>
+<li><code>AxPROT[0]</code> — privileged or unprivileged. <code>AxPROT[2]</code> — instruction or data.</li>
+<li><code>AxCACHE</code> — cacheability and bufferability, derived from the page table's memory attributes.</li>
+<li><code>AxLEN</code>, <code>AxSIZE</code>, <code>AxBURST</code> — the shape of the burst.</li>
+</ul>
+<p>So the <code>NS</code> and <code>AttrIndx</code> fields you set in a page table descriptor are not
+abstractions — they become <em>physical signals</em>, and hardware downstream (the SMMU, the TZASC, the XPU)
+makes allow/deny decisions from them. Setting a bit in a descriptor is setting a wire on the interconnect.</p>
+</div>
+
+<h2 id="external">External buses worth recognising</h2>
+
+<p>Beyond the chip, a handful of buses account for nearly everything you will encounter. You do not need to know them in depth, but recognising their characteristics tells you immediately what kind of driver a device will need.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bus</th><th>Wires</th><th>Speed</th><th>Character</th></tr></thead>
+<tbody>
+<tr><td><strong>I2C</strong></td><td>2 (SDA, SCL)</td><td>100 kHz – 3.4 MHz</td><td>Addressed, multi-drop, open-drain. Slow and cheap: sensors, EEPROMs, PMICs.</td></tr>
+<tr><td><strong>SPI</strong></td><td>4 (MOSI, MISO, SCK, CS)</td><td>1–100 MHz</td><td>Full duplex, one chip-select per device. Flash, displays, radios.</td></tr>
+<tr><td><strong>UART</strong></td><td>2 (TX, RX)</td><td>9.6 k – 4 M baud</td><td>Asynchronous, no clock line, point-to-point. The debug console.</td></tr>
+<tr><td><strong>USB</strong></td><td>Differential pair(s)</td><td>12 Mb/s – 40 Gb/s</td><td>Host-controlled, enumerable, hot-pluggable, powered.</td></tr>
+<tr><td><strong>PCIe</strong></td><td>1–16 lanes</td><td>2–64 GB/s</td><td>Switched point-to-point, enumerable, DMA-capable, MSI interrupts.</td></tr>
+<tr><td><strong>CAN</strong></td><td>2 (differential)</td><td>1–8 Mb/s</td><td>Multi-master, priority arbitration, robust. Automotive and industrial.</td></tr>
+<tr><td><strong>Ethernet</strong></td><td>Pairs</td><td>10 Mb/s – 800 Gb/s</td><td>Packet switched, and increasingly used inside vehicles too.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Discoverable versus described</h3>
+
+<pre class="diagram">DISCOVERABLE buses can be probed. Software asks, hardware answers.
+
+  PCIe: read the configuration space at each bus/device/function
+        -> vendor ID, device ID, class, BAR sizes
+  USB:  the host requests descriptors from every device it detects
+
+  -> the OS matches a driver against the reported IDs, automatically.
+
+NON-DISCOVERABLE buses cannot. There is no way to ask address
+0x40001000 whether a UART lives there - and a wrong guess may hang
+the bus or trigger a side effect.
+
+  On-SoC peripherals, I2C and SPI slaves are all in this category.
+
+  -> the hardware must be DESCRIBED to software out of band:
+       device tree (embedded Linux, ARM)
+       ACPI tables  (servers, Windows on ARM, x86)
+       board files  (legacy, deprecated)
+
+This distinction is exactly why the device tree exists, and why an
+embedded Linux driver looks so different from a PCIe driver.</pre>
+
+<h2 id="interrupts">Getting an interrupt from a device to a core</h2>
+
+<p>A device needs a way to say "I am ready" without the processor constantly asking. The path that signal takes — from a pin or a message, through a controller, to a specific core — is worth following once, because every interrupt problem lives somewhere along it.</p>
+
+<pre class="diagram">Wired interrupt (traditional)
+
+  device asserts a physical line -> interrupt controller -> core
+  · limited by pin count, so lines get shared
+  · shared lines mean every handler must check "is it mine?"
+    and return "not mine" if not
+
+Message-signalled interrupt (MSI / MSI-X, and ARM's LPIs)
+
+  device performs a WRITE to a special address, carrying a payload
+  · no dedicated wires at all - it is just a bus transaction
+  · thousands of distinct interrupts per device
+  · no sharing, so no "is it mine?" ambiguity
+  · arrives IN ORDER with the DMA data it refers to, which removes
+    a classic race: with a wired interrupt the signal can arrive
+    before the data it announces has landed in memory</pre>
+
+<p>The interrupt controller itself — priority, masking, routing to a specific core, security grouping — is
+covered in <a href="arm-23-gic-architecture.html">ARM chapters 23</a> and
+<a href="arm-24-gic-lifecycle.html">24</a>.</p>
+
+<h2 id="inspect">Inspecting a real system</h2>
+
+<p>All of this topology is enumerable on a running machine. Walking it for a real system connects the abstractions above to hardware you can actually point at.</p>
+
+<pre><code># who owns which physical address range
+cat /proc/iomem
+#   40000000-40000fff : serial@40000000
+#   80000000-bfffffff : System RAM
+
+# interrupt counts per CPU - is the handler actually firing?
+cat /proc/interrupts
+
+# enumerate discoverable buses
+lspci -vv          # BARs, capabilities, link speed, MSI config
+lsusb -t           # topology tree
+
+# non-discoverable hardware, as described to the kernel
+ls /proc/device-tree/
+dtc -I fs -O dts /proc/device-tree | less
+
+# DMA and IOMMU groupings
+ls /sys/kernel/iommu_groups/*/devices/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Register reads return all zeros or all ones</td><td>Device unclocked or unpowered, wrong base address, or a bus firewall denying access</td></tr>
+<tr><td>Writes appear to have no effect</td><td>Region mapped cacheable instead of Device; or a write-1-to-clear register</td></tr>
+<tr><td>Device works in the debugger, fails at speed</td><td>Missing barriers between register writes, or a required delay</td></tr>
+<tr><td>Reading a status register consumes data</td><td>Side-effecting register plus speculative or repeated reads</td></tr>
+<tr><td>Interrupt fires continuously, system unresponsive</td><td>Not cleared at the device before acknowledging the controller</td></tr>
+<tr><td>Interrupt never fires</td><td>Wrong number, wrong trigger type, masked, or not enabled at the device</td></tr>
+<tr><td>DMA lands in the wrong place</td><td>Device programmed with a virtual or physical address instead of the DMA address</td></tr>
+<tr><td>Interrupt arrives before the DMA data is visible</td><td>Wired-interrupt race; MSI avoids it by construction</td></tr>
+<tr><td>PCIe device enumerates but its driver never binds</td><td>Vendor/device ID not in the driver's match table</td></tr>
+<tr><td>On-SoC peripheral is invisible to Linux</td><td>Missing or <code>status = "disabled"</code> device tree node</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain memory-mapped I/O and one thing it gets for free from the MMU.</li>
+  <li>Give three reasons MMIO must not be cached or speculated.</li>
+  <li>Compare polling, interrupts and DMA on CPU cost, latency and failure mode.</li>
+  <li>Explain the two problems DMA creates and name the hardware that solves each.</li>
+  <li>Say why AXI separates address and data channels, and what that enables.</li>
+  <li>List what an AXI transaction carries besides address and data, and why security depends on it.</li>
+  <li>Explain discoverable versus described buses and why the device tree exists.</li>
+  <li>Give two advantages of MSI over a wired shared interrupt.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

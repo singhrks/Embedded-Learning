@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interrupt virtualisation and the vGIC | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Interrupt virtualisation and the vGIC</h1>
+<p class="lead">A guest must be able to receive an interrupt, acknowledge it, and signal end-of-interrupt —
+all without trapping, because interrupts are frequent and traps are expensive. The GIC provides a second,
+virtual CPU interface for exactly this, and a set of list registers through which the hypervisor stages the
+interrupts it wants the guest to believe in.</p>
+
+<h2 id="problem">The problem</h2>
+
+<p>Interrupts are the hardest device to virtualise, because a guest handling one touches the controller many times and trapping every access would be ruinous.</p>
+
+<pre class="diagram">   An interrupt arrives from real hardware.
+
+   1. It must go to the HYPERVISOR first - the guest is not
+      allowed to see a wire it does not own, and the interrupt
+      may belong to the host, or to a different guest, or to a
+      vCPU that is not currently running.
+
+      HCR_EL2.IMO = 1 routes physical IRQ to EL2.
+
+   2. The hypervisor decides it belongs to guest G, vCPU 3.
+
+   3. If vCPU 3 is running right now: inject it and resume.
+      If not: mark it pending; inject when that vCPU next runs.
+      (And if the vCPU is halted in WFI: wake its thread.)
+
+   4. The guest then does the NORMAL interrupt dance:
+        read IAR      to acknowledge and learn the INTID
+        run its handler
+        write EOIR    to signal completion
+        maybe write DIR to deactivate
+
+      Each of those is a register access. If each one trapped,
+      a busy guest would exit thousands of times a second just
+      to service its own interrupts.
+
+   The GIC's answer: give the guest its own CPU interface
+   registers, which are REAL hardware, and let it drive them
+   without trapping at all.</pre>
+
+<div class="key">
+<b>The division of labour</b>
+<p>The <em>distributor</em> and <em>redistributor</em> (routing, priorities, enables) are emulated in
+software, because a guest reprogramming them is rare. The <em>CPU interface</em> (acknowledge, EOI,
+priority mask) is virtualised in hardware, because a guest touches it on every single interrupt. Emulate the
+cold path; virtualise the hot path.</p>
+</div>
+
+<h2 id="pieces">The hardware pieces</h2>
+
+<p>The GIC provides dedicated hardware for virtualisation, and knowing which piece does what is most of the battle.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Piece</th><th>GICv2 name</th><th>GICv3 name</th><th>Who drives it</th></tr></thead>
+<tbody>
+<tr><td>Physical CPU interface</td><td><code>GICC_*</code></td><td><code>ICC_*_EL1</code></td><td>The
+hypervisor (and the host)</td></tr>
+<tr><td>Virtual CPU interface</td><td><code>GICV_*</code></td><td><code>ICV_*_EL1</code></td><td><strong>The
+guest</strong>, directly, with no trap</td></tr>
+<tr><td>Virtualisation control</td><td><code>GICH_*</code></td><td><code>ICH_*_EL2</code></td><td>The
+hypervisor</td></tr>
+<tr><td>List registers</td><td><code>GICH_LR&lt;n&gt;</code></td><td><code>ICH_LR&lt;n&gt;_EL2</code></td><td>The
+hypervisor writes; hardware and guest update</td></tr>
+<tr><td>Distributor</td><td><code>GICD_*</code></td><td><code>GICD_*</code> +
+redistributors</td><td>Emulated in software</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   GICv3, the essential trick:
+
+   The guest executes   MRS x0, ICC_IAR1_EL1
+   ...but HCR_EL2.IMO = 1, so at EL1 that instruction is
+   REDIRECTED by hardware to ICV_IAR1_EL1 - the VIRTUAL
+   interface. No trap. The guest reads a virtual INTID out of
+   real silicon.
+
+   Same for ICC_EOIR1_EL1 -> ICV_EOIR1_EL1
+            ICC_PMR_EL1   -> ICV_PMR_EL1
+            ICC_HPPIR1_EL1-> ICV_HPPIR1_EL1
+
+   It is the same redirection idea as VHE's E2H, applied to the
+   interrupt controller. The guest's driver is unmodified; the
+   registers it touches are simply different ones.
+
+   Meanwhile the hypervisor, at EL2, uses ICH_* to decide what
+   the virtual interface will report.</pre>
+
+<h2 id="lr">List registers: the interface between the two</h2>
+
+<p>The list registers are the actual interface between the hypervisor and the guest's interrupt controller, and almost every vGIC bug is a misunderstanding of them.</p>
+
+<pre class="diagram">   ICH_LR&lt;n&gt;_EL2 - typically 4 to 16 of them per CPU.
+   Each one describes ONE interrupt the guest should see.
+
+    63 62 61 60 59 58 56 55       48 47      32 31          0
+   +--+--+--+--+-----+-----+---------+---------+------------+
+   |State|HW|Grp| Pri |     | pINTID            | vINTID     |
+   +--+--+--+--+-----+-----+---------+---------+------------+
+
+   State [63:62]   00 invalid    01 pending
+                   10 active     11 pending+active
+   HW    [61]      0 = purely virtual (software generated)
+                   1 = HARDWARE-BACKED: this virtual interrupt
+                       corresponds to physical interrupt pINTID
+   Group [60]      Group 0 (FIQ) or Group 1 (IRQ)
+   Priority[55:48]
+   pINTID[41:32]   the PHYSICAL interrupt this maps to
+   vINTID[31:0]    what the guest will read from ICV_IAR1_EL1
+
+   THE HW BIT IS THE CLEVER PART.
+
+   With HW=1, when the guest writes ICV_EOIR1_EL1 with vINTID,
+   the hardware ALSO deactivates physical interrupt pINTID.
+   The guest's EOI directly deactivates the real device's
+   interrupt line - with no trap, no exit, no hypervisor
+   involvement whatsoever.
+
+   That is what makes device PASSTHROUGH performant. Without
+   it, every EOI would be an exit, and a 100k-interrupts-per-
+   second NIC would be unusable.</pre>
+
+<h2 id="flow">One interrupt, end to end</h2>
+
+<p>Following a single interrupt from the device to the guest's handler is the clearest way to see how the pieces fit.</p>
+
+<pre><code>/* Case A: an EMULATED device (virtio) wants to interrupt vCPU 2 */
+
+  1. QEMU/vhost decides the virtqueue has data.
+  2. It asks KVM to raise virtual INTID 32 on vCPU 2:
+        ioctl(vmfd, KVM_IRQ_LINE, {irq: 32, level: 1})
+     or, faster, it kicks an irqfd that KVM has pre-bound.
+  3. KVM marks INTID 32 pending in its software vGIC model.
+  4. If vCPU 2 is running on another physical CPU, KVM sends an
+     IPI to force it to exit so the LR can be written.
+     If it is halted in WFI, KVM wakes the thread.
+  5. On the next guest entry, KVM writes:
+        ICH_LR0_EL2 = pending | Group1 | prio | vINTID=32
+        HW = 0        (there is no physical interrupt behind it)
+  6. ERET. The virtual CPU interface now signals IRQ to EL1.
+  7. Guest reads ICV_IAR1_EL1 -> 32.  NO TRAP.
+     Guest handles it.
+     Guest writes ICV_EOIR1_EL1 = 32. NO TRAP. The LR state
+     goes to invalid.
+  8. On the next exit, KVM reads back the LRs to learn the
+     interrupt completed.
+
+  Exits used: one to inject (maybe zero if the vCPU was already
+  going to exit). Zero for the guest's own handling.
+
+
+/* Case B: a PASSED-THROUGH device (chapter 17)              */
+
+  1. Real device raises physical INTID 137.
+  2. HCR_EL2.IMO routes it to EL2. The host's handler runs -
+     it does NOT know how to service the device, and must not.
+  3. KVM looks up the mapping: physical 137 -> vCPU 2, virtual 137.
+  4. It writes:
+        ICH_LR0_EL2 = pending | HW=1 | pINTID=137 | vINTID=137
+     and does NOT deactivate the physical interrupt.
+  5. Guest reads ICV_IAR1_EL1 -> 137, services the real device
+     through its passed-through MMIO, writes ICV_EOIR1_EL1.
+  6. Because HW=1, the hardware deactivates physical 137 too.
+
+  Exits used: one, for the physical interrupt itself. The
+  entire guest-side handling is trap-free.
+
+/* The remaining exit in case B is what GICv4 direct injection
+   removes - see chapter 12.                                 */</code></pre>
+
+<h2 id="maint">Maintenance interrupts</h2>
+
+<p>The hypervisor needs to know when the guest has finished with an interrupt, and maintenance interrupts are how it finds out without polling.</p>
+
+<pre><code>/* The hypervisor has only N list registers (often 4). A guest
+   with more than N interrupts pending needs the hypervisor to
+   refill them - but the hypervisor is not running.
+
+   ICH_HCR_EL2 configures a MAINTENANCE INTERRUPT that fires
+   when the LR state changes in ways you asked about:      */
+
+   ICH_HCR_EL2.UIE   Underflow: fewer than 2 LRs are valid.
+                     "I am running out of queued interrupts,
+                      give me more."
+   ICH_HCR_EL2.LRENPIE  A list register with EOIcount != 0
+                     needs attention.
+   ICH_HCR_EL2.NPIE  No pending interrupts.
+   ICH_HCR_EL2.VGrp0EIE / VGrp1EIE
+                     the guest enabled or disabled a group -
+                     the hypervisor may want to know.
+
+/* The maintenance interrupt is a normal physical PPI (KVM
+   prints it at boot: "vgic interrupt IRQ9"). When it fires:
+
+     -> exit to EL2
+     -> drain completed interrupts out of the LRs
+     -> load more pending interrupts in
+     -> resume
+
+   With enough LRs and a sane workload this is rare. With 4 LRs
+   and an interrupt storm it becomes the dominant exit reason,
+   and you will see it in perf as a flood of maintenance
+   interrupts. That is the signal to reduce interrupt rate
+   (coalescing, NAPI) rather than to tune the hypervisor.   */</code></pre>
+
+<div class="warn">
+<b>The distributor is emulated, and that is a trap you will hit</b>
+<p>A guest writing <code>GICD_ISENABLER</code>, changing a priority, or re-routing an interrupt causes an
+MMIO exit into the software vGIC model. Guests that reconfigure interrupts constantly — some RTOSes do this
+per operation — perform terribly under virtualisation for this reason alone. Configure once at init, as
+Linux does.</p>
+</div>
+
+<h2 id="v2v3">GICv2 versus GICv3 for guests</h2>
+
+<p>Which GIC version the guest sees is a decision with consequences for scalability and for what the guest's driver must support.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>GICv2</th><th>GICv3</th></tr></thead>
+<tbody>
+<tr><td>Guest CPU interface</td><td>MMIO region (<code>GICV</code>) mapped over where the guest expects
+<code>GICC</code></td><td>System registers, redirected by <code>HCR_EL2.IMO</code></td></tr>
+<tr><td>Max CPUs</td><td>8</td><td>Effectively unlimited (affinity routing)</td></tr>
+<tr><td>Interrupt IDs</td><td>SGI 0–15, PPI 16–31, SPI 32–1019</td><td>Adds LPIs (8192+) via the
+ITS</td></tr>
+<tr><td>Cost of guest EOI</td><td>Uncached MMIO write, but no trap</td><td>System register write — cheaper
+still</td></tr>
+<tr><td>KVM device type</td><td><code>KVM_DEV_TYPE_ARM_VGIC_V2</code></td><td><code>KVM_DEV_TYPE_ARM_VGIC_V3</code></td></tr>
+<tr><td>QEMU option</td><td><code>-machine virt,gic-version=2</code></td><td><code>gic-version=3</code>
+(or <code>host</code>, or <code>max</code>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Which one is in use?
+
+# On the host:
+$ dmesg | grep -i vgic
+[    0.512480] kvm [1]: vgic interrupt IRQ9
+$ dmesg | grep -i 'GICv'
+[    0.000000] GICv3: GIC: Using split EOI/Deactivate mode
+
+# Inside the guest:
+$ dmesg | grep -i gic
+[    0.000000] GICv3: 288 SPIs implemented
+[    0.000000] GICv3: CPU0: found redistributor 0 region 0
+
+$ cat /proc/interrupts
+           CPU0       CPU1
+  3:       1204       1188   GICv3  27 Level  arch_timer
+ 25:          0          0   GICv3  33 Level  virtio0
+ 26:      88104          0   GICv3  34 Level  virtio1
+
+# A guest that shows "GICv2" while the host is GICv3 is running
+# a legacy-mode vGIC - possible, and slower. Prefer matching.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest never receives interrupts at all</td><td><code>HCR_EL2.IMO</code> clear, so the virtual interface
+is not enabled and <code>ICC_*</code> is not redirected</td></tr>
+<tr><td>Guest receives an interrupt once, then never again</td><td>Guest's EOI not reflected back into the
+hypervisor's model — LRs not synced on exit</td></tr>
+<tr><td>Passed-through device stops after one interrupt</td><td><code>HW</code> bit not set in the list
+register, so the physical interrupt was never deactivated</td></tr>
+<tr><td>Interrupt storm of maintenance interrupts</td><td>More pending interrupts than list registers; guest
+interrupt rate too high</td></tr>
+<tr><td>vCPU in <code>WFI</code> never wakes</td><td>Injection path marks pending but does not kick the
+blocked thread</td></tr>
+<tr><td>Interrupt delivered to the wrong vCPU</td><td>Affinity routing mismatch between the emulated
+distributor and the vCPU's <code>VMPIDR_EL2</code></td></tr>
+<tr><td>Guest boots on GICv2 but not GICv3 (or vice versa)</td><td>Guest device tree describes a different GIC
+version than the one configured</td></tr>
+<tr><td>Terrible performance in an RTOS guest</td><td>The guest reprograms the distributor per operation; every
+write is an MMIO exit</td></tr>
+<tr><td>Timer interrupt lost when a vCPU migrates</td><td>Per-CPU (PPI) state not migrated with the vCPU</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the CPU interface is virtualised in hardware while the distributor is emulated.</li>
+  <li>Describe what <code>HCR_EL2.IMO</code> does to a guest's <code>ICC_IAR1_EL1</code> access.</li>
+  <li>Draw a list register and name the state, HW, pINTID and vINTID fields.</li>
+  <li>Explain exactly what the <code>HW</code> bit causes to happen on guest EOI, and why passthrough needs
+  it.</li>
+  <li>Trace an emulated-device interrupt from device model to guest handler, counting exits.</li>
+  <li>Trace a passed-through interrupt the same way and say where the remaining exit is.</li>
+  <li>Explain what a maintenance interrupt is and name two conditions that raise one.</li>
+  <li>Give two reasons a guest might be slow that are visible only in the vGIC.</li>
+  <li>Determine from a running host and guest which GIC version each is using.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

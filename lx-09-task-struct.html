@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Processes, threads and task_struct | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Processes, threads and <code>task_struct</code></h1>
+<p class="lead">Linux has no separate notion of a process and a thread. There is one structure,
+<code>task_struct</code>, and everything else is a question of what two tasks choose to share — which
+turns out to be a much cleaner model than the one most textbooks describe.</p>
+
+<h2 id="one">One structure for both</h2>
+
+<p>Linux does not have separate machinery for processes and threads. There is exactly one structure describing something the scheduler can run, and whether you call a given instance a process or a thread depends only on how much it shares with its neighbours.</p>
+
+<pre class="diagram">A "process" with three threads is really THREE task_structs
+that share most of their pointers:
+
+   task_struct (tid 100)      task_struct (tid 101)
+   +------------------+       +------------------+
+   | pid   = 100      |       | pid   = 100      |  &lt;- SAME
+   | tid   = 100      |       | tid   = 101      |  &lt;- differs
+   | mm    = ---------+---+---+ mm    =          |
+   | files = ---------+-+ |   | files =          |
+   | fs    = ...      | | |   | fs    =          |
+   | signal= ...      | | |   | signal=          |
+   | stack = 0xffff.. | | |   | stack = 0xffff.. |  &lt;- OWN
+   +------------------+ | |   +------------------+
+                        | |
+                        | +--&gt; struct mm_struct   the address
+                        |      (page tables, VMAs) space
+                        |
+                        +----&gt; struct files_struct  the fd table
+
+  WHAT IS ALWAYS PRIVATE:
+     the kernel stack, the register state, the tid,
+     the scheduler state, pending signals
+
+  WHAT MAY BE SHARED, decided at clone() time:
+     CLONE_VM       the address space   -> "threads"
+     CLONE_FILES    the fd table
+     CLONE_FS       cwd, root, umask
+     CLONE_SIGHAND  signal handlers
+     CLONE_THREAD   the thread group (same pid)
+     CLONE_NEWNS/NEWPID/NEWNET/...  namespaces -> containers
+
+  fork()   = clone(SIGCHLD)                    shares nothing
+  pthread  = clone(CLONE_VM|CLONE_FILES|CLONE_FS|
+                   CLONE_SIGHAND|CLONE_THREAD|...)
+  container= clone(... | CLONE_NEWPID | CLONE_NEWNET | ...)
+
+  So processes, threads and containers are three points on one
+  continuum, not three mechanisms.</pre>
+
+<h2 id="pidtid">pid, tid, and the naming trap</h2>
+
+<p>This is one of the genuinely confusing corners of Linux, because the words mean different things inside the kernel than they do to a user-space programmer — and the mismatch is exactly backwards from what most people assume.</p>
+
+<pre><code>/* The kernel's names are the OPPOSITE of what userspace calls
+   them, and this confuses everyone once.                    */
+
+   task->pid       the THREAD id.  Unique per task.
+                   Userspace calls this the TID.
+   task->tgid      the THREAD GROUP id. Shared by all threads
+                   in a process. Userspace calls this the PID.
+
+/* So: */
+        getpid()  in userspace  returns  task->tgid
+        gettid()  in userspace  returns  task->pid
+
+/* In kernel code: */
+        current-&gt;pid            /* this THREAD */
+        current-&gt;tgid           /* the process */
+        task_pid_nr(current)    /* pid in the INIT namespace */
+        task_tgid_nr(current)
+        task_pid_vnr(current)   /* pid as the task's own
+                                   namespace sees it - what a
+                                   containerised process
+                                   believes its pid to be    */
+
+/* WHICH TO USE when identifying a caller in a driver:
+     for logging          -> current->pid and current->comm
+     for ownership        -> the struct file, NOT the pid.
+                             A pid can be reused after exit.
+     across a namespace   -> think hard; a pid means nothing
+                             outside the namespace that
+                             created it                      */</code></pre>
+
+<h2 id="current">current</h2>
+
+<p>Kernel code frequently needs to know which task it is running on behalf of. Rather than passing that around everywhere, the kernel provides a single expression that always evaluates to the current task — and understanding how it works explains why it is safe in some contexts and meaningless in others.</p>
+
+<pre><code>#include &lt;linux/sched.h&gt;
+
+        current             /* the task_struct running NOW */
+        current-&gt;pid
+        current-&gt;comm       /* the command name, 16 bytes */
+        current-&gt;mm         /* NULL for a kernel thread! */
+        current-&gt;flags
+
+/* On arm64 `current` is SP_EL0, repurposed: the kernel keeps
+   the current task_struct pointer there while running at EL1,
+   so reading it is a single register read, not a lookup.
+   (arch/arm64/include/asm/current.h)                        */
+
+/* USEFUL IN A DRIVER: */
+        dev_dbg(dev, "ioctl from %s[%d]\n",
+                current-&gt;comm, current-&gt;pid);
+
+/* AND THE TRAPS:
+
+   1. `current` is only meaningful in PROCESS CONTEXT. In an
+      interrupt handler it points at whatever task was
+      unluckily interrupted - which has nothing to do with the
+      device. Never attribute interrupt work to `current`.
+
+   2. current->mm is NULL for KERNEL THREADS. Code that
+      assumes an address space exists will crash when called
+      from a kthread or a workqueue.
+
+           if (!current->mm)
+                   return -EINVAL;      /* kernel thread */
+
+   3. Do not store `current` and use it later. The task can
+      exit. If you need a reference, take one:
+           get_task_struct(task);
+           ...
+           put_task_struct(task);                            */</code></pre>
+
+<h2 id="states">Task states</h2>
+
+<p>Every task's state answers the scheduler's one question — is this task runnable right now — but the
+distinctions within "not runnable" matter enormously for anyone debugging a hung system, since they determine
+whether a stuck process can be interrupted, signalled, or killed at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>State</th><th><code>ps</code></th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>TASK_RUNNING</code></td><td>R</td><td>Running, or on a runqueue ready to run</td></tr>
+<tr><td><code>TASK_INTERRUPTIBLE</code></td><td>S</td><td>Sleeping; <strong>signals wake it</strong></td></tr>
+<tr><td><code>TASK_UNINTERRUPTIBLE</code></td><td>D</td><td>Sleeping; signals do <strong>not</strong> wake it</td></tr>
+<tr><td><code>TASK_KILLABLE</code></td><td>D</td><td>Uninterruptible except by a fatal signal — usually the right choice</td></tr>
+<tr><td><code>__TASK_STOPPED</code></td><td>T</td><td>Stopped by SIGSTOP</td></tr>
+<tr><td><code>EXIT_ZOMBIE</code></td><td>Z</td><td>Exited, not yet reaped by its parent</td></tr>
+<tr><td><code>TASK_IDLE</code></td><td>I</td><td>Uninterruptible but not counted in load average — for kthreads</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The D state is a driver's fault more often than not</b>
+<p>A process stuck in <code>D</code> cannot be killed, not even with <code>SIGKILL</code>, and it drives the
+load average up. It is almost always waiting on I/O in a driver that used
+<code>wait_event()</code> — the uninterruptible form — instead of
+<code>wait_event_interruptible()</code>. Use the interruptible or killable variants unless you can state
+exactly why a signal must not interrupt this wait; and if the hardware genuinely cannot be abandoned
+mid-operation, use a timeout so the wait is at least bounded.</p>
+</div>
+
+<h2 id="sleep">Sleeping and waking, correctly</h2>
+
+<p>Waiting is the operation drivers get wrong most often. A driver that spins waiting for hardware burns a CPU; one that sleeps incorrectly misses its wake-up and hangs forever. There is a correct pattern, and it is worth learning as a pattern rather than reconstructing it each time.</p>
+
+<pre><code>/* THE PATTERN every blocking driver uses. */
+
+struct my_dev {
+        wait_queue_head_t  wq;
+        bool               data_ready;
+        spinlock_t         lock;
+};
+
+        init_waitqueue_head(&amp;d-&gt;wq);
+
+/* --- the reader: wait for data --------------------------- */
+static ssize_t my_read(struct file *f, char __user *buf,
+                       size_t count, loff_t *ppos)
+{
+        struct my_dev *d = f-&gt;private_data;
+        int ret;
+
+        /* non-blocking mode must be honoured */
+        if (f-&gt;f_flags &amp; O_NONBLOCK) {
+                if (!d-&gt;data_ready)
+                        return -EAGAIN;
+        } else {
+                ret = wait_event_interruptible(d-&gt;wq,
+                                               d-&gt;data_ready);
+                if (ret)
+                        return -ERESTARTSYS;   /* a signal:
+                                                  let libc
+                                                  restart it */
+        }
+        ...
+}
+
+/* --- the interrupt handler: wake it ---------------------- */
+static irqreturn_t my_isr(int irq, void *dev_id)
+{
+        struct my_dev *d = dev_id;
+
+        d-&gt;data_ready = true;
+        wake_up_interruptible(&amp;d-&gt;wq);
+        return IRQ_HANDLED;
+}
+
+/* WHY wait_event_* IS A MACRO AND NOT A FUNCTION:
+   it expands to the correct sleep sequence, which is subtle:
+
+        for (;;) {
+                prepare_to_wait(&amp;wq, &amp;entry, TASK_INTERRUPTIBLE);
+                if (condition)         &lt;-- re-check AFTER
+                        break;             being queued
+                if (signal_pending(current)) { ret = -ERESTARTSYS;
+                                               break; }
+                schedule();
+        }
+        finish_wait(&amp;wq, &amp;entry);
+
+   The ORDER is what matters: queue yourself FIRST, then check
+   the condition. Check first and a wakeup arriving in between
+   is lost, and you sleep forever. This is the lost-wakeup
+   race, and it is why you use the macro rather than writing
+   it out.                                                  */
+
+/* THE VARIANTS: */
+        wait_event(wq, cond);                    /* D state  */
+        wait_event_interruptible(wq, cond);      /* S state  */
+        wait_event_killable(wq, cond);           /* SIGKILL  */
+        wait_event_timeout(wq, cond, HZ);        /* bounded  */
+        wait_event_interruptible_timeout(wq, cond, HZ);
+
+/* AND THE RETURN VALUES DIFFER - a classic bug: */
+        ret = wait_event_interruptible_timeout(wq, cond, HZ);
+        if (ret == 0)   return -ETIMEDOUT;   /* timed out    */
+        if (ret &lt; 0)    return ret;          /* interrupted  */
+        /* ret > 0: condition true, jiffies remaining        */</code></pre>
+
+<h2 id="kthread">Kernel threads</h2>
+
+<p>Sometimes a driver needs work done in the background, in a context where it is allowed to sleep, without any user process being involved. A kernel thread is a task with no user-space side at all — it exists only to run kernel code.</p>
+
+<pre><code>#include &lt;linux/kthread.h&gt;
+
+static int my_thread_fn(void *data)
+{
+        struct my_dev *d = data;
+
+        while (!kthread_should_stop()) {
+                wait_event_interruptible(d-&gt;wq,
+                        d-&gt;work_pending || kthread_should_stop());
+                if (kthread_should_stop())
+                        break;
+                do_the_work(d);
+        }
+        return 0;
+}
+
+        d-&gt;task = kthread_run(my_thread_fn, d, "my_worker/%d", id);
+        if (IS_ERR(d-&gt;task))
+                return PTR_ERR(d-&gt;task);
+        ...
+        kthread_stop(d-&gt;task);   /* sets the flag, wakes it,
+                                    WAITS for it to return   */
+
+/* PROPERTIES:
+     · runs in process context - CAN SLEEP
+     · current->mm is NULL - no user address space
+     · appears in ps in [square brackets]
+     · schedulable, so it can be niced and affined
+     · kthread_should_stop() must be checked, AND the thread
+       must be woken for it to notice - hence the condition
+       above includes it
+
+   WHEN TO USE ONE:
+     you need a long-running, sleeping loop of your own.
+
+   WHEN NOT TO - which is most of the time:
+     for short deferred work, use a WORKQUEUE (chapter 15).
+     A workqueue shares worker threads across the whole
+     kernel; a dedicated kthread per device costs memory and
+     scheduler entries. Reach for a kthread only when you
+     genuinely need a private, long-lived, sleeping context -
+     a polling loop, or a thread servicing a hardware queue.  */</code></pre>
+
+<h2 id="signals">Signals in the kernel</h2>
+
+<p>Signals are a user-space concept, but they reach into the kernel: they are what allows a blocked process to be interrupted, and a driver that waits without accounting for them is the reason processes get stuck unkillable.</p>
+
+<pre><code>/* A driver rarely handles signals, but it must react to them
+   correctly when interrupted.                              */
+
+        if (signal_pending(current))
+                return -ERESTARTSYS;
+
+/* THE ERROR CODES, and the difference matters to userspace:
+
+     -EINTR         "your syscall was interrupted". Userspace
+                    sees EINTR and must retry itself.
+
+     -ERESTARTSYS   "restart the syscall automatically, IF the
+                    handler was installed with SA_RESTART".
+                    Never reaches userspace as-is; the signal
+                    machinery converts it to EINTR or restarts
+                    the call. THIS IS USUALLY WHAT YOU WANT
+                    from a wait that made no progress.
+
+     -ERESTARTNOINTR  always restart, regardless of SA_RESTART
+
+   THE RULE: if the operation made NO observable progress,
+   return -ERESTARTSYS. If it partially completed - you copied
+   some bytes - return the count you completed instead, and
+   let the caller resume from there. Returning -ERESTARTSYS
+   after partial progress causes the work to be done twice. */
+
+        if (copied &gt; 0)
+                return copied;          /* partial success */
+        if (signal_pending(current))
+                return -ERESTARTSYS;    /* nothing done */</code></pre>
+
+<h2 id="inspect">Looking at tasks</h2>
+
+<p>Every task is visible from user space, along with what it is currently waiting on. When something is hung, these are the first places to look, and they usually identify the responsible driver directly.</p>
+
+<pre><code># From userspace:
+    ps -eLf                 # -L shows THREADS, not just
+                            # processes: LWP is the tid
+    cat /proc/$PID/status   # Tgid, Pid, Threads, State, ...
+    cat /proc/$PID/task/*/  # one directory per thread
+    cat /proc/$PID/stack    # kernel backtrace - where is it
+                            # blocked? THE tool for a D state
+    cat /proc/$PID/wchan    # the function it is sleeping in
+    cat /proc/$PID/maps     # the address space
+
+# Finding what a D-state process is stuck on:
+    ps -eo pid,stat,comm | awk '$2 ~ /D/'
+    sudo cat /proc/1234/stack
+      [<0>] my_driver_read+0x120/0x2a0     &lt;-- there it is
+      [<0>] vfs_read+0xb4/0x1e0
+      ...
+
+# Or the whole system's blocked tasks, from the kernel:
+    echo w > /proc/sysrq-trigger
+    dmesg                   # "Showing all locks held" and
+                            # blocked task backtraces
+
+# The hung task detector will do it for you automatically:
+    CONFIG_DETECT_HUNG_TASK=y
+    # prints a backtrace for any task in D state for 120s</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Process stuck in D, unkillable</td><td>Uninterruptible wait in a driver — check <code>/proc/PID/stack</code></td></tr>
+<tr><td>Load average high with idle CPUs</td><td>D-state tasks count toward it</td></tr>
+<tr><td>Process sleeps forever despite the event happening</td><td>Lost wakeup — condition checked before queuing; use <code>wait_event_*</code></td></tr>
+<tr><td>Wakes up but the condition is false</td><td>Spurious wakeup — always re-check in a loop, which the macros do</td></tr>
+<tr><td><code>Ctrl-C</code> does not interrupt a read</td><td>Used <code>wait_event()</code> instead of the interruptible form</td></tr>
+<tr><td>Data delivered twice after a signal</td><td>Returned <code>-ERESTARTSYS</code> after partial progress</td></tr>
+<tr><td>Crash in an interrupt handler using <code>current-&gt;mm</code></td><td><code>current</code> is meaningless there</td></tr>
+<tr><td>NULL deref on <code>current-&gt;mm</code></td><td>Called from a kernel thread</td></tr>
+<tr><td><code>rmmod</code> hangs</td><td><code>kthread_stop()</code> waiting on a thread that never checks <code>kthread_should_stop()</code></td></tr>
+<tr><td>PID-based ownership breaks</td><td>PIDs are reused; key off the <code>struct file</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain how one structure represents processes, threads and containers.</li>
+  <li>Say which of <code>pid</code> and <code>tgid</code> userspace calls "the PID".</li>
+  <li>List three traps in using <code>current</code>.</li>
+  <li>Name the task states and explain why D state is usually a driver bug.</li>
+  <li>Write a correct blocking read with a wakeup from an interrupt.</li>
+  <li>Explain the lost-wakeup race and why <code>wait_event</code> is a macro.</li>
+  <li>Give the return-value convention for the timeout variants.</li>
+  <li>Write a kernel thread with correct shutdown, and say when not to use one.</li>
+  <li>Distinguish <code>-EINTR</code> from <code>-ERESTARTSYS</code>, and the partial-progress rule.</li>
+  <li>Find where a D-state process is blocked, from userspace.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

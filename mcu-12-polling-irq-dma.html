@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polling, interrupts and DMA: three ways to move data | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Polling, interrupts and DMA: three ways to move data</h1>
+<p class="lead">Every peripheral transfer is one of three mechanisms, and choosing wrongly is the most common
+cause of a design that works on the bench and falls over in the field. This chapter is the decision, with the
+arithmetic that makes it.</p>
+
+<h2 id="three">The three mechanisms</h2>
+
+<pre class="diagram">   POLLING
+     CPU: while (!(flag)) { }  then read
+     Cost: 100% of a core, doing nothing useful
+     Latency: as good as it gets - you are already looking
+     Use when: the wait is shorter than an interrupt entry
+               (~12 cycles + your prologue), or during init,
+               or in a hard real-time loop that has nothing
+               else to do.
+
+   INTERRUPT
+     CPU: handler runs per BYTE or per EVENT
+     Cost: ~20-40 cycles of overhead per event
+     Latency: 12 cycles + whatever is blocking you
+     Use when: events are infrequent relative to the
+               overhead, or their timing is unpredictable.
+
+   DMA
+     CPU: configure once, then nothing until the block ends
+     Cost: bus bandwidth, contention with the CPU
+     Latency: irrelevant per byte; one interrupt per BLOCK
+     Use when: the data is a block, or the rate is high
+               enough that per-event interrupts would
+               saturate the CPU.
+
+   THE ARITHMETIC THAT DECIDES:
+
+     UART at 115200 baud = 11520 bytes/s
+       per-byte interrupt at 30 cycles = 345,600 cycles/s
+       on a 168 MHz core = 0.2% CPU. Interrupts are fine.
+
+     UART at 3 Mbaud = 300,000 bytes/s
+       per-byte interrupt at 30 cycles = 9,000,000 cycles/s
+       = 5.4% CPU, and 300k interrupts/s starves everything
+       else. Use DMA.
+
+     ADC at 1 Msample/s
+       per-sample interrupt = 30,000,000 cycles/s = 18% CPU
+       doing nothing but copying. Use DMA. Always.
+
+   Do this calculation. It takes thirty seconds and it is
+   the difference between a design that scales and one that
+   is rewritten under deadline.</pre>
+
+<h2 id="polling">Polling, done correctly</h2>
+
+<pre><code>/* Polling gets a bad name because it is usually written
+   without a timeout. This version cannot hang.            */
+
+int uart_send_blocking(const uint8_t *p, size_t n, uint32_t ms)
+{
+    uint32_t deadline = g_ms + ms;
+
+    for (size_t i = 0; i &lt; n; i++) {
+        while (!(USART1-&gt;ISR &amp; USART_ISR_TXE)) {
+            if ((int32_t)(g_ms - deadline) &gt;= 0) {
+                return -ETIMEDOUT;      /* the crucial part */
+            }
+        }
+        USART1-&gt;TDR = p[i];
+    }
+    return 0;
+}
+
+/* Three rules for any polling loop that ships:
+
+   1. A TIMEOUT, always. A peripheral that never sets its
+      flag - because a clock is off, a cable is unplugged,
+      or the far end died - turns a poll into a hang. This
+      is the single most common cause of a field unit that
+      "just stops".
+
+   2. The flag variable must be volatile, or read through a
+      volatile pointer. Otherwise the compiler may hoist the
+      load out of the loop and spin forever on a stale value
+      (see the C track, chapter 10).
+
+   3. Consider what else is starved. A 10 ms poll with
+      interrupts enabled is fine; the same poll inside a
+      critical section delays every interrupt by 10 ms.     */
+</code></pre>
+
+<h2 id="dma">DMA: the controller does the copying</h2>
+
+<pre><code>/* DMA is a second bus master. It reads and writes memory
+   without the CPU, arbitrating for the bus alongside it.  */
+
+/* UART receive into a circular buffer - the configuration
+   worth memorising, because it never overruns.            */
+
+DMA2_Stream5-&gt;PAR  = (uint32_t) &amp;USART1-&gt;RDR;   /* source */
+DMA2_Stream5-&gt;M0AR = (uint32_t) rx_buffer;      /* dest   */
+DMA2_Stream5-&gt;NDTR = sizeof(rx_buffer);
+DMA2_Stream5-&gt;CR   = (4u &lt;&lt; 25)          /* channel 4      */
+                   | DMA_SxCR_MINC       /* increment mem  */
+                   | DMA_SxCR_CIRC       /* CIRCULAR       */
+                   | DMA_SxCR_TCIE       /* half/full IRQ  */
+                   | DMA_SxCR_HTIE;
+USART1-&gt;CR3 |= USART_CR3_DMAR;
+DMA2_Stream5-&gt;CR |= DMA_SxCR_EN;
+
+/* CIRCULAR mode means NDTR reloads automatically at the end
+   and the controller wraps to the buffer start. Combined
+   with the half-transfer interrupt you get a classic
+   double-buffer: process the first half while the second
+   fills, and vice versa. The UART can now receive
+   continuously, forever, with two interrupts per buffer
+   instead of one per byte.
+
+   Add the UART's IDLE-line interrupt and you also learn
+   when a variable-length message ENDED, which is what makes
+   this pattern work for protocols rather than just streams:
+
+     bytes_received = sizeof(rx_buffer) - DMA2_Stream5-&gt;NDTR;
+
+   That expression, read in the IDLE handler, tells you
+   exactly how much arrived. This combination - circular DMA
+   plus IDLE detection - is the standard high-performance
+   UART receive design, and it is worth knowing by heart.  */
+</code></pre>
+
+<div class="danger">
+<b>Four DMA rules that are not optional</b>
+<pre class="diagram">   1. THE BUFFER MUST BE REACHABLE.
+      Many parts have RAM banks the DMA engine cannot see -
+      CCM RAM on STM32F4 is the classic. A buffer there
+      produces a transfer error or silent zeros. Place DMA
+      buffers explicitly (chapter 05).
+
+   2. THE BUFFER MUST NOT BE ON THE STACK.
+      A local array goes out of scope when the function
+      returns; the DMA controller keeps writing to it. This
+      corrupts whatever occupies that stack space next, at
+      a delay, and is genuinely one of the hardest embedded
+      bugs to find. Use static or heap.
+
+   3. CACHE MAINTENANCE ON M7.
+      Cortex-M7 has data caches. Before a memory-to-
+      peripheral transfer, CLEAN the cache so the DMA sees
+      your writes. After a peripheral-to-memory transfer,
+      INVALIDATE so the CPU does not read stale lines.
+      Miss this and it works at -O0 and fails at -O2, or
+      works until the buffer happens to stay in cache.
+
+        SCB_CleanDCache_by_Addr((uint32_t*)buf, len);
+        ... start TX DMA ...
+
+        ... RX DMA completes ...
+        SCB_InvalidateDCache_by_Addr((uint32_t*)buf, len);
+
+      M0/M3/M4 have no data cache, so this is one of the
+      few places where code does not port upward cleanly.
+
+   4. ALIGNMENT AND WIDTH MUST AGREE.
+      A 32-bit peripheral width with a byte-aligned buffer
+      is a transfer error, not a slow transfer.</pre>
+</div>
+
+<h2 id="volatile">The compiler does not know about DMA</h2>
+
+<pre><code>/* DMA writes memory behind the compiler's back. Every
+   variable the DMA controller touches must be volatile, and
+   volatile alone is still not quite enough.               */
+
+static volatile uint8_t rx_buffer[256];   /* volatile: yes */
+static volatile int     rx_done;
+
+void DMA2_Stream5_IRQHandler(void)
+{
+    DMA2-&gt;HIFCR = DMA_HIFCR_CTCIF5;
+    rx_done = 1;
+}
+
+void consumer(void)
+{
+    while (!rx_done) { }        /* volatile: the load repeats */
+
+    __asm volatile ("dmb");     /* ordering: see below        */
+    process(rx_buffer);
+}
+
+/* The DMB matters. volatile guarantees the COMPILER does
+   not reorder or elide the accesses. It says nothing about
+   the memory system. On Cortex-M the core is largely
+   in-order and this is usually benign, but write buffers
+   and the bus matrix can still reorder the DMA's buffer
+   writes relative to its completion signal.
+
+   The rule: volatile for the compiler, a barrier for the
+   hardware. They solve different problems and you often
+   need both. This is exactly the distinction the ARM track
+   makes in its barriers chapter, and it applies here in
+   miniature.                                               */
+</code></pre>
+
+<h2 id="choosing">A decision table</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>Mechanism</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Reading a status register during init</td><td>Polling</td><td>Happens once; an ISR would be more code
+than the wait</td></tr>
+<tr><td>Waiting ~1 µs for a peripheral to be ready</td><td>Polling</td><td>Shorter than interrupt entry and
+exit</td></tr>
+<tr><td>Button press</td><td>Interrupt</td><td>Rare and unpredictable; polling wastes power</td></tr>
+<tr><td>UART console at 115200</td><td>Interrupt</td><td>0.2% CPU — simplicity wins</td></tr>
+<tr><td>UART at 1 Mbaud or above</td><td>DMA</td><td>Interrupt rate would dominate the CPU</td></tr>
+<tr><td>ADC sampling continuously</td><td>DMA, circular</td><td>Per-sample interrupts are unaffordable at any
+real rate</td></tr>
+<tr><td>SPI display refresh</td><td>DMA</td><td>Large block, no per-byte decision to make</td></tr>
+<tr><td>I2C register read of 2 bytes</td><td>Interrupt</td><td>DMA setup costs more than the transfer</td></tr>
+<tr><td>Audio in or out</td><td>DMA, double-buffered</td><td>Hard deadline, continuous, unattended</td></tr>
+<tr><td>Motor commutation on a hall edge</td><td>Interrupt, highest priority</td><td>Latency is the entire
+requirement</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device stops responding, no crash</td><td>A polling loop with no timeout waiting on a flag that never
+sets</td></tr>
+<tr><td>Poll loop never exits despite the flag setting</td><td>Missing <code>volatile</code>; the load was
+hoisted</td></tr>
+<tr><td>DMA completes but the buffer holds zeros</td><td>Buffer in RAM the DMA engine cannot reach</td></tr>
+<tr><td>Random corruption some time after a transfer</td><td>DMA buffer was a stack local that went out of
+scope</td></tr>
+<tr><td>Works at <code>-O0</code>, fails at <code>-O2</code>, Cortex-M7</td><td>Missing cache clean or
+invalidate around the transfer</td></tr>
+<tr><td>DMA reports a transfer error immediately</td><td>Alignment or width mismatch between peripheral and
+memory</td></tr>
+<tr><td>UART drops bytes under load</td><td>Per-byte interrupts cannot keep up — move to circular DMA</td></tr>
+<tr><td>Received message length is unknown</td><td>Use IDLE-line detection with <code>NDTR</code> to find the
+boundary</td></tr>
+<tr><td>System responsive on the bench, not in the field</td><td>Interrupt load calculated for the demo rate,
+not the real one</td></tr>
+<tr><td>Occasional stale data read after DMA completes</td><td>No barrier between the completion flag and the
+buffer read</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the CPU cost of per-byte interrupts for a 3 Mbaud UART on a 168 MHz core.</li>
+  <li>State the three rules for a polling loop that ships.</li>
+  <li>Explain why a polling loop without a timeout is a field-reliability problem.</li>
+  <li>Describe circular DMA plus IDLE detection and what problem it solves.</li>
+  <li>Write the expression that gives bytes received so far from <code>NDTR</code>.</li>
+  <li>Explain why a DMA buffer must not be a stack local.</li>
+  <li>State the cache maintenance required around DMA on Cortex-M7, in both directions.</li>
+  <li>Explain why <code>volatile</code> and a barrier solve different problems.</li>
+  <li>Choose a mechanism for a 2-byte I2C register read and justify it.</li>
+  <li>Explain why DMA buffers sometimes must be placed in a specific RAM bank.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The boot flow: TF-A, BL32 and the handover | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The boot flow: TF-A, BL32 and the handover</h1>
+<p class="lead">OP-TEE does not boot itself. It is loaded, verified and started by ARM Trusted Firmware as
+one stage of a chain that begins in mask ROM and ends in Linux. Understanding which stage owns what — and
+which one you are debugging — is the difference between a productive afternoon and a wasted one.</p>
+
+<h2 id="chain">The chain</h2>
+
+<p>The secure world must be running and verified before the normal world exists, which dictates the order of the entire boot sequence. Every stage loads and checks the next.</p>
+
+<pre class="diagram">   POWER ON
+      |
+      v
+   +--------------------------------------------------------+
+   | BL1   boot ROM, or TF-A's BL1 stage.        EL3        |
+   |       In mask ROM on real silicon - IMMUTABLE.         |
+   |       Contains the root of trust: a hash of the public  |
+   |       key that signs everything after it.               |
+   |       Loads and VERIFIES BL2.                           |
+   +--------------------------------------------------------+
+      |
+      v
+   +--------------------------------------------------------+
+   | BL2   trusted boot firmware.                 EL1 (S)   |
+   |       Initialises DRAM. Parses the FIP. Loads and       |
+   |       verifies BL31, BL32 and BL33 into their places.   |
+   |       Builds the parameter structures each will need.   |
+   |       Then hands control to BL31.                       |
+   +--------------------------------------------------------+
+      |
+      v
+   +--------------------------------------------------------+
+   | BL31  EL3 RUNTIME FIRMWARE - the secure monitor.  EL3   |
+   |       This one NEVER EXITS. It stays resident for the   |
+   |       life of the system, and every world switch, every |
+   |       PSCI call and every SMC goes through it.          |
+   |                                                         |
+   |       Its boot job: initialise the GIC, install the     |
+   |       SMC vector table, then run each "runtime service" |
+   |       initialiser - including the OP-TEE dispatcher     |
+   |       (opteed), which starts BL32.                      |
+   +--------------------------------------------------------+
+      |
+      +--&gt; BL32 = OP-TEE OS                        S-EL1
+      |         initialises: MMU, secure memory pools, the
+      |         crypto library, the TA loader, its own
+      |         console. Registers its entry vectors with
+      |         BL31. Returns "I am ready".
+      |
+      v
+   +--------------------------------------------------------+
+   | BL33  NON-SECURE bootloader - U-Boot or UEFI.  EL2/EL1 |
+   |       The normal world starts here. From this moment    |
+   |       the secure world only runs when called.           |
+   +--------------------------------------------------------+
+      |
+      v
+   Linux -> optee driver probes -> /dev/tee0 appears
+         -> tee-supplicant starts
+         -> your client can open a session</pre>
+
+<div class="key">
+<b>BL31 is the one that stays</b>
+<p>BL1 and BL2 run once and are gone. BL33 hands off to an OS. <strong>BL31 and BL32 remain resident for
+ever.</strong> Every SMC your client issues, for the rest of the machine's uptime, enters BL31 and is routed
+by it. When something goes wrong at the world boundary, BL31 is where it goes wrong.</p>
+</div>
+
+<h2 id="fip">The FIP: how the images travel together</h2>
+
+<p>All the images have to be packaged together in a way firmware can locate and verify. The container format is how that works, and knowing it makes build output comprehensible.</p>
+
+<pre><code># A Firmware Image Package is a simple container: a header, a
+# table of contents keyed by UUID, and the images.
+
+$ fiptool info fip.bin
+Trusted Boot Firmware BL2: offset=0xB0, size=0x54D8, cmdline="--tb-fw"
+EL3 Runtime Firmware BL31: offset=0x5588, size=0xC1C8, cmdline="--soc-fw"
+Secure Payload BL32 (Trusted OS): offset=0x11750, size=0x3E000, cmdline="--tos-fw"
+Secure Payload BL32 Extra1: offset=0x4F750, size=0x5A000, cmdline="--tos-fw-extra1"
+Secure Payload BL32 Extra2: offset=0xA9750, size=0x21000, cmdline="--tos-fw-extra2"
+Non-Trusted Firmware BL33: offset=0xCA750, size=0x9B240, cmdline="--nt-fw"
+
+# The three BL32 entries are OP-TEE's three parts:
+#   tos-fw         tee-header_v2.bin   - the header
+#   tos-fw-extra1  tee-pager_v2.bin    - the pageable part
+#   tos-fw-extra2  tee-pageable_v2.bin - the rest
+# (see chapter 5 for why OP-TEE is split this way)
+
+# Building one:
+$ fiptool create \
+    --tb-fw         bl2.bin \
+    --soc-fw        bl31.bin \
+    --tos-fw        tee-header_v2.bin \
+    --tos-fw-extra1 tee-pager_v2.bin \
+    --tos-fw-extra2 tee-pageable_v2.bin \
+    --nt-fw         u-boot.bin \
+    fip.bin
+
+# Unpack one you were given, to see what a vendor shipped:
+$ fiptool unpack fip.bin --out ./extracted/
+
+# TF-A's own build does this for you:
+$ make -C arm-trusted-firmware PLAT=qemu \
+       BL32=$OPTEE/out/arm-plat-vexpress/core/tee-header_v2.bin \
+       BL32_EXTRA1=.../tee-pager_v2.bin \
+       BL32_EXTRA2=.../tee-pageable_v2.bin \
+       BL33=$UBOOT/u-boot.bin \
+       SPD=opteed all fip</code></pre>
+
+<h2 id="spd">SPD: how BL31 learns about OP-TEE</h2>
+
+<p>Something has to dispatch calls from the normal world into the trusted OS. That component lives in EL3 firmware and knows the specific protocol the trusted OS expects.</p>
+
+<pre><code>/* SPD = Secure Payload Dispatcher. A TF-A runtime service that
+   knows how to talk to a particular trusted OS. Build TF-A
+   with SPD=opteed and you get the OP-TEE one.               */
+
+  services/spd/opteed/
+      opteed_main.c     initialisation and the SMC handler
+      opteed_common.c   context save/restore
+      teesmc_opteed.h   the private ABI between TF-A and OP-TEE
+
+/* At boot: */
+
+  1. BL31 runs its runtime service initialisers.
+  2. opteed_setup() finds BL32's entry point from the
+     parameters BL2 left behind.
+  3. It builds a secure execution context and ERETs into
+     OP-TEE's entry point, at S-EL1.
+  4. OP-TEE initialises, then calls back:
+         SMC(TEESMC_OPTEED_RETURN_ENTRY_DONE, vectors_addr)
+     handing BL31 a table of entry points:
+         fast_smc_entry     std_smc_entry
+         cpu_on_entry       cpu_off_entry
+         cpu_resume_entry   cpu_suspend_entry
+         fiq_entry          system_off_entry  system_reset_entry
+  5. opteed records them and returns to BL2's caller, which
+     proceeds to BL33.
+
+/* At RUNTIME, every OP-TEE SMC from the normal world: */
+
+     normal world executes SMC
+        -> EL3 vector table
+        -> BL31 decodes the function ID
+        -> it is in the Trusted OS range -> opteed
+        -> opteed SAVES the non-secure context
+        -> restores the secure context
+        -> ERETs to std_smc_entry in OP-TEE
+        ... OP-TEE does the work ...
+        -> OP-TEE executes SMC(TEESMC_OPTEED_RETURN_CALL_DONE)
+        -> opteed restores the non-secure context
+        -> ERET back to the normal world
+
+/* Two SMCs and two full context switches per invocation. That
+   is the floor on TA call latency, and it is why TAs are for
+   valuable operations rather than hot loops.                */</code></pre>
+
+<h2 id="verify">Verified boot: what "chain of trust" means concretely</h2>
+
+<p>Each handover is a signature check, and where the keys come from determines whether the chain means anything. This is what that looks like in practice.</p>
+
+<pre class="diagram">   Each stage verifies the next BEFORE executing it.
+
+   BL1  holds ROTPK_HASH in ROM or eFuses  (immutable)
+     |    reads the Trusted Key certificate from the FIP
+     |    checks: SHA256(public key in cert) == ROTPK_HASH
+     |    checks: cert signature verifies with that key
+     |    -> now the trusted world key is trusted
+     v
+   BL2  its hash is in a certificate signed by that key
+     |    BL2 in turn verifies BL31, BL32 and BL33 the same way
+     v
+   BL31, BL32, BL33
+
+   Turn it on:  make ... TRUSTED_BOARD_BOOT=1 GENERATE_COT=1 \
+                         ARM_ROTPK_LOCATION=devel_rsa \
+                         ROT_KEY=plat/arm/board/common/rotpk/arm_rotprivk_rsa.pem
+
+   MEASURED boot is different and complementary:
+     each stage HASHES the next and EXTENDS the hash into a
+     PCR (a TPM register, or OP-TEE's own measurement store)
+     before running it. Nothing is blocked; instead the record
+     of what ran can later be attested.
+
+     Verified boot  : refuses to run unexpected software
+     Measured boot  : runs it, but records what it was
+
+   Chapter 22's fTPM is where measured boot lands: the PCRs
+   that record the boot chain live inside a trusted
+   application.</pre>
+
+<div class="warn">
+<b>Development keys are development keys</b>
+<p>Every OP-TEE and TF-A tree ships a test signing key, and every tutorial uses it — including this one. It
+is public. A device shipped with the default key can have arbitrary trusted applications loaded onto it by
+anyone. Key management is covered in <a href="tee-14-ta-build-sign.html">chapter 14</a>; the short version is
+that the private key belongs in an HSM and never in a repository.</p>
+</div>
+
+<h2 id="watch">Watching the boot</h2>
+
+<p>Watching the boot happen, stage by stage, is the quickest way to confirm your mental model matches reality — and the fastest way to find which stage is failing.</p>
+
+<pre><code>$ qemu-system-aarch64 -M virt,secure=on,virtualization=on \
+    -cpu max -smp 2 -m 1057 -nographic \
+    -bios bl1.bin \
+    -semihosting-config enable=on,target=native \
+    -serial mon:stdio -serial file:secure.log
+
+NOTICE:  Booting Trusted Firmware
+NOTICE:  BL1: v2.10.0(release)
+NOTICE:  BL1: Booting BL2
+NOTICE:  BL2: v2.10.0(release)
+NOTICE:  BL1: Booting BL31
+NOTICE:  BL31: v2.10.0(release)
+I/TC: Reserved shared memory is enabled
+I/TC: Dynamic shared memory is enabled
+I/TC: Normal World virtualization support is disabled
+I/TC: Asynchronous notifications are disabled
+I/TC: OP-TEE version: 4.1.0
+I/TC: Primary CPU switching to normal world boot
+U-Boot 2024.01
+...
+[    2.114] optee: probing for conduit method.
+[    2.115] optee: revision 4.1 (0e3e9c9d)
+[    2.118] optee: dynamic shared memory is enabled
+[    2.130] optee: initialized driver
+
+# The "I/TC:" lines are OP-TEE's own console - Trusted Core.
+# With two -serial they go to secure.log; with one they
+# interleave with everything else, which is confusing but
+# occasionally useful for ordering.
+
+# Prefixes you will see all track long:
+#   I/TC:  info,  trusted core (OP-TEE OS)
+#   E/TC:  error, trusted core
+#   D/TC:  debug, trusted core
+#   I/TA:  from inside a trusted application
+#   F/TC:  flow tracing (very verbose)</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Stops after <code>BL1: Booting BL2</code></td><td>BL2 missing from the FIP, or DRAM init failed, or a
+verification failure with <code>TRUSTED_BOARD_BOOT</code></td></tr>
+<tr><td>No <code>I/TC:</code> lines at all</td><td>TF-A built without <code>SPD=opteed</code>, or BL32 not in
+the FIP</td></tr>
+<tr><td><code>BL31: Error initializing runtime service opteed_fast</code></td><td>BL32 entry point wrong, or
+OP-TEE built for a different platform</td></tr>
+<tr><td>OP-TEE prints then the machine hangs</td><td>Secure memory carve-out overlaps normal-world RAM
+(<a href="tee-06-secure-memory.html">chapter 6</a>)</td></tr>
+<tr><td>Linux boots but <code>/dev/tee0</code> is absent</td><td><code>CONFIG_OPTEE</code> off, or no
+<code>optee</code> node in the device tree, or OP-TEE never registered</td></tr>
+<tr><td><code>optee: api uid mismatch</code></td><td>Linux driver and OP-TEE versions incompatible</td></tr>
+<tr><td>Verified boot fails on a rebuilt image</td><td>The certificate chain was not regenerated —
+<code>GENERATE_COT=1</code></td></tr>
+<tr><td>Works with <code>-kernel</code>, not with <code>-bios</code></td><td>Different worlds entirely; with
+<code>-bios</code> you supply everything (<a href="qemu-05-direct-boot.html">QEMU chapter 5</a>)</td></tr>
+<tr><td>Secondary CPUs hang</td><td>PSCI handled by BL31, but OP-TEE's <code>cpu_on_entry</code> not
+registered</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five boot stages, the exception level each runs at, and which two stay resident.</li>
+  <li>Say what BL2 does that BL31 does not.</li>
+  <li>Explain what a FIP is and list the entries an OP-TEE build puts in one.</li>
+  <li>Explain what an SPD is and how BL31 learns OP-TEE's entry points.</li>
+  <li>Count the SMCs and context switches in one TA invocation.</li>
+  <li>Distinguish verified boot from measured boot, and say which one blocks.</li>
+  <li>Explain the risk of shipping with the default signing key.</li>
+  <li>Identify from a boot log whether OP-TEE initialised, and where its console output goes.</li>
+  <li>Name three reasons <code>/dev/tee0</code> might be missing after a successful OP-TEE boot.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async Rust | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Async Rust</h1>
+<p class="lead">Concurrency without threads: a state machine the compiler writes for you. On embedded this
+is transformative — Embassy gives you cooperative multitasking with no RTOS, no per-task stacks, and code
+that reads like blocking code.</p>
+
+<h2 id="model">The model</h2>
+
+<p>Async in Rust is unusual: it compiles to a state machine, has no runtime unless you supply one, and works on a microcontroller. Understanding the model explains all three.</p>
+
+<pre class="diagram">   An `async fn` does not run when called. It returns a
+   FUTURE - a value representing work not yet done.
+
+        async fn read_sensor() -> u16 { ... }
+
+        let fut = read_sensor();        // NOTHING HAS
+                                        // HAPPENED
+        let v = fut.await;              // now it runs, and
+                                        // may yield
+
+   THE FUTURE TRAIT, which is the whole mechanism:
+
+        trait Future {
+            type Output;
+            fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;)
+                    -> Poll&lt;Self::Output&gt;;
+        }
+        enum Poll&lt;T&gt; { Ready(T), Pending }
+
+   The EXECUTOR calls poll(). If the future returns Pending,
+   it has arranged - via the Waker in the Context - to be
+   woken when progress is possible, and the executor runs
+   something else. When woken, poll() is called again.
+
+   THE COMPILER TRANSFORMS an async fn into a STATE MACHINE:
+
+        async fn f() {
+            let a = step1().await;      // state 0
+            let b = step2(a).await;     // state 1
+            finish(b);                  // state 2
+        }
+
+   becomes, in effect:
+
+        enum F { S0, S1 { a: A }, S2 { b: B }, Done }
+        impl Future for F {
+            fn poll(...) -> Poll&lt;()&gt; {
+                loop { match self.state {
+                    S0 => match step1().poll() {
+                        Pending => return Pending,
+                        Ready(a) => self.state = S1 { a },
+                    },
+                    ...
+                }}
+            }
+        }
+
+   THE SIZE OF THAT ENUM is the size of the future - it holds
+   every local that is live across an await point. That is
+   why async needs no per-task stack: the state that would
+   have lived on a stack lives in the future instead, sized
+   exactly, at compile time.
+
+   AND WHY THAT MATTERS ON EMBEDDED: an RTOS gives every task
+   a stack, sized by guesswork and usually over-provisioned.
+   Embassy's tasks are futures - typically tens or a few
+   hundred bytes, exactly measured by the compiler.</pre>
+
+<h2 id="writing">Writing async code</h2>
+
+<p>The syntax is small. The adjustment is that an async function does nothing until polled, which is the source of most early confusion.</p>
+
+<pre><code>    async fn fetch(id: u32) -> Result&lt;Data, Error&gt; {
+        let conn = connect().await?;            // `?` works
+        let raw = conn.request(id).await?;
+        Ok(parse(raw)?)
+    }
+
+/* IT READS LIKE BLOCKING CODE. That is the point - the
+   alternative is a hand-written state machine or a chain of
+   callbacks, both of which obscure the control flow.
+
+/* CONCURRENCY WITHIN ONE TASK: */
+    use futures::future::join;
+
+    let (a, b) = join(read_temp(), read_pressure()).await;
+    // both progress; completes when BOTH do
+
+    use futures::future::select;
+    match select(read_sensor(), timer(Duration::from_ms(100)))
+              .await {
+        Either::Left((v, _))  => got_value(v),
+        Either::Right((_, _)) => timed_out(),
+    }
+    // whichever finishes first; the other is DROPPED
+
+/* IN EMBASSY the same things read better: */
+    use embassy_futures::{join::join, select::{select,
+                                               Either}};
+
+    match select(uart.read(&amp;mut buf),
+                 Timer::after_millis(100)).await {
+        Either::First(r) => handle(r?),
+        Either::Second(_) => return Err(Error::Timeout),
+    }
+/* A TIMEOUT ON ANY OPERATION, in three lines, with no timer
+   callbacks and no state to unwind. This single pattern is
+   worth the whole model on embedded.
+
+/* CANCELLATION IS DROPPING THE FUTURE: */
+    let fut = long_operation();
+    drop(fut);                  // it simply stops - its Drop
+                                // runs, releasing whatever it
+                                // held
+/* WHICH IS WHY `select` can abandon the loser safely, and
+   why every async operation must be CANCEL SAFE: it must be
+   correct to stop at any await point. A future that has
+   started a DMA transfer must stop it in Drop, or the
+   hardware writes into a buffer that no longer exists.
+   THIS IS THE MAIN CORRECTNESS HAZARD in embedded async, and
+   it is the one to think about when writing a driver.   */</code></pre>
+
+<div class="key">
+<b>Async is concurrency, not parallelism</b>
+<p>On a single core, an executor interleaves tasks at await points — one runs at a time, and a task that
+never awaits blocks everything. That is cooperative multitasking, and it means no preemption, no data races
+between tasks on one executor, and no locking needed for data shared between them. It also means a
+compute-bound loop must yield explicitly.</p>
+</div>
+
+<h2 id="embassy">Embassy</h2>
+
+<p>This is the part that matters most for embedded work: an async executor small enough for a microcontroller, which turns interrupt-driven firmware into readable sequential code.</p>
+
+<pre><code>#![no_std]
+#![no_main]
+
+use embassy_executor::Spawner;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_time::{Duration, Timer};
+
+#[embassy_executor::task]
+async fn blink(mut led: Output&lt;'static&gt;) {
+    loop {
+        led.set_high();
+        Timer::after_millis(500).await;      // YIELDS - the
+        led.set_low();                       // executor runs
+        Timer::after_millis(500).await;      // other tasks
+    }
+}
+
+#[embassy_executor::task]
+async fn sensor(mut i2c: I2c&lt;'static, Async&gt;) {
+    let mut buf = [0u8; 2];
+    loop {
+        i2c.write_read(ADDR, &amp;[REG_TEMP], &amp;mut buf)
+           .await
+           .unwrap();                        // an actual DMA
+                                             // transfer,
+                                             // awaited
+        let temp = i16::from_be_bytes(buf);
+        CHANNEL.send(Reading::Temp(temp)).await;
+        Timer::after_secs(1).await;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+
+    let led = Output::new(p.PC13, Level::Low, Speed::Low);
+    spawner.spawn(blink(led)).unwrap();
+    spawner.spawn(sensor(i2c)).unwrap();
+
+    loop {
+        match CHANNEL.receive().await {
+            Reading::Temp(t) => log(t),
+        }
+    }
+}
+
+/* WHAT IS HAPPENING UNDERNEATH:
+
+   · `Timer::after_millis(500).await` registers with a
+     hardware timer and returns Pending. The executor finds
+     nothing else runnable and executes WFI - the core sleeps
+     until an interrupt. Power consumption drops to
+     microamps.
+
+   · `i2c.write_read(...).await` starts a DMA transfer and
+     returns Pending. The DMA-complete interrupt wakes the
+     task. NO POLLING, NO BUSY-WAIT, and the core sleeps
+     during the transfer.
+
+   · Each task is a future stored in a statically allocated
+     slot sized by the compiler. NO HEAP, NO PER-TASK STACK.
+
+   THE COMPARISON WITH AN RTOS:
+     FreeRTOS: 8 tasks x 1 KB stack = 8 KB of RAM, guessed,
+               plus context-switch cost, plus a scheduler
+     Embassy:  8 futures x ~100 bytes = under 1 KB, exact,
+               with switches that are ordinary function
+               returns
+
+/* THE SYNCHRONISATION PRIMITIVES, all no-alloc: */
+    use embassy_sync::{channel::Channel, mutex::Mutex,
+                       signal::Signal, pubsub::PubSubChannel};
+    use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+
+    static CHANNEL: Channel&lt;ThreadModeRawMutex, Reading, 8&gt;
+                = Channel::new();
+    static SIGNAL: Signal&lt;ThreadModeRawMutex, ()&gt;
+                = Signal::new();
+
+    // an ASYNC mutex - awaiting the lock yields rather than
+    // blocking
+    static SHARED: Mutex&lt;ThreadModeRawMutex, State&gt;
+                = Mutex::new(State::new());
+    { let mut s = SHARED.lock().await; s.update(); }</code></pre>
+
+<h2 id="pin">Pin, briefly</h2>
+
+<p><code>Pin</code> exists because of one specific problem created by compiling async functions into state machines. This is the minimum needed to read it in an error message.</p>
+
+<pre><code>/* A future that holds a reference into itself - which the
+   state machine transformation produces whenever a local
+   reference lives across an await - must not MOVE, or the
+   reference dangles.
+
+   `Pin&lt;P&gt;` is the type-level promise that the pointee will
+   not move.                                               */
+
+    async fn f() {
+        let data = [0u8; 64];
+        let slice = &amp;data[..];          // a reference INTO
+                                        // the future
+        io.read(slice).await;           // live across an
+                                        // await -&gt;
+                                        // self-referential
+    }
+
+/* IN PRACTICE YOU RARELY TOUCH Pin:
+     · `.await` handles pinning for you
+     · pin_mut! or Box::pin when you must hold a future
+     · implementing Future by hand is where you meet it
+
+    use futures::pin_mut;
+    let fut = do_thing();
+    pin_mut!(fut);              // pins it to the stack
+    poll_fn(|cx| fut.as_mut().poll(cx)).await;
+
+/* `Unpin` MEANS "moving me is fine" - most types are Unpin,
+   and only self-referential ones are not. If an error
+   mentions Unpin, you are holding a future that needs
+   pinning; pin_mut! or Box::pin is the fix.             */</code></pre>
+
+<h2 id="hosted">Async on Linux</h2>
+
+<p>On Linux the picture is different: a real runtime, real threads underneath, and a different set of trade-offs.</p>
+
+<pre><code>/* For embedded LINUX rather than bare metal, tokio is the
+   standard runtime. */
+
+    #[tokio::main]
+    async fn main() -> Result&lt;()&gt; {
+        let listener = TcpListener::bind("0.0.0.0:8080")
+                            .await?;
+        loop {
+            let (socket, _) = listener.accept().await?;
+            tokio::spawn(async move { handle(socket).await });
+        }
+    }
+
+/* TOKIO gives you: a multi-threaded work-stealing executor,
+   async file and socket I/O, timers, channels, and
+   synchronisation primitives. It is what a network service
+   on an embedded Linux gateway should use.
+
+/* THE CATCH - BLOCKING IN AN ASYNC CONTEXT: */
+    async fn bad() {
+        std::thread::sleep(Duration::from_secs(1));  // BLOCKS
+                                                     // THE
+                                                     // EXECUTOR
+        let data = std::fs::read("file")?;           // ditto
+    }
+    async fn good() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let data = tokio::fs::read("file").await?;
+        // and for genuinely blocking work:
+        let r = tokio::task::spawn_blocking(|| heavy_cpu())
+                     .await?;
+    }
+/* A blocking call in an async task stalls every other task
+   on that executor thread. This is the commonest async bug,
+   in every language that has it.
+
+/* AND THE RUNTIME QUESTION: async code is tied to its
+   runtime's primitives, so a library written against tokio
+   does not work under async-std or Embassy. Libraries should
+   be runtime-agnostic where possible - which in practice
+   means depending only on `futures` traits.            */</code></pre>
+
+<h2 id="when">When to use it</h2>
+
+<p>Async is not a general improvement over threads. The choice turns on what the work is actually waiting for.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>Approach</th></tr></thead>
+<tbody>
+<tr><td>Many I/O-bound tasks, bare metal</td><td><strong>Embassy</strong> — this is its case</td></tr>
+<tr><td>Hard real-time, priority-driven</td><td><strong>RTIC</strong> — preemptive, with compile-time analysis</td></tr>
+<tr><td>A simple superloop with two or three activities</td><td>A plain loop with state; async adds nothing</td></tr>
+<tr><td>Network service on embedded Linux</td><td><strong>tokio</strong></td></tr>
+<tr><td>CPU-bound work</td><td>Threads, or <code>spawn_blocking</code> — async does not help</td></tr>
+<tr><td>Existing RTOS codebase</td><td>Keep the RTOS; async is not a drop-in replacement</td></tr>
+<tr><td>Very tight flash budget</td><td>Measure — Embassy is small but not free</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE HONEST TRADE-OFFS:
+
+   IN FAVOUR:
+     · code that reads sequentially for logic that is
+       concurrent
+     · no per-task stacks - typically a large RAM saving
+     · automatic power management: the executor sleeps when
+       nothing is ready
+     · timeouts and cancellation are three lines
+     · no priority inversion, no preemption races between
+       tasks on one executor
+
+   AGAINST:
+     · the state machine transformation makes debugging
+       harder - a backtrace shows the executor, not your
+       logic
+     · CANCEL SAFETY is a real hazard: every await point is a
+       possible cancellation point
+     · a future's size can surprise you - a large array
+       across an await lives in the future
+     · no preemption, so a long computation starves
+       everything; you must yield explicitly
+     · error messages involving Pin and generic futures are
+       poor
+     · it is newer than the alternatives
+
+   MEASURE THE FUTURE SIZES, which is the one number that
+   catches people out:                                     */
+        const _: () = assert!(
+            core::mem::size_of_val(&amp;my_task()) &lt; 512);
+/* A future holding a 4 KB buffer across an await is 4 KB of
+   static RAM. Box it, or restructure so the buffer is not
+   live across the await.                                */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>The async function never runs</td><td>The future was created and not awaited</td></tr>
+<tr><td>Everything stalls</td><td>A blocking call, or a compute loop with no await</td></tr>
+<tr><td>"future cannot be sent between threads"</td><td>It holds a non-<code>Send</code> value across an await</td></tr>
+<tr><td>"<code>X</code> is not <code>Unpin</code>"</td><td>Pin it: <code>pin_mut!</code> or <code>Box::pin</code></td></tr>
+<tr><td>DMA writes into a freed buffer</td><td>The future was cancelled without stopping the transfer — cancel safety</td></tr>
+<tr><td>Data lost on a timeout</td><td>The abandoned future had consumed input — restructure to be cancel safe</td></tr>
+<tr><td>Static RAM much larger than expected</td><td>A large local live across an await</td></tr>
+<tr><td>Backtrace shows only the executor</td><td>Expected — instrument with <code>defmt</code> instead</td></tr>
+<tr><td>Deadlock on an async mutex</td><td>Held across an await that waits on the holder</td></tr>
+<tr><td>Power consumption never drops</td><td>A task is polling rather than awaiting a real interrupt</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what an <code>async fn</code> returns and when the work happens.</li>
+  <li>Describe the state machine transformation and where the state lives.</li>
+  <li>Explain why async needs no per-task stack, and compare with an RTOS.</li>
+  <li>Use <code>join</code> and <code>select</code>, and implement a timeout.</li>
+  <li>Explain cancel safety and give a hardware example where it matters.</li>
+  <li>Write an Embassy task and explain what happens at each await.</li>
+  <li>Explain why the core can sleep during an awaited DMA transfer.</li>
+  <li>Say what <code>Pin</code> is for and when you actually meet it.</li>
+  <li>Name the commonest async bug on a hosted runtime and its fix.</li>
+  <li>Decide between Embassy, RTIC, an RTOS and a superloop for four situations.</li>
+  <li>Measure a future's size and say what makes it large.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

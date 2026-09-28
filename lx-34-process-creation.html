@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Process creation internals: fork, exec and clone | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Process creation internals: fork, exec and clone</h1>
+<p class="lead"><a href="lx-09-task-struct.html">Chapter 10</a> covered <code>task_struct</code> once it
+exists. This chapter is where it comes from — why Unix split "create a process" and "run a program" into two
+separate calls, what a thread actually is at the kernel level, and the single system call underneath all of
+it.</p>
+
+<h2 id="fork">fork(): copy first, ask questions later</h2>
+
+<p>Unix creates a new process by duplicating an existing one, which strikes most people as a strange choice. The result is a second process identical to the first in every respect except one — and that single difference is how each side knows which it is.</p>
+
+<pre class="diagram">   fork() CREATES A NEW PROCESS THAT IS, AT THE INSTANT IT
+   IS CREATED, A NEAR-EXACT COPY OF THE CALLER:
+
+     BEFORE fork()                 AFTER fork()
+
+     PARENT                        PARENT           CHILD
+     pid 100                       pid 100          pid 101
+     memory: A, B, C                memory: A,B,C    memory: A,B,C
+     fds: 3, 4, 5                   fds: 3,4,5       fds: 3,4,5
+     return value: -                return: 101      return: 0
+
+   BOTH PROCESSES RESUME EXECUTION AT THE SAME POINT, right
+   after the fork() call - the ONLY difference visible to the
+   program is fork()'s return value, which is how each side
+   knows which one it is. Everything else - open file
+   descriptors, memory contents, signal handlers, the current
+   working directory - starts out identical and then
+   DIVERGES independently from that moment on.</pre>
+
+<div class="key">
+<b>Copy-on-write: fork() does not actually copy memory</b>
+<p>Duplicating an entire address space on every <code>fork()</code> — potentially gigabytes — would make it
+unusably slow, and in the overwhelmingly common case (<code>fork()</code> immediately followed by
+<code>exec()</code>, replacing the memory anyway) all of that copying would be wasted work. Instead the kernel
+marks every page in both processes' page tables read-only and lets them share the same physical pages. The
+first write by either process — parent or child — triggers a page fault (<a
+href="win-31-memory-manager.html">the same fault mechanism the Windows internals chapter on memory
+describes</a>, and Linux's own page-fault path works the same way), the kernel copies just that one page, and
+each process gets its own private copy from that point on. This is <strong>copy-on-write</strong>, and it is
+why <code>fork()</code> is fast regardless of how much memory the parent holds: the cost is proportional to how
+much memory actually gets modified afterward, not to the process's total size.</p>
+</div>
+
+<h2 id="exec">exec(): the same process, entirely new content</h2>
+
+<p>Creating a process and running a program are two separate operations in Unix. This is the second one, and unlike <code>fork</code> it creates nothing: it replaces the contents of the process that calls it.</p>
+
+<pre><code>/* exec() does NOT create a new process. It REPLACES the
+   calling process's memory image, in place, with a new
+   program - the pid stays the same, but code, data, heap and
+   stack are all discarded and rebuilt from the new binary.  */
+
+execve("/bin/ls", argv, envp);
+/* If this returns AT ALL, it failed - success means the
+   calling code has been replaced and execution resumes at
+   the NEW program's entry point, not at the line after
+   execve().                                                */
+
+/* THE CLASSIC PATTERN, and why fork/exec are two calls
+   instead of one "spawn" call: */
+
+pid_t pid = fork();
+if (pid == 0) {
+        /* CHILD: free to do things ONLY the child should do
+           before the new program starts - redirect stdin/out,
+           close inherited file descriptors, change directory,
+           drop privileges, set up a new process group -
+           because it is still running the PARENT'S code and
+           can still call ordinary functions.                */
+        dup2(pipe_fd, STDOUT_FILENO);
+        execve("/bin/ls", argv, envp);
+        _exit(127);   /* only reached if execve() itself failed */
+} else {
+        /* PARENT: continues immediately, pid holds the
+           child's pid for waitpid() later.                  */
+        waitpid(pid, &amp;status, 0);
+}</code></pre>
+
+<div class="note">
+<b>Why not one combined "spawn" call?</b>
+<p>The gap between <code>fork()</code> and <code>execve()</code> is not an implementation accident — it is the
+whole point of splitting process creation this way. Every shell feature that looks like it needs special
+support from the kernel — I/O redirection (<code>&gt;</code>), pipes (<code>|</code>), changing the working
+directory for one command only, running a command as a different user — is implemented entirely in that gap,
+using nothing but ordinary system calls the child process runs on itself before replacing its own image.
+Windows, by contrast, has no equivalent split — <code>CreateProcess</code> combines both steps into one call
+and has to expose each of those behaviours as an explicit parameter instead.</p>
+</div>
+
+<h2 id="clone">clone(): the one real syscall underneath both</h2>
+
+<p>Neither of the calls above is really a system call. Both are thin wrappers around a single, more general one, and what it produces — a separate process or a thread sharing everything — depends entirely on the flags you give it.</p>
+
+<pre class="diagram">   NEITHER fork() NOR pthread_create() IS ITS OWN SYSTEM
+   CALL. BOTH ARE LIBRARY WRAPPERS AROUND ONE UNDERLYING
+   SYSCALL: clone(). What clone() actually creates - a
+   process that looks completely separate, or a thread that
+   shares almost everything with its creator - is controlled
+   entirely by a set of FLAGS passed to it.
+
+     fork()  is roughly:
+        clone(SIGCHLD, 0)
+        - shares NOTHING extra: new address space, new file
+          descriptor table (a COPY, not shared), new signal
+          handler table (a copy)
+
+     pthread_create()  is roughly:
+        clone(CLONE_VM | CLONE_FS | CLONE_FILES |
+              CLONE_SIGHAND | CLONE_THREAD | ..., stack)
+        - CLONE_VM:      SHARE the address space - this is
+                         what makes it a thread rather than a
+                         process; a write by one is
+                         immediately visible to the other,
+                         with no copy-on-write involved at all
+        - CLONE_FILES:   SHARE the file descriptor table -
+                         close(fd) in one thread closes it for
+                         every thread
+        - CLONE_SIGHAND: SHARE signal handlers
+        - CLONE_THREAD:  put it in the same thread GROUP, so
+                         getpid() returns the SAME value for
+                         every thread (chapter 10's pid/tid
+                         distinction is exactly this: what
+                         getpid() reports for a thread is its
+                         thread GROUP's id, not the value the
+                         scheduler tracks it under)
+
+   THE CONSEQUENCE: at the kernel level, a THREAD IS SIMPLY A
+   task_struct THAT HAPPENS TO SHARE ITS mm_struct, file table
+   and signal handlers WITH ANOTHER task_struct. There is no
+   separate "thread" data structure in the scheduler at all -
+   chapter 10's task_struct and chapter 11's scheduler treat
+   every runnable thing identically, whether a userspace
+   thread calls it a thread or a process.</pre>
+
+<h2 id="whatsshared">What CLONE_* flags actually control</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Shared instead of copied</th><th>Set by</th></tr></thead>
+<tbody>
+<tr><td><code>CLONE_VM</code></td><td>The entire address space</td><td><code>pthread_create()</code></td></tr>
+<tr><td><code>CLONE_FILES</code></td><td>The open file descriptor table</td><td><code>pthread_create()</code></td></tr>
+<tr><td><code>CLONE_FS</code></td><td>Current working directory, root, umask</td><td><code>pthread_create()</code></td></tr>
+<tr><td><code>CLONE_SIGHAND</code></td><td>Signal disposition table (requires <code>CLONE_VM</code>)</td><td><code>pthread_create()</code></td></tr>
+<tr><td><code>CLONE_THREAD</code></td><td>Thread group membership — same <code>getpid()</code></td><td><code>pthread_create()</code></td></tr>
+<tr><td><code>CLONE_NEWNS/NEWPID/NEWNET/...</code></td><td>Nothing shared — a new, isolated namespace instead
+(<a href="lx-35-namespaces-cgroups.html">chapter 40</a>)</td><td>Container runtimes</td></tr>
+<tr><td>None of the above</td><td>Nothing — an ordinary, independent process</td><td><code>fork()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Reading this table is the fastest way to understand a genuinely confusing piece of Linux terminology: a
+"process" and a "thread" are not two different kernel object types, they are the same
+<code>task_struct</code>-based mechanism used with a different combination of sharing flags. Everything else
+— how much isolation you get, whether a crash in one takes down the other, whether <code>kill()</code> targets
+one or all of them — follows directly from which resources that particular <code>clone()</code> call chose to
+share.</p>
+
+<h2 id="observe">Observing it</h2>
+
+<p>All of this is visible from outside. Being able to see which flags a program actually used, and which tasks share what, turns the process/thread distinction from a definition into something you can check.</p>
+
+<pre><code>strace -f -e trace=clone,fork,execve ./myprogram
+# -f follows children; the clone() line's flags argument
+# shows exactly which CLONE_* bits a given fork() or
+# pthread_create() call actually used underneath.
+
+ps -eLf              # -L shows every THREAD as its own row,
+                     # with a shared PID and a distinct LWP
+                     # (light-weight process) id - the
+                     # kernel's actual per-thread identifier
+
+cat /proc/PID/status | grep -i threads
+cat /proc/PID/task/   # one directory per thread, each with
+                      # its own /proc/PID/task/TID/stack etc.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A large process's <code>fork()</code> is unexpectedly fast</td><td>Copy-on-write — no memory is actually
+duplicated until something writes to it</td></tr>
+<tr><td>A forked child writes to a variable and the parent sees the old value</td><td>Expected — copy-on-write
+gave each process its own private page the moment either one wrote</td></tr>
+<tr><td>Memory use spikes sharply right after a large process forks</td><td>The child (or parent) is writing to
+many shared pages, triggering copy-on-write across all of them</td></tr>
+<tr><td>Closing a file descriptor in one thread breaks another thread</td><td>Expected — <code>CLONE_FILES</code>
+means threads share one file descriptor table</td></tr>
+<tr><td><code>getpid()</code> returns the same value in every thread of a process</td><td>Expected —
+<code>CLONE_THREAD</code> puts them in one thread group</td></tr>
+<tr><td>A signal handler runs, and it is unclear which thread will receive the next signal</td><td>Signal
+disposition is shared (<code>CLONE_SIGHAND</code>) but delivery targets one thread — check which thread the
+signal was actually routed to</td></tr>
+<tr><td>Code assumes <code>fork()</code> and <code>execve()</code> are one atomic step</td><td>They are not —
+anything the child does between them runs with the parent's memory image still intact</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what changes and what stays identical the instant <code>fork()</code> returns in each process.</li>
+  <li>Explain copy-on-write and why it makes <code>fork()</code> cheap even for a large process.</li>
+  <li>Explain why <code>fork()</code> and <code>exec()</code> are separate calls, using a shell redirection
+  example.</li>
+  <li>Explain what <code>clone()</code> is, and how <code>fork()</code> and <code>pthread_create()</code>
+  relate to it.</li>
+  <li>Name three resources <code>CLONE_VM</code>, <code>CLONE_FILES</code> and <code>CLONE_THREAD</code> each
+  cause to be shared, and what sharing each one implies practically.</li>
+  <li>Explain why the kernel scheduler does not need a separate "thread" data structure.</li>
+  <li>Use <code>ps -eLf</code> or <code>strace -f</code> to observe threads versus processes on a running
+  system.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

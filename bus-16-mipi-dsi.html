@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIPI DSI and display interfaces | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>MIPI DSI and display interfaces</h1>
+<p class="lead">Displays are CSI-2 in reverse, with one important addition: some panels have memory and some do
+not, and that single fact decides whether your firmware sends a frame when something changes or sixty times a
+second forever.</p>
+
+<h2 id="spectrum">The display interface spectrum</h2>
+
+<pre class="diagram">   In increasing order of bandwidth and complexity:
+
+   SPI                  up to ~320x240
+     A display controller with its own frame buffer. You
+     send only what changed. Simple, slow, and completely
+     adequate for a small UI. ILI9341, ST7789 and similar.
+
+   PARALLEL 8080/6800   up to ~800x480
+     8 or 16 data lines plus control strobes. Still a
+     controller with memory; just a wider path to it.
+     Often driven by an MCU's FSMC/FMC memory controller,
+     so writing a pixel is a store to an address.
+
+   RGB PARALLEL (DPI)   up to ~1024x600
+     NO MEMORY IN THE PANEL. 16-24 data lines plus HSYNC,
+     VSYNC, DE and PCLK, and you must supply every pixel of
+     every frame, continuously, forever. Needs an LCD
+     controller peripheral (LTDC) and a frame buffer in RAM.
+
+   MIPI DSI             1080p and beyond
+     1-4 differential lanes, same D-PHY as CSI-2
+     (chapter 15). Panels may or may not have memory.
+
+   LVDS / eDP           laptop-class panels
+     Different physical layer, same fundamental split.
+
+   THE SPLIT THAT MATTERS MORE THAN THE WIRING:
+
+   COMMAND MODE / with GRAM
+     The panel has RAM. You write a region when it changes
+     and stop. The panel refreshes itself.
+     -&gt; low average power, simple firmware, ideal for a
+        mostly-static UI.
+
+   VIDEO MODE / no memory
+     You stream every frame at the refresh rate, with
+     blanking intervals, exactly like an old CRT.
+     -&gt; constant bandwidth and power whether anything
+        changes or not, but no tearing and no panel RAM cost.
+
+   A wearable with a static watch face wants command mode.
+   A device playing video wants video mode. Choosing the
+   panel decides which firmware you write.</pre>
+
+<h2 id="timing">Video mode timing</h2>
+
+<pre class="diagram">   Video mode inherits CRT vocabulary, and the blanking
+   intervals are real time you must budget for.
+
+   |&lt;----------------- HTOTAL ------------------&gt;|
+   |&lt;-HSA-&gt;|&lt;-HBP-&gt;|&lt;--- HACT ---&gt;|&lt;-HFP-&gt;|
+   +-------+-------+---------------+-------+
+   | sync  | back  |   PIXELS      | front |
+   |       | porch |               | porch |
+   +-------+-------+---------------+-------+
+
+   Same structure vertically: VSA, VBP, VACT, VFP.
+
+   PIXEL CLOCK = HTOTAL x VTOTAL x refresh_rate
+
+   WORKED, for 800x480 at 60 Hz:
+     HTOTAL = 48 + 40 + 800 + 40 = 928
+     VTOTAL = 3 + 29 + 480 + 13  = 525
+     PCLK   = 928 x 525 x 60 = 29.2 MHz
+
+   BANDWIDTH at 24 bits per pixel:
+     29.2e6 x 24 = 701 Mbit/s
+   Two DSI lanes at 500 Mbit/s each covers it.
+
+   NOTE THE OVERHEAD: 928x525 = 487,200 clocks to deliver
+   384,000 pixels. Twenty percent of your bandwidth is
+   blanking. The porch values come from the PANEL DATASHEET
+   and are not negotiable - they are the time the panel's
+   internal circuitry needs.
+
+   FRAME BUFFER COST:
+     800 x 480 x 3 bytes = 1.1 MB
+   That does not fit in any microcontroller's SRAM, which
+   is why RGB parallel and DSI video mode need external
+   SDRAM. This single number is often what forces a design
+   from an MCU to an application processor - or to a
+   command-mode panel with its own memory.</pre>
+
+<h2 id="commands">Talking to the panel</h2>
+
+<pre><code>/* DSI carries both pixels and commands on the same lanes.
+   DCS (Display Command Set) is the standard command
+   vocabulary, and lane 0 is bidirectional so the panel can
+   answer.                                                 */
+
+/* Standard DCS commands - the same on every compliant panel */
+#define DCS_ENTER_SLEEP_MODE   0x10
+#define DCS_EXIT_SLEEP_MODE    0x11
+#define DCS_SET_DISPLAY_OFF    0x28
+#define DCS_SET_DISPLAY_ON     0x29
+#define DCS_SET_COLUMN_ADDRESS 0x2A
+#define DCS_SET_PAGE_ADDRESS   0x2B
+#define DCS_WRITE_MEMORY_START 0x2C
+#define DCS_SET_TEAR_ON        0x35
+
+static void panel_init(void)
+{
+    dsi_dcs_write(DCS_EXIT_SLEEP_MODE, NULL, 0);
+    delay_ms(120);              /* datasheet: mandatory     */
+
+    /* Then the VENDOR's initialisation sequence: dozens of
+       manufacturer-specific commands setting gamma curves,
+       power rails and timing. Undocumented, supplied as a
+       blob, and NOT derivable. Every panel needs its own,
+       and the panel vendor must give you one - if they
+       will not, choose another panel.                      */
+    panel_vendor_init_sequence();
+
+    dsi_dcs_write(DCS_SET_DISPLAY_ON, NULL, 0);
+}
+
+/* COMMAND MODE UPDATE - only the changed rectangle. */
+void panel_blit(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                const uint16_t *pixels)
+{
+    uint8_t col[4] = { x &gt;&gt; 8, x &amp; 0xFF,
+                       (x+w-1) &gt;&gt; 8, (x+w-1) &amp; 0xFF };
+    uint8_t page[4] = { y &gt;&gt; 8, y &amp; 0xFF,
+                        (y+h-1) &gt;&gt; 8, (y+h-1) &amp; 0xFF };
+
+    dsi_dcs_write(DCS_SET_COLUMN_ADDRESS, col,  4);
+    dsi_dcs_write(DCS_SET_PAGE_ADDRESS,   page, 4);
+    dsi_dcs_write_memory(pixels, (size_t) w * h * 2u);
+}
+
+/* Updating a 100x20 status area costs 4 kB instead of the
+   750 kB a full 800x480 frame would - a 180x saving, and
+   the difference between a responsive UI and a slideshow
+   on a slow link.                                         */
+</code></pre>
+
+<div class="warn">
+<b>Tearing, and the TE signal</b>
+<p>If you write the panel's memory while it is scanning that region out, the top of the display shows the new
+image and the bottom the old — a visible tear that moves. Command-mode panels provide a <em>tearing effect</em>
+output that pulses at the start of vertical blanking; wait for it before starting an update and the panel
+scans out only complete frames. It costs one pin and one interrupt. Video-mode panels avoid the problem
+differently, by double-buffering in the host and switching buffers during blanking.</p>
+</div>
+
+<h2 id="mcu">Displays on a microcontroller</h2>
+
+<pre><code>/* Two viable strategies, and the choice follows from the
+   frame buffer arithmetic above.                          */
+
+/* STRATEGY 1: SPI or parallel panel WITH memory.
+   No frame buffer in RAM at all - draw directly into the
+   panel, one region at a time.                            */
+void draw_button(int x, int y, const char *label)
+{
+    panel_fill_rect(x, y, 100, 40, COLOUR_BLUE);
+    panel_draw_text(x + 10, y + 12, label, COLOUR_WHITE);
+}
+/* Works on a part with 32 kB of RAM. The limit is redraw
+   speed: at 40 MHz SPI, a full 320x240 16-bit refresh is
+   1.5 Mbit = 38 ms. Fine for a UI, useless for animation. */
+
+/* STRATEGY 2: RGB parallel with an LTDC and external SDRAM.
+   A real frame buffer, hardware layer compositing, and
+   DMA2D for accelerated fills and blits.                  */
+LTDC_Layer1-&gt;CFBAR = (uint32_t) framebuffer;
+DMA2D-&gt;CR = DMA2D_CR_MODE_R2M;      /* register to memory  */
+DMA2D-&gt;OCOLR = 0xFF0000FF;
+DMA2D-&gt;CR |= DMA2D_CR_START;        /* hardware fill       */
+
+/* PARTIAL REFRESH IS THE KEY OPTIMISATION EITHER WAY. Track
+   dirty rectangles and update only those. A UI that redraws
+   the whole screen for a blinking cursor is the most common
+   embedded graphics performance mistake, and the fix is
+   almost always bookkeeping rather than a faster bus.
+
+   LVGL and similar libraries do this dirty-rectangle
+   tracking for you and are worth using rather than
+   reimplementing.                                          */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Panel stays black, backlight on</td><td>Vendor init sequence missing or incomplete</td></tr>
+<tr><td>Image rolls or is offset</td><td>Porch timings do not match the panel datasheet</td></tr>
+<tr><td>Image tears horizontally</td><td>Writing during scan-out — use the TE signal or
+double-buffer</td></tr>
+<tr><td>Colours inverted or byte-swapped</td><td>Pixel format mismatch: RGB565 versus BGR565, or
+endianness</td></tr>
+<tr><td>Bottom of the screen shows garbage</td><td>Frame buffer smaller than the configured
+resolution</td></tr>
+<tr><td>UI feels sluggish</td><td>Full-screen redraws; track dirty rectangles</td></tr>
+<tr><td>LTDC underrun errors</td><td>SDRAM bandwidth exhausted — reduce colour depth or refresh
+rate</td></tr>
+<tr><td>Works at 30 Hz, fails at 60 Hz</td><td>Pixel clock or lane bandwidth exceeded</td></tr>
+<tr><td>Panel needs a different init after a power cycle</td><td>Sleep-out delay too short — the 120 ms is
+mandatory</td></tr>
+<tr><td>Cannot fit a frame buffer</td><td>Correct — use a command-mode panel with its own memory</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name five display interfaces in order of bandwidth.</li>
+  <li>Explain the difference between command mode and video mode.</li>
+  <li>Say which mode suits a mostly-static UI and why.</li>
+  <li>Compute the pixel clock for 800×480 at 60 Hz with given porches.</li>
+  <li>Explain what fraction of bandwidth blanking consumes and why it exists.</li>
+  <li>Compute the frame buffer size for 800×480 at 24 bits and say what it implies.</li>
+  <li>Explain what DCS is and why a vendor init sequence is still needed.</li>
+  <li>Describe tearing and the two ways to prevent it.</li>
+  <li>Give the bandwidth saving from a partial update of a small region.</li>
+  <li>Explain why dirty-rectangle tracking matters more than bus speed.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

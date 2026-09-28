@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The vector table and the NVIC | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The vector table and the NVIC</h1>
+<p class="lead">The Nested Vectored Interrupt Controller is part of the ARM architecture, at a fixed address,
+identical on every vendor's chip. It is also the reason Cortex-M interrupt latency is a number you can quote
+rather than a distribution you must measure.</p>
+
+<h2 id="path">From pin to handler</h2>
+
+<pre class="diagram">   A signal arrives. Six things must all be true or nothing
+   happens - and "nothing happens" is the most common
+   interrupt bug there is.
+
+   1. PERIPHERAL         The peripheral must generate the
+      enable             event at all: clock on, configured,
+                         running.
+        |
+        v
+   2. PERIPHERAL         The peripheral's own interrupt
+      interrupt enable   enable bit (e.g. USART_CR1.RXNEIE).
+        |                Separate from the event itself.
+        v
+   3. Peripheral sets    A status flag latches. This flag is
+      its STATUS FLAG    what you must clear in the handler.
+        |
+        v
+   4. NVIC ENABLE        NVIC_ISER bit for that IRQ number.
+        |                Set with NVIC_EnableIRQ().
+        v
+   5. NVIC PRIORITY      Must be numerically lower (= more
+      versus current     urgent) than whatever is running,
+      execution          and not blocked by BASEPRI/PRIMASK.
+        |
+        v
+   6. PRIMASK clear      Global enable. cpsie i.
+        |
+        v
+   HANDLER RUNS - and must clear the flag from step 3, or it
+   will run again immediately, forever.
+
+   Debugging checklist: read the peripheral status register,
+   NVIC_ISER, NVIC_ISPR (pending), and PRIMASK. One of those
+   four answers "why is my interrupt not firing" every time.</pre>
+
+<h2 id="numbering">Two numbering schemes</h2>
+
+<p>Exception numbers and IRQ numbers are different, offset by 16, and mixing them up is a rite of passage.</p>
+
+<pre><code>/* EXCEPTION number: the index into the vector table.
+   IRQ number:       what the NVIC API takes.
+
+   exception = irq + 16
+
+   Exception  Vector offset  IRQ    Name
+      1        0x04          -      Reset
+      2        0x08          -14    NMI
+      3        0x0C          -13    HardFault
+      4        0x10          -12    MemManage
+      5        0x14          -11    BusFault
+      6        0x18          -10    UsageFault
+     11        0x2C           -5    SVCall
+     14        0x38           -2    PendSV
+     15        0x3C           -1    SysTick
+     16        0x40            0    first peripheral IRQ
+     17        0x44            1    second peripheral IRQ
+
+   System exceptions get NEGATIVE IRQ numbers, which is how
+   the CMSIS API distinguishes them - NVIC_SetPriority takes
+   an IRQn_Type that may be negative, and internally routes
+   to SHPR (system handler priority) instead of IPR.
+
+   So to find the vector table slot for USART1 with IRQ 37:
+       offset = (37 + 16) * 4 = 0xD4                       */
+
+/* Reading the currently active exception at runtime: */
+uint32_t active = SCB-&gt;ICSR &amp; SCB_ICSR_VECTACTIVE_Msk;
+/* This is an EXCEPTION number, so subtract 16 for the IRQ. */
+</code></pre>
+
+<h2 id="registers">The NVIC registers</h2>
+
+<pre><code>/* All at 0xE000E100. Note the SET/CLEAR pair design: you
+   never read-modify-write, so there is no race with an
+   interrupt that fires between the read and the write.     */
+
+/*  ISER[]  0xE000E100  Interrupt Set Enable   - write 1 to enable
+    ICER[]  0xE000E180  Interrupt Clear Enable - write 1 to disable
+    ISPR[]  0xE000E200  Interrupt Set Pending  - write 1 to force
+    ICPR[]  0xE000E280  Interrupt Clear Pending- write 1 to drop
+    IABR[]  0xE000E300  Interrupt Active (read only)
+    IPR[]   0xE000E400  Interrupt Priority, one BYTE per IRQ    */
+
+/* Writing 0 to any of these does nothing. That is the point:
+   to disable IRQ 37 you write bit 37 of ICER, you do NOT
+   read ISER, clear a bit and write it back. The latter would
+   lose any interrupt enabled by a higher-priority handler
+   that preempted you mid-sequence.                          */
+
+static inline void my_enable_irq(int irq)
+{
+    NVIC-&gt;ISER[irq &gt;&gt; 5] = 1UL &lt;&lt; (irq &amp; 0x1F);
+}
+static inline void my_disable_irq(int irq)
+{
+    NVIC-&gt;ICER[irq &gt;&gt; 5] = 1UL &lt;&lt; (irq &amp; 0x1F);
+    __asm volatile ("dsb");   /* ensure it takes effect...   */
+    __asm volatile ("isb");   /* ...before the next instr    */
+}
+
+/* The barriers after DISABLE are the subtle part. Without
+   them an interrupt already on its way can still be taken
+   after your ICER write returns - the write is posted, the
+   NVIC has not yet acted, and the pipeline continues. Code
+   that disables an interrupt and then frees the buffer that
+   interrupt uses will, rarely, use-after-free. This is one
+   of the genuinely hard-to-reproduce bare-metal bugs.       */
+</code></pre>
+
+<div class="key">
+<b>Set/clear register pairs are a hardware idiom worth recognising</b>
+<p>You will see the same design in GPIO (<code>BSRR</code>), in DMA, and in the GIC on Cortex-A. The reason is
+always the same: a single write that affects exactly the bits you name is atomic with respect to anything else
+touching that register, so no lock is needed. When you meet a peripheral with only a read-write control
+register and no set/clear pair, that is a signal you will need a critical section around it.</p>
+</div>
+
+<h2 id="pending">Pending, active, and the difference</h2>
+
+<pre class="diagram">   PENDING  the NVIC has latched a request but the handler
+            has not started. Bit in ISPR/ICPR.
+
+   ACTIVE   the handler has started and has not returned.
+            Bit in IABR. Stays set through preemption.
+
+   Both can be set at once: a handler is running (active)
+   and the same interrupt has been requested again (pending).
+   When the handler returns, it is immediately re-entered.
+
+   time --&gt;
+            req         req2
+             |           |
+   pending  _|--|________|-------|______
+   active   ____|--------|-------|______
+                handler   handler
+                  #1        #2
+
+   This is why clearing the PERIPHERAL flag is not the same
+   as clearing the NVIC pending bit, and why the ORDER
+   matters:
+
+     WRONG                      RIGHT
+     NVIC_ClearPendingIRQ(n);   USARTx-&gt;ICR = flag;  /* source */
+     USARTx-&gt;ICR = flag;        /* NVIC pending clears itself  */
+
+   Clear the source first. If you clear NVIC pending while
+   the peripheral flag is still asserted, the peripheral
+   immediately re-asserts it and you have achieved nothing.</pre>
+
+<h2 id="spurious">The write-buffer race at handler exit</h2>
+
+<pre><code>/* The most notorious Cortex-M interrupt bug. */
+
+void USART1_IRQHandler(void)
+{
+    if (USART1-&gt;ISR &amp; USART_ISR_RXNE) {
+        ring_put(USART1-&gt;RDR);      /* reading RDR clears RXNE */
+    }
+    /* Handler returns here. */
+}
+
+/* On a part where the peripheral sits behind a write buffer
+   or a slow bus bridge, the flag-clearing write may still be
+   in flight when the exception return completes. The NVIC
+   samples the (still asserted) line and re-enters the
+   handler. The second entry finds nothing to do - a
+   "spurious" interrupt. Usually harmless; occasionally it
+   corrupts a state machine that counts entries.
+
+   The fix is a barrier that forces the write to complete
+   before the return:                                        */
+
+void USART1_IRQHandler_fixed(void)
+{
+    if (USART1-&gt;ISR &amp; USART_ISR_RXNE) {
+        ring_put(USART1-&gt;RDR);
+    }
+    __asm volatile ("dsb");   /* drain the write buffer */
+}
+
+/* ARM's own guidance is that this is only required on
+   specific parts, and vendors document it inconsistently.
+   Pragmatically: if you see doubled interrupts under load,
+   add the DSB before spending a day on anything else.
+   The cost is a few cycles.                                 */
+</code></pre>
+
+<h2 id="latency">Where the twelve cycles go</h2>
+
+<pre class="diagram">   INTERRUPT LATENCY, Cortex-M3/M4, zero wait states:
+
+   cycle  0   request asserted
+   1-8        hardware stacks 8 registers (R0-R3, R12,
+              LR, PC, xPSR) onto the current stack
+   (overlapped) vector fetch from the table
+   9-11       pipeline refill at the handler address
+   12         first instruction of your handler executes
+
+   TAIL-CHAINING: if a second interrupt is pending when the
+   first returns, the hardware does NOT unstack and restack.
+   It jumps straight to the next handler in 6 cycles.
+
+   LATE ARRIVAL: if a higher-priority interrupt arrives
+   DURING the stacking of a lower one, the hardware
+   redirects to the higher one without restarting the push.
+
+   +-------------+---------+-------------+
+   | naive model | stack 8 | unstack 8   |  ~24 cycles
+   +-------------+---------+-------------+   between handlers
+   | actual      | stack 8 | tail-chain  |  ~6 cycles
+   +-------------+---------+-------------+
+
+   Flash wait states change all of these numbers. At 168 MHz
+   with 5 wait states the vector fetch alone costs more than
+   the whole sequence above. Enable the flash prefetch and
+   ART accelerator, or put the vector table in SRAM if
+   latency truly matters.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Interrupt never fires</td><td>One of the six gates — check peripheral enable, NVIC ISER, PRIMASK, in
+that order</td></tr>
+<tr><td>Handler runs once then loops forever</td><td>Peripheral status flag never cleared in the
+handler</td></tr>
+<tr><td>Handler runs twice per event</td><td>Write-buffer race at exit — add a <code>DSB</code></td></tr>
+<tr><td>Clearing NVIC pending has no effect</td><td>Peripheral flag still asserted; clear the source
+first</td></tr>
+<tr><td>Wrong handler entered</td><td>Exception number used where an IRQ number was wanted, or vice versa (off
+by 16)</td></tr>
+<tr><td>Disabling an interrupt does not take effect at once</td><td>Missing <code>DSB</code>/<code>ISB</code>
+after the <code>ICER</code> write</td></tr>
+<tr><td>Rare use-after-free in an ISR-owned buffer</td><td>Same missing barrier — an in-flight interrupt
+arrived after disable</td></tr>
+<tr><td>An interrupt is lost under load</td><td>Pending is one bit deep; a third request while one is active
+and one pending is dropped</td></tr>
+<tr><td>Latency far worse than 12 cycles</td><td>Flash wait states; enable prefetch or move the table to
+SRAM</td></tr>
+<tr><td>Enabling one interrupt disables another</td><td>Read-modify-write on <code>ISER</code> instead of a
+single-bit write</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the six conditions that must hold for an interrupt to reach its handler.</li>
+  <li>Convert IRQ number 37 to a vector table byte offset.</li>
+  <li>Explain why system exceptions have negative IRQ numbers in CMSIS.</li>
+  <li>Explain why NVIC uses set/clear register pairs rather than read-modify-write.</li>
+  <li>Distinguish pending from active, and describe a state where both are set.</li>
+  <li>Say which to clear first: the peripheral flag or the NVIC pending bit, and why.</li>
+  <li>Describe the write-buffer race at handler exit and its fix.</li>
+  <li>Explain why barriers are needed after disabling an interrupt.</li>
+  <li>Explain tail-chaining and give its cycle count against the naive model.</li>
+  <li>Name two things that make real latency worse than the architectural 12 cycles.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

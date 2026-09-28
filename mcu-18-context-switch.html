@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The context switch, PendSV and the scheduler core | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The context switch, PendSV and the scheduler core</h1>
+<p class="lead">Twenty instructions separate "a program" from "an operating system". This chapter builds the
+switch itself: why it must run in PendSV, why PendSV must be the lowest priority in the system, and what the
+hardware does for you at each end.</p>
+
+<h2 id="idea">The whole idea in one picture</h2>
+
+<pre class="diagram">   A "context" is just a stack with registers saved on it.
+   Switching tasks means changing which stack PSP points at.
+
+   TASK A's STACK              TASK B's STACK
+   +--------------+            +--------------+
+   |   xPSR       | \          |   xPSR       | \
+   |   PC         |  |         |   PC         |  |  hardware
+   |   LR         |  | pushed  |   LR         |  |  pushes
+   |   R12        |  | by HW   |   R12        |  |  and pops
+   |   R3         |  |         |   R3         |  |  these 8
+   |   R2         |  |         |   R2         |  |
+   |   R1         |  |         |   R1         |  |
+   |   R0         | /          |   R0         | /
+   +--------------+            +--------------+
+   |   R11        | \          |   R11        | \
+   |   R10        |  |         |   R10        |  |  YOU push
+   |   R9         |  | pushed  |   R9         |  |  and pop
+   |   R8         |  | by YOU  |   R8         |  |  these 8
+   |   R7         |  |         |   R7         |  |
+   |   R6         |  |         |   R6         |  |
+   |   R5         |  |         |   R5         |  |
+   |   R4         | /          |   R4         | /
+   +--------------+ &lt;- saved   +--------------+ &lt;- saved
+        PSP_A         in TCB        PSP_B         in TCB
+
+   THE SWITCH:
+     1. hardware pushed 8 registers onto A's stack already
+     2. push R4-R11 onto A's stack
+     3. save PSP into A's TCB
+     4. pick the next task
+     5. load PSP from B's TCB
+     6. pop R4-R11 from B's stack
+     7. BX to EXC_RETURN - hardware pops B's 8 registers
+
+   Step 7 returns to whatever B was doing, because B's PC is
+   in the frame the hardware just popped. There is no jump
+   to task B; you simply return from an interrupt into it.</pre>
+
+<h2 id="pendsv">Why PendSV</h2>
+
+<pre class="diagram">   PendSV is an exception whose ONLY purpose is deferring
+   work to the lowest priority. Set its priority to 0xFF -
+   the lowest possible - and it runs only when no other
+   exception is active.
+
+   WITHOUT PendSV, switching directly in SysTick:
+
+     SysTick fires -> switch to task B -> return
+     But an interrupt was PREEMPTED by SysTick and is still
+     ACTIVE. Returning into task B while that interrupt's
+     frame is on the stack corrupts the exception nesting,
+     and the core takes a UsageFault (INVPC) or worse.
+
+   WITH PendSV:
+
+   time --&gt;
+     UART IRQ  |=====================|
+     SysTick        |==|  (sets PendSV pending, returns)
+     PendSV                          |=====|  switch here
+     task B                                 |=========
+
+     Every other exception drains first. PendSV runs last,
+     with a clean nesting state, and the switch is safe.
+
+   THE RULE: PendSV must be the LOWEST priority exception in
+   the system. If anything is lower, it can be preempted by
+   the switch and the same corruption returns.
+
+     NVIC_SetPriority(PendSV_IRQn, 0xFF);
+     NVIC_SetPriority(SysTick_IRQn, 0xFE);
+
+   This is why every Cortex-M RTOS port uses PendSV. It is
+   not a convention; it is the only correct place.</pre>
+
+<h2 id="asm">The switch, in full</h2>
+
+<pre><code>/* This is a complete, working PendSV handler for ARMv7-M.
+   'naked' because we must control every instruction - a
+   compiler prologue would corrupt the frame we are building. */
+
+__attribute__((naked)) void PendSV_Handler(void)
+{
+    __asm volatile (
+    /* --- SAVE the outgoing task ------------------------- */
+    "   mrs   r0, psp              \n"  /* current task SP   */
+    "   cbz   r0, restore          \n"  /* first switch: no  */
+                                        /* task to save      */
+    "   subs  r0, r0, #32          \n"  /* room for R4-R11   */
+    "   stm   r0, {r4-r11}         \n"
+
+    "   ldr   r1, =current_tcb     \n"
+    "   ldr   r2, [r1]             \n"  /* r2 = current TCB  */
+    "   str   r0, [r2]             \n"  /* TCB-&gt;sp = r0      */
+                                        /* sp is at offset 0 */
+
+    /* --- CHOOSE the next task --------------------------- */
+    "restore:                      \n"
+    "   push  {lr}                 \n"  /* EXC_RETURN        */
+    "   bl    scheduler_next       \n"  /* C function        */
+    "   pop   {lr}                 \n"
+
+    /* --- RESTORE the incoming task ---------------------- */
+    "   ldr   r1, =current_tcb     \n"
+    "   ldr   r2, [r1]             \n"
+    "   ldr   r0, [r2]             \n"  /* r0 = TCB-&gt;sp      */
+    "   ldm   r0, {r4-r11}         \n"
+    "   adds  r0, r0, #32          \n"
+    "   msr   psp, r0              \n"
+
+    "   isb                        \n"
+    "   bx    lr                   \n"  /* EXC_RETURN -&gt;     */
+                                        /* hardware unstacks */
+    );
+}
+
+/* Points worth dwelling on:
+
+   - scheduler_next() is ordinary C. It reads the ready list
+     and writes current_tcb. All the policy lives there; the
+     assembly is pure mechanism.
+
+   - LR must be preserved across the call, hence push/pop.
+     It holds EXC_RETURN, and losing it means you cannot
+     return from the exception at all.
+
+   - 'sp' is deliberately the FIRST member of the TCB, so
+     the offset is zero and the assembly needs no knowledge
+     of the struct layout. Every RTOS does this.
+
+   - This code does NOT save the FP registers. On a part
+     with an FPU where two tasks use float, add:
+
+         tst   lr, #0x10          @ EXC_RETURN bit 4
+         it    eq
+         vstmdbeq r0!, {s16-s31}  @ save if FP frame present
+
+     and the mirror on restore. Omitting it is the classic
+     bug that only appears when a second task uses float
+     (chapter 02).                                          */
+</code></pre>
+
+<h2 id="firststack">Manufacturing the first stack frame</h2>
+
+<p>A task that has never run has no saved context. You fabricate one that looks exactly like a real switch,
+so the first restore starts it at its entry point.</p>
+
+<pre><code>uint32_t *task_stack_init(uint32_t *stack_top,
+                          void (*entry)(void *), void *arg)
+{
+    /* 8-byte alignment is required by AAPCS. */
+    uint32_t *sp = (uint32_t *)((uint32_t) stack_top &amp; ~7u);
+
+    /* --- the frame the HARDWARE will pop, in its order --- */
+    *(--sp) = 0x01000000u;            /* xPSR: THUMB BIT SET */
+    *(--sp) = (uint32_t) entry &amp; ~1u; /* PC                  */
+    *(--sp) = (uint32_t) task_exit;   /* LR: where a task    */
+                                      /* goes if it returns  */
+    *(--sp) = 0x12121212u;            /* R12                 */
+    *(--sp) = 0x03030303u;            /* R3                  */
+    *(--sp) = 0x02020202u;            /* R2                  */
+    *(--sp) = 0x01010101u;            /* R1                  */
+    *(--sp) = (uint32_t) arg;         /* R0 = first argument */
+
+    /* --- the registers WE pop --------------------------- */
+    *(--sp) = 0x11111111u;            /* R11                 */
+    *(--sp) = 0x10101010u;            /* R10                 */
+    *(--sp) = 0x09090909u;            /* R9                  */
+    *(--sp) = 0x08080808u;            /* R8                  */
+    *(--sp) = 0x07070707u;            /* R7                  */
+    *(--sp) = 0x06060606u;            /* R6                  */
+    *(--sp) = 0x05050505u;            /* R5                  */
+    *(--sp) = 0x04040404u;            /* R4                  */
+
+    return sp;                        /* store in TCB-&gt;sp    */
+}
+
+/* THREE THINGS THAT MUST BE RIGHT:
+
+   1. xPSR MUST have bit 24 (T) set. Clear it and the core
+      faults with INVSTATE the instant the task starts
+      (chapter 02). This is the single most common bug when
+      writing a scheduler from scratch.
+
+   2. The PC entry must have bit 0 CLEAR here, even though
+      function pointers carry it set. The hardware takes the
+      T state from xPSR, not from the PC, and a set bit 0 in
+      the stacked PC is architecturally unpredictable.
+
+   3. LR should point at a function that handles a task
+      returning. A task that falls off the end otherwise
+      branches to whatever 0x0E0E0E0E-style filler you put
+      there. Make it explicit:                              */
+
+static void task_exit(void)
+{
+    task_delete(current_tcb);
+    for (;;) { }        /* never reached; the switch away
+                           happens inside task_delete       */
+}
+
+/* The recognisable filler values are a debugging gift: in a
+   fault dump, seeing 0x07070707 in R7 tells you instantly
+   that this task has never actually run.                   */
+</code></pre>
+
+<h2 id="starting">Starting the scheduler</h2>
+
+<pre><code>/* Getting from main() - running on MSP, privileged - into
+   the first task on PSP is a one-time bootstrap.          */
+
+void scheduler_start(void)
+{
+    NVIC_SetPriority(PendSV_IRQn,  0xFF);   /* lowest       */
+    NVIC_SetPriority(SysTick_IRQn, 0xFE);
+
+    current_tcb = scheduler_highest_ready();
+
+    /* Point PSP at the first task's frame, skipping the 8
+       registers the hardware will pop for us.              */
+    __set_PSP((uint32_t) current_tcb-&gt;sp + 32);
+
+    /* Switch Thread mode to PSP. */
+    __set_CONTROL(0x02);
+    __ISB();                    /* MANDATORY (chapter 03)   */
+
+    systick_init(1000);         /* 1 kHz tick               */
+
+    /* Jump to the task entry. From here the only way back
+       into main() is a bug.                                */
+    void (*entry)(void *) = current_tcb-&gt;entry;
+    entry(current_tcb-&gt;arg);
+}
+
+/* THE TICK. SysTick does no switching itself - it accounts
+   for time and, if that changed who should run, requests a
+   PendSV. That request is a single register write:        */
+
+void SysTick_Handler(void)
+{
+    g_ticks++;
+    if (scheduler_tick()) {                  /* returns 1 if
+                                                a switch is
+                                                needed      */
+        SCB-&gt;ICSR = SCB_ICSR_PENDSVSET_Msk;  /* request it  */
+    }
+}
+
+/* Any code, including any ISR, can request a switch with
+   that one store. A UART handler that unblocks a waiting
+   task does exactly this, which is how a task becomes
+   runnable "immediately" rather than at the next tick.    */
+</code></pre>
+
+<div class="key">
+<b>Mechanism and policy are cleanly separated</b>
+<p>The assembly above is the entire <em>mechanism</em>, and it never changes. Round-robin, fixed-priority
+preemptive, rate-monotonic, or EDF are all just different implementations of
+<code>scheduler_next()</code> — ordinary C, testable on a host, with no assembly involved. When you read
+FreeRTOS or Zephyr, this is the seam to look for first: <code>port.c</code> holds the twenty instructions,
+and everything else is policy on top.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Fault the instant the first task starts</td><td>T bit not set in the fabricated xPSR</td></tr>
+<tr><td>UsageFault with <code>INVPC</code></td><td>Corrupted <code>EXC_RETURN</code> — usually LR not
+preserved across the scheduler call</td></tr>
+<tr><td>Fault when switching from inside an ISR</td><td>Switching somewhere other than PendSV</td></tr>
+<tr><td>Rare corruption under interrupt load</td><td>PendSV is not the lowest priority exception</td></tr>
+<tr><td>Variables corrupt across switches</td><td>R4–R11 not saved, or the wrong number of words
+adjusted</td></tr>
+<tr><td>Corruption only when two tasks use float</td><td>FP registers not saved; test
+<code>EXC_RETURN</code> bit 4</td></tr>
+<tr><td>Task runs once then the system dies</td><td>Task returned; LR in the fabricated frame pointed at
+nothing valid</td></tr>
+<tr><td>First switch faults, later ones work</td><td>No null check for "no outgoing task" on the very first
+entry</td></tr>
+<tr><td>Scheduler never runs after <code>CONTROL</code> write</td><td>Missing <code>ISB</code></td></tr>
+<tr><td>Registers full of <code>0x07070707</code> in a dump</td><td>The task never ran — your filler values
+telling you exactly that</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State which eight registers the hardware saves and which eight you must save.</li>
+  <li>Explain why the switch must happen in PendSV rather than SysTick.</li>
+  <li>Say what priority PendSV must have and what breaks otherwise.</li>
+  <li>Explain why returning with <code>EXC_RETURN</code> starts the new task.</li>
+  <li>Explain why <code>sp</code> is the first member of the TCB.</li>
+  <li>List the three things that must be right in a fabricated first frame.</li>
+  <li>Say why the stacked PC must have bit 0 clear while function pointers have it set.</li>
+  <li>Explain why LR must be pushed around the call to the scheduler.</li>
+  <li>Give the single store that requests a context switch from any ISR.</li>
+  <li>Explain the mechanism/policy split and where to find it in a real RTOS.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

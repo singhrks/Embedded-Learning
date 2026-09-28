@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The ARM64 boot flow | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The ARM64 boot flow</h1>
+<p class="lead">From power-on to the first line of C. This is where the ARM architecture track and the Linux
+track meet: exception levels, the MMU, the device tree and secure firmware all appear in the first few
+hundred instructions, and knowing the sequence is what makes bring-up tractable.</p>
+
+<h2 id="overview">The whole sequence</h2>
+
+<p>Before a single line of Linux runs, three or four other programs have already executed and handed control onward, each one more capable than the last. This chain matters for a practical reason: when a board does not boot, <em>where</em> it stopped tells you which program failed, and each link in the chain is debugged with completely different tools.</p>
+
+<pre class="diagram">  POWER ON
+     |
+     v
+  BOOT ROM (BL1)            EL3, MMU off, caches off
+     |  verifies and loads BL2 (isolation ch. 14)
+     v
+  BL2                       EL3 (or EL1S)
+     |  initialises DRAM, loads BL31/BL32/BL33
+     v
+  BL31 - TF-A runtime       EL3, stays resident forever
+     |  installs the SMC handlers, PSCI, the vectors
+     |  drops to...
+     +--&gt; BL32 - OP-TEE     S-EL1  (isolation ch. 12)
+     |
+     v
+  BL33 - U-Boot / UEFI      EL2 (usually) or EL1
+     |  loads Image + DTB into DRAM
+     |  may verify them (FIT signatures)
+     v
+  KERNEL, at its entry point           EL2 or EL1
+     |
+     +-- head.S:  primary_entry
+     |      preserve x0 = DTB physical address
+     |      record the EL we were entered at
+     |      if EL2: init_kernel_el -> either stay for KVM,
+     |              or drop to EL1
+     |      __create_page_tables    build the initial mapping
+     |      __primary_switch        turn the MMU ON
+     |      set up the stack, clear BSS
+     v
+  start_kernel()            the first C function (chapter 05)
+     |
+     v
+  ... subsystems, initcalls, drivers ...
+     |
+     v
+  init process, PID 1</pre>
+
+<h2 id="handoff">The boot protocol</h2>
+
+<p>The bootloader and the kernel have to agree, precisely, on the state the machine is in at the moment control passes over — which register holds what, whether caches are on, what is mapped. This is a real contract, written down in the kernel source, and the reason breaking it hurts so much is that it fails <em>silently</em>: no error, no panic, just a board that stops with nothing on the console.</p>
+
+<pre><code>/* Documentation/arch/arm64/booting.rst - the CONTRACT between
+   the bootloader and the kernel. Violate any of it and you get
+   a silent hang with no output at all.                      */
+
+   THE BOOTLOADER MUST:
+
+   1. Load the kernel Image to a 2 MB-aligned address, anywhere
+      in the first usable DRAM. The Image header declares where
+      it wants to go and how big it is.
+
+   2. Set:
+        x0 = physical address of the DEVICE TREE BLOB
+        x1 = 0    (reserved)
+        x2 = 0
+        x3 = 0
+
+   3. Enter at the first byte of the Image, in:
+        EL2 (preferred - enables KVM) or EL1 (non-secure)
+        AArch64
+        MMU OFF
+        D-cache OFF          &lt;-- and this one matters
+        I-cache on or off
+        interrupts (DAIF) masked
+
+   4. Have CLEANED the kernel image and DTB TO THE POINT OF
+      COHERENCY. With the MMU off, the kernel's accesses are
+      Device/non-cacheable and will NOT snoop dirty lines the
+      bootloader left in the cache (ARM chapters 18 and 19).
+      This is the single most common cause of "loads, jumps,
+      dies instantly".
+
+   5. Ensure all secondary CPUs are either in a WFE holding
+      pen, or - much better - parked and brought up via PSCI
+      (isolation ch. 11).
+
+   6. Provide a valid DTB, itself in memory the kernel can
+      reach, with /memory and /chosen nodes.
+
+/* THE IMAGE HEADER, first 64 bytes of arch/arm64/kernel/head.S: */
+
+        code0           /* executable code, or an MZ magic for
+                           EFI so the same file boots as a PE  */
+        code1
+        text_offset     /* where to load, relative to 2 MB     */
+        image_size      /* total size including BSS - use this
+                           to know how much room to leave      */
+        flags           /* endianness, page size, placement    */
+        res2..res4
+        magic           /* "ARM\x64"                           */
+        res5            /* PE header offset                    */
+
+/* Read it with: */
+        head -c 64 arch/arm64/boot/Image | xxd</code></pre>
+
+<div class="warn">
+<b>"It hangs before any output" — the four causes</b>
+<ol>
+<li><strong>Caches not cleaned</strong> before jumping. The kernel reads stale memory.</li>
+<li><strong>Entered at the wrong EL</strong>, or in AArch32, or with the MMU on.</li>
+<li><strong>A bad DTB</strong> — wrong address in x0, corrupt magic, or a <code>/memory</code> node that
+does not describe real DRAM.</li>
+<li><strong>The console is not where you think.</strong> The kernel is running fine and printing to a UART
+you are not watching. Try <code>earlycon</code> before assuming a crash.</li>
+</ol>
+</div>
+
+<h2 id="head">head.S, in order</h2>
+
+<p>This is the first kernel code to execute, and it is assembly rather than C because a C environment does not exist yet — there is no stack, no page tables, and no memory map. Everything below exists to build that environment, and the moment it is ready the code jumps into C and never returns here.</p>
+
+<pre><code>/* arch/arm64/kernel/head.S. Read it once; it is only a few
+   hundred lines and it demystifies the whole thing.        */
+
+SYM_CODE_START(primary_entry)
+        bl      record_mmu_state      /* were we entered with
+                                         the MMU on? (EFI)    */
+        bl      preserve_boot_args    /* stash x0..x3 - the
+                                         DTB pointer!         */
+        bl      create_idmap          /* an IDENTITY map: VA
+                                         == PA, so we can keep
+                                         executing across the
+                                         MMU enable            */
+        b       __primary_switch
+SYM_CODE_END(primary_entry)
+
+/* THE IDENTITY MAP TRICK - the central problem of MMU enable:
+
+   Before:  PC = 0x40080000 (physical), MMU off
+   After:   PC must be 0xffff800008080000 (virtual)
+
+   You cannot change both at once. So:
+     1. build a page table where VA 0x40080000 maps to
+        PA 0x40080000 (the identity map), AND where the real
+        kernel VA range maps to the same physical memory
+     2. enable the MMU - the next instruction fetch at
+        0x40080000 now translates through the identity map and
+        finds the same code. Nothing appears to change.
+     3. branch to the high virtual address
+     4. tear down the identity map
+
+   Same trick every OS uses, and the reason arm64 requires the
+   kernel to be position-independent early on.             */
+
+__primary_switch:
+        adrp    x1, reserved_pg_dir
+        adrp    x2, init_idmap_pg_dir
+        bl      __enable_mmu          /* set SCTLR_EL1.M = 1   */
+        bl      clear_page_tables
+        bl      create_kernel_mapping /* the real mapping */
+        ...
+        bl      __primary_switched
+
+__primary_switched:
+        adr_l   x8, vectors           /* the exception table
+                                         (ARM ch. 27)          */
+        msr     vbar_el1, x8          /* now faults are
+                                         survivable            */
+        ...
+        str_l   x21, __fdt_pointer, x5   /* save the DTB addr */
+        bl      __pi_memset              /* clear BSS */
+        ...
+        b       start_kernel             /* into C */</code></pre>
+
+<h2 id="el">Which exception level, and why it matters</h2>
+
+<p>ARM processors have several privilege levels, and the kernel can be started at more than one of them. Which one it got is decided by the bootloader before Linux has any say, and it permanently determines whether virtualisation will work on this boot. <a href="lx-45-arm-exception-levels.html">Chapter 44</a> covers the levels in full; what matters here is that the choice was already made for you.</p>
+
+<pre><code>/* The kernel records the EL it was entered at, and behaves
+   differently:                                             */
+
+   Entered at EL2:
+        · KVM is possible. The kernel installs a hypervisor
+          stub at EL2 and runs itself at EL1.
+        · With VHE (ARMv8.1, FEAT_VHE), the kernel runs
+          DIRECTLY at EL2 with EL2 registers behaving like EL1
+          ones - this is the normal case on modern hardware.
+        · dmesg says:  "CPU: All CPU(s) started at EL2"
+
+   Entered at EL1:
+        · no KVM. Everything else works.
+        · dmesg says:  "CPU: All CPU(s) started at EL1"
+        · usually means the bootloader dropped to EL1 itself,
+          or a hypervisor is already running above you
+
+/* CHECK IT FIRST when virtualisation does not work: */
+        dmesg | grep "CPU(s) started at"
+        dmesg | grep -i kvm
+
+/* A bootloader that drops to EL1 before entering Linux
+   silently disables KVM forever. On U-Boot this is
+   CONFIG_ARMV8_SWITCH_TO_EL1 - leave it off.               */</code></pre>
+
+<h2 id="dtb">The device tree arrives</h2>
+
+<p>One kernel binary runs on thousands of different boards, so it cannot have any particular board's hardware built into it. Instead it is <em>told</em> what exists, by a data structure the bootloader passes in — and that entire description arrives as a single pointer in one CPU register.</p>
+
+<pre class="diagram">x0 at entry -&gt; __fdt_pointer -&gt; used in three phases:
+
+  1. EARLY, before the MMU is fully set up:
+       early_init_dt_scan()
+         - /chosen  -&gt; the kernel command line, initrd, stdout
+         - /memory  -&gt; how much DRAM, and where
+         - reserved-memory -&gt; carve-outs to keep out of the
+           allocator (isolation ch. 18)
+       These have to work with almost nothing available, so the
+       early FDT code is a self-contained flat parser.
+
+  2. UNFLATTENING, once memblock works:
+       unflatten_device_tree() converts the flat blob into a
+       tree of struct device_node objects with pointers.
+       Now of_find_node_by_*() and friends work.
+
+  3. DEVICE CREATION, much later, from an initcall:
+       of_platform_populate() walks the tree and creates a
+       struct platform_device for each node with a
+       `compatible` - which is what your driver eventually
+       binds to (chapter 19).
+
+  So the DTB is consumed three times, in three different
+  representations. Knowing which phase you are in explains why
+  of_* APIs "do not work yet" in early code.</pre>
+
+<h2 id="console">Getting output before the console exists</h2>
+
+<p>There is a long stretch of boot during which the kernel is running normally but everything it prints is invisible, because the driver for the serial port has not started yet. If a board hangs inside that window you see a blank screen and nothing else, which is why the technique below is the single most valuable skill in board bring-up.</p>
+
+<pre><code># The single most useful bring-up skill. A normal console is
+# only registered once the serial DRIVER probes - hundreds of
+# initcalls in. Everything before that is invisible by default.
+
+# EARLYCON - a minimal, direct-MMIO UART writer, available
+# almost immediately:
+
+    earlycon                    # use /chosen/stdout-path from DT
+    earlycon=pl011,0x9000000    # or name it explicitly
+    earlycon=uart8250,mmio32,0xff000000
+    earlycon=uart,mmio32,0x1c020000,115200n8
+
+# combine with:
+    keep_bootcon    # do not switch away when the real console
+                    # registers - you see BOTH, and the handover
+    ignore_loglevel # print everything regardless of loglevel
+    debug           # raise the loglevel
+    initcall_debug  # print every initcall and its result -
+                    # invaluable for "it hangs during boot"
+
+# A good bring-up command line:
+    earlycon keep_bootcon ignore_loglevel initcall_debug \
+      console=ttyAMA0,115200 root=/dev/mmcblk0p2 rw
+
+# And in the device tree:
+    chosen {
+        stdout-path = "serial0:115200n8";
+        bootargs = "earlycon console=ttyAMA0,115200";
+    };
+
+# IF EARLYCON PRODUCES NOTHING:
+#   the address is wrong; the UART is not clocked; the pin mux
+#   is not set; or the driver name does not match. Try writing
+#   a character directly from the bootloader to confirm the
+#   UART works at all before blaming the kernel.
+
+# LAST RESORT: CONFIG_DEBUG_LL / earlyprintk with a hard-coded
+# address, compiled in. Ugly, and it works when nothing else
+# does.</code></pre>
+
+<div class="tip">
+<b><code>initcall_debug</code> is the boot-hang debugger</b>
+<p>It prints every initcall before and after it runs, with the time it took. A hang shows as a
+<code>calling ...</code> line with no matching <code>initcall ... returned</code>. That names the exact
+function, which names the driver, in one boot. Pair it with <code>printk.time=1</code> and you also get a
+free boot-time profile.</p>
+</div>
+
+<h2 id="smp">Bringing up the other CPUs</h2>
+
+<p>Everything up to this point has run on one CPU. The others are still parked — held in reset, or spinning inside firmware — and starting them is a deliberate step that happens surprisingly late. The hardware does not do it for you.</p>
+
+<pre><code>/* Only CPU0 runs everything above. The rest are brought up
+   much later, from smp_init(), using the method the device
+   tree declares:                                           */
+
+        cpus {
+                cpu@0 {
+                        device_type = "cpu";
+                        compatible = "arm,cortex-a53";
+                        reg = &lt;0x0&gt;;
+                        enable-method = "psci";
+                };
+                cpu@1 { ... reg = &lt;0x1&gt;; enable-method = "psci"; };
+        };
+
+        psci {
+                compatible = "arm,psci-1.0";
+                method = "smc";          /* or "hvc" */
+        };
+
+/* PSCI path (isolation ch. 11):
+        Linux issues SMC(CPU_ON, target_mpidr, entry_point)
+        EL3 firmware powers the core and starts it at
+        secondary_entry, which repeats the MMU setup and joins
+        the scheduler.
+
+   The older "spin-table" method has the bootloader park each
+   secondary in a WFE loop watching a mailbox address. It works
+   and it cannot power cores off - so PSCI is what you want.
+
+/* SYMPTOM: only CPU0 online.
+        cat /proc/cpuinfo          # one entry
+        dmesg | grep -i psci
+        dmesg | grep "CPU. failed to come online"
+   Almost always: wrong `method` (smc vs hvc), missing PSCI
+   node, wrong `reg` values (they must match MPIDR_EL1
+   affinity), or firmware refusing CPU_ON. Check the TF-A
+   console.                                                 */</code></pre>
+
+<h2 id="memory">How the kernel learns about memory</h2>
+
+<p>The kernel cannot ask the hardware how much RAM is fitted or where it lives in the address space; there is no standard way to probe for that. Like everything else about the board, it has to be described from outside.</p>
+
+<pre><code>        memory@80000000 {
+                device_type = "memory";      /* REQUIRED */
+                reg = &lt;0x0 0x80000000 0x0 0x40000000&gt;;  /* 1 GB */
+        };
+
+/* Consumed by early_init_dt_scan_memory() into MEMBLOCK - a
+   simple early allocator that exists before the real page
+   allocator (chapter 06).
+
+   Then:
+     reserved-memory nodes are removed from it
+     the kernel image itself is reserved
+     the initrd is reserved
+     memblock hands the rest to the buddy allocator at
+     mem_init()
+
+   CHECK IT:
+        dmesg | grep -i "Memory:"
+          Memory: 892340K/1048576K available (...)
+        cat /proc/iomem
+        dmesg | grep -i memblock       (with memblock=debug)
+
+   COMMON PROBLEMS:
+     · device_type = "memory" omitted -&gt; node ignored -&gt; the
+       kernel finds no RAM and hangs immediately
+     · #address-cells/#size-cells mismatch -&gt; the reg values
+       are parsed wrong -&gt; wildly wrong size, or an address of
+       zero
+     · memory described that does not physically exist -&gt; a
+       crash the first time the allocator hands out that range,
+       long after boot
+     · a secure carve-out NOT removed -&gt; the kernel maps memory
+       the TZASC denies -&gt; an SError at an unpredictable moment
+       (isolation ch. 18)                                    */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Absolutely no output</td><td>Caches not cleaned; wrong EL; bad DTB pointer; or wrong console — try <code>earlycon</code> first</td></tr>
+<tr><td><code>earlycon</code> works, then output stops</td><td>Real console mismatch — add <code>keep_bootcon</code> to see the handover</td></tr>
+<tr><td>Hangs after "Starting kernel..."</td><td>Load address, image alignment, or the DTB</td></tr>
+<tr><td>Hangs at a specific driver</td><td><code>initcall_debug</code> names it in one boot</td></tr>
+<tr><td>"CPU(s) started at EL1", KVM unavailable</td><td>Bootloader dropped to EL1</td></tr>
+<tr><td>Only CPU0 online</td><td>PSCI conduit or <code>enable-method</code> wrong; check TF-A</td></tr>
+<tr><td>Kernel reports the wrong amount of RAM</td><td><code>#address-cells</code>/<code>#size-cells</code> mismatch in the memory node</td></tr>
+<tr><td>Immediate crash with no RAM found</td><td><code>device_type = "memory"</code> missing</td></tr>
+<tr><td>SError at a random later instruction</td><td>Mapped a carve-out the hardware denies — add <code>no-map</code></td></tr>
+<tr><td>Boots from one loader, not another</td><td>Boot protocol violated — check register state and cache maintenance</td></tr>
+<tr><td>Works cold, fails on warm reset</td><td>State left behind by the previous boot; firmware not reinitialising</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the sequence from power-on to <code>start_kernel</code>, naming each stage.</li>
+  <li>State the six requirements of the arm64 boot protocol.</li>
+  <li>Explain why the caches must be cleaned before entering the kernel.</li>
+  <li>Explain the identity-map trick and why the MMU cannot simply be switched on.</li>
+  <li>Say what changes if the kernel is entered at EL1 instead of EL2, and how to check.</li>
+  <li>Name the three phases in which the device tree is consumed.</li>
+  <li>Build an <code>earlycon</code> command line for a board and say what to check if it is silent.</li>
+  <li>Use <code>initcall_debug</code> to locate a boot hang.</li>
+  <li>Explain how secondary CPUs start, and the three usual reasons they do not.</li>
+  <li>Write a <code>/memory</code> node and list four ways it goes wrong.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

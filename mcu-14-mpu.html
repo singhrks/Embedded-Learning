@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The MPU: memory protection without an MMU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The MPU: memory protection without an MMU</h1>
+<p class="lead">An MPU cannot translate addresses, so it gives you no virtual memory and no isolation between
+identical address spaces. What it does give you is the ability to turn silent corruption into an immediate,
+localised fault — which on a system with no <code>SIGSEGV</code> is worth a great deal.</p>
+
+<h2 id="versus">What it is and is not</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>MMU (Cortex-A)</th><th>MPU (Cortex-M)</th></tr></thead>
+<tbody>
+<tr><td>Translates addresses</td><td>Yes — virtual to physical</td><td>No. Addresses are physical,
+always</td></tr>
+<tr><td>Granularity</td><td>4 kB pages, millions of them</td><td>8 or 16 regions, sized by powers of two</td></tr>
+<tr><td>Configuration store</td><td>Page tables in memory</td><td>A handful of registers</td></tr>
+<tr><td>Per-process address space</td><td>Yes</td><td>No — one physical space, different permissions</td></tr>
+<tr><td>Cost to reconfigure</td><td>TLB maintenance</td><td>A few register writes; cheap enough per
+context switch</td></tr>
+<tr><td>What it buys you</td><td>Isolation and virtual memory</td><td>Fault-on-mistake, and privilege
+separation</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>So the MPU is not a security boundary in the way TrustZone is (that is
+<a href="sec-15-trustzone-m.html">a separate mechanism</a>), and it is not virtual memory. It is a
+programmable set of rules about which addresses may be read, written or executed, and by whom.</p>
+
+<h2 id="worth">The three things it is genuinely worth doing</h2>
+
+<pre class="diagram">   1. STACK GUARD - the highest-value use by far.
+
+      Place a small, no-access region immediately below each
+      stack. Overflow hits it and takes a MemManage fault
+      AT THE INSTRUCTION THAT OVERFLOWED, with the faulting
+      task identifiable.
+
+      Without it:  the stack grows into .bss, a variable
+                   changes for no reason, and you spend
+                   three days.
+      With it:     an immediate fault naming the culprit.
+
+      +----------------+ &lt;- stack top
+      |  task stack    |
+      |       |        |
+      |       v        |
+      +----------------+ &lt;- stack bottom
+      |  GUARD 32 B    |  MPU: no access
+      +----------------+
+      |  other data    |
+      +----------------+
+
+   2. EXECUTE NEVER on RAM and peripherals.
+
+      Mark everything that is not flash as XN. A corrupted
+      function pointer or a smashed return address then
+      faults instead of executing whatever bytes it found.
+      This is the single cheapest robustness measure
+      available, and it costs one region.
+
+   3. READ-ONLY on .rodata and the vector table.
+
+      Catches wild pointer writes at the instant they
+      happen rather than when the corrupted value is later
+      used.
+
+   Everything else - full task isolation, unprivileged
+   tasks, per-task peripheral permissions - is real but
+   costs regions and design effort. These three are close
+   to free.</pre>
+
+<h2 id="config">Configuring a region</h2>
+
+<pre><code>/* ARMv7-M MPU. Regions are numbered, sized by powers of two,
+   and must be aligned to their own size - a 1 kB region
+   must start on a 1 kB boundary. That constraint drives
+   your linker script (chapter 05).                        */
+
+static void mpu_region(uint32_t n, uint32_t base,
+                       uint32_t size_log2, uint32_t attr)
+{
+    MPU-&gt;RNR  = n;
+    MPU-&gt;RBAR = base &amp; MPU_RBAR_ADDR_Msk;
+    MPU-&gt;RASR = attr
+              | ((size_log2 - 1u) &lt;&lt; MPU_RASR_SIZE_Pos)
+              | MPU_RASR_ENABLE_Msk;
+}
+
+/* Access permission field (AP), bits 24-26 of RASR:
+     000  no access at all
+     001  privileged RW,        unprivileged none
+     010  privileged RW,        unprivileged RO
+     011  full access           (RW for both)
+     101  privileged RO,        unprivileged none
+     110  read-only             (RO for both)             */
+
+#define AP_NONE     (0u &lt;&lt; 24)
+#define AP_PRIV_RW  (1u &lt;&lt; 24)
+#define AP_FULL     (3u &lt;&lt; 24)
+#define AP_RO       (6u &lt;&lt; 24)
+#define XN          (1u &lt;&lt; 28)
+#define MEM_NORMAL  ((1u &lt;&lt; 17) | (1u &lt;&lt; 18))  /* C and B  */
+
+void mpu_init(void)
+{
+    extern uint32_t _stack_guard;   /* from the linker script */
+
+    MPU-&gt;CTRL = 0;                  /* disable while editing  */
+    __DSB(); __ISB();
+
+    /* 0: all of SRAM, full access, execute never.           */
+    mpu_region(0, 0x20000000, 17, AP_FULL | XN | MEM_NORMAL);
+
+    /* 1: the guard band below the stack. Higher-numbered
+          regions WIN where they overlap, so this carves a
+          hole out of region 0.                              */
+    mpu_region(1, (uint32_t) &amp;_stack_guard, 5, AP_NONE);
+
+    /* 2: peripherals, privileged only, execute never.       */
+    mpu_region(2, 0x40000000, 29, AP_PRIV_RW | XN);
+
+    /* PRIVDEFENA: privileged code keeps the default memory
+       map for anything no region covers. Without it, any
+       address you did not explicitly describe faults - which
+       is stricter, and a good way to discover you forgot
+       the flash region.                                     */
+    MPU-&gt;CTRL = MPU_CTRL_ENABLE_Msk | MPU_CTRL_PRIVDEFENA_Msk;
+    __DSB(); __ISB();
+}
+
+/* THE BARRIERS ARE MANDATORY. Enabling the MPU changes how
+   the very next fetch is permission-checked. Without DSB
+   and ISB you get a fault whose address makes no sense,
+   and which moves when you change unrelated code.         */
+</code></pre>
+
+<div class="warn">
+<b>ARMv8-M redesigned this, and for the better</b>
+<p>ARMv8-M (Cortex-M23/M33/M55) replaces power-of-two sizing with plain base and limit addresses, so a region
+can be any size at any 32-byte-aligned address. It also moves memory attributes into an indexed
+<code>MAIR</code> register, as on Cortex-A. If you have written v7-M MPU code, the v8-M version is
+substantially simpler and the alignment gymnastics disappear. Check which you have before copying an example
+— the register layouts are incompatible.</p>
+</div>
+
+<h2 id="rtos">Per-task protection in an RTOS</h2>
+
+<pre><code>/* The MPU is cheap enough to reprogram on every context
+   switch, which is what FreeRTOS-MPU and Zephyr's userspace
+   do. Each task carries its own region set.               */
+
+typedef struct {
+    uint32_t rbar;
+    uint32_t rasr;
+} mpu_region_t;
+
+typedef struct {
+    uint32_t     *stack_top;
+    mpu_region_t  regions[3];   /* task stack + 2 private   */
+} tcb_t;
+
+/* Inside the context switch (chapter 18), after selecting
+   the next task and before returning:                     */
+static inline void mpu_load(const tcb_t *t)
+{
+    MPU-&gt;CTRL = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        MPU-&gt;RNR  = 4 + i;          /* task regions: 4,5,6  */
+        MPU-&gt;RBAR = t-&gt;regions[i].rbar;
+        MPU-&gt;RASR = t-&gt;regions[i].rasr;
+    }
+    MPU-&gt;CTRL = MPU_CTRL_ENABLE_Msk | MPU_CTRL_PRIVDEFENA_Msk;
+    __DSB(); __ISB();
+}
+
+/* Roughly 20 cycles. Against a context switch of ~100
+   cycles that is affordable, and it buys you a task that
+   physically cannot corrupt another task's stack.
+
+   THE HONEST LIMITATION: with 8 regions and 3-4 spent on
+   global policy, you have 4-5 per task. A task needing its
+   stack, a DMA buffer, two peripherals and a shared queue
+   has already run out. Full isolation on Cortex-M is a real
+   design constraint, not a checkbox - which is why most
+   projects use the MPU for the three high-value cases above
+   and stop there.                                          */
+</code></pre>
+
+<h2 id="faults">Reading a MemManage fault</h2>
+
+<pre><code>/* The MPU reports through MemManage, which is a
+   configurable fault - you must ENABLE it, or it escalates
+   to HardFault and you lose the diagnostic detail.        */
+
+SCB-&gt;SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk;
+
+void MemManage_Handler(void)
+{
+    uint32_t mmfsr = (SCB-&gt;CFSR &amp; 0xFFu);
+
+    /*  bit 0  IACCVIOL   instruction fetch violation - you
+                          jumped into an XN region
+        bit 1  DACCVIOL   data access violation
+        bit 3  MUNSTKERR  fault while unstacking on return
+        bit 4  MSTKERR    fault while STACKING on entry -
+                          this is your stack guard firing
+        bit 7  MMARVALID  MMFAR holds the faulting address  */
+
+    uint32_t addr = (mmfsr &amp; (1u &lt;&lt; 7)) ? SCB-&gt;MMFAR : 0xFFFFFFFF;
+
+    fault_record(mmfsr, addr, current_task_id());
+    __asm volatile ("bkpt #0");
+}
+
+/* MSTKERR is the one to recognise on sight: the hardware
+   could not push the exception frame because the stack
+   pointer had already run into the guard region. That is a
+   stack overflow, caught at the moment it happened, naming
+   the task. Compare with the alternative - silent
+   corruption discovered days later - and the MPU has paid
+   for itself with this one bit.                            */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Fault immediately on enabling the MPU</td><td>A region you need is not covered and
+<code>PRIVDEFENA</code> is off</td></tr>
+<tr><td>Fault address makes no sense</td><td>Missing <code>DSB</code>/<code>ISB</code> after writing
+<code>CTRL</code></td></tr>
+<tr><td>Region appears to have no effect</td><td>Base address not aligned to the region size — low bits
+ignored</td></tr>
+<tr><td>Two regions overlap unexpectedly</td><td>Higher region number wins; check the ordering</td></tr>
+<tr><td>MemManage never fires, HardFault does</td><td><code>MEMFAULTENA</code> not set — the fault
+escalated</td></tr>
+<tr><td><code>MMFAR</code> holds nonsense</td><td><code>MMARVALID</code> is clear; the address was not
+captured</td></tr>
+<tr><td>Stack overflow still silent</td><td>Guard region sized smaller than one exception frame — use at least
+32 bytes</td></tr>
+<tr><td>Example code does not compile for this part</td><td>ARMv8-M MPU registers differ from ARMv7-M
+entirely</td></tr>
+<tr><td>Run out of regions adding one task</td><td>The real constraint — reduce per-task regions or drop full
+isolation</td></tr>
+<tr><td>Faults appear only after enabling optimisation</td><td>Inlining moved a buffer; the region no longer
+covers it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State two things an MPU does not do that an MMU does.</li>
+  <li>Name the three highest-value uses of an MPU and why each is nearly free.</li>
+  <li>Explain how a stack guard region converts a silent bug into an immediate fault.</li>
+  <li>State the alignment rule for an ARMv7-M region and its effect on the linker script.</li>
+  <li>Say which region wins where two overlap.</li>
+  <li>Explain what <code>PRIVDEFENA</code> does and the trade-off in leaving it off.</li>
+  <li>Explain why <code>DSB</code> and <code>ISB</code> are required around MPU changes.</li>
+  <li>Say what <code>MSTKERR</code> means and why it is the most useful fault bit.</li>
+  <li>Explain why MemManage faults sometimes appear as HardFaults.</li>
+  <li>Give the practical limit on per-task isolation with 8 regions.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

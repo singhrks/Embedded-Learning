@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trap-and-emulate and the Popek-Goldberg conditions | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Trap-and-emulate and the Popek-Goldberg conditions</h1>
+<p class="lead">In 1974 two researchers wrote down the exact property an instruction set must have to be
+virtualisable. For thirty years most popular architectures failed the test, and the industry built
+increasingly baroque workarounds. Understanding the test tells you precisely what EL2 was added to fix.</p>
+
+<h2 id="mechanism">The mechanism, stripped down</h2>
+
+<p>Classical virtualisation is one idea: <strong>run the guest at a privilege level lower than it thinks it
+has, and catch it when it notices.</strong></p>
+
+<pre class="diagram">   Guest kernel BELIEVES it runs at the highest privilege.
+   It ACTUALLY runs de-privileged.
+
+   guest executes an ordinary instruction
+        |
+        |  ADD, LDR to its own memory, B, ...
+        v
+   runs at full speed on real silicon.  No hypervisor involvement.
+   This is most instructions, and it is why virtualisation is fast.
+
+
+   guest executes a PRIVILEGED instruction
+        |
+        |  "write TTBR0", "disable interrupts", "read the timer"
+        v
+   the CPU refuses at this privilege level  ->  TRAP
+        |
+        v
+   +---------------------------------------------+
+   |  hypervisor's exception handler             |
+   |   1. decode: what did the guest try to do?  |
+   |   2. is it allowed, in the guest's own      |
+   |      virtual world?                          |
+   |   3. perform the EQUIVALENT operation on    |
+   |      the guest's shadow state               |
+   |   4. advance the guest's PC past it         |
+   |   5. return                                  |
+   +---------------------------------------------+
+        |
+        v
+   guest resumes, having observed nothing unusual.
+
+   Cost: steps 1-5 are perhaps 1000-2000 cycles.
+   Correctness: step 3 must be indistinguishable from the real thing.</pre>
+
+<div class="key">
+<b>The invariant</b>
+<p>The guest must not be able to tell. Not "must not be able to escape" — <em>must not be able to tell</em>.
+Any observable difference between running natively and running virtualised is a bug, and historically most
+of them were also security holes.</p>
+</div>
+
+<h2 id="classes">Popek and Goldberg's instruction classes</h2>
+
+<p>The 1974 paper divides every instruction into categories based on two questions: does it touch privileged
+state, and does its behaviour depend on privileged state?</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>Definition</th><th>AArch64 examples</th></tr></thead>
+<tbody>
+<tr><td><strong>Privileged</strong></td><td>Traps when executed in user mode, works in supervisor
+mode</td><td><code>MSR TTBR0_EL1</code>, <code>TLBI</code>, <code>AT</code>, <code>ERET</code></td></tr>
+<tr><td><strong>Sensitive — control</strong></td><td>Changes the configuration of resources: memory mapping,
+privilege, interrupt state</td><td><code>MSR SCTLR_EL1</code>, <code>MSR DAIFSet</code>,
+<code>MSR VBAR_EL1</code></td></tr>
+<tr><td><strong>Sensitive — behaviour</strong></td><td>Its <em>result</em> depends on the privilege level or
+on real resource configuration</td><td><code>MRS CurrentEL</code>, <code>MRS MIDR_EL1</code>, reading a
+physical counter</td></tr>
+<tr><td><strong>Innocuous</strong></td><td>Everything else</td><td><code>ADD</code>, <code>LDR</code>,
+<code>B</code>, floating point</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   THE THEOREM
+
+     A machine is efficiently virtualisable if
+     the set of SENSITIVE instructions is a SUBSET
+     of the set of PRIVILEGED instructions.
+
+   In words: every instruction that could betray the illusion
+   must TRAP when executed by a de-privileged guest.
+
+     +---------------------------------+
+     |         all instructions        |
+     |   +-------------------------+   |
+     |   |      privileged         |   |    GOOD: sensitive fits
+     |   |   +---------------+     |   |    entirely inside
+     |   |   |  sensitive    |     |   |    privileged. Everything
+     |   |   +---------------+     |   |    dangerous traps.
+     |   +-------------------------+   |
+     +---------------------------------+
+
+     +---------------------------------+
+     |   +-------------+               |
+     |   | privileged  |               |    BAD: sensitive
+     |   +------+------+               |    instructions exist
+     |   +------|-----------+          |    OUTSIDE privileged.
+     |   |   sensitive      |          |    They silently do the
+     |   +------------------+          |    WRONG THING instead
+     +---------------------------------+    of trapping.
+
+   The instructions in that overhang are called CRITICAL
+   instructions. They are the entire problem.</pre>
+
+<h2 id="failures">Where architectures failed</h2>
+
+<p>x86 before VT-x had 17 critical instructions. The canonical one is <code>POPF</code>, which pops the flags
+register. In kernel mode it can change the interrupt-enable flag; in user mode it silently ignores that bit
+rather than faulting. A de-privileged guest kernel executing <code>POPF</code> to disable interrupts would
+get <em>no trap and no effect</em>. The hypervisor never learns the guest wanted interrupts off, and the
+guest never learns it failed.</p>
+
+<p>Classic ARM (ARMv7-A without the Virtualization Extensions) had its own version of the problem, and it is
+worth knowing because you meet it on old parts:</p>
+
+<pre><code>/* ARMv7-A, no VE. The guest kernel is de-privileged to USR mode. */
+
+    MRS  r0, CPSR        /* reads the mode field. In USR mode the
+                            mode bits read back as USR - so a guest
+                            that inspects its own mode discovers it
+                            is not in SVC. It can TELL. */
+
+    MSR  CPSR_c, #0xD3   /* attempt to switch to SVC and mask IRQs.
+                            In USR mode: silently ignored. No trap.
+                            The guest believes interrupts are off.
+                            They are not. */
+
+    LDM  sp, {r0-r14}^   /* the "^" form accesses USR-mode banked
+                            registers - meaningless and unfaulting
+                            when you are already in USR mode. */
+
+/* Three sensitive-but-not-privileged instructions, and therefore
+   three ways for the illusion to break silently. This is why Xen
+   on ARMv7 required PARAVIRTUALISATION: you had to patch the guest
+   kernel to replace every critical instruction with a hypercall.  */</code></pre>
+
+<h2 id="workarounds">The three historical workarounds</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>How it dodges critical instructions</th><th>Price</th></tr></thead>
+<tbody>
+<tr><td><strong>Binary translation</strong></td><td>Scan the guest's instruction stream ahead of execution and
+rewrite critical instructions into traps or inline emulation</td><td>A translator and a translation cache in
+the trusted computing base; self-modifying guest code is a nightmare</td></tr>
+<tr><td><strong>Paravirtualisation</strong></td><td>Change the guest source so it never emits a critical
+instruction — it calls the hypervisor instead</td><td>Every guest OS must be ported and maintained; closed
+guests cannot run at all</td></tr>
+<tr><td><strong>Hardware extension</strong></td><td>Add a new mode in which the awkward instructions
+trap</td><td>None, once the silicon exists. This is what won</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>Why "shadow page tables" were the real pain</b>
+<p>Even with the instruction problem solved, memory remained hard. The guest builds page tables mapping
+guest-virtual to <em>guest-physical</em> addresses, but the MMU consumes host-physical. Pre-hardware
+solutions had the hypervisor maintain a hidden <em>shadow</em> table composing the two, write-protect the
+guest's tables to detect edits, and rebuild on every change. It worked, and it cost a fortune on
+fork-heavy workloads. Stage-2 translation (<a href="virt-05-stage2.html">chapter 05</a>) is the hardware
+answer, and it is the single biggest reason modern virtualisation is cheap.</p>
+</div>
+
+<h2 id="arm">How ARMv8-A passes the test</h2>
+
+<p>ARM did not try to make EL1 instructions trap by de-privileging the guest into EL0. That was the ARMv7
+mistake. Instead it added a <em>higher</em> level, EL2, and made trapping <strong>configurable</strong>: the
+guest genuinely runs at EL1, with real EL1 registers, and the hypervisor selects which EL1 operations should
+divert to EL2.</p>
+
+<pre class="diagram">   ARMv7 approach (broken)        ARMv8 approach (works)
+
+   EL0  app                       EL0  app
+        guest kernel  &lt;- squashed
+                          in here  EL1  guest kernel, genuinely at EL1
+   SVC  hypervisor                      with its own SCTLR_EL1, TTBR0_EL1,
+                                        VBAR_EL1 ... all real registers
+
+                                  EL2  hypervisor, and it holds the
+                                       CONTROL: HCR_EL2 says which
+                                       EL1 operations trap up to here
+
+   Consequence: the guest is NOT de-privileged, so it cannot
+   detect de-privileging. Sensitive instructions do not need to
+   be privileged - they need to be TRAPPABLE, and HCR_EL2 makes
+   almost all of them trappable on demand.
+
+   MRS CurrentEL in a guest reads "EL1" - which is TRUE.
+   The lie is not about privilege. The lie is about being alone.</pre>
+
+<p>This is the key architectural insight of the ARM virtualisation extensions, and it is why
+<a href="virt-04-hcr-traps.html">HCR_EL2</a> is the register this whole track revolves around. Popek and
+Goldberg asked for sensitive ⊆ privileged. ARM instead offered <em>sensitive ⊆ configurably trappable</em>,
+which is strictly more useful: the hypervisor traps what it must emulate and lets the rest run at full
+speed.</p>
+
+<h2 id="selective">Selective trapping in practice</h2>
+
+<p>The theory says trap on sensitive instructions. Real hypervisors trap on far fewer than they are permitted to, and the reason is entirely about cost.</p>
+
+<pre><code>/* Not everything should trap. The art is choosing.        */
+
+  TRAP IT when the guest must not see real hardware state, or
+  when you must maintain shadow state:
+
+    guest writes to the GIC distributor      -> trap, emulate
+    guest reads the physical counter         -> trap or offset
+    guest executes WFI                       -> trap, so you can
+                                                schedule another vCPU
+    guest reads ID registers (MIDR, ID_AA64*)-> trap, present a
+                                                sanitised view
+    guest does SMC / HVC                     -> always to EL2/EL3
+
+  DO NOT TRAP when the hardware already isolates it, because a
+  trap you did not need is pure cost:
+
+    guest writes TTBR0_EL1, TCR_EL1          -> let it. Stage-2
+                                                already constrains
+                                                the result.
+    guest issues TLBI VAE1                   -> let it. VMID tags
+                                                the entries.
+    guest takes its own EL0 syscall          -> let it. Never
+                                                involves EL2.
+    guest sets DAIF                          -> let it, unless you
+                                                are virtualising
+                                                interrupts strictly.
+
+/* A well-configured arm64 KVM guest running a compile job may
+   execute BILLIONS of instructions between exits. A badly
+   configured one exits thousands of times a second doing the
+   same work.                                                */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest works alone, corrupts state when a second guest runs</td><td>A sensitive operation is not being
+trapped — the guest is touching real shared state</td></tr>
+<tr><td>Guest detects it is virtualised despite your efforts</td><td>An ID register, timer or cache-topology
+value was not sanitised; the guest read the truth</td></tr>
+<tr><td>Guest disables interrupts and still gets interrupted</td><td>Interrupt masking is being emulated and
+the emulation lost a state change — classic critical-instruction bug</td></tr>
+<tr><td>Enormous exit rate for an idle guest</td><td><code>WFI</code>/<code>WFE</code> trapping combined with a
+guest that spins, or an untrapped-but-should-be timer read</td></tr>
+<tr><td>Guest hangs when it re-programs its own page tables</td><td>Under shadow paging, a missed write-protect;
+under stage-2, a stale TLB — see <a href="virt-06-stage2-faults.html">chapter 06</a></td></tr>
+<tr><td>Emulated instruction executes twice</td><td>The handler forgot to advance the guest PC past the
+trapping instruction</td></tr>
+<tr><td>Works on one core, breaks on SMP</td><td>Shadow state updated without the lock the real hardware
+provided implicitly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the Popek-Goldberg condition in one sentence, using the words sensitive and privileged.</li>
+  <li>Define a critical instruction and explain why it is worse than an instruction that faults.</li>
+  <li>Give one x86 and one ARMv7 critical instruction and say exactly what goes wrong.</li>
+  <li>Name the three workarounds for a non-virtualisable ISA and one real product that used each.</li>
+  <li>Explain why shadow page tables were expensive and what replaced them.</li>
+  <li>Explain how ARMv8 sidesteps the theorem rather than satisfying it directly.</li>
+  <li>Give two operations a hypervisor should trap and two it should deliberately not, with reasons.</li>
+  <li>List the five steps of a trap-and-emulate handler, and say what breaks if you skip step 4.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

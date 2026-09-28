@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authenticated encryption | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Authenticated encryption</h1>
+<p class="lead">Confidentiality and integrity in one primitive, analysed as a whole. This is the answer to
+almost every "how do I encrypt this?" question, and using anything else needs a specific justification.</p>
+
+<h2 id="interface">The interface</h2>
+
+<p>Combining encryption and authentication by hand is error-prone and historically got it wrong more often than right. Authenticated encryption makes it one operation that cannot be assembled incorrectly.</p>
+
+<pre class="diagram">   ENCRYPT(key, nonce, plaintext, associated_data)
+        -> ciphertext, tag
+
+   DECRYPT(key, nonce, ciphertext, associated_data, tag)
+        -> plaintext, or FAILURE
+
+   THE FOUR INPUTS:
+
+     KEY               secret, 128 or 256 bits
+     NONCE             not secret; MUST BE UNIQUE per key
+     PLAINTEXT         encrypted AND authenticated
+     ASSOCIATED DATA   authenticated but NOT encrypted
+
+   THE ASSOCIATED DATA IS THE UNDER-USED PART. It is for
+   anything that must be bound to the message but has to stay
+   readable:
+
+     · a packet header the router must see
+     · a message type or version field
+     · a sequence number
+     · the sender and recipient identifiers
+     · the record layer header in TLS
+
+   Bind them, and an attacker cannot take a valid ciphertext
+   and replay it with a different header - which is a real
+   attack whenever the header carries routing or type
+   information.
+
+   THE FAILURE MODE IS THE POINT: decryption returns FAILURE,
+   not plaintext. There is no partial result, no "decrypt
+   then check", no window in which unauthenticated plaintext
+   exists. That is what makes an AEAD safe where a composed
+   construction is not (chapter 05's padding oracle).</pre>
+
+<h2 id="gcm">AES-GCM</h2>
+
+<p>The most widely deployed authenticated mode, fast where hardware accelerates it, and carrying a nonce requirement whose violation is unusually destructive — it can expose the authentication key itself.</p>
+
+<pre><code>/* THE CONSTRUCTION: AES-CTR for confidentiality, GHASH for
+   authentication, sharing one key.                        */
+
+    H = AES_K(0^128)                    /* the GHASH key */
+    J0 = nonce ‖ 0^31 ‖ 1               /* for a 96-bit
+                                           nonce */
+    ciphertext = AES-CTR_K(J0+1, plaintext)
+    tag = GHASH_H(aad ‖ ciphertext ‖ lengths) XOR AES_K(J0)
+
+/* GHASH is polynomial evaluation in GF(2^128) - the same
+   universal-hashing idea as Poly1305 (chapter 08), and with
+   the same one-time-key requirement.
+
+/* WHY IT WON:
+     · CTR mode is fully parallelisable
+     · GHASH maps onto the PMULL (ARM) and PCLMULQDQ (x86)
+       carry-less multiply instructions
+     · with AES-NI or the ARM crypto extension, roughly
+       1 cycle/byte
+     · it is in every standard: TLS, IPsec, SSH, 802.11ac,
+       NVMe, storage
+
+/* THE NONCE RULE, and it is absolute:
+
+     NEVER REUSE A (key, nonce) PAIR.
+
+   Reuse does not merely leak the XOR of the plaintexts, as
+   it would with plain CTR. It reveals H, THE
+   AUTHENTICATION KEY - because two tags give two
+   polynomial equations in H. The attacker can then FORGE
+   ARBITRARY MESSAGES under that key.
+
+   This is the single most damaging misuse in modern
+   cryptography, and it has happened in shipped TLS stacks,
+   VPNs and IoT devices.
+
+/* THE LIMITS:
+     96-bit nonce  the only size that avoids an extra GHASH
+                   step; always use exactly 12 bytes
+     2^32 - 2 blocks (about 64 GB) per (key, nonce)
+     2^32 messages per key before the birthday bound on
+       random nonces becomes uncomfortable - use a counter
+
+/* TRUNCATED TAGS: GCM allows 96, 104, 112, 120 or 128 bits.
+   USE 128. Short tags weaken the forgery bound far more than
+   the arithmetic suggests, because a successful forgery with
+   a short tag can leak information about H.              */</code></pre>
+
+<h2 id="chachapoly">ChaCha20-Poly1305</h2>
+
+<p>The software-friendly counterpart, pairing a stream cipher with a one-time authenticator. It is the default where AES hardware is absent, and it is more forgiving of implementation mistakes.</p>
+
+<pre><code>/* RFC 8439. ChaCha20 for confidentiality (chapter 06),
+   Poly1305 for authentication (chapter 08).              */
+
+    one-time key (r, s) = ChaCha20(key, nonce, counter = 0)
+                          [first 32 bytes]
+    ciphertext          = ChaCha20(key, nonce, counter = 1)
+                          XOR plaintext
+    tag = Poly1305(r, s,
+                   aad ‖ pad16 ‖ ciphertext ‖ pad16 ‖
+                   len(aad) ‖ len(ciphertext))
+
+/* THE PADDING AND LENGTH FIELDS make the encoding
+   unambiguous - without them an attacker could shift bytes
+   between the AAD and the ciphertext (chapter 08).
+
+/* THE ONE-TIME KEY IS DERIVED FROM THE NONCE, which is what
+   makes Poly1305's one-time requirement satisfiable.
+
+/* WHY USE IT:
+     · 3-4x faster than SOFTWARE AES-GCM
+     · CONSTANT TIME with no effort - ARX, no tables
+       (chapter 19)
+     · small: a few kilobytes of code total
+     · no timing variability, so no cache-attack surface
+
+/* AND XCHACHA20-POLY1305, which is the version to prefer:
+     192-bit nonce, derived via HChaCha20.
+     RANDOM NONCES ARE SAFE INDEFINITELY - a 192-bit random
+     nonce will not collide before the heat death of
+     anything. That removes the entire nonce-management
+     problem, which is where most AEAD misuse comes from.
+
+/* THE PRACTICAL SPLIT: TLS 1.3 offers both AES-GCM and
+   ChaCha20-Poly1305 and negotiates. A server with AES-NI
+   picks GCM; a phone without AES acceleration picks
+   ChaCha20. Both are correct choices for their hardware. */</code></pre>
+
+<div class="key">
+<b>The decision, in four lines</b>
+<pre>hardware AES available          -> AES-GCM (or AES-GCM-SIV)
+software only                   -> XChaCha20-Poly1305
+nonce uniqueness not guaranteed -> AES-GCM-SIV or XChaCha20
+very constrained hardware       -> AES-CCM, or ASCON</pre>
+<p>And in all four cases: call the AEAD API, not a cipher plus a MAC you compose yourself.</p>
+</div>
+
+<h2 id="others">The others</h2>
+
+<p>Several other constructions exist, including ones deliberately designed to survive nonce reuse — which matters when you genuinely cannot guarantee uniqueness.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>AEAD</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>AES-GCM</strong></td><td>The standard. Fast with hardware. Absolutely nonce-critical</td></tr>
+<tr><td><strong>ChaCha20-Poly1305</strong></td><td>Fast in software, constant time. 96-bit nonce</td></tr>
+<tr><td><strong>XChaCha20-Poly1305</strong></td><td>192-bit nonce — random nonces are safe. <strong>The easiest correct choice</strong></td></tr>
+<tr><td><strong>AES-GCM-SIV</strong></td><td><strong>Nonce-misuse resistant.</strong> Two passes, so it cannot stream</td></tr>
+<tr><td>AES-CCM</td><td>CTR + CBC-MAC. Only needs the encrypt direction — good on tiny hardware. 802.15.4, Zigbee, Bluetooth LE, WPA2</td></tr>
+<tr><td>AES-OCB</td><td>One pass, very fast. Patents expired</td></tr>
+<tr><td>AES-EAX</td><td>CTR + CMAC. Simple, streaming, no patents</td></tr>
+<tr><td><strong>ASCON</strong></td><td><strong>NIST lightweight standard (2023).</strong> Sponge-based, tiny hardware</td></tr>
+<tr><td>AEGIS, MORUS</td><td>AES-round-based, extremely fast where AES-NI exists</td></tr>
+<tr><td>Deoxys-II</td><td>CAESAR winner for misuse resistance</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* --- AES-CCM, worth understanding for embedded --- */
+    CBC-MAC over the nonce, AAD and plaintext -> tag
+    CTR mode to encrypt the plaintext AND the tag
+
+/* IT NEEDS ONLY THE AES ENCRYPT DIRECTION, so the
+   implementation is half the size - which matters when the
+   whole crypto library must fit in 8 KB. And it is what
+   every 802.15.4-derived protocol uses, so if you are doing
+   Zigbee, Thread, Bluetooth LE or Matter, you are using CCM
+   whether you chose it or not.
+
+   THE COSTS: two passes over the data (so the length must be
+   known in advance), not parallelisable, and it is
+   MAC-then-encrypt in structure - which is provably fine
+   here because it was analysed as a whole, but is a reminder
+   that "use a standard construction" beats "apply a rule of
+   thumb".
+
+/* --- AES-GCM-SIV, and when to reach for it --- */
+    tag = POLYVAL(auth_key, aad ‖ plaintext ‖ lengths)
+    nonce_for_ctr = tag
+    ciphertext = AES-CTR(enc_key, tag, plaintext)
+
+/* The tag is computed FIRST, over the plaintext, and then
+   used as the CTR nonce. So repeating a nonce with
+   DIFFERENT plaintexts still gives different ciphertexts;
+   the only leak is that identical (nonce, plaintext) pairs
+   produce identical ciphertexts.
+
+   USE IT WHEN NONCE UNIQUENESS CANNOT BE GUARANTEED:
+     · a device that may be restored from a backup
+     · a stateless server with no shared counter
+     · firmware whose counter resets on reflash (chapter 02)
+     · any design where "the counter is monotonic" is a hope
+       rather than a mechanism
+
+   THE COST: two passes, so no streaming, and the plaintext
+   must be buffered.                                      */</code></pre>
+
+<h2 id="using">Using one correctly</h2>
+
+<p>The interface has one parameter people ignore: additional authenticated data, which is authenticated but not encrypted. Using it correctly is what binds a ciphertext to its context.</p>
+
+<pre><code>/* --- THE HIGH-LEVEL API, which is the recommendation --- */
+    #include &lt;sodium.h&gt;
+
+    /* KEY: from a KDF or the CSPRNG, never a password
+       directly (chapter 10) */
+    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    crypto_aead_xchacha20poly1305_ietf_keygen(key);
+
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    randombytes_buf(nonce, sizeof nonce);   /* 192 bits:
+                                               random is safe */
+
+    unsigned long long ct_len;
+    crypto_aead_xchacha20poly1305_ietf_encrypt(
+            ciphertext, &amp;ct_len,
+            plaintext, plaintext_len,
+            header, header_len,             /* the AAD */
+            NULL, nonce, key);
+
+    /* transmit: nonce ‖ header ‖ ciphertext (tag included) */
+
+    /* DECRYPT - and this is the whole error handling: */
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            decrypted, &amp;pt_len, NULL,
+            ciphertext, ct_len,
+            header, header_len,
+            nonce, key) != 0) {
+            /* FORGED, CORRUPTED, OR WRONG KEY.
+               DISCARD EVERYTHING. Do not use any bytes of
+               `decrypted`. Do not report which check failed.
+               Do not log the ciphertext. */
+            return -1;
+    }
+
+/* --- ON EMBEDDED, mbedTLS --- */
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&amp;ctx);
+    mbedtls_gcm_setkey(&amp;ctx, MBEDTLS_CIPHER_ID_AES, key, 256);
+
+    mbedtls_gcm_crypt_and_tag(&amp;ctx, MBEDTLS_GCM_ENCRYPT,
+                              len, nonce, 12,
+                              aad, aad_len,
+                              input, output,
+                              16, tag);      /* FULL 16-byte
+                                                tag */
+
+    /* and decryption, which checks the tag internally: */
+    if (mbedtls_gcm_auth_decrypt(&amp;ctx, len, nonce, 12,
+                                 aad, aad_len, tag, 16,
+                                 input, output) != 0)
+            return ERROR;                   /* FAIL CLOSED */
+
+    mbedtls_gcm_free(&amp;ctx);
+
+/* --- THE RULES, restated because each is a real failure --- */
+
+  1. NEVER REUSE A (key, nonce) PAIR. Use a persistent
+     counter, or a 192-bit random nonce.
+
+  2. VERIFY BEFORE USING ANY PLAINTEXT. Not "decrypt then
+     check" - a correct API does not give you the plaintext
+     until the tag verified. If yours does, treat the buffer
+     as untrusted until the check returns.
+
+  3. AUTHENTICATE THE HEADERS via the AAD. Anything that
+     changes the meaning of the message must be bound to it.
+
+  4. USE THE FULL TAG LENGTH.
+
+  5. INCLUDE A SEQUENCE NUMBER, in the AAD, and reject
+     replays (chapter 08). An AEAD gives no freshness.
+
+  6. ROTATE KEYS before the message or byte limits.
+
+  7. ON FAILURE, RETURN ONE INDISTINGUISHABLE ERROR, and
+     rate-limit.                                          */</code></pre>
+
+<h2 id="misuse">Where it still goes wrong</h2>
+
+<p>Authenticated encryption removes most ways to get encryption wrong and leaves a few. These are the remaining ones, and nonce management accounts for nearly all of them.</p>
+
+<pre><code>/* An AEAD removes most of the classic failures. These
+   remain: */
+
+   1. NONCE REUSE - by far the most common, and the most
+      damaging. Sources: a hardcoded IV, a counter in
+      volatile RAM, a device cloned from an image, a random
+      nonce that is too short, a counter that resets.
+
+   2. NOT AUTHENTICATING THE AAD YOU MEANT TO. Sending a
+      header outside the AAD makes it forgeable.
+
+   3. USING THE PLAINTEXT BEFORE VERIFICATION. Some
+      streaming APIs release plaintext incrementally. If you
+      act on it before the final tag check, you have
+      re-created the padding-oracle situation.
+
+   4. TREATING THE TAG AS OPTIONAL - truncating it, or
+      skipping verification "for performance".
+
+   5. NO REPLAY PROTECTION. A valid message replays forever.
+
+   6. KEY REUSE ACROSS CONTEXTS - the same key for both
+      directions, or for two protocols. Derive separate keys
+      (chapter 10).
+
+   7. EXCEEDING THE LIMITS - 64 GB per GCM nonce, and the
+      message-count bounds.
+
+   8. ENCRYPTING THE LENGTH AWAY BUT NOT THE PATTERN. An
+      AEAD hides content, not size or timing. A protocol
+      whose message lengths reveal the content - a keyboard
+      remote, a voice codec - needs padding as well.
+
+   9. AND THE ONE PEOPLE FORGET: AN AEAD DOES NOT
+      AUTHENTICATE THE SENDER'S IDENTITY, only that they
+      hold the key. If two parties share a key, either could
+      have sent any message (chapter 01). For a real identity
+      claim you need a signature or a properly authenticated
+      key exchange (chapters 13 and 15).                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Forged messages accepted</td><td>GCM nonce reuse leaked the authentication key</td></tr>
+<tr><td>Two ciphertexts XOR to plaintext</td><td>Nonce reuse</td></tr>
+<tr><td>Header modified without detection</td><td>Not included in the AAD</td></tr>
+<tr><td>Old messages replayed</td><td>No sequence number — AEADs give no freshness</td></tr>
+<tr><td>Decryption fails after 64 GB</td><td>GCM block limit for one nonce</td></tr>
+<tr><td>Interop failure on the tag</td><td>Different tag lengths, or AAD not byte-identical</td></tr>
+<tr><td>Works one way, fails the other</td><td>Same key both directions, or nonce spaces overlapping</td></tr>
+<tr><td>Plaintext acted on before verification</td><td>A streaming API used incorrectly</td></tr>
+<tr><td>Attacker infers content from message sizes</td><td>An AEAD hides content, not length — pad</td></tr>
+<tr><td>Nonce repeats after a factory reset</td><td>Counter in volatile storage — use GCM-SIV or XChaCha20</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the AEAD interface and what associated data is for.</li>
+  <li>Explain why the failure mode — no partial plaintext — is the security property.</li>
+  <li>Describe AES-GCM's construction and why GCM nonce reuse is worse than CTR nonce reuse.</li>
+  <li>State GCM's nonce size, tag size and message limits.</li>
+  <li>Describe ChaCha20-Poly1305 and say why the length fields matter.</li>
+  <li>Explain what XChaCha20 changes and why it removes a class of bug.</li>
+  <li>Say when AES-CCM is the right choice and what it costs.</li>
+  <li>Explain nonce-misuse resistance and four situations that call for it.</li>
+  <li>Write a correct encrypt and a correct fail-closed decrypt.</li>
+  <li>List the seven usage rules and the nine remaining failure modes.</li>
+  <li>Explain what an AEAD does <em>not</em> authenticate.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

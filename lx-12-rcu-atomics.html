@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atomics, RCU and lockless techniques | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Atomics, RCU and lockless techniques</h1>
+<p class="lead">RCU lets readers run with <em>zero</em> synchronisation overhead — no atomics, no cache-line
+bouncing, no waiting. The price is a discipline about how updates are published and when memory can be
+freed, and it rests entirely on the memory model from ARM chapters 20 and 21.</p>
+
+<h2 id="idea">The idea</h2>
+
+<p>RCU solves a problem that sounds impossible at first: letting readers run with no locking whatsoever, no waiting and almost no cost, while writers change the data underneath them. The trick is that writers never modify anything in place — they publish a new version and leave the old one alone until every reader that might still be looking at it has finished.</p>
+
+<pre class="diagram">A pointer to a data structure, read constantly, updated rarely.
+
+  WITH A LOCK: every reader takes and releases the lock. On an
+  8-core system that is one cache line ping-ponging between
+  all eight caches, thousands of times a second, purely to
+  read data that almost never changes.
+
+  WITH RCU: readers do NOTHING. No atomic, no write, no wait.
+  The update instead works like this:
+
+     1. the writer makes a NEW copy with the change
+     2. it publishes the new one with a single pointer store
+     3. new readers see the new version; readers already
+        running keep using the old one - which is fine,
+        because it is still a consistent, valid version
+     4. the writer WAITS until every reader that could still
+        hold the old pointer has finished
+     5. only then does it free the old copy
+
+  Read - Copy - Update. Step 4 is the whole trick, and it is
+  cheap because of a clever definition of "finished".
+
+     time -&gt;
+     reader A: [--- reads old ---]
+     reader B:      [------ reads old ------]
+     writer:     publish new
+                          |
+                          +-- grace period --+
+                                             |
+                                          free old
+                                       (A and B are done;
+                                        anyone starting after
+                                        "publish" sees new)</pre>
+
+<h2 id="grace">Grace periods, and why they are cheap</h2>
+
+<p>The obvious question is how the writer knows when it is safe to free the old version, given that readers announce nothing. The answer is the clever part, and it is why RCU reads cost nothing: instead of tracking readers, the kernel waits for a moment when every CPU has demonstrably finished any read it could have started.</p>
+
+<pre><code>/* THE KEY OBSERVATION: an RCU read-side critical section may
+   not sleep or be preempted (in classic RCU). So if a CPU has
+   passed through a CONTEXT SWITCH, it cannot possibly still be
+   inside one.
+
+   A "quiescent state" = context switch, idle, or userspace.
+   A "grace period"    = every CPU has passed through at least
+                         one quiescent state since the update.
+
+   So RCU does not track individual readers at all. It waits
+   for a system-wide condition that is already being reported
+   for other reasons. That is why readers cost NOTHING - there
+   is nothing to record.
+
+   Typical grace period: a few milliseconds to tens of ms.
+   RCU is therefore for data where UPDATES ARE RARE and the
+   latency of reclaiming memory does not matter.           */</code></pre>
+
+<h2 id="api">The API</h2>
+
+<p>The API is small, and most of it exists to tell the compiler and CPU what they may not reorder. The calls below do almost nothing at runtime — that is the point — but leaving one out breaks the guarantee in ways that only appear on some processors, under load.</p>
+
+<pre><code>#include &lt;linux/rcupdate.h&gt;
+
+/* --- READER ---------------------------------------------- */
+        rcu_read_lock();                /* NOT a lock. It just
+                                           marks the section
+                                           and disables
+                                           preemption.       */
+        p = rcu_dereference(gp);        /* the ONLY correct
+                                           way to read the
+                                           pointer           */
+        if (p)
+                use(p-&gt;field);          /* safe until
+                                           rcu_read_unlock  */
+        rcu_read_unlock();
+
+/* RULES for the read side:
+     · MAY NOT SLEEP inside (unless using SRCU)
+     · the pointer is only valid INSIDE the section. Do not
+       stash it in a global and use it later.
+     · rcu_dereference() carries the dependency barrier that
+       makes the ARM memory model safe here - a plain read is
+       NOT equivalent (see below).
+
+/* --- WRITER ---------------------------------------------- */
+        struct foo *new, *old;
+
+        new = kmalloc(sizeof(*new), GFP_KERNEL);
+        *new = *old_contents;
+        new-&gt;field = updated_value;      /* fully initialise
+                                            BEFORE publishing */
+
+        spin_lock(&amp;update_lock);         /* writers still need
+                                            mutual exclusion
+                                            with EACH OTHER   */
+        old = rcu_dereference_protected(gp,
+                        lockdep_is_held(&amp;update_lock));
+        rcu_assign_pointer(gp, new);     /* PUBLISH */
+        spin_unlock(&amp;update_lock);
+
+        synchronize_rcu();               /* wait for the grace
+                                            period - SLEEPS  */
+        kfree(old);
+
+/* OR, without blocking: */
+        call_rcu(&amp;old-&gt;rcu_head, my_free_cb);
+        /* the callback runs after the grace period */
+
+static void my_free_cb(struct rcu_head *h)
+{
+        struct foo *p = container_of(h, struct foo, rcu_head);
+        kfree(p);
+}
+/* For a plain kfree there is a shortcut: */
+        kfree_rcu(old, rcu_head);</code></pre>
+
+<div class="key">
+<b>Why <code>rcu_assign_pointer</code> and <code>rcu_dereference</code> are not optional</b>
+<p>They are the memory barriers that make this correct on a weakly-ordered machine like ARM (ARM chapters 20
+and 21). <code>rcu_assign_pointer</code> is a release store: it guarantees the initialisation of the new
+object is visible <em>before</em> the pointer to it. <code>rcu_dereference</code> preserves the address
+dependency so the reader cannot observe the new pointer with stale contents. Write
+<code>gp = new;</code> and <code>p = gp;</code> instead and it will work on x86 and fail on ARM, rarely,
+under load — the worst possible failure mode.</p>
+</div>
+
+<h2 id="lists">RCU-protected lists</h2>
+
+<p>Since the commonest thing to protect this way is a list, the kernel provides RCU-aware list operations. They are ordinary list calls with the necessary publication ordering built in, and mixing them with the plain versions silently removes the protection.</p>
+
+<pre><code>/* The common real use: a list of devices, sessions, or rules,
+   read on every operation, changed on hotplug.             */
+
+        struct my_entry {
+                struct list_head list;
+                struct rcu_head  rcu;
+                int              id;
+                ...
+        };
+
+        LIST_HEAD(my_list);
+        DEFINE_SPINLOCK(my_list_lock);   /* writers only */
+
+/* --- READER: traverse without any lock ------------------- */
+static struct my_entry *find_entry(int id)
+{
+        struct my_entry *e;
+
+        list_for_each_entry_rcu(e, &amp;my_list, list) {
+                if (e-&gt;id == id)
+                        return e;
+        }
+        return NULL;
+}
+        /* called as: */
+        rcu_read_lock();
+        e = find_entry(id);
+        if (e)
+                do_something(e-&gt;value);
+        rcu_read_unlock();
+
+/* --- WRITER: add --------------------------------------- */
+        spin_lock(&amp;my_list_lock);
+        list_add_rcu(&amp;new-&gt;list, &amp;my_list);
+        spin_unlock(&amp;my_list_lock);
+        /* no grace period needed to ADD - a reader either
+           sees it or does not, and both are correct       */
+
+/* --- WRITER: remove ------------------------------------- */
+        spin_lock(&amp;my_list_lock);
+        list_del_rcu(&amp;e-&gt;list);
+        spin_unlock(&amp;my_list_lock);
+
+        synchronize_rcu();       /* now no reader holds e */
+        kfree(e);
+        /* or: kfree_rcu(e, rcu); */
+
+/* NOTE list_del_rcu leaves the FORWARD pointer intact, so a
+   reader already traversing the deleted node can still walk
+   onward to the rest of the list. That is deliberate, and it
+   is why you must use the _rcu variants rather than the
+   ordinary list functions.                                */</code></pre>
+
+<h2 id="flavours">The flavours</h2>
+
+<p>Plain RCU's rule that a reader may never sleep is a real restriction, not a formality, so the kernel offers
+several variants of the same read-side idea, each relaxing or specialising that rule for a different context —
+choosing between them is choosing which grace-period domain your reader actually needs to be counted in.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flavour</th><th>Readers may sleep</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td><code>rcu_read_lock()</code></td><td>No</td><td>The default. Preemption disabled in the section.</td></tr>
+<tr><td><code>rcu_read_lock_bh()</code></td><td>No</td><td>Data also touched from softirqs (networking).</td></tr>
+<tr><td><code>rcu_read_lock_sched()</code></td><td>No</td><td>Preempt-disable regions.</td></tr>
+<tr><td><code>srcu_read_lock()</code></td><td><strong>Yes</strong></td><td>Sleepable RCU — readers may block. Per-domain, so one slow reader does not stall everyone.</td></tr>
+<tr><td>RCU Tasks</td><td>—</td><td>For trampolines and tracing; waits for voluntary context switches.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* SRCU, when a reader must sleep - e.g. it does I/O or copies
+   to userspace: */
+
+        struct srcu_struct my_srcu;
+        init_srcu_struct(&amp;my_srcu);
+
+        int idx = srcu_read_lock(&amp;my_srcu);
+        p = srcu_dereference(gp, &amp;my_srcu);
+        ... may sleep here ...
+        srcu_read_unlock(&amp;my_srcu, idx);
+
+        synchronize_srcu(&amp;my_srcu);     /* the writer side */
+
+/* SRCU grace periods can be MUCH longer, because a sleeping
+   reader may sleep for a long time. Do not use it where you
+   need memory back promptly.                              */</code></pre>
+
+<h2 id="barriers">Barriers, briefly</h2>
+
+<p>Modern CPUs and compilers reorder memory accesses freely, and both will happily break code that depends on one write becoming visible before another. Barriers are how you forbid specific reorderings — a topic worth an entire track of its own, reduced here to what a driver author actually needs.</p>
+
+<pre><code>/* ARM is weakly ordered (ARM ch. 20-21). Without barriers,
+   both the compiler and the CPU may reorder your accesses. */
+
+        smp_mb()        full barrier
+        smp_rmb()       reads before / reads after
+        smp_wmb()       writes before / writes after
+        smp_store_release(&amp;p, v)    /* release store */
+        v = smp_load_acquire(&amp;p)    /* acquire load  */
+        barrier()       compiler only, no CPU instruction
+
+/* THE CANONICAL PAIR - publish a structure safely: */
+        /* producer */
+        obj-&gt;data = 42;
+        smp_store_release(&amp;shared_ptr, obj);
+
+        /* consumer */
+        p = smp_load_acquire(&amp;shared_ptr);
+        if (p)
+                use(p-&gt;data);          /* guaranteed to be 42 */
+
+/* WITHOUT the release/acquire pair, the consumer can observe
+   shared_ptr as non-NULL while p->data is still stale. On
+   arm64 this is not theoretical - it happens.
+
+/* AND FOR DEVICE MEMORY, a DIFFERENT set (chapter 26):
+        wmb()/rmb()/mb()       full barriers including devices
+        dma_wmb()/dma_rmb()    ordering against a DMA engine
+        writel()/readl()       already carry the ordering you
+                               need for MMIO in most cases
+
+   Do not use smp_* barriers for DMA ordering: the smp_
+   variants compile to nothing on a UP kernel, and a DMA
+   engine is a second agent regardless of how many CPUs you
+   have. That substitution is a real and subtle bug.       */</code></pre>
+
+<div class="warn">
+<b>The honest advice about lockless code</b>
+<p>Use RCU where the pattern fits — a read-mostly pointer or list — because it is a well-tested framework
+with lockdep support and clear rules. <strong>Do not invent your own lockless algorithms.</strong> Hand-rolled
+lock-free code on a weakly-ordered architecture is beyond what code review reliably catches, and the bugs
+appear as one-in-a-billion corruption under load. If a mutex is fast enough, use the mutex.</p>
+</div>
+
+<h2 id="debug">Debugging RCU</h2>
+
+<p>RCU misuse rarely fails immediately; it produces rare corruption or a stall message long after the mistake. These options make the kernel check the rules on every access and complain the first time one is broken.</p>
+
+<pre><code># Enable these while developing anything using RCU:
+    CONFIG_PROVE_RCU=y              # lockdep for RCU
+    CONFIG_DEBUG_OBJECTS_RCU_HEAD=y # double call_rcu, etc.
+    CONFIG_RCU_EQS_DEBUG=y
+
+# PROVE_RCU catches the big one - dereferencing outside a
+# read-side section:
+
+  WARNING: suspicious RCU usage
+  drivers/mydrv/mydrv.c:142 suspicious rcu_dereference_check()
+  usage!
+  other info that might help us debug this:
+  rcu_scheduler_active = 2, debug_locks = 1
+  no locks held by mytask/431.
+
+# "no locks held" = you called rcu_dereference() without
+# rcu_read_lock(). A real bug, caught statically at runtime.
+
+# If you legitimately hold a lock instead, say so:
+    p = rcu_dereference_protected(gp, lockdep_is_held(&my_lock));
+
+# RCU STALLS - a reader that never finishes:
+  INFO: rcu_sched self-detected stall on CPU
+# Means a CPU spent tens of seconds without a quiescent state.
+# Causes: an infinite loop with preemption disabled, a very
+# long rcu_read_lock section, or a spinlock deadlock.
+
+# Watch grace periods and callbacks:
+    cat /sys/kernel/debug/rcu/rcu_preempt/rcugp
+    cat /proc/sched_debug | grep -i rcu</code></pre>
+
+<h2 id="when">When RCU is the answer</h2>
+
+<p>RCU pays off specifically when reads vastly outnumber writes and readers cannot tolerate lock contention —
+the moment writes become frequent, or the reader needs anything stronger than "some recent, consistent
+snapshot," a lock or an atomic is the simpler and correct tool instead.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>RCU?</th></tr></thead>
+<tbody>
+<tr><td>A list of registered devices, read on every I/O</td><td><strong>Yes</strong> — the textbook case</td></tr>
+<tr><td>A configuration structure, changed via sysfs</td><td><strong>Yes</strong></td></tr>
+<tr><td>A routing or filter table</td><td><strong>Yes</strong></td></tr>
+<tr><td>A counter</td><td>No — use <code>atomic_t</code> or per-CPU</td></tr>
+<tr><td>A queue with frequent adds and removes</td><td>No — grace periods will dominate</td></tr>
+<tr><td>Data written as often as it is read</td><td>No — use a mutex</td></tr>
+<tr><td>Memory that must be freed promptly</td><td>No — grace periods delay reclamation</td></tr>
+<tr><td>Readers that need a consistent view across two structures</td><td>No — RCU gives per-pointer consistency only</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Use-after-free in a reader</td><td>Freed without a grace period, or the pointer used after <code>rcu_read_unlock</code></td></tr>
+<tr><td>Reader sees a partially initialised object</td><td>Plain store instead of <code>rcu_assign_pointer</code></td></tr>
+<tr><td>Works on x86, corrupts on arm64</td><td>Missing barriers — the memory model is weaker</td></tr>
+<tr><td><code>suspicious rcu_dereference_check() usage</code></td><td>Dereference outside a read-side section</td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code> inside RCU</td><td>Slept in an RCU read section — use SRCU</td></tr>
+<tr><td><code>rcu_sched self-detected stall</code></td><td>A CPU not reaching a quiescent state — a loop or a deadlock</td></tr>
+<tr><td>Memory usage climbs under a rapid update rate</td><td>Callbacks queued faster than grace periods complete</td></tr>
+<tr><td>Update latency of tens of milliseconds</td><td><code>synchronize_rcu()</code> in a hot path — use <code>call_rcu</code>/<code>kfree_rcu</code></td></tr>
+<tr><td>Rare corruption with hand-rolled lockless code</td><td>Exactly why not to write it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the read-copy-update cycle and why readers pay nothing.</li>
+  <li>Define a quiescent state and a grace period, and say why they are cheap to detect.</li>
+  <li>Write a correct RCU reader and writer.</li>
+  <li>Explain what <code>rcu_assign_pointer</code> and <code>rcu_dereference</code> guarantee on ARM.</li>
+  <li>Convert a spinlock-protected list to RCU.</li>
+  <li>Say when SRCU is needed and what it costs.</li>
+  <li>Pair a release store with an acquire load and say what it guarantees.</li>
+  <li>Explain why <code>smp_wmb()</code> is wrong for DMA ordering.</li>
+  <li>Enable <code>PROVE_RCU</code> and interpret a warning.</li>
+  <li>Decide, for eight situations, whether RCU is the right tool.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

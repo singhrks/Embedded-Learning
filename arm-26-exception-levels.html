@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exception levels | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Exception levels</h1>
+<p class="lead">ARMv8 replaced ARMv7's processor modes with four numbered privilege levels. Every piece of
+system software on the machine is defined by which one it runs at, and the vocabulary of exception levels is
+shared by kernels, hypervisors and secure firmware alike.</p>
+
+<h2 id="model">The four levels</h2>
+
+<p>Privilege on AArch64 is a numbered ladder rather than a pair of modes, and each rung runs different software with different powers. Fixing this in your head early makes the rest of the architecture far easier to place.</p>
+
+<pre class="diagram">   EL3  ┌──────────────────────────────────────────────────┐
+        │  Secure Monitor — ARM Trusted Firmware (BL31)     │
+        │  owns SCR_EL3.NS, handles every SMC, switches     │
+        │  between the two worlds. Exists in BOTH worlds.   │
+        └──────────────────────────────────────────────────┘
+   EL2  ┌──────────────────────────────────────────────────┐
+        │  Hypervisor — KVM, Xen, Hyper-V, Hafnium          │
+        │  owns stage-2 translation, traps guest operations │
+        └──────────────────────────────────────────────────┘
+   EL1  ┌──────────────────────────────────────────────────┐
+        │  OS kernel — Linux, Windows, an RTOS, OP-TEE      │
+        │  owns stage-1 tables, IRQs, MMIO, YOUR DRIVER     │
+        └──────────────────────────────────────────────────┘
+   EL0  ┌──────────────────────────────────────────────────┐
+        │  Applications                                     │
+        │  virtual addresses only, no privileged registers  │
+        └──────────────────────────────────────────────────┘
+
+  Higher number = more privilege, and privilege is strictly
+  NESTED: EL3 can do everything EL2 can, EL2 everything EL1 can.
+  There is no "EL0-only" capability — which is why AP bits cannot
+  express one (chapter 14) and PAN exists instead.
+
+  Orthogonal to all of this is the SECURITY STATE (Secure or
+  Non-secure), giving S-EL0, S-EL1 and S-EL2 as separate
+  execution contexts with their own register banks.</pre>
+
+<h2 id="what">What each level uniquely controls</h2>
+
+<p>The four levels form a strict nesting of trust, and this table shows the mechanism that actually enforces
+it: each level owns a set of system registers that only it (or something above it) may touch, so "EL1 cannot
+escape a hypervisor" is not a policy statement, it is the simple fact that <code>VTTBR_EL2</code> and
+<code>HCR_EL2</code> are physically unreadable and unwritable from EL1 — an attempt to access them traps rather
+than succeeding. EL0 is the most restricted for the most familiar reason: it is where arbitrary application
+code runs, and it can only ever see the memory and resources EL1 explicitly handed it. EL3 stands apart because
+it owns the one bit — the NS bit in <code>SCR_EL3</code> — that decides which of the other three worlds is
+even active, which is why it has no "cannot" column: there is nothing above it to forbid anything.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Level</th><th>Owns</th><th>Cannot</th></tr></thead>
+<tbody>
+<tr><td><strong>EL0</strong></td><td>Its own general registers, and whatever memory EL1 mapped for it</td><td>Access system registers, execute privileged instructions, disable interrupts, touch MMIO</td></tr>
+<tr><td><strong>EL1</strong></td><td><code>TTBR0/1_EL1</code>, <code>SCTLR_EL1</code>, <code>VBAR_EL1</code>, interrupt masks, cache and TLB maintenance, device access</td><td>See or change stage-2 translation; escape a hypervisor</td></tr>
+<tr><td><strong>EL2</strong></td><td><code>VTTBR_EL2</code> (stage 2), <code>HCR_EL2</code> (traps), virtual interrupts, guest timers</td><td>Change the security state</td></tr>
+<tr><td><strong>EL3</strong></td><td><code>SCR_EL3</code> — the NS bit itself — interrupt routing, SMC handling</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="optional">Which levels exist is a design choice</h2>
+
+<p>Not every chip implements every level. Which exist is decided by the silicon designer, and code that assumes a level is present will fail on hardware where it simply is not.</p>
+
+<pre><code>/* EL2 and EL3 are OPTIONAL. Never assume — query. */
+
+        mrs     x0, id_aa64pfr0_el1
+/*  ID_AA64PFR0_EL1:
+       [3:0]    EL0 support   [7:4]   EL1
+       [11:8]   EL2 support   [15:12] EL3
+       0 = not implemented, 1 = AArch64 only, 2 = both states  */
+
+static bool has_el2(void)
+{
+        uint64_t pfr0;
+        asm volatile("mrs %0, id_aa64pfr0_el1" : "=r"(pfr0));
+        return ((pfr0 &gt;&gt; 8) &amp; 0xF) != 0;
+}
+
+/* Typical configurations:
+     simple embedded SoC     EL0, EL1 only
+     phone / tablet          all four
+     server                  all four, plus S-EL2
+     Cortex-M                none of this — a different model
+                             entirely (chapter 02)             */
+
+/* And note: a level EXISTING is not the same as being USED.
+   Linux boots at EL2 on most platforms and immediately drops to
+   EL1 unless KVM is enabled. Which level you are at right now:  */
+        mrs     x0, CurrentEL        /* bits [3:2] hold the EL */
+        lsr     x0, x0, #2</code></pre>
+
+<h2 id="entry">Moving between levels</h2>
+
+<div class="key">
+<b>Up only by exception, down only by <code>ERET</code></b>
+<p>You can never simply <em>jump</em> to a higher exception level. The only way up is to take an exception —
+and the entry point is the <em>higher</em> level's vector table, at an address <em>it</em> chose. That is what
+makes privilege enforceable: the caller supplies a number, never an address.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Direction</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><td>EL0 &rarr; EL1</td><td><code>SVC</code>, an interrupt, or a fault</td></tr>
+<tr><td>EL1 &rarr; EL2</td><td><code>HVC</code>, a trapped operation, a stage-2 fault, or a routed interrupt</td></tr>
+<tr><td>Any &rarr; EL3</td><td><code>SMC</code>, a Secure interrupt, or an external abort routed to EL3</td></tr>
+<tr><td>Downward</td><td><code>ERET</code> — target EL from <code>SPSR_ELx.M</code>, target PC from <code>ELR_ELx</code></td></tr>
+<tr><td>Sideways (world switch)</td><td>EL3 changes <code>SCR_EL3.NS</code>, then <code>ERET</code>s</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Dropping from EL3 to EL1 — what firmware does at the end of
+   boot (OS chapter 18):                                     */
+
+        /* configure the world we are about to enter */
+        mov     x0, #(1 &lt;&lt; 10)          /* RW=1: EL1 below is AArch64 */
+        orr     x0, x0, #(1 &lt;&lt; 0)       /* NS=1: Non-secure           */
+        msr     scr_el3, x0
+
+        /* the PSTATE to install on ERET */
+        mov     x0, #0x3C5              /* M=0b0101 (EL1h), DAIF masked */
+        msr     spsr_el3, x0
+
+        ldr     x0, =kernel_entry
+        msr     elr_el3, x0
+
+        eret                            /* now at EL1, Non-secure */
+
+/* SPSR.M[3:0] encodes the target:
+      0b0000 EL0t     0b0100 EL1t     0b1000 EL2t     0b1100 EL3t
+                      0b0101 EL1h     0b1001 EL2h     0b1101 EL3h
+
+   The t/h suffix selects SP_EL0 (thread) or SP_ELx (handler)
+   as the stack pointer — chapter 04.                        */</code></pre>
+
+<h2 id="routing">Where an exception is taken</h2>
+
+<p>An exception does not always go to the level immediately above the one that caused it. Where it lands is configurable, and that configurability is exactly what allows a hypervisor to intercept things a kernel would otherwise handle.</p>
+
+<pre class="diagram">An exception does NOT always go to the next level up. Routing is
+configurable, and this is the mechanism virtualisation is built
+from.
+
+   SYNCHRONOUS exceptions (faults, SVC)
+        → normally the current EL, or EL1 if from EL0
+        → HCR_EL2 trap bits can redirect specific ones to EL2
+        → HCR_EL2.TGE routes ALL EL0 exceptions to EL2
+          (used when the host runs at EL2 with VHE)
+
+   IRQ / FIQ / SError
+        → SCR_EL3.{IRQ,FIQ,EA}   route to EL3
+        → HCR_EL2.{IMO,FMO,AMO}  route to EL2 instead of EL1
+
+   The typical configuration on a virtualised system:
+        IRQ  → EL2   the hypervisor decides which guest gets it,
+                     and injects a VIRTUAL interrupt via the GIC
+                     list registers (chapter 23)
+        FIQ  → EL3   secure interrupts, unmaskable by the guest
+        SMC  → EL3   always
+
+   And on a non-virtualised system:
+        IRQ  → EL1   straight to the kernel
+        FIQ  → EL3   if a secure world exists
+
+  An exception can never be taken to a LOWER level than the one
+  that was executing. So EL2 code's faults go to EL2 or EL3,
+  never to EL1.</pre>
+
+<h2 id="registers">Per-level register banks</h2>
+
+<p>Many system registers exist several times over — one copy per exception level — so that each level has its own configuration that the others cannot disturb. The naming suffix tells you which copy you are looking at.</p>
+
+<pre><code>/* Each level has its OWN copy of the exception-handling
+   registers. These are genuinely separate registers, not views: */
+
+   ELR_EL1, ELR_EL2, ELR_EL3          return address
+   SPSR_EL1, SPSR_EL2, SPSR_EL3       saved PSTATE
+   ESR_EL1, ESR_EL2, ESR_EL3          syndrome
+   FAR_EL1, FAR_EL2, FAR_EL3          fault address
+   VBAR_EL1, VBAR_EL2, VBAR_EL3       vector base
+   SP_EL0, SP_EL1, SP_EL2, SP_EL3     stack pointers
+   TTBR0_EL1/EL2/EL3, TCR_*, MAIR_*, SCTLR_*
+
+/* Banking these is what allows an exception at EL2 to occur while
+   EL1's ELR still holds a pending return — the two do not
+   collide.
+
+   But note what is NOT banked: X0-X30. There are no banked
+   general-purpose registers in AArch64 (chapter 04), which is
+   why every handler must save them in software.            */
+
+/* And Secure/Non-secure banking: the EL1 register set is banked
+   AGAIN by security state, so the secure OS and the normal OS
+   each have their own SCTLR_EL1, TTBR0_EL1 and so on, selected
+   by SCR_EL3.NS. EL3 sees whichever the current state selects,
+   which is why the monitor must save and restore them
+   explicitly on a world switch.                            */</code></pre>
+
+<h2 id="software">What runs where, in practice</h2>
+
+<p>The four-level, two-world model in the abstract becomes concrete once you name the actual software that
+occupies each cell, and the pattern is that <em>each level does the same conceptual job on both sides of the
+security boundary</em> — an EL1 always means "the kernel of whatever OS is running here", it just happens to be
+Linux on the non-secure side and a trusted OS like OP-TEE on the secure side, running the same architectural
+mechanisms in complete isolation from each other. EL3 is the exception to the pattern rather than an example of
+it: because it owns the NS bit that switches between the two worlds, there is only ever one EL3 image — ARM
+Trusted Firmware — servicing both, which is why that row spans the whole table rather than being split into
+two columns like the others.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Level</th><th>Non-secure</th><th>Secure</th></tr></thead>
+<tbody>
+<tr><td>EL0</td><td>Applications, libraries</td><td>Trusted applications (keymaster, DRM, biometrics)</td></tr>
+<tr><td>EL1</td><td>Linux, Windows, an RTOS</td><td>Trusted OS: OP-TEE, Trusty, QSEE</td></tr>
+<tr><td>EL2</td><td>KVM, Xen, Hyper-V, pKVM</td><td>Secure partition manager: Hafnium (ARMv8.4+)</td></tr>
+<tr><td>EL3</td><td colspan="2" style="text-align:center">ARM Trusted Firmware — one monitor serving both worlds</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="vhe">VHE: the host at EL2</h2>
+
+<p>Running a host kernel at EL2 was originally awkward because EL2 was designed for hypervisors rather than for full operating systems. These extensions remove that friction, and they are why modern kernels run there unmodified.</p>
+
+<pre><code>/* The original design assumed a hypervisor was a small separate
+   program at EL2 with the host OS at EL1. That is wrong for KVM,
+   where the "hypervisor" IS Linux.                          */
+
+/* Without VHE: Linux runs at EL1 with a small stub at EL2, and
+   every VM entry/exit crosses between them — saving and
+   restoring the host's EL1 state each time.
+
+   With VHE (HCR_EL2.E2H = 1, ARMv8.1):
+     · EL2 gains TTBR1_EL2 and behaves like the EL1&0 regime
+     · EL0 can run directly under EL2 (host userspace)
+     · accessing the _EL1 register names AT EL2 is REDIRECTED to
+       the _EL2 equivalents
+     · the _EL12 accessors reach the real guest EL1 state
+
+   Result: an unmodified Linux kernel runs at EL2, host
+   userspace at EL0, guests at EL1. The host never leaves EL2,
+   so VM exits are far cheaper.                             */
+
+        mrs     x0, id_aa64mmfr1_el1
+        ubfx    x0, x0, #8, #4          /* VH field */
+        cbz     x0, no_vhe
+
+/* You can see which mode a system is in: */
+//   dmesg | grep -i 'hyp mode'
+//   kvm [1]: Hyp mode initialized successfully        (no VHE)
+//   kvm [1]: VHE mode initialized successfully        (VHE)</code></pre>
+
+<h2 id="detect">Determining your level at runtime</h2>
+
+<p>Code sometimes needs to know which level it is executing at — a bootloader especially. The processor will tell you, and the answer determines what you are allowed to do next.</p>
+
+<pre><code>static inline unsigned current_el(void)
+{
+        uint64_t el;
+        asm volatile("mrs %0, CurrentEL" : "=r"(el));
+        return (el &gt;&gt; 2) &amp; 3;
+}
+
+/* Boot code commonly branches on this, because firmware may
+   hand off at EL2 or EL1 depending on the platform:        */
+
+        mrs     x0, CurrentEL
+        cmp     x0, #(2 &lt;&lt; 2)
+        b.eq    at_el2
+        cmp     x0, #(1 &lt;&lt; 2)
+        b.eq    at_el1
+        b       unsupported
+
+at_el2: /* configure EL2, then drop to EL1 — or stay if we are
+           going to be a hypervisor */
+        bl      init_el2
+        b       drop_to_el1
+
+at_el1: /* already where we want to be */
+        bl      init_el1
+
+/* Linux's head.S does exactly this, and the "Booted at EL2" /
+   "Booted at EL1" distinction determines whether KVM can be
+   used at all.                                              */
+//   dmesg | grep -i 'CPU: All CPU(s) started at EL'</code></pre>
+
+<h2 id="security">Why EL3 is special</h2>
+
+<p>EL3 is not simply "the most privileged level". It is the only one that can switch between security states, which makes it a different kind of thing from the levels below it.</p>
+
+<pre class="diagram">EL3 is the only level that exists in BOTH security states
+simultaneously. It is not "the most privileged part of the secure
+world" — it is the gatekeeper between the worlds.
+
+   Its unique responsibilities:
+     · owns SCR_EL3.NS — the bit that selects which world the
+       levels below are in
+     · saves and restores the ENTIRE state of one world before
+       switching to the other, including scrubbing registers so
+       nothing leaks
+     · dispatches every SMC to the right service (PSCI, a trusted
+       OS, a SiP-specific function)
+     · routes secure interrupts
+
+   Consequences:
+     · EL3 code is the most security-critical on the chip. A bug
+       there compromises everything, in both worlds.
+     · it should be SMALL. ARM Trusted Firmware's BL31 is tens of
+       thousands of lines, deliberately.
+     · it stays RESIDENT for the machine's whole life, unlike the
+       earlier boot stages.
+
+  The security track covers the world switch, SMC calling
+  convention and the TEE stack in detail.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>KVM will not initialise</td><td>Booted at EL1, not EL2 — check firmware and <code>dmesg</code></td></tr>
+<tr><td>Undefined instruction on <code>MRS</code></td><td>Register requires a higher exception level</td></tr>
+<tr><td><code>HVC</code> causes an undefined instruction</td><td>EL2 not implemented, or <code>HCR_EL2.HCD</code> disables it</td></tr>
+<tr><td><code>SMC</code> causes an undefined instruction</td><td>EL3 not implemented, or <code>SCR_EL3.SMD</code> set</td></tr>
+<tr><td>Guest hangs on a system register write</td><td>A trap is configured and the hypervisor is not emulating it</td></tr>
+<tr><td>Interrupts never reach the kernel</td><td>Routed to EL2 or EL3 by <code>HCR</code>/<code>SCR</code></td></tr>
+<tr><td>Secure interrupt unmaskable by Linux</td><td>Delivered as FIQ, routed to EL3 — by design</td></tr>
+<tr><td>VM exits unexpectedly expensive</td><td>No VHE; host EL1 state saved and restored every exit</td></tr>
+<tr><td>Firmware works on one SoC, not another</td><td>Assumed EL2 or EL3 exists without querying <code>ID_AA64PFR0_EL1</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four exception levels and what runs at each, in both security states.</li>
+  <li>Explain why privilege being strictly nested means AP bits cannot express "EL0 only".</li>
+  <li>State the rule for moving up and down between levels, and why it makes privilege enforceable.</li>
+  <li>Decode <code>SPSR.M = 0b0101</code>.</li>
+  <li>Explain how <code>HCR_EL2</code> and <code>SCR_EL3</code> change where an interrupt is taken.</li>
+  <li>Say which registers are banked per level and which are not.</li>
+  <li>Explain what VHE changes and why KVM needed it.</li>
+  <li>Explain why EL3 is different in kind from the other levels.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

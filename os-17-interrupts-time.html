@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interrupts, timers and timekeeping | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Interrupts, timers and timekeeping</h1>
+<p class="lead">Interrupts are how hardware gets the kernel's attention, and timers are how the kernel gets its
+own. Both are governed by one constraint: the code that runs in interrupt context is severely restricted, and
+everything else about the design follows from working around that.</p>
+
+<h2 id="context">Interrupt context</h2>
+
+<p>Code running in response to an interrupt operates under restrictions ordinary code does not. Knowing precisely what those are is the foundation for everything else in this chapter.</p>
+
+<div class="danger">
+<b>The rule everything else follows from</b>
+<p>An interrupt handler runs in a <em>borrowed</em> context: on some arbitrary thread's kernel stack, with
+interrupts partly or fully masked, and with no task to schedule away from. Therefore it <strong>cannot
+sleep</strong>. No mutex, no <code>GFP_KERNEL</code> allocation, no <code>copy_to_user</code>, no waiting for
+I/O. Violating this deadlocks the machine.</p>
+<p>Windows expresses the same constraint as <strong>IRQL</strong>: at DIRQL and DISPATCH_LEVEL you may not
+touch pageable memory or wait. Linux calls it "atomic context". The concept is identical.</p>
+</div>
+
+<pre class="diagram">   device asserts its interrupt line, or writes an MSI
+        │
+   interrupt controller (GIC) prioritises and routes to a core
+        │
+   CPU takes the exception  (ARM chapters 24, 28)
+        │
+   ┌────▼──────────────────────────────────────────┐
+   │  TOP HALF / ISR — runs with interrupts masked   │
+   │    · read status, confirm it is OURS            │
+   │    · ACKNOWLEDGE at the DEVICE                  │
+   │    · grab anything volatile                     │
+   │    · schedule the bottom half                   │
+   │    · return                                     │
+   │  Must be SHORT. Every microsecond here is       │
+   │  added latency for every other interrupt.       │
+   └────┬──────────────────────────────────────────┘
+        │
+   ┌────▼──────────────────────────────────────────┐
+   │  BOTTOM HALF — deferred, interrupts enabled     │
+   │    the real work                                │
+   └───────────────────────────────────────────────┘
+
+  The split exists solely because the top half runs with interrupts
+  disabled. Anything you do there delays every other device.</pre>
+
+<h2 id="bottom">Deferred work</h2>
+
+<p>Because interrupt handlers must be short, the real work is deferred to a mechanism that runs later with fewer restrictions. Every operating system has several of these, differing in whether they may block.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Linux</th><th>Windows</th><th>Context</th><th>Can sleep?</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>softirq</strong></td><td>—</td><td>Atomic</td><td>No</td><td>Networking, block completion. Statically defined; you will not add one.</td></tr>
+<tr><td><strong>tasklet</strong></td><td><strong>DPC</strong></td><td>Atomic</td><td>No</td><td>Legacy in Linux (being removed); the standard mechanism on Windows</td></tr>
+<tr><td><strong>workqueue</strong></td><td><strong>work item</strong></td><td>Process (kernel thread)</td><td><strong>Yes</strong></td><td>Anything that may block</td></tr>
+<tr><td><strong>threaded IRQ</strong></td><td>—</td><td>Process (dedicated thread)</td><td><strong>Yes</strong></td><td><strong>The modern default</strong> for device drivers</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Threaded IRQ: a tiny hard handler plus a sleepable thread.
+   This is what you should reach for first.                  */
+devm_request_threaded_irq(dev, irq,
+                          my_hard_isr,   /* atomic: ack, return */
+                          my_thread_fn,  /* may sleep           */
+                          IRQF_ONESHOT, dev_name(dev), d);
+
+static irqreturn_t my_hard_isr(int irq, void *p)
+{
+        struct my_dev *d = p;
+        u32 st = readl(d-&gt;regs + STATUS);
+
+        if (!(st &amp; IRQ_PENDING))
+                return IRQ_NONE;        /* not ours — ESSENTIAL on a
+                                           shared line, or the core
+                                           cannot detect a stuck IRQ */
+        writel(st, d-&gt;regs + STATUS);   /* W1C: clear at the SOURCE  */
+        d-&gt;last_status = st;
+        return IRQ_WAKE_THREAD;
+}
+
+/* PREEMPT_RT makes ALL interrupt handlers threaded by default —
+   which is how it achieves bounded latency, at some throughput
+   cost.                                                       */</code></pre>
+
+<div class="warn">
+<b>The interrupt storm</b>
+<p>Clear the interrupt at the controller but not at the <em>device</em>, and a level-triggered line
+re-asserts immediately. The core does nothing but enter and leave the handler forever; the system appears hung
+with 100% CPU in the ISR. Always clear the condition at the source <em>first</em>, then acknowledge upward.
+Linux's spurious-interrupt detector will eventually disable the line and log <code>"nobody cared"</code> —
+which is a diagnosis, not a fix.</p>
+</div>
+
+<h2 id="edge-level">Edge versus level</h2>
+
+<p>An interrupt signals in one of two ways, and the difference is not merely electrical: it determines whether missing one loses it forever or merely delays it, and whether a badly written handler produces a storm.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Level-triggered</th><th>Edge-triggered</th></tr></thead>
+<tbody>
+<tr><td>Asserted</td><td>While the condition holds</td><td>On the transition only</td></tr>
+<tr><td>Sharing</td><td><strong>Possible</strong> — each handler checks and clears its own</td><td>Unsafe: two simultaneous edges register as one</td></tr>
+<tr><td>Missed interrupts</td><td>Cannot be missed — the line stays asserted</td><td><strong>Can be lost</strong> if masked during the edge</td></tr>
+<tr><td>Failure mode</td><td>Storm, if never cleared</td><td>Silent hang, waiting for an event that already happened</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The classic edge-triggered race, and the standard fix: */
+static irqreturn_t isr(int irq, void *p)
+{
+        do {
+                status = readl(STATUS);
+                handle(status);
+                writel(status, STATUS);        /* clear */
+        } while (readl(STATUS) &amp; PENDING);     /* RE-CHECK before
+                                                  returning — a new
+                                                  event may have
+                                                  arrived while we
+                                                  were handling      */
+        return IRQ_HANDLED;
+}
+/* Without the loop, an event arriving between handle() and return
+   produces no new edge and is lost forever. The device then waits
+   for a response that never comes.                             */</code></pre>
+
+<h2 id="msi">MSI: interrupts as memory writes</h2>
+
+<p>Modern buses signal interrupts by writing to memory rather than asserting a wire, which removes the sharing problems of line-based interrupts and allows far more of them per device.</p>
+
+<pre class="diagram">WIRED interrupt              MESSAGE-SIGNALLED (MSI/MSI-X, ARM LPI)
+  a physical line              a WRITE to a special address
+  pin-limited → shared         thousands per device, never shared
+  needs "is it mine?"          the vector identifies the source
+  can arrive BEFORE the DMA    arrives IN ORDER with the DMA data,
+  data it announces            because it is the same bus stream
+
+That last point is not a minor detail. With a wired interrupt, a
+driver must issue a read (a "PCI posting flush") to guarantee the
+DMA data has landed before it reads the buffer. With MSI the
+ordering is free, which removes a subtle and common data-corruption
+bug.
+
+  cat /proc/interrupts        # PCI-MSI entries vs IO-APIC/GIC-SPI
+  lspci -vv | grep -A3 MSI-X</pre>
+
+<h2 id="affinity">Interrupt routing and affinity</h2>
+
+<p>On a multiprocessor machine, which core handles an interrupt is configurable and matters for both latency and cache behaviour — with the usual caveat that manual tuning makes things worse about as often as better.</p>
+
+<pre><code># which CPU handles which interrupt?
+cat /proc/interrupts
+#            CPU0    CPU1    CPU2    CPU3
+#  24:     102394       0       0       0   GICv3  35 Level  eth0
+
+# all on CPU0 is a scalability problem. Spread them:
+cat /proc/irq/24/smp_affinity_list
+echo 2 &gt; /proc/irq/24/smp_affinity_list      # pin to CPU2
+
+# irqbalance does this automatically — and is usually wrong for
+# latency-sensitive or RT workloads. Disable it and pin by hand:
+systemctl stop irqbalance
+
+# keep interrupts OFF your real-time cores entirely
+# kernel cmdline: isolcpus=2,3 nohz_full=2,3 irqaffinity=0,1
+
+# network multi-queue: one IRQ per queue, pinned per core, with RSS
+# steering flows to queues. This is how a NIC scales past one core.
+ethtool -l eth0
+ethtool -L eth0 combined 4</code></pre>
+
+<h2 id="timers">Timer hardware</h2>
+
+<p>Every system needs a way to measure elapsed time and to be woken later. The hardware providing that has particular characteristics, and knowing them explains the resolution and cost of every timer API above it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Role</th><th>Provides</th><th>ARM example</th></tr></thead>
+<tbody>
+<tr><td><strong>Clocksource</strong></td><td>A monotonically increasing counter — "what time is it?"</td><td><code>CNTPCT_EL0</code>, the architected generic timer</td></tr>
+<tr><td><strong>Clockevent</strong></td><td>Programmable "interrupt me at time T"</td><td><code>CNTP_CVAL_EL0</code> comparator</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+#   arch_sys_counter        (ARM generic timer — the good one)
+#   tsc hpet acpi_pm        (x86 options)
+
+/* A good clocksource must be: monotonic, constant-rate (not
+   affected by CPU frequency), synchronised across cores, and
+   cheap to read. Early x86 TSC failed several of these, which is
+   why HPET existed and why "unstable TSC" messages mattered.
+
+   ARM's generic timer is architected: same behaviour on every
+   implementation, readable from EL0 without a trap, which is what
+   makes the vDSO clock_gettime possible (OS chapter 03).      */</code></pre>
+
+<h2 id="tick">The tick, and doing without it</h2>
+
+<p>Traditionally the kernel interrupted itself at a fixed rate to keep time and make scheduling decisions. Modern systems avoid that when idle, which saves substantial power and complicates timekeeping.</p>
+
+<pre class="diagram">PERIODIC TICK — the traditional design
+   a timer interrupt every 1/HZ seconds (HZ = 100, 250 or 1000)
+   each tick: update jiffies, run expired timers, account CPU
+              time, check whether to preempt
+
+   Simple. But it wakes the CPU 1000 times a second even when
+   completely idle, preventing deep sleep states (CA chapter 20).
+
+TICKLESS IDLE (NO_HZ_IDLE) — the default
+   when a CPU goes idle, program the timer for the NEXT actual
+   deadline instead of the next tick. An idle laptop can sleep
+   for seconds at a time.
+
+FULL TICKLESS (NO_HZ_FULL)
+   suppress the tick even while RUNNING, if only one task is
+   runnable on that CPU. Removes ~1000 interruptions per second
+   from a latency-critical thread.
+      kernel cmdline: nohz_full=2,3 rcu_nocbs=2,3 isolcpus=2,3
+   Combined with IRQ affinity and a pinned RT thread, this is the
+   standard recipe for microsecond-class latency on Linux.</pre>
+
+<pre><code>/* jiffies: the tick counter. Still used, and still a trap. */
+unsigned long timeout = jiffies + msecs_to_jiffies(500);
+
+if (time_after(jiffies, timeout))       /* CORRECT               */
+if (jiffies &gt; timeout)                  /* WRONG — breaks on the
+                                           32-bit wrap, which on a
+                                           1000 HZ system happens
+                                           every 49.7 days       */
+/* time_after/time_before do signed subtraction, which is correct
+   across wraparound. Use them always.                          */</code></pre>
+
+<h2 id="kernel-timers">Kernel timers</h2>
+
+<p>Kernels provide timers at more than one resolution, with quite different costs, and choosing the wrong one gives you either unnecessary overhead or unacceptable jitter.</p>
+
+<pre><code>/* Low resolution — jiffy granularity, very cheap, batched */
+struct timer_list t;
+timer_setup(&amp;t, callback, 0);
+mod_timer(&amp;t, jiffies + msecs_to_jiffies(100));
+del_timer_sync(&amp;t);            /* MUST be _sync before freeing —
+                                  waits for a running callback   */
+
+/* High resolution — nanosecond, backed by a clockevent */
+struct hrtimer h;
+hrtimer_init(&amp;h, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+h.function = callback;
+hrtimer_start(&amp;h, ms_to_ktime(10), HRTIMER_MODE_REL);
+hrtimer_cancel(&amp;h);
+
+/* Short delays, no timer needed */
+udelay(50);       /* BUSY-WAIT. Atomic context OK. Keep under
+                     ~100 µs — you are burning a CPU.           */
+usleep_range(100, 200);   /* SLEEPS. Process context only. The
+                             range lets the kernel BATCH your
+                             wakeup with others, saving power.  */
+msleep(20);
+
+/* Never usleep_range with a zero-width range: it defeats batching
+   and wakes the CPU precisely for you alone.                   */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Need to wait</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>&lt; 10 µs</td><td><code>udelay</code> / <code>ndelay</code> — busy-wait</td></tr>
+<tr><td>10 µs – 20 ms</td><td><code>usleep_range</code></td></tr>
+<tr><td>&gt; 20 ms</td><td><code>msleep</code></td></tr>
+<tr><td>Until an event</td><td><code>wait_event_*</code> — not a timer at all</td></tr>
+<tr><td>Precise, repeating</td><td><code>hrtimer</code></td></tr>
+<tr><td>Coarse, cancellable</td><td><code>timer_list</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="userspace">Time in user space</h2>
+
+<p>Applications reach all of this through a set of APIs that hide the hardware, and knowing which clock each uses matters as soon as you care whether time can jump backwards.</p>
+
+<pre><code>struct timespec ts;
+clock_gettime(CLOCK_MONOTONIC, &amp;ts);      /* durations — NEVER jumps */
+clock_gettime(CLOCK_REALTIME, &amp;ts);       /* wall clock — CAN jump   */
+clock_gettime(CLOCK_BOOTTIME, &amp;ts);       /* monotonic + suspend time */
+
+/* Served by the vDSO: no syscall, ~25 ns. */
+
+/* precise periodic work, without drift */
+struct timespec next;
+clock_gettime(CLOCK_MONOTONIC, &amp;next);
+for (;;) {
+        next.tv_nsec += 1000000;                /* +1 ms */
+        if (next.tv_nsec &gt;= 1000000000) { next.tv_nsec -= 1000000000; next.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &amp;next, NULL);
+        do_work();
+}
+/* ABSOLUTE deadlines. Sleeping for a RELATIVE 1 ms accumulates the
+   work time plus wakeup jitter into permanent drift.          */
+
+/* timerfd: a timer as a file descriptor — integrates with epoll */
+int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+timerfd_settime(tfd, 0, &amp;spec, NULL);</code></pre>
+
+<div class="warn">
+<b>Never measure durations with <code>CLOCK_REALTIME</code></b>
+<p>NTP steps it, daylight saving changes it, an administrator can set it backwards, and a virtual machine can
+have it jump on migration. Durations computed from it go negative or enormous. Use
+<code>CLOCK_MONOTONIC</code> for anything you subtract, and <code>CLOCK_REALTIME</code> only for timestamps a
+human will read.</p>
+</div>
+
+<h2 id="latency">Interrupt latency</h2>
+
+<p>The delay between a device signalling and your code responding is a sum of several distinct contributions. Knowing what they are is the only way to reduce it deliberately.</p>
+
+<pre class="diagram">   device asserts
+        │  ← hardware propagation, GIC arbitration
+        │  ← INTERRUPTS DISABLED somewhere in the kernel  ◄── the
+        │     (a spinlock, a critical section)                variable
+        │  ← exception entry, register save                   part
+        │  ← handler dispatch
+        ▼
+   your ISR's first instruction
+
+  Total latency = hardware + longest interrupts-disabled region
+                + entry cost
+
+  The DOMINANT and most variable term is the interrupt-disabled
+  time somewhere else in the kernel. This is exactly what
+  PREEMPT_RT attacks: it converts most spinlocks to sleeping
+  mutexes and threads the handlers, bounding that term.
+
+  Measuring it:
+     cyclictest -t4 -p 90 -i 200 -m -D 3600
+     → report the MAXIMUM, not the average. The average is
+       always fine; the maximum is what breaks deadlines.
+
+     ftrace: irqsoff and preemptoff tracers find the exact
+     longest region and its stack trace.
+         echo irqsoff &gt; /sys/kernel/debug/tracing/current_tracer
+         cat /sys/kernel/debug/tracing/trace</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>System hangs at 100% CPU in an ISR</td><td>Interrupt storm — not cleared at the device</td></tr>
+<tr><td><code>"irq N: nobody cared"</code> in dmesg</td><td>Handler returned <code>IRQ_HANDLED</code> without handling it, or a shared line with no owner</td></tr>
+<tr><td>Device stops responding after high load</td><td>Lost edge-triggered interrupt; add the re-check loop</td></tr>
+<tr><td>Interrupt count never increases</td><td>Wrong number, wrong trigger type, or masked at the device</td></tr>
+<tr><td>All interrupts land on CPU0</td><td>No affinity spreading; the core saturates</td></tr>
+<tr><td>Latency spikes only on some cores</td><td>Interrupts not steered away from the RT cores</td></tr>
+<tr><td>"scheduling while atomic" / bug check 0xA</td><td>Slept in interrupt context</td></tr>
+<tr><td>Timer callback runs after the structure is freed</td><td>Used <code>del_timer</code> instead of <code>del_timer_sync</code></td></tr>
+<tr><td>Periodic task drifts over hours</td><td>Relative sleeps instead of absolute deadlines</td></tr>
+<tr><td>Measured duration is negative</td><td>Used <code>CLOCK_REALTIME</code>; NTP stepped it</td></tr>
+<tr><td>Idle laptop has poor battery life</td><td>A periodic timer preventing deep idle (<a href="ca-20-power.html">CA ch. 20</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why an interrupt handler cannot sleep, and name the Windows equivalent of the rule.</li>
+  <li>Give the top-half/bottom-half split and four deferred-work mechanisms.</li>
+  <li>Explain the interrupt storm and the ordering that prevents it.</li>
+  <li>Compare edge and level triggering on sharing and on missed interrupts.</li>
+  <li>Give two advantages of MSI, including the ordering property.</li>
+  <li>Distinguish clocksource from clockevent.</li>
+  <li>Explain tickless operation and what <code>nohz_full</code> buys.</li>
+  <li>Explain why <code>jiffies &gt; timeout</code> is wrong.</li>
+  <li>Say which term dominates interrupt latency and how PREEMPT_RT addresses it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

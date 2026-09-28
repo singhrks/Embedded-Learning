@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread scheduling internals: priority, quantum and boosts | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Thread scheduling internals: priority, quantum and boosts</h1>
+<p class="lead"><a href="win-11-threads.html">Chapter 12</a> covered what a driver author needs to create and
+stop a thread. This chapter is the scheduler itself — the actual algorithm that decides which of possibly
+thousands of runnable threads gets the next CPU cycle, and the handful of mechanisms Windows layers on top of
+a plain priority queue to stop that algorithm from producing obviously bad outcomes.</p>
+
+<h2 id="priorities">32 priority levels, two ranges</h2>
+
+<p>Windows schedules by numeric priority, and the range is split into two halves that behave completely differently. Confusing them is how a well-meaning priority change starves the rest of the system.</p>
+
+<pre class="diagram">   31  ---+
+    .     |  REAL-TIME (16-31). Fixed. Never boosted, never
+    .     |  decayed by the scheduler. A thread here that
+   16  ---+  never yields can starve every ordinary thread
+            in the system - which is exactly why creating
+            one requires a privilege ordinary processes do
+            not hold by default.
+
+   15  ---+
+    .     |  DYNAMIC (0-15, "variable"). Boosted temporarily
+    .     |  on events (see below), decays back toward its
+    1  ---+  base priority afterward.
+
+    0      the ZERO PAGE THREAD only - reserved, and the
+           reason 0 never appears as a real base priority.
+
+   A THREAD'S ACTUAL PRIORITY = a PROCESS priority CLASS
+   (IDLE, BELOW_NORMAL, NORMAL, ABOVE_NORMAL, HIGH,
+   REALTIME) combined with a per-thread RELATIVE priority
+   (IDLE, LOWEST, BELOW_NORMAL, NORMAL, ABOVE_NORMAL,
+   HIGHEST, TIME_CRITICAL) - a small lookup table, not
+   simple addition, and it is why Task Manager shows both a
+   process's priority class AND lets you separately see
+   individual thread priorities in Process Explorer.       */</pre>
+
+<h2 id="dispatcher">The dispatcher: one ready queue per priority, per processor</h2>
+
+<p>Conceptually, the scheduler (in the <code>Ke</code> layer described in
+<a href="win-28-nt-layers.html">chapter 27</a>) maintains a ready queue for each of the 32 priority levels, on
+each logical processor, and a bitmask recording which queues are non-empty. Picking the next thread to run is
+then a matter of finding the highest set bit in that mask and taking the thread at the head of that queue — an
+operation the hardware can do in a handful of instructions via a bit-scan instruction, which is why this
+scales to systems with hundreds of runnable threads without the dispatch decision itself becoming a
+bottleneck. Multiprocessor systems add ideal-processor affinity: each thread has a preferred CPU, chosen to
+keep it near its cache-warm data and to spread load, and the scheduler prefers to run a thread on its ideal
+processor when that processor is free rather than migrating it and paying a cold-cache penalty elsewhere.</p>
+
+<h2 id="quantum">The quantum, and why Windows Server defaults to a longer one</h2>
+
+<p>How long a thread runs before being preempted is not a fixed constant — it varies by edition, by whether the thread is in the foreground, and by a registry setting. Those differences explain why the same code feels different on a workstation and a server.</p>
+
+<pre class="diagram">   A THREAD DOES NOT RUN FOREVER even at fixed priority. It
+   is given a QUANTUM - a budget of clock-tick charges, not
+   literal wall-clock time - and when it is exhausted the
+   scheduler looks again at whether a higher or equal-
+   priority thread should run instead.
+
+   CLIENT WINDOWS (default): short quantum, VARIABLE -
+     the foreground process's threads get a LONGER quantum
+     than background ones. This is a deliberate,
+     interactivity-first choice: the window you are
+     actively using should feel snappier than a background
+     compile, even at equal priority.
+
+   SERVER WINDOWS (default): long quantum, FIXED, no
+     foreground boost - because a server has no "the user
+     is looking at this window" concept, and workloads
+     (a database, a web server) benefit far more from fewer
+     context switches and better cache locality than from
+     interactive responsiveness.
+
+   THIS IS A REGISTRY-CONFIGURABLE SETTING
+   (HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl\
+   Win32PrioritySeparation), which is precisely why a
+   workstation running a long batch job sometimes has that
+   setting tuned to behave more like a server.             */</pre>
+
+<h2 id="boosts">Priority boosts: patching the scheduler's own blind spots</h2>
+
+<p>A pure fixed-priority scheduler has a well-known failure mode covered from the concurrency angle in the
+<a href="track.html?t=mt">concurrency track</a>'s priority-inversion chapter: a low-priority thread holding
+something a high-priority thread needs can be starved by medium-priority threads that share nothing with
+either. Windows does not rely on strict priority inheritance the way a real-time kernel would; instead it
+applies several targeted, heuristic boosts that solve the common cases in practice.</p>
+
+<pre class="diagram">   I/O COMPLETION BOOST
+     A thread that was waiting on a disk or network I/O
+     gets a temporary priority boost the instant its I/O
+     completes - the intuition being that a thread which
+     was just waiting on something external is likely
+     about to do useful, short work with the result, and
+     should not then sit behind CPU-bound threads before
+     it even gets to look at what it was waiting for.
+
+   FOREGROUND BOOST
+     The active window's process gets a temporary boost
+     when its threads wake from a wait, on top of its
+     longer quantum - reinforcing the "the thing you are
+     looking at feels responsive" design goal from above.
+
+   THE "STARVATION" BOOST (balance-set manager)
+     A dedicated system thread periodically scans for
+     READY threads that have not run in roughly four
+     seconds and gives them a one-time boost to priority
+     15 with one quantum at that level, then lets them
+     decay back down. This is Windows's blunt, practical
+     answer to unbounded starvation: not a proof of
+     bounded latency, just a periodic correction that
+     makes indefinite starvation extremely unlikely in
+     practice.
+
+   MUTEX/CRITICAL SECTION OWNER BOOST
+     A thread that owns a lock another, higher-priority
+     thread is waiting on can receive a temporary boost -
+     Windows's answer to priority inversion, though it is a
+     heuristic response rather than the deterministic
+     priority-inheritance protocol used in POSIX real-time
+     mutexes or the mcu track's RTOS chapter.
+
+   NONE of these apply to REAL-TIME priority threads (16-31)
+   - by design, because boosting would defeat the entire
+   point of a fixed, guaranteed priority range.</pre>
+
+<div class="key">
+<b>Why "just raise the priority" is still the wrong first instinct</b>
+<p>Exactly as in the embedded RTOS world, raising a Windows thread's priority to fix a responsiveness problem
+usually moves the problem rather than solving it — a thread starved because it waits on a lock held by
+something lower-priority is not fixed by raising the waiter's priority; it is fixed by shortening the critical
+section, or ensuring the lock-holding path cannot itself be preempted for long. The scheduler's boost
+mechanisms exist precisely because Microsoft found that developers reaching for
+<code>REALTIME_PRIORITY_CLASS</code> to solve ordinary responsiveness problems was common enough, and harmful
+enough to overall system stability, to be worth mitigating with automatic, safer heuristics instead.</p>
+</div>
+
+<h2 id="observing">Observing the scheduler in practice</h2>
+
+<p>None of this needs to be taken on faith. The debugger can show you which threads are ready, which are running and what priority each is actually at — including the temporary boosts that explain otherwise puzzling behaviour.</p>
+
+<pre><code># Process Explorer / Task Manager (Details tab, add the
+# "Base Priority" column): shows priority CLASS per process
+
+# In WinDbg, live or on a dump:
+kd&gt; !ready                 # every ready thread, by priority
+kd&gt; !running               # what each logical CPU is
+                            # executing right now
+kd&gt; !thread ffff8a0c...    # one thread: Priority, BasePriority
+                            # (the boosted vs base value),
+                            # and its wait reason if blocked
+
+# The gap between "Priority" and "BasePriority" in !thread
+# output IS a boost in progress - if you see a thread with
+# Priority 15 and BasePriority 8, the balance-set manager's
+# starvation boost (or an I/O completion boost) is currently
+# active and has not yet decayed back down.
+
+# xperf / Windows Performance Analyzer's CPU Usage (Precise)
+# graph is the tool for "why did my thread not run when I
+# expected it to" - it shows, for every microsecond, which
+# thread was actually running on which CPU and why a
+# ready thread had to wait, which no simpler tool exposes.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Foreground app feels sluggish under background load</td><td>Win32PrioritySeparation tuned toward server
+behaviour, or the foreground process lost focus</td></tr>
+<tr><td>A real-time-priority thread stalls the whole system</td><td>Expected — priorities 16-31 receive no
+boosts and can starve everything below them</td></tr>
+<tr><td>A thread's priority appears higher than expected in !thread</td><td>A temporary boost — check
+<code>BasePriority</code> for the real, unboosted value</td></tr>
+<tr><td>Raising priority did not fix a latency problem</td><td>The thread was blocked on a lock, not starved
+of CPU time — find what it is waiting on instead</td></tr>
+<tr><td>Server workload feels less responsive interactively</td><td>Expected trade-off — the server quantum
+favours throughput over interactivity</td></tr>
+<tr><td>A thread that has not run in seconds suddenly gets one burst of CPU</td><td>The balance-set manager's
+starvation-prevention boost</td></tr>
+<tr><td>Creating a REALTIME_PRIORITY_CLASS process fails silently or is capped</td><td>Missing the
+<code>SeIncreaseBasePriorityPrivilege</code> needed for the real-time range</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the two priority ranges and which one the scheduler never boosts or decays.</li>
+  <li>Describe how a thread's actual priority is derived from its process class and relative priority.</li>
+  <li>Explain what a quantum is and why client and server defaults differ.</li>
+  <li>Name three priority boost mechanisms and the specific problem each addresses.</li>
+  <li>Explain why raising a thread's priority is often the wrong fix for a latency complaint.</li>
+  <li>Use <code>!thread</code> to detect that a boost is currently active on a given thread.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

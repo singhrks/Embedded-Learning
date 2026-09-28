@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging in practice: four bugchecks, hunted end to end | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging in practice: four bugchecks, hunted end to end</h1>
+<p class="lead"><a href="win-22-windbg.html">Chapter 23</a> gave you WinDbg and
+<a href="win-21-verifier.html">chapter 22</a> gave you Driver Verifier. This chapter uses them on four real
+failures — a crash, a silence, a delayed crash and an intermittent one — each followed from the symptom you
+are actually handed to the line that caused it. Read it as four worked examples, not as reference material.</p>
+
+<div class="key">
+<b>The one principle underneath all four</b>
+<p>Ask the cheapest question that eliminates the most possibilities. Every hunt below applies it: not "what is
+wrong with my driver", which is unanswerable, but "what IRQL was I at", "did the device even start", "who
+freed this". Each answer halves the search space and costs seconds. Reading your own code hoping to spot the
+bug is the most expensive question available, and it comes last.</p>
+</div>
+
+<h2 id="bug1">Bug 1 — the crash: <code>DRIVER_IRQL_NOT_LESS_OR_EQUAL</code></h2>
+
+<p>This is the friendliest failure in Windows driver work, because the bugcheck parameters alone usually
+identify the mistake before you look at a single line of code. The skill is knowing what the four arguments
+mean — most people read the name and skip straight past the numbers that actually answer the question.</p>
+
+<pre><code>0: kd&gt; !analyze -v
+
+DRIVER_IRQL_NOT_LESS_OR_EQUAL (d1)
+An attempt was made to access a pageable (or completely invalid)
+address at an interrupt request level (IRQL) that is too high.
+Arguments:
+Arg1: ffffd0002a3b1018, memory referenced
+Arg2: 0000000000000002, IRQL
+Arg3: 0000000000000000, value 0 = read, 1 = write
+Arg4: fffff80412a4b2ac, address which referenced memory
+
+MODULE_NAME:  mydrv
+IMAGE_NAME:   mydrv.sys
+
+STACK_TEXT:
+nt!KeBugCheckEx
+nt!KiPageFault
+mydrv!MydrvEvtInterruptDpc+0x3c
+nt!KiRetireDpcList
+nt!KiIdleLoop</code></pre>
+
+<p>Those four arguments are a complete sentence once you know the grammar, and reading them in this order turns
+the dump into a specific, checkable claim about your code.</p>
+
+<pre class="diagram">   Arg2 = 2        THE IRQL AT THE TIME.
+                   2 is DISPATCH_LEVEL (chapter 03). So this
+                   code was running in a DPC, a timer routine,
+                   or while holding a spinlock - NOT at
+                   PASSIVE_LEVEL where most driver code lives.
+
+   Arg3 = 0        IT WAS A READ, not a write. That usually
+                   halves the candidate lines immediately.
+
+   Arg1 = ffffd000`2a3b1018
+                   THE ADDRESS TOUCHED. A kernel address, and
+                   a plausible one - so this is almost
+                   certainly PAGED memory that happened to be
+                   paged out, not a wild pointer. (A wild
+                   pointer normally shows as a small or
+                   obviously junk value.)
+
+   Arg4 = fffff804`12a4b2ac
+                   THE INSTRUCTION that did it. This is the
+                   exact location, and it is resolvable.
+
+   PUT TOGETHER: "code in a DPC read pageable memory."
+   That is the whole bug, stated before opening the source.</pre>
+
+<pre><code># TURN Arg4 INTO A LINE OF YOUR CODE:
+0: kd&gt; ln fffff80412a4b2ac
+(fffff804`12a4b270)  mydrv!MydrvEvtInterruptDpc+0x3c
+
+0: kd&gt; .reload /f mydrv.sys           # make sure symbols match
+0: kd&gt; u fffff80412a4b2ac L1
+mydrv!MydrvEvtInterruptDpc+0x3c:
+fffff804`12a4b2ac 8b4818   mov ecx, dword ptr [rax+18h]
+
+# With private symbols and sources, WinDbg names the line:
+0: kd&gt; .lines -e
+0: kd&gt; ln fffff80412a4b2ac
+    d:\dev\mydrv\interrupt.c(214)
+
+# AND CONFIRM WHAT KIND OF MEMORY Arg1 IS:
+0: kd&gt; !pte ffffd0002a3b1018
+   ... PTE not valid, page is in the paging file ...
+0: kd&gt; !pool ffffd0002a3b1018
+   Pool page ffffd0002a3b1018 region is Paged pool
+#  ^^ paged pool, confirmed. Arg2 said DISPATCH_LEVEL.
+#     The two facts together are the diagnosis.</code></pre>
+
+<pre><code>/* THE CAUSE, in interrupt.c around line 214: */
+
+/* allocated at start-up, from the WRONG pool: */
+ctx-&gt;stats = ExAllocatePool2(POOL_FLAG_PAGED,        /* &lt;-- */
+                             sizeof(MYDRV_STATS),
+                             MYDRV_TAG);
+
+/* ...and read in the DPC, which runs at DISPATCH_LEVEL: */
+VOID MydrvEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT Dev)
+{
+        PMYDRV_CTX ctx = MydrvGetCtx(Dev);
+
+        count = ctx-&gt;stats-&gt;packets;   /* line 214 - touches
+                                           PAGED memory at
+                                           DISPATCH_LEVEL     */
+}
+
+/* THE FIX - anything a DPC, ISR or spinlock holder can touch
+   must be non-paged:                                        */
+ctx-&gt;stats = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                             sizeof(MYDRV_STATS),
+                             MYDRV_TAG);
+
+/* THE SAME BUG WEARS THREE OTHER DISGUISES, all producing an
+   identical bugcheck:
+     · a function marked PAGED via #pragma alloc_text() being
+       called from a DPC
+     · touching a user-mode buffer at DISPATCH_LEVEL
+       (chapter 08 - the address space may not even be mapped)
+     · a paged lookaside list used from an ISR (chapter 07)  */</code></pre>
+
+<div class="tip">
+<b>What this generalises to</b>
+<p>For <em>any</em> bugcheck, read the arguments before the name. <code>!analyze -v</code> prints what each
+one means for that specific code, and two of them — the IRQL and the faulting instruction — are usually
+enough to name the mistake. Getting fluent with <code>ln</code>, <code>!pool</code> and <code>!pte</code>
+turns most of these into a five-minute job, and all three need symbols, so set
+<code>_NT_SYMBOL_PATH</code> up before you need it.</p>
+</div>
+
+<h2 id="bug2">Bug 2 — the silence: the device never starts</h2>
+
+<p>Harder than a crash, because nothing fails loudly. The driver installs, Device Manager shows a yellow
+warning icon, and there is no dump to analyse. Debugging an <em>absence</em> means walking the chain of things
+that must each have happened and finding the first that did not.</p>
+
+<pre class="diagram">   THE CHAIN, and every link is separately checkable:
+
+     1. the INF was accepted and the driver package staged
+              |
+     2. a service entry exists in the registry
+              |
+     3. the device node exists and matched your Hardware ID
+              |
+     4. the driver image actually LOADED
+              |
+     5. AddDevice / EvtDeviceAdd ran
+              |
+     6. EvtDevicePrepareHardware succeeded
+              |
+     7. the device reached the started state (D0)
+
+   ASK THEM IN ORDER. The first "no" is your bug. Device
+   Manager's error code is a shortcut that often names the
+   step directly:
+
+     Code 28  no driver installed          -> step 1
+     Code 39  driver image failed to load  -> step 4
+              (very often a SIGNING problem - chapter 21)
+     Code 10  the device failed to start   -> step 6 or 7
+              i.e. YOUR code returned a failure status
+     Code 31  the device is not working properly
+     Code 43  the driver reported a failure</pre>
+
+<pre><code># 1 - was the package accepted, and what did setup think?
+C:\&gt; pnputil /enum-drivers
+# THE definitive install log, and the file people never open:
+C:\&gt; notepad %windir%\INF\setupapi.dev.log
+   ...
+   !!!  dvi: Device not started: Device has problem: 0x0a
+   ...
+
+# 2 - is there a service entry?
+C:\&gt; sc query mydrv
+C:\&gt; reg query HKLM\SYSTEM\CurrentControlSet\Services\mydrv
+
+# 3 and 4 - from a kernel debugger:
+0: kd&gt; lm m mydrv
+   (nothing listed = the image never loaded -> step 4)
+
+0: kd&gt; !devnode 0 1 mydrv
+   DevNode 0xffffe000`12345678 for PDO 0xffffe000`87654321
+     InstancePath  "PCI\VEN_1234&amp;DEV_5678\..."
+     State         DeviceNodeInitialized       &lt;-- never started
+     Problem       CM_PROB_FAILED_START (0x0a)
+
+0: kd&gt; !devstack ffffe00087654321
+   !DevObj   !DrvObj        !DevExt
+   ffffe000  \Driver\mydrv  ffffe000...
+#  ^ your driver IS attached, so AddDevice ran (step 5 passed)
+#    which means the failure is in step 6.
+
+# 6 - break on your own start path and watch the status:
+0: kd&gt; bp mydrv!MydrvEvtDevicePrepareHardware
+0: kd&gt; g
+   ... breakpoint hits; step until the return ...
+0: kd&gt; gu
+0: kd&gt; r rax
+rax=00000000c0000010     # STATUS_INVALID_DEVICE_REQUEST</code></pre>
+
+<div class="note">
+<b>Two Windows-specific traps at this step</b>
+<p>First, <strong>test signing</strong>: on a 64-bit system an unsigned driver silently fails to load with Code
+39 no matter how correct the code is, and the fix is enabling test signing on the target rather than anything
+in your driver (<a href="win-20-signing.html">chapter 21</a>). Second, <strong>resource conflicts</strong>: if
+<code>EvtDevicePrepareHardware</code> receives a resource list that does not contain what you expect — no
+interrupt, or a memory range of the wrong length — the problem is usually the INF or the firmware, not your
+parsing code. Print the whole resource list before assuming your driver is at fault.</p>
+</div>
+
+<h2 id="bug3">Bug 3 — the delayed crash: pool corruption</h2>
+
+<p>Here the machine bugchecks minutes after the mistake, usually inside a completely unrelated component —
+sometimes inside the memory manager itself. The stack trace names an innocent party, which is exactly why this
+class of bug eats days. Windows ships the cure, and it is the direct counterpart of KASAN on Linux.</p>
+
+<pre><code># THE SYMPTOM WITHOUT VERIFIER: random bugchecks, minutes
+# after I/O to your device, in different components each time.
+
+BAD_POOL_HEADER (19)
+Arguments:
+Arg1: 0000000000000020, a pool block header size is corrupt
+...
+STACK_TEXT:
+nt!KeBugCheckEx
+nt!ExFreePoolWithTag          &lt;-- an innocent bystander
+nt!IopCompleteRequest         &lt;-- also innocent
+...
+#  Nothing here mentions your driver at all.
+
+# THE CURE - turn on Driver Verifier with SPECIAL POOL for
+# just your driver, then reproduce:
+C:\&gt; verifier /standard /driver mydrv.sys
+C:\&gt; verifier /flags 0x1 /driver mydrv.sys   # special pool
+C:\&gt; shutdown /r /t 0
+
+# NOW THE CRASH MOVES TO THE EXACT MOMENT OF THE OVERRUN:
+
+DRIVER_PAGE_FAULT_BEYOND_END_OF_ALLOCATION (d6)
+Arguments:
+Arg1: ffffd0012f4a1000, memory referenced
+Arg4: fffff80412a4c118, address which referenced memory
+
+STACK_TEXT:
+nt!KeBugCheckEx
+nt!MmAccessFault
+mydrv!MydrvCopyPayload+0x88   &lt;-- YOUR code, the real culprit
+mydrv!MydrvEvtIoRead+0x54</code></pre>
+
+<p>Special pool works by placing each allocation at the very end of its own page, with the next page left
+unmapped — so a one-byte overrun faults immediately instead of quietly damaging whatever happened to be
+allocated next. That single change converts an unreproducible, misattributed crash into a stack trace pointing
+at the offending line.</p>
+
+<pre><code>/* THE CAUSE, in MydrvCopyPayload: */
+
+len = request-&gt;PayloadLength;            /* from the CLIENT */
+buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, len, MYDRV_TAG);
+
+RtlCopyMemory(buf, src, len + sizeof(HEADER));   /* &lt;-- */
+/*                        ^^^^^^^^^^^^^^^^^^ copies MORE than
+                          was allocated - the classic
+                          off-by-a-header overrun            */
+
+/* THE FIX - allocate what you copy, and check the arithmetic
+   for overflow, because `len` came from user space
+   (chapter 08):                                             */
+        if (len &gt; MYDRV_MAX_PAYLOAD)
+                return STATUS_INVALID_BUFFER_SIZE;
+
+        total = len + sizeof(HEADER);        /* cannot overflow
+                                                now that len is
+                                                bounded        */
+        buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, total,
+                              MYDRV_TAG);
+        RtlCopyMemory(buf, src, total);
+
+/* AND FIND LEAKS OF THE SAME MEMORY while you are here -
+   your pool TAG is what makes this possible:               */
+0: kd&gt; !poolused 2          /* sorted by allocation count */
+0: kd&gt; !poolfind MyDr       /* every block with your tag   */</code></pre>
+
+<div class="danger">
+<b>Turn Driver Verifier on before you need it</b>
+<p>The bug above is close to unfindable without special pool and close to trivial with it — the difference is
+not skill, it is whether Verifier was enabled when the crash happened. It costs performance and memory, which
+is irrelevant on a development machine, and it catches IRQL violations, leaks at unload, double completions and
+bad handles in the same pass. Run your driver under <code>verifier /standard</code> from the first day it
+loads, not after the first customer crash.</p>
+</div>
+
+<h2 id="bug4">Bug 4 — the intermittent: fine on the bench, fails in the field</h2>
+
+<p>The last kind is the one that damages schedules: everything passes in testing and fails at a customer site,
+or once a day, or only under load. These are almost always races that were present from the first line of code
+and simply never had the opportunity to fire — and the fix is to make them deterministic rather than to catch
+them in the act.</p>
+
+<pre><code># THE REPORT: "the machine bugchecks occasionally, usually
+# when the user closes the application while a transfer is
+# running." Nothing reproducible on the bench.
+
+# STEP 1 - do NOT chase it. Turn on the I/O verification that
+# makes this class of bug deterministic:
+C:\&gt; verifier /standard /driver mydrv.sys
+# (I/O verification and "force pending I/O requests" are part
+#  of the standard set, and the second one is what matters
+#  here - it makes requests pend that would normally complete
+#  immediately, so the cancellation path actually runs.)
+
+# NOW, ON THE FIRST RUN:
+
+DRIVER_VERIFIER_DETECTED_VIOLATION (c4)
+Arg1: 0000000000000234, an IRP was completed twice
+...
+STACK_TEXT:
+nt!KeBugCheckEx
+nt!VerifierIoCompleteRequest
+mydrv!MydrvEvtRequestCancel+0x28
+mydrv!MydrvCancelRoutine</code></pre>
+
+<p>The dump names the mistake outright. The interesting question is why months of testing never produced it —
+and the answer is a genuinely useful piece of Windows knowledge rather than bad luck.</p>
+
+<pre class="diagram">   THE MISTAKE: the driver completes a request in its cancel
+   routine, AND the normal completion path completes it too.
+
+   WHY IT NEVER HAPPENED ON THE BENCH:
+
+     The cancel routine only runs if a request is CANCELLED,
+     which only happens when an application exits or times out
+     with I/O still outstanding. Bench testing ran the
+     transfer to completion every single time, so the cancel
+     path NEVER EXECUTED AT ALL - not rarely, never.
+
+     In the field, users close the application mid-transfer,
+     and the path runs for the first time.
+
+   THE GENERAL SHAPE OF "WORKS ON MY MACHINE": the bug was
+   100% present from day one. What varied was whether the
+   conditions existed to REACH the code. This is why "add a
+   retry" is never the fix and "find the rule that was
+   broken" always is.
+
+   THE RULE HERE: ownership of a request is EXCLUSIVE. Once
+   you have handed it to the cancel path, the completion path
+   must not touch it, and vice versa. Exactly one of them
+   completes it.</pre>
+
+<pre><code>/* THE FIX - let the framework arbitrate ownership instead of
+   trying to reason about the race yourself.               */
+
+/* WdfRequestUnmarkCancelable returns STATUS_CANCELLED if the
+   cancel routine has ALREADY started running. That return
+   value is the ownership handshake:                        */
+
+NTSTATUS status = WdfRequestUnmarkCancelable(request);
+
+if (status == STATUS_CANCELLED) {
+        /* The cancel routine owns it now. Do NOT complete
+           it here - just return.                          */
+        return;
+}
+
+/* We own it - safe to complete. */
+WdfRequestComplete(request, STATUS_SUCCESS);
+
+/* BETTER STILL: use a MANUAL queue and let WDF own the
+   cancellation entirely (chapter 16). WdfRequestForwardToQueue
+   plus WdfIoQueueRetrieveNextRequest gives you the same
+   behaviour with no cancel routine of your own to get wrong -
+   which is the single best reason to prefer KMDF over WDM
+   for anything involving pended requests.                  */</code></pre>
+
+<div class="key">
+<b>The rule for every intermittent bug</b>
+<p>Do not try to reproduce it; make it deterministic. Driver Verifier's standard flags do not wait for the bad
+thing to happen — they force the rare paths to execute (pending I/O, low-resource allocation failures) and
+verify the rules on every call, so a violation surfaces the first time the code runs rather than the first time
+the timing aligns. An intermittent driver bug that survives <code>verifier /standard</code> plus special pool
+is rare; one found by them in ten minutes is the normal outcome.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Start here</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck <code>0xD1</code> naming your driver</td><td>Read Arg2 (the IRQL) and Arg3 (read or write),
+then <code>ln</code> on Arg4</td></tr>
+<tr><td>Bugcheck stack names only <code>nt!</code> functions</td><td>Memory corruption — the stack is an
+innocent bystander; enable special pool</td></tr>
+<tr><td>Yellow bang in Device Manager, no crash</td><td>Walk the seven-step start chain; the error code names
+the step</td></tr>
+<tr><td>Code 39, and the code looks correct</td><td>Signing — enable test signing on the target machine</td></tr>
+<tr><td>Code 10 with your driver attached in <code>!devstack</code></td><td>
+<code>EvtDevicePrepareHardware</code> returned a failure — break on it and read the status</td></tr>
+<tr><td>Crashes only when the app is closed mid-transfer</td><td>A cancellation race — the cancel path had
+never executed before</td></tr>
+<tr><td><code>0xC4</code> "IRP completed twice"</td><td>Both the cancel and completion paths own the request —
+use <code>WdfRequestUnmarkCancelable</code>'s return value</td></tr>
+<tr><td>A bugcheck that stops happening under Verifier</td><td>Suspect a timing race that Verifier's overhead
+perturbs — keep I/O verification on and look at ownership</td></tr>
+<tr><td>Everything passes but the machine leaks pool</td><td><code>!poolused 2</code> and your own tag —
+check the unload and error paths</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Given a <code>0xD1</code> bugcheck, say what each of the four arguments tells you.</li>
+  <li>Resolve a faulting address to a function, offset and source line in WinDbg.</li>
+  <li>Explain how to tell paged memory from a wild pointer using <code>!pool</code> and <code>!pte</code>.</li>
+  <li>List the seven links in the device-start chain and the command that checks each.</li>
+  <li>Map three Device Manager error codes to the step of that chain they indicate.</li>
+  <li>Explain what special pool does and why it moves the crash to the real culprit.</li>
+  <li>Explain why a cancellation bug can hide through months of testing.</li>
+  <li>Describe the ownership handshake that prevents completing a request twice.</li>
+  <li>Say what you would enable before attempting to reproduce any intermittent failure.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

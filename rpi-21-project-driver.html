@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: an I2C sensor driver, overlay to userspace | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: an I2C sensor driver, overlay to userspace</h1>
+<p class="lead">A complete, correct Linux device driver for a real sensor on a real board: a device tree
+overlay that declares the hardware, a kernel module that binds to it, an IIO interface that any application
+can consume, and the debugging workflow that gets you there. This is the canonical embedded Linux task.</p>
+
+<h2 id="scope">What you build</h2>
+
+<pre class="diagram">   HARDWARE: a BME280 (temperature, pressure, humidity) on
+   I2C1 at address 0x76. About three pounds. The same sensor
+   as the buses track's project (bus chapter 21) - which
+   wrote a BARE-METAL driver for it. Doing both is the point:
+   the same chip, the same registers, two completely
+   different software worlds.
+
+   WIRING (bus chapter 06 for why no pull-ups needed):
+     Pi pin 1  (3V3)  -- VCC
+     Pi pin 3  (GPIO2, SDA) -- SDA
+     Pi pin 5  (GPIO3, SCL) -- SCL
+     Pi pin 9  (GND)  -- GND
+
+   THE STACK YOU WILL BUILD:
+
+   +--------------------------------------------------+
+   |  userspace:  cat /sys/bus/iio/devices/...         |
+   |              or libiio, or your own app           |
+   +--------------------------------------------------+
+   |  IIO subsystem - generic sensor interface         |
+   +--------------------------------------------------+
+   |  YOUR DRIVER  bme280_probe(), read_raw()          |
+   +--------------------------------------------------+
+   |  i2c-core - bus arbitration, locking              |
+   +--------------------------------------------------+
+   |  i2c-bcm2835 / rp1 - the controller driver        |
+   +--------------------------------------------------+
+   |  the wire                                         |
+   +--------------------------------------------------+
+
+   NOTE what you do NOT write: bus arbitration, locking,
+   power management, the userspace ABI, or anything about
+   the controller. That is the value of the subsystem, and
+   the reason a kernel driver is ~200 lines where the bare
+   metal version was ~400.
+
+   A REAL bme280 DRIVER SHIPS IN THE KERNEL. We are writing
+   our own deliberately, under a different compatible
+   string, so nothing binds first and you see every step.</pre>
+
+<h2 id="step0">Step 0: prove the hardware before writing code</h2>
+
+<pre><code># Never write a driver for a device you have not talked to
+# by hand. Ten minutes here saves a day of debugging the
+# wrong layer (chapter 12).
+
+$ sudo raspi-config nonint do_i2c 0 &amp;&amp; sudo reboot
+
+$ i2cdetect -y 1
+70: -- -- -- -- -- -- 76 --
+#                     ^^ present, unclaimed
+
+$ i2cget -y 1 0x76 0xD0         # chip ID register
+0x60                            # BME280 - correct
+
+# If either of those fails, STOP. Check wiring, address
+# (0x76 vs 0x77 by the SDO pin), and power. No driver can
+# fix a bus problem.
+</code></pre>
+
+<h2 id="step1">Step 1: the overlay</h2>
+
+<pre><code>/* bme280-custom-overlay.dts
+   Declares the device so the kernel will look for a driver.
+   Chapter 10 explains the mechanism.                       */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711", "brcm,bcm2712";
+
+    fragment@0 {
+        target = &lt;&amp;i2c1&gt;;
+        __overlay__ {
+            status = "okay";
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;0&gt;;
+
+            bme280_custom: bme280@76 {
+                /* OUR OWN compatible string, so the
+                   in-tree bosch,bme280 driver does not
+                   claim the device before ours does.      */
+                compatible = "learn,bme280-custom";
+                reg = &lt;0x76&gt;;
+                status = "okay";
+            };
+        };
+    };
+
+    __overrides__ {
+        addr = &lt;&amp;bme280_custom&gt;,"reg:0";
+    };
+};
+</code></pre>
+
+<pre><code>$ dtc -@ -I dts -O dtb -o bme280-custom.dtbo bme280-custom-overlay.dts
+$ sudo cp bme280-custom.dtbo /boot/firmware/overlays/
+$ echo "dtoverlay=bme280-custom" | sudo tee -a /boot/firmware/config.txt
+$ sudo reboot
+
+# VERIFY - chapter 10's four steps, and do not skip them:
+$ dtc -I fs -O dts /sys/firmware/devicetree/base 2&gt;/dev/null | \
+      grep -A4 bme280
+        bme280@76 {
+                compatible = "learn,bme280-custom";
+                reg = &lt;0x76&gt;;
+                status = "okay";
+        };
+# Node present = overlay applied.
+
+$ ls /sys/bus/i2c/devices/1-0076/
+# Directory exists = the i2c core instantiated a client.
+$ ls /sys/bus/i2c/devices/1-0076/driver
+ls: cannot access ...: No such file or directory
+# NO DRIVER YET. That is exactly the state we want: the
+# device exists and nothing has claimed it. Now write the
+# thing that will.
+</code></pre>
+
+<h2 id="step2">Step 2: the driver</h2>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/* bme280_custom.c - an IIO driver for the BME280 over I2C.
+   Compare every part of this with bus chapter 21's bare
+   metal version.                                           */
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/i2c.h&gt;
+#include &lt;linux/mod_devicetable.h&gt;
+#include &lt;linux/regmap.h&gt;
+#include &lt;linux/iio/iio.h&gt;
+#include &lt;linux/pm_runtime.h&gt;
+
+#define BME_REG_ID        0xD0
+#define BME_REG_RESET     0xE0
+#define BME_REG_CTRL_HUM  0xF2
+#define BME_REG_STATUS    0xF3
+#define BME_REG_CTRL_MEAS 0xF4
+#define BME_REG_CONFIG    0xF5
+#define BME_REG_PRESS_MSB 0xF7
+#define BME_CHIP_ID       0x60
+
+struct bme_calib {
+	u16 t1; s16 t2, t3;
+	u16 p1; s16 p2, p3, p4, p5, p6, p7, p8, p9;
+	u8  h1; s16 h2; u8 h3; s16 h4, h5; s8 h6;
+	s32 t_fine;              /* shared between compensations */
+};
+
+struct bme_data {
+	struct regmap    *regmap;
+	struct mutex      lock;   /* serialises a burst read +
+				     t_fine, which is per-device
+				     shared state                */
+	struct bme_calib  cal;
+};
+
+/* regmap does the I2C register access for us: locking,
+   caching, endianness, debugfs. Writing raw i2c_transfer
+   calls by hand is what bus chapter 21 did; here it is
+   three lines of configuration.                            */
+static const struct regmap_config bme_regmap_config = {
+	.reg_bits     = 8,
+	.val_bits     = 8,
+	.max_register = 0xFF,
+	.cache_type   = REGCACHE_NONE,   /* data regs change */
+};
+
+/* --- compensation, straight from the datasheet --- */
+static s32 bme_comp_temp(struct bme_calib *c, s32 adc_t)
+{
+	s32 v1 = ((((adc_t &gt;&gt; 3) - ((s32)c-&gt;t1 &lt;&lt; 1))) * (s32)c-&gt;t2) &gt;&gt; 11;
+	s32 v2 = (((((adc_t &gt;&gt; 4) - (s32)c-&gt;t1) *
+		    ((adc_t &gt;&gt; 4) - (s32)c-&gt;t1)) &gt;&gt; 12) * (s32)c-&gt;t3) &gt;&gt; 14;
+	c-&gt;t_fine = v1 + v2;
+	return (c-&gt;t_fine * 5 + 128) &gt;&gt; 8;      /* milli-degC/10 */
+}
+
+/* --- the IIO channel table: what this device exposes --- */
+static const struct iio_chan_spec bme_channels[] = {
+	{
+		.type = IIO_TEMP,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+	},
+	{
+		.type = IIO_PRESSURE,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+	},
+	{
+		.type = IIO_HUMIDITYRELATIVE,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+	},
+};
+
+static int bme_read_raw(struct iio_dev *indio,
+			struct iio_chan_spec const *chan,
+			int *val, int *val2, long mask)
+{
+	struct bme_data *d = iio_priv(indio);
+	u8 buf[8];
+	s32 adc_t, adc_p, adc_h, t;
+	int ret;
+
+	if (mask != IIO_CHAN_INFO_PROCESSED)
+		return -EINVAL;
+
+	mutex_lock(&amp;d-&gt;lock);
+
+	/* ONE burst read of all 8 data registers. The sensor
+	   shadows them during a burst, so reading separately
+	   can mix two different measurements - the same
+	   correctness point as bus chapter 21.               */
+	ret = regmap_bulk_read(d-&gt;regmap, BME_REG_PRESS_MSB, buf, 8);
+	if (ret)
+		goto out;
+
+	adc_p = (buf[0] &lt;&lt; 12) | (buf[1] &lt;&lt; 4) | (buf[2] &gt;&gt; 4);
+	adc_t = (buf[3] &lt;&lt; 12) | (buf[4] &lt;&lt; 4) | (buf[5] &gt;&gt; 4);
+	adc_h = (buf[6] &lt;&lt; 8)  |  buf[7];
+
+	if (adc_t == 0x80000) { ret = -EAGAIN; goto out; }
+
+	/* temperature FIRST - it computes t_fine, which the
+	   others consume.                                     */
+	t = bme_comp_temp(&amp;d-&gt;cal, adc_t);
+
+	switch (chan-&gt;type) {
+	case IIO_TEMP:
+		*val = t * 10;            /* IIO wants milli-degC */
+		break;
+	case IIO_PRESSURE:
+		*val = bme_comp_press(&amp;d-&gt;cal, adc_p);
+		break;
+	case IIO_HUMIDITYRELATIVE:
+		*val = bme_comp_hum(&amp;d-&gt;cal, adc_h);
+		break;
+	default:
+		ret = -EINVAL; goto out;
+	}
+	ret = IIO_VAL_INT;
+out:
+	mutex_unlock(&amp;d-&gt;lock);
+	return ret;
+}
+
+static const struct iio_info bme_info = {
+	.read_raw = bme_read_raw,
+};
+
+/* --- probe: called when a device matches our compatible --- */
+static int bme_probe(struct i2c_client *client)
+{
+	struct device   *dev = &amp;client-&gt;dev;
+	struct iio_dev  *indio;
+	struct bme_data *d;
+	unsigned int     id;
+	int              ret;
+
+	/* devm_* allocations are freed automatically when the
+	   device goes away. Using them removes the entire
+	   class of unwind bugs that chapter 16 warned about. */
+	indio = devm_iio_device_alloc(dev, sizeof(*d));
+	if (!indio)
+		return -ENOMEM;
+
+	d = iio_priv(indio);
+	mutex_init(&amp;d-&gt;lock);
+
+	d-&gt;regmap = devm_regmap_init_i2c(client, &amp;bme_regmap_config);
+	if (IS_ERR(d-&gt;regmap))
+		return dev_err_probe(dev, PTR_ERR(d-&gt;regmap),
+				     "regmap init failed\n");
+
+	/* IDENTIFY THE DEVICE. A probe that does not verify it
+	   is talking to what it expects will bind to anything
+	   and fail confusingly later.                         */
+	ret = regmap_read(d-&gt;regmap, BME_REG_ID, &amp;id);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot read chip id\n");
+	if (id != BME_CHIP_ID)
+		return dev_err_probe(dev, -ENODEV,
+				     "wrong chip id 0x%02x\n", id);
+
+	ret = bme_read_calibration(d);
+	if (ret)
+		return dev_err_probe(dev, ret, "calibration read failed\n");
+
+	/* CTRL_HUM must be written BEFORE CTRL_MEAS - a
+	   datasheet footnote that costs an afternoon if missed
+	   (bus chapter 21).                                   */
+	regmap_write(d-&gt;regmap, BME_REG_CTRL_HUM,  0x01);
+	regmap_write(d-&gt;regmap, BME_REG_CONFIG,    0xA0);
+	regmap_write(d-&gt;regmap, BME_REG_CTRL_MEAS, 0x27);
+
+	indio-&gt;name      = "bme280_custom";
+	indio-&gt;info      = &amp;bme_info;
+	indio-&gt;modes     = INDIO_DIRECT_MODE;
+	indio-&gt;channels  = bme_channels;
+	indio-&gt;num_channels = ARRAY_SIZE(bme_channels);
+
+	dev_info(dev, "BME280 registered\n");
+	return devm_iio_device_register(dev, indio);
+	/* No remove() function needed at all - devm handles it.
+	   Contrast with chapter 16's manual unwind.           */
+}
+
+static const struct of_device_id bme_of_match[] = {
+	{ .compatible = "learn,bme280-custom" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, bme_of_match);
+
+static const struct i2c_device_id bme_id[] = {
+	{ "bme280-custom", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, bme_id);
+
+static struct i2c_driver bme_driver = {
+	.driver = {
+		.name           = "bme280_custom",
+		.of_match_table = bme_of_match,
+	},
+	.probe    = bme_probe,
+	.id_table = bme_id,
+};
+module_i2c_driver(bme_driver);
+/* module_i2c_driver expands to the init/exit boilerplate.
+   The whole module is now declarative: a match table, a
+   probe, and the channels it exposes.                     */
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("you");
+MODULE_DESCRIPTION("BME280 IIO driver (teaching version)");
+</code></pre>
+
+<h2 id="step3">Step 3: build, load, read</h2>
+
+<pre><code>$ cat Makefile
+obj-m += bme280_custom.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+$ make
+$ sudo insmod bme280_custom.ko
+$ dmesg | tail -3
+i2c 1-0076: BME280 registered
+
+# THE MOMENT IT BINDS, the device gains a driver symlink and
+# an IIO device appears - with no further work on your part:
+$ ls -l /sys/bus/i2c/devices/1-0076/driver
+... -&gt; ../../../../bus/i2c/drivers/bme280_custom
+
+$ ls /sys/bus/iio/devices/
+iio:device0
+
+$ cd /sys/bus/iio/devices/iio:device0
+$ cat name
+bme280_custom
+$ cat in_temp_input
+21430                       # milli-degC = 21.43 C
+$ cat in_pressure_input
+101325
+$ cat in_humidityrelative_input
+44120
+
+# THAT INTERFACE IS FREE. Any IIO-aware tool now works:
+$ sudo apt install libiio-utils
+$ iio_info
+$ iio_attr -a -c
+
+# And your application reads a file:
+$ while sleep 2; do
+    echo "$(date +%T) $(cat in_temp_input)"
+  done
+</code></pre>
+
+<div class="key">
+<b>What the subsystem gave you</b>
+<p>You wrote about 200 lines and got: a stable userspace ABI that predates your driver and will outlive it,
+automatic device/driver matching from the device tree, bus locking shared with every other I2C device, sysfs
+attribute plumbing, hotplug and udev integration, and lifetime management through <code>devm_</code>. The
+bare-metal version in <a href="bus-21-project-i2c-sensor.html">bus chapter 21</a> had to invent all of it, and
+whatever it invented worked only with itself. That difference is the entire argument for driver frameworks,
+and now you have written both sides of it.</p>
+</div>
+
+<h2 id="debug">Debugging it</h2>
+
+<pre><code># PROBE NEVER CALLED?
+$ ls /sys/bus/i2c/drivers/bme280_custom/
+# Empty = the driver loaded but matched nothing. Check that
+# the compatible string in the .dts EXACTLY matches
+# bme_of_match. A single character difference gives you
+# silence, not an error.
+
+# See matching happen (chapter 17):
+$ echo 'file drivers/i2c/i2c-core-base.c +p' | \
+      sudo tee /sys/kernel/debug/dynamic_debug/control
+$ sudo rmmod bme280_custom &amp;&amp; sudo insmod bme280_custom.ko
+$ dmesg | tail -20
+
+# WATCH THE ACTUAL BUS TRAFFIC:
+$ sudo bpftrace -e '
+    kprobe:i2c_transfer { printf("%s: %d msgs\n", comm, arg2); }'
+
+# Or trace the controller driver's transfer function and get
+# durations (chapter 17):
+$ cd /sys/kernel/tracing
+$ echo function_graph | sudo tee current_tracer
+$ echo 'bcm2835_i2c_*' | sudo tee set_ftrace_filter
+$ echo 1 | sudo tee tracing_on; cat /sys/bus/iio/devices/iio:device0/in_temp_input
+$ sudo cat trace | head -20
+
+# regmap gives you a free register-level debug view:
+$ ls /sys/kernel/debug/regmap/1-0076/
+$ sudo cat /sys/kernel/debug/regmap/1-0076/registers
+
+# PROBE DEFERRED? dev_err_probe logs it properly and retries
+# later - which is correct behaviour when a dependency is
+# not ready yet, and confusing if you do not know it exists:
+$ dmesg | grep -i defer
+$ cat /sys/kernel/debug/devices_deferred
+</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<ul>
+  <li><strong>Compare with the in-tree driver.</strong> Read
+  <code>drivers/iio/pressure/bmp280-core.c</code> in the kernel source. It handles more variants, oversampling
+  configuration, power management and buffered reads. Identify three things it does that yours does not, and
+  why each matters.</li>
+  <li><strong>Add sysfs attributes</strong> for oversampling, exposed through
+  <code>IIO_CHAN_INFO_OVERSAMPLING_RATIO</code>, so userspace can trade accuracy against time.</li>
+  <li><strong>Add runtime PM</strong> so the sensor is put into sleep mode between reads and woken on demand.
+  Measure the current difference.</li>
+  <li><strong>Add a triggered buffer</strong> so IIO can sample at a fixed rate into a ring buffer that
+  userspace reads with one syscall — the interface real data acquisition uses.</li>
+  <li><strong>Break it deliberately.</strong> Disconnect SDA while a read is in flight. Confirm you get a clean
+  <code>-EREMOTEIO</code> rather than a hang, and that the driver recovers when reconnected.</li>
+  <li><strong>Cross-compile it</strong> (chapter 06) and deploy with the sync loop from chapter 07.</li>
+  <li><strong>Package it</strong> as a <code>.deb</code> with the overlay and a modules-load config, so a fresh
+  Pi is one <code>apt install</code> from working (chapter 07).</li>
+</ul>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Module loads, probe never runs</td><td>Compatible string mismatch between <code>.dts</code> and
+<code>of_match_table</code></td></tr>
+<tr><td>No I2C device node at all</td><td>Overlay not applied — check the live device tree</td></tr>
+<tr><td>Probe runs, chip ID wrong</td><td>Wrong address, or another device at 0x76</td></tr>
+<tr><td>In-tree driver binds instead of yours</td><td>You used <code>bosch,bme280</code>; use your own
+string</td></tr>
+<tr><td>Temperature right, pressure nonsense</td><td>Compensation called out of order —
+<code>t_fine</code> stale</td></tr>
+<tr><td>Humidity wildly wrong</td><td>H4/H5 nibble packing decoded incorrectly</td></tr>
+<tr><td>Occasional mismatched readings</td><td>Registers read separately instead of one burst</td></tr>
+<tr><td>Values change under concurrent readers</td><td>Missing mutex around the burst and
+<code>t_fine</code></td></tr>
+<tr><td>Module will not unload</td><td>Something holds the IIO device open</td></tr>
+<tr><td>Probe returns <code>-EPROBE_DEFER</code> forever</td><td>A dependency never appears — check
+<code>devices_deferred</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the layers between your driver and the wire, and say what each provides.</li>
+  <li>Explain why you prove the hardware with <code>i2cget</code> before writing any code.</li>
+  <li>Say why the overlay uses a custom compatible string.</li>
+  <li>Describe the expected state after the overlay but before the driver, and how to confirm it.</li>
+  <li>Explain what <code>regmap</code> replaces and why that is worth using.</li>
+  <li>Say why the mutex is needed, given the I2C core already locks the bus.</li>
+  <li>Explain what <code>devm_</code> allocation removes the need for.</li>
+  <li>Say why <code>probe</code> must verify the chip ID.</li>
+  <li>List four things the IIO subsystem provided that you did not write.</li>
+  <li>Give the first thing to check when a driver loads but never probes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a peripheral attaches: registers, IRQs and DMA | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>How a peripheral attaches: registers, IRQs and DMA</h1>
+<p class="lead">Every serial controller in this track — UART, SPI, I2C, CAN, USB — presents the same four
+surfaces to software. Learn the shape once and each new peripheral becomes a question of which bits, not how
+it works.</p>
+
+<h2 id="shape">The universal shape</h2>
+
+<pre class="diagram">   FOUR SURFACES, and every peripheral has all four.
+
+   1. CONTROL registers     you write: enable, mode, speed
+   2. STATUS registers      you read:  ready, busy, error
+   3. DATA registers        the actual bytes, in and out
+   4. INTERRUPT enables     which status bits raise an IRQ
+
+   +--------------------------------------------------+
+   |  CPU        writes CR1  ---------------+         |
+   |             reads  SR   &lt;---------+    |         |
+   |             writes DR   -------+  |    |         |
+   +--------------------------------|--|----|---------+
+                                    v  |    v
+   +--------------------------------------------------+
+   |  PERIPHERAL                                      |
+   |    +---------+   +-----------+   +------------+  |
+   |    | control |   |  SHIFT    |   |   status   |  |
+   |    | logic   |--&gt;|  REGISTER |--&gt;|   flags    |  |
+   |    +---------+   +-----------+   +------------+  |
+   |                        |               |         |
+   +------------------------|---------------|---------+
+                            v               v
+                          PINS            NVIC
+
+   THE SHIFT REGISTER IS THE HEART. A serial peripheral is a
+   parallel-to-serial converter with timing logic: you write
+   a byte, it clocks the bits out one at a time at the
+   configured rate. Everything else is bookkeeping around
+   that.
+
+   THE DOUBLE BUFFER that confuses everyone:
+
+     DR (data register)  --&gt;  SHIFT REGISTER  --&gt; pin
+
+   Two stages. "TXE" (transmit empty) means DR is free for
+   the NEXT byte - the previous one is still shifting out.
+   "TC" (transmission complete) means the shift register is
+   empty too and the line is genuinely idle.
+
+   Get these confused and you disable the transmitter, or
+   turn off an RS-485 driver, while the last byte is still
+   on the wire. Truncated final characters are ALWAYS this
+   bug (chapter 14).</pre>
+
+<h2 id="registers">Reading a register map</h2>
+
+<pre><code>/* Vendor headers give you a struct; the reference manual
+   gives you the meaning. Both are needed.                  */
+
+typedef struct {
+    volatile uint32_t CR1;    /* control 1: enable, parity   */
+    volatile uint32_t CR2;    /* control 2: stop bits, addr  */
+    volatile uint32_t CR3;    /* control 3: flow, DMA        */
+    volatile uint32_t BRR;    /* baud rate divisor           */
+    volatile uint32_t GTPR;
+    volatile uint32_t RTOR;
+    volatile uint32_t RQR;
+    volatile uint32_t ISR;    /* status - READ ONLY          */
+    volatile uint32_t ICR;    /* interrupt CLEAR             */
+    volatile uint32_t RDR;    /* receive data  - READ ONLY   */
+    volatile uint32_t TDR;    /* transmit data - WRITE ONLY  */
+} USART_TypeDef;
+
+/* FOUR CLEARING IDIOMS, and you must know which applies:
+
+   1. WRITE 1 TO CLEAR (w1c)
+        USART1-&gt;ICR = USART_ICR_TCCF;
+      Writing 0 does nothing. Writing ~0 clears everything -
+      an easy accidental bug.
+
+   2. READ TO CLEAR
+        (void) USART1-&gt;RDR;        // clears RXNE
+      Dangerous: a debugger displaying the register CLEARS
+      THE FLAG. "It works until I watch it" is this.
+
+   3. READ ONE, THEN READ/WRITE ANOTHER
+        status = USART1-&gt;SR; (void) USART1-&gt;DR;
+      The classic F1-era sequence. Skipping the first read
+      leaves the flag set forever.
+
+   4. WRITE 0 TO CLEAR (rc_w0)
+        TIM2-&gt;SR = ~TIM_SR_UIF;
+      Note the complement: write ones everywhere EXCEPT the
+      bit you are clearing. Writing 0 directly would clear
+      every flag, including ones set since you read.
+
+   Using the wrong idiom gives you an interrupt that fires
+   forever, or a flag you never see. Check the "Access"
+   column in the reference manual's register table - it is
+   there for exactly this.                                  */
+</code></pre>
+
+<div class="warn">
+<b>Read-to-clear registers and debuggers do not mix</b>
+<p>If a status flag clears on read, then a debugger's register view, a watch expression, or a memory window
+covering that address will clear it behind your back. The peripheral then behaves differently under
+observation. When a bug vanishes the moment you look at a peripheral register, this is nearly always why —
+close the register view and use a variable you copy the status into instead.</p>
+</div>
+
+<h2 id="init">The initialisation order that always works</h2>
+
+<pre><code>/* Get this order wrong and the peripheral silently ignores
+   you. It is the same for every controller in this track.  */
+
+/* 1. ENABLE THE PERIPHERAL CLOCK, and read it back.
+      Without a clock, register writes are discarded and
+      reads return zero (mcu chapter 09).                   */
+RCC-&gt;APB1ENR |= RCC_APB1ENR_USART2EN;
+(void) RCC-&gt;APB1ENR;
+
+/* 2. CONFIGURE THE PINS - mode, alternate function, speed,
+      pull. Do this BEFORE enabling the peripheral, or the
+      first edge it drives comes from an unconfigured pin
+      (mcu chapter 10).                                     */
+gpio_config_af(GPIOA, 2, AF7, PUSHPULL, FAST);
+
+/* 3. CONFIGURE THE PERIPHERAL WHILE IT IS DISABLED.
+      Most controllers latch configuration only when going
+      from disabled to enabled, and many IGNORE writes to
+      config fields while enabled - silently.               */
+USART2-&gt;CR1 = 0;                       /* ensure disabled   */
+USART2-&gt;BRR = brr_for(115200);
+USART2-&gt;CR2 = 0;                       /* 1 stop bit        */
+USART2-&gt;CR3 = 0;
+
+/* 4. ENABLE INTERRUPTS AT THE PERIPHERAL, then set priority
+      and enable at the NVIC. This order matters if the line
+      could already be active.                              */
+USART2-&gt;CR1 |= USART_CR1_RXNEIE;
+NVIC_SetPriority(USART2_IRQn, 6);
+NVIC_EnableIRQ(USART2_IRQn);
+
+/* 5. ENABLE THE PERIPHERAL LAST. */
+USART2-&gt;CR1 |= USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+
+/* THE RULE: clock, pins, config, interrupts, enable.
+   Deviating from it produces "works sometimes" behaviour
+   that depends on optimisation level and what the pin was
+   doing beforehand.                                        */
+</code></pre>
+
+<h2 id="synchrony">Synchronous, asynchronous, and why it decides everything</h2>
+
+<pre class="diagram">   SYNCHRONOUS - a clock line is transmitted alongside data.
+     SPI, I2C, USB (embedded in the encoding), MIPI.
+
+     The receiver samples on the clock edge the transmitter
+     provided, so the two need no agreement about rate.
+     Speed can be changed freely and can reach hundreds of
+     MHz. Costs a pin.
+
+       CLK  __|--|__|--|__|--|__
+       DATA ___X====X====X====X_
+                ^    ^    ^     sampled here
+
+   ASYNCHRONOUS - no clock line. Both ends must independently
+     agree on the rate BEFORE any data flows.
+     UART, RS-485, CAN.
+
+     The receiver finds the start edge, then samples at
+     pre-agreed intervals based on its OWN clock.
+
+       DATA --|_______X===X===X===X---
+              start   ^   ^   ^   ^
+                      sampled on internal timing
+
+     This is why UART needs an accurate clock and SPI does
+     not (mcu chapter 09), why UART has a baud rate you must
+     configure identically at both ends, and why UART tops
+     out in the low megabits while SPI reaches 100 Mbit.
+
+   THE THIRD CATEGORY: self-clocking codes. CAN and USB
+   embed clock information in the data by guaranteeing
+   transitions - bit stuffing in CAN, NRZI plus stuffing in
+   USB. The receiver recovers the clock from the edges, so
+   you get asynchronous wiring with synchronous accuracy.
+   Chapters 09 and 12 cover these.</pre>
+
+<h2 id="errors">Error flags are the real interface</h2>
+
+<pre><code>/* Every peripheral in this track has an error status you
+   are supposed to check and most code ignores.            */
+
+void USART2_IRQHandler(void)
+{
+    uint32_t isr = USART2-&gt;ISR;
+
+    /* CHECK ERRORS FIRST. An overrun leaves RXNE set with
+       stale data; handling the byte before the error means
+       you process garbage and never clear the condition.  */
+    if (isr &amp; (USART_ISR_ORE | USART_ISR_FE |
+               USART_ISR_NE  | USART_ISR_PE)) {
+        if (isr &amp; USART_ISR_ORE) { stats.overrun++; }
+        if (isr &amp; USART_ISR_FE)  { stats.framing++; }
+        if (isr &amp; USART_ISR_NE)  { stats.noise++;   }
+        if (isr &amp; USART_ISR_PE)  { stats.parity++;  }
+
+        USART2-&gt;ICR = USART_ICR_ORECF | USART_ICR_FECF |
+                      USART_ICR_NECF  | USART_ICR_PECF;
+        (void) USART2-&gt;RDR;         /* discard the bad byte */
+        return;
+    }
+
+    if (isr &amp; USART_ISR_RXNE) {
+        ring_put((uint8_t) USART2-&gt;RDR);
+    }
+}
+
+/* WHAT EACH ERROR ACTUALLY TELLS YOU - this is diagnosis,
+   not bookkeeping:
+
+     OVERRUN   your software is too slow. The fix is DMA or
+               a higher interrupt priority, not more retries.
+     FRAMING   the stop bit was not high: baud rate mismatch,
+               a clock error, or noise. Check both ends.
+     NOISE     the three samples per bit disagreed. Electrical:
+               long wires, no ground, missing termination.
+     PARITY    a bit flipped. Rare, and means real corruption.
+
+   Counting these in a struct you can print is one of the
+   highest-value things you can add to a driver. Without it
+   "the link is unreliable" is unactionable; with it you
+   know within seconds whether the problem is your code,
+   the baud rate, or the cable.                            */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Register writes have no effect, reads give zero</td><td>Peripheral clock not enabled</td></tr>
+<tr><td>Configuration ignored</td><td>Written while the peripheral was enabled</td></tr>
+<tr><td>Last character of every message lost</td><td>Waited for TXE rather than TC before
+disabling</td></tr>
+<tr><td>Interrupt fires continuously</td><td>Wrong clearing idiom for that status register</td></tr>
+<tr><td>Bug vanishes when the debugger shows the register</td><td>Read-to-clear flag being cleared by the
+debugger</td></tr>
+<tr><td>Flag never clears despite writing to it</td><td>Register is read-to-clear, or needs the two-step
+sequence</td></tr>
+<tr><td>All flags cleared when you meant to clear one</td><td>Wrote 0 to an <code>rc_w0</code> register instead
+of the complement</td></tr>
+<tr><td>Receive stops permanently after a burst</td><td>Overrun set and never cleared — the flag blocks
+further reception</td></tr>
+<tr><td>Spurious first byte on startup</td><td>Peripheral enabled before its pins were configured</td></tr>
+<tr><td>"The link is unreliable"</td><td>No error counters — add them before doing anything else</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four register surfaces every serial peripheral presents.</li>
+  <li>Explain the difference between TXE and TC and the bug that confuses them.</li>
+  <li>List the four flag-clearing idioms and how to tell which applies.</li>
+  <li>Explain why read-to-clear registers misbehave under a debugger.</li>
+  <li>Give the five-step initialisation order and what breaks if you reorder it.</li>
+  <li>Explain why a synchronous bus needs no clock accuracy agreement.</li>
+  <li>Say why UART tops out far below SPI in achievable rate.</li>
+  <li>Explain what self-clocking codes achieve and name two buses that use them.</li>
+  <li>Say what an overrun error tells you about your software, specifically.</li>
+  <li>Distinguish framing, noise and parity errors as diagnostic signals.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

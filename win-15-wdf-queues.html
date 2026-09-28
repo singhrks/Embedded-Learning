@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WDF request queues | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>WDF request queues</h1>
+<p class="lead">Queues are where WDF earns its keep. They handle dispatch, cancellation, power stalling and
+per-handle cleanup — the four things that made raw WDM I/O so error-prone — and they reduce your driver to a
+handful of callbacks.</p>
+
+<h2 id="dispatch">Dispatch types</h2>
+
+<p>A queue decides how requests reach your driver, and the choice between the three dispatch types is a real design decision: it determines whether your callbacks can run concurrently, and therefore what you must lock.</p>
+
+<pre class="diagram">   SEQUENTIAL
+      One request at a time. The next is not delivered until
+      the current one COMPLETES.
+      -&gt; simplest to write; no concurrency to reason about
+      -&gt; correct for hardware that can only do one thing
+      -&gt; the default choice for a first driver
+
+   PARALLEL
+      Requests delivered as they arrive, from any CPU,
+      concurrently.
+      -&gt; you must handle concurrency yourself
+      -&gt; correct for hardware with multiple channels, or when
+         you queue internally
+
+   MANUAL
+      Nothing is delivered. You call
+      WdfIoQueueRetrieveNextRequest when you are ready.
+      -&gt; a holding pen for pending requests
+      -&gt; THE standard pattern for asynchronous I/O: the
+         default queue receives, hands to a manual queue, and
+         the DPC retrieves and completes
+
+   THE COMMON ARCHITECTURE, and the one to learn:
+
+      default queue (parallel)   receives every request
+            |
+            +-- a read arrives, no data yet
+            |         -&gt; WdfRequestForwardToIoQueue(manual)
+            |
+            v
+      manual queue               holds pending reads
+            ^
+            |  interrupt -&gt; DPC
+            |         -&gt; WdfIoQueueRetrieveNextRequest
+            |         -&gt; fill it, complete it
+
+   That structure gives you asynchronous, cancellable,
+   power-aware I/O in about forty lines - versus several
+   hundred in WDM (chapter 05).</pre>
+
+<h2 id="create">Creating queues</h2>
+
+<p>Most drivers use more than one queue — typically a default queue plus a manual queue to park requests that cannot be answered yet. Setting them up is where you declare which request types you actually handle.</p>
+
+<pre><code>/* THE DEFAULT QUEUE - receives anything not routed elsewhere */
+
+        WDF_IO_QUEUE_CONFIG queueConfig;
+        NTSTATUS status;
+
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                        WdfIoQueueDispatchParallel);
+
+        queueConfig.EvtIoRead          = MyEvtIoRead;
+        queueConfig.EvtIoWrite         = MyEvtIoWrite;
+        queueConfig.EvtIoDeviceControl = MyEvtIoDeviceControl;
+        queueConfig.EvtIoStop          = MyEvtIoStop;
+
+        status = WdfIoQueueCreate(device, &amp;queueConfig,
+                                  WDF_NO_OBJECT_ATTRIBUTES,
+                                  &amp;ctx-&gt;DefaultQueue);
+
+/* A MANUAL QUEUE, for holding pending requests: */
+
+        WDF_IO_QUEUE_CONFIG_INIT(&amp;queueConfig,
+                                 WdfIoQueueDispatchManual);
+        queueConfig.PowerManaged = WdfFalse;   /* see below */
+
+        status = WdfIoQueueCreate(device, &amp;queueConfig,
+                                  WDF_NO_OBJECT_ATTRIBUTES,
+                                  &amp;ctx-&gt;PendingReadQueue);
+
+/* ROUTING a specific request type to its own queue: */
+
+        status = WdfDeviceConfigureRequestDispatching(device,
+                        ctx-&gt;WriteQueue,
+                        WdfRequestTypeWrite);
+/* now every IRP_MJ_WRITE goes to WriteQueue instead of the
+   default one - useful when reads and writes have completely
+   different handling and concurrency needs.              */
+
+/* POWER MANAGED (the default for the default queue):
+     the framework STOPS the queue when the device leaves D0
+     and RESTARTS it on return. Requests wait rather than
+     failing. This is what makes S0 idle transparent to
+     userspace (chapter 15).
+
+   NOT POWER MANAGED:
+     the queue keeps delivering regardless of power state.
+     Required for a manual queue used from a DPC, and for any
+     queue that must work while powering down.
+
+   GETTING THIS WRONG produces "requests hang after the device
+   idles" (power-managed manual queue that nobody restarts) or
+   "requests arrive while the device is off" (not power
+   managed when it should be).                            */</code></pre>
+
+<h2 id="callbacks">The callbacks</h2>
+
+<p>These are the functions the framework calls when a request arrives. Each corresponds to an operation the application performed, and each arrives at a defined IRQL with defined guarantees about what has already been validated.</p>
+
+<pre><code>VOID
+MyEvtIoRead(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+            _In_ size_t Length)
+{
+        WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+        PMY_CONTEXT ctx = MyGetContext(device);
+        PVOID buffer;
+        size_t bufLen;
+        NTSTATUS status;
+
+        if (Length &lt; sizeof(MY_SAMPLE)) {
+                WdfRequestComplete(Request,
+                                   STATUS_BUFFER_TOO_SMALL);
+                return;
+        }
+
+        /* data available right now? */
+        WdfSpinLockAcquire(ctx-&gt;StateLock);
+        if (ctx-&gt;DataReady) {
+                ctx-&gt;DataReady = FALSE;
+                WdfSpinLockRelease(ctx-&gt;StateLock);
+
+                status = WdfRequestRetrieveOutputBuffer(Request,
+                                sizeof(MY_SAMPLE),
+                                &amp;buffer, &amp;bufLen);
+                if (!NT_SUCCESS(status)) {
+                        WdfRequestComplete(Request, status);
+                        return;
+                }
+
+                RtlCopyMemory(buffer, &amp;ctx-&gt;LastSample,
+                              sizeof(MY_SAMPLE));
+
+                WdfRequestCompleteWithInformation(Request,
+                                STATUS_SUCCESS,
+                                sizeof(MY_SAMPLE));
+                return;
+        }
+        WdfSpinLockRelease(ctx-&gt;StateLock);
+
+        /* no data - park it on the manual queue */
+        status = WdfRequestForwardToIoQueue(Request,
+                                ctx-&gt;PendingReadQueue);
+        if (!NT_SUCCESS(status))
+                WdfRequestComplete(Request, status);
+
+        /* THAT IS ALL. The framework now owns cancellation,
+           power stalling and cleanup for this request.    */
+}
+
+/* AND IN THE DPC (chapter 11): */
+VOID
+MyEvtInterruptDpc(_In_ WDFINTERRUPT Interrupt,
+                  _In_ WDFOBJECT AssociatedObject)
+{
+        PMY_CONTEXT ctx = MyGetContext(
+                        WdfInterruptGetDevice(Interrupt));
+        WDFREQUEST request;
+        PVOID buffer;
+        size_t bufLen;
+        NTSTATUS status;
+
+        UNREFERENCED_PARAMETER(AssociatedObject);
+
+        status = WdfIoQueueRetrieveNextRequest(
+                        ctx-&gt;PendingReadQueue, &amp;request);
+        if (!NT_SUCCESS(status))
+                return;      /* nobody waiting - fine */
+
+        /* From here, the request is OURS. It can no longer be
+           cancelled out from under us - retrieving it removed
+           it from the queue and took ownership.          */
+
+        status = WdfRequestRetrieveOutputBuffer(request,
+                        sizeof(MY_SAMPLE), &amp;buffer, &amp;bufLen);
+        if (NT_SUCCESS(status)) {
+                RtlCopyMemory(buffer, &amp;ctx-&gt;LastSample,
+                              sizeof(MY_SAMPLE));
+                WdfRequestCompleteWithInformation(request,
+                                STATUS_SUCCESS,
+                                sizeof(MY_SAMPLE));
+        } else {
+                WdfRequestComplete(request, status);
+        }
+}</code></pre>
+
+<div class="key">
+<b>The ownership rule</b>
+<p>A request belongs to exactly one place at a time: the queue, or you. <code>WdfIoQueueRetrieveNextRequest</code>
+transfers ownership to you and guarantees it cannot be cancelled behind your back. Once you own it, you
+<strong>must</strong> complete it, forward it, or requeue it — dropping it hangs the caller forever. This
+single guarantee is what removes the cancel-routine race that dominates WDM queue code
+(<a href="win-04-irps.html">chapter 05</a>).</p>
+</div>
+
+<h2 id="cancel">Cancellation</h2>
+
+<p>Cancellation is the hardest part of raw WDM, and the strongest reason to use the framework: WDF can own the whole problem for you, provided you let it. The rules below are about not taking that ownership back by accident.</p>
+
+<pre><code>/* A request sitting on a queue is cancellable automatically.
+   The framework completes it with STATUS_CANCELLED and you
+   write nothing.
+
+   IF YOU NEED TO KNOW - to abort a hardware operation, for
+   example - mark it cancellable explicitly after taking
+   ownership: */
+
+        status = WdfRequestMarkCancelableEx(request,
+                                            MyEvtRequestCancel);
+        if (status == STATUS_CANCELLED) {
+                /* it was ALREADY cancelled - complete it and
+                   do not use it                             */
+                WdfRequestComplete(request, STATUS_CANCELLED);
+                return;
+        }
+
+VOID
+MyEvtRequestCancel(_In_ WDFREQUEST Request)
+{
+        WDFDEVICE device = WdfIoQueueGetDevice(
+                        WdfRequestGetIoQueue(Request));
+        PMY_CONTEXT ctx = MyGetContext(device);
+
+        /* abort the hardware operation */
+        MyAbortTransfer(ctx);
+
+        WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
+/* AND BEFORE COMPLETING IT NORMALLY, take it back: */
+        status = WdfRequestUnmarkCancelable(request);
+        if (status == STATUS_CANCELLED) {
+                /* the cancel routine is running or has run -
+                   it owns the request. DO NOT complete it. */
+                return;
+        }
+        WdfRequestComplete(request, STATUS_SUCCESS);
+
+/* THIS IS THE SAME OWNERSHIP PROTOCOL as WDM's
+   IoSetCancelRoutine(NULL) dance (chapter 05) - but it is
+   three lines with a clear return code, rather than a
+   spinlock-protected sequence you must get exactly right on
+   every path.                                              */
+
+/* PURGING a queue - cancel everything on it: */
+        WdfIoQueuePurgeSynchronously(queue);
+        /* returns when every request is completed */
+
+        WdfIoQueueStopSynchronously(queue);   /* pause */
+        WdfIoQueueStart(queue);               /* resume */</code></pre>
+
+<h2 id="stop">EvtIoStop</h2>
+
+<p>When a device is being powered down or removed with requests still queued, the framework asks your driver what to do with each of them. Answering correctly is what makes power transitions clean rather than a source of stuck requests.</p>
+
+<pre><code>/* Called when the framework must stop the queue - a power
+   transition, a purge, or removal - and a request is still
+   IN FLIGHT (you own it, not the queue).                   */
+
+VOID
+MyEvtIoStop(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+            _In_ ULONG ActionFlags)
+{
+        if (ActionFlags &amp; WdfRequestStopActionSuspend) {
+                /* "can you pause this?" - acknowledge that we
+                   will not complete it soon, and let the
+                   framework proceed                        */
+                WdfRequestStopAcknowledge(Request, FALSE);
+
+        } else if (ActionFlags &amp; WdfRequestStopActionPurge) {
+                /* "cancel it" */
+                WdfRequestCancelSentRequest(Request);
+        }
+}
+
+/* WHAT HAPPENS IF YOU DO NOT IMPLEMENT IT: the framework
+   waits for the request to complete before allowing the power
+   transition. For a request waiting on hardware that will not
+   respond until the device is powered - which is exactly the
+   case during a suspend - that is a DEADLOCK, and it appears
+   as "the machine will not sleep".
+
+   IMPLEMENT EvtIoStop for any queue that can hold a request
+   for an unbounded time. That is most manual queues.     */</code></pre>
+
+<h2 id="retrieve">Getting at a request</h2>
+
+<p>Once you have a request, you need its buffers, its parameters and eventually a way to complete it. These are the accessors, and they work identically regardless of which buffering method the IOCTL used.</p>
+
+<pre><code>/* BUFFERS - method-independent (chapter 08): */
+        status = WdfRequestRetrieveInputBuffer(request,
+                        minLength, &amp;buffer, &amp;actualLength);
+        status = WdfRequestRetrieveOutputBuffer(request,
+                        minLength, &amp;buffer, &amp;actualLength);
+/* both CHECK the minimum length for you and return
+   STATUS_BUFFER_TOO_SMALL - so the most commonly forgotten
+   validation is not optional.                            */
+
+/* AS WDFMEMORY, if you want to pass it on: */
+        status = WdfRequestRetrieveInputMemory(request, &amp;memory);
+
+/* AS AN MDL, for DMA (chapter 19): */
+        status = WdfRequestRetrieveOutputWdmMdl(request, &amp;mdl);
+
+/* THE PARAMETERS - what kind of request is this: */
+        WDF_REQUEST_PARAMETERS params;
+
+        WDF_REQUEST_PARAMETERS_INIT(&amp;params);
+        WdfRequestGetParameters(request, &amp;params);
+
+        params.Type                  /* WdfRequestTypeRead ... */
+        params.Parameters.Read.Length
+        params.Parameters.DeviceIoControl.IoControlCode
+        params.Parameters.DeviceIoControl.InputBufferLength
+        params.Parameters.DeviceIoControl.OutputBufferLength
+
+/* THE FILE OBJECT - which handle issued this: */
+        WDFFILEOBJECT file = WdfRequestGetFileObject(request);
+        PMY_FILE_CONTEXT fc = MyGetFileContext(file);
+/* This is how you keep PER-HANDLE state, the Windows
+   equivalent of file->private_data (Linux ch. 22).       */
+
+/* COMPLETING: */
+        WdfRequestComplete(request, status);
+        WdfRequestCompleteWithInformation(request, status,
+                                          bytesTransferred);
+        WdfRequestCompleteWithPriorityBoost(request, status,
+                                            IO_DISK_INCREMENT);
+
+/* SET THE INFORMATION. It is what ReadFile reports as bytes
+   transferred; omitting it means userspace sees zero, or
+   worse, an uninitialised value.                          */</code></pre>
+
+<h2 id="fileobject">Per-handle state</h2>
+
+<p>When several applications open your device at once, you usually need to keep state per handle rather than per device. WDF can create an object for each open file and hang your context off it.</p>
+
+<pre><code>/* Get callbacks when a handle is opened and closed: */
+
+        WDF_FILEOBJECT_CONFIG fileConfig;
+        WDF_OBJECT_ATTRIBUTES fileAttr;
+
+        WDF_FILEOBJECT_CONFIG_INIT(&amp;fileConfig,
+                        MyEvtDeviceFileCreate,
+                        MyEvtFileClose,
+                        MyEvtFileCleanup);
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;fileAttr,
+                        MY_FILE_CONTEXT);
+
+        WdfDeviceInitSetFileObjectConfig(DeviceInit,
+                        &amp;fileConfig, &amp;fileAttr);
+
+VOID
+MyEvtDeviceFileCreate(_In_ WDFDEVICE Device,
+                      _In_ WDFREQUEST Request,
+                      _In_ WDFFILEOBJECT FileObject)
+{
+        PMY_FILE_CONTEXT fc = MyGetFileContext(FileObject);
+
+        fc-&gt;OpenTime = KeQueryInterruptTime();
+        fc-&gt;Subscribed = FALSE;
+
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        /* complete it to ACCEPT the open; complete with an
+           error to REFUSE it                               */
+}
+
+VOID
+MyEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
+{
+        /* Last handle in the process closed. CANCEL this
+           handle's pending I/O here - the framework already
+           purges requests owned by this file object from its
+           queues, but anything YOU are holding is your
+           responsibility.                                  */
+}
+
+/* THE FRAMEWORK AUTOMATICALLY completes requests belonging to
+   a closing file object with STATUS_CANCELLED - which is the
+   IRP_MJ_CLEANUP obligation from chapter 05, handled for
+   you.                                                     */</code></pre>
+
+<h2 id="debug">Debugging queues</h2>
+
+<p>When requests seem to vanish, the framework extension will show you every queue, how many requests each holds and which are in flight — which almost always identifies where they stopped.</p>
+
+<pre><code># The single most useful command for "requests are stuck":
+    !wdfkd.wdfdevicequeues &lt;WDFDEVICE&gt;
+
+      Queue: 0x0000... State: Accepting Requests, Dispatching
+      Type: Parallel, PowerManaged: TRUE
+      Requests: 0
+
+      Queue: 0x0000... State: Accepting Requests, NOT Dispatching
+      Type: Manual, PowerManaged: FALSE
+      Requests: 3               &lt;-- three pending reads
+        WDFREQUEST 0x0000...
+        WDFREQUEST 0x0000...
+
+# READ THE STATE:
+#   "NOT Dispatching" on a power-managed queue -&gt; the device
+#     is not in D0. Expected while idle; a bug if it never
+#     resumes.
+#   Requests climbing on a manual queue -&gt; nothing is
+#     retrieving them. Your DPC is not running, or the
+#     hardware stopped.
+#   Requests on the default queue -&gt; your callback is not
+#     completing or forwarding them.
+
+    !wdfqueue &lt;WDFQUEUE&gt;            one queue in detail
+    !wdfrequest &lt;WDFREQUEST&gt;        one request's state,
+                                    owner, and IRP
+    !wdflogdump mydriver            the framework's own trace
+
+# AND FROM USER MODE, the symptom to correlate: a thread stuck
+# in ReadFile. Find its IRP with !irpfind (chapter 05), then
+# !wdfrequest on the corresponding WDFREQUEST.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Application hangs in <code>ReadFile</code></td><td>Request retrieved and never completed — you own it</td></tr>
+<tr><td>Requests pile up on a manual queue</td><td>Nothing retrieving them; the DPC is not firing</td></tr>
+<tr><td>Requests hang after the device idles</td><td>Power-managed manual queue with nothing to restart it</td></tr>
+<tr><td>Requests arrive while the device is off</td><td>Queue not power-managed when it should be</td></tr>
+<tr><td>Machine will not sleep</td><td>No <code>EvtIoStop</code>; the framework waits for an in-flight request</td></tr>
+<tr><td>Bugcheck completing a cancelled request</td><td>Ignored the return of <code>WdfRequestUnmarkCancelable</code></td></tr>
+<tr><td>Corruption with a parallel queue</td><td>Concurrency not handled — use sequential or add locking</td></tr>
+<tr><td>Byte count is zero in userspace</td><td><code>Information</code> not set — use <code>CompleteWithInformation</code></td></tr>
+<tr><td>Two handles interfere with each other</td><td>Per-handle state kept in the device context</td></tr>
+<tr><td>Requests leak on handle close</td><td>Holding a request outside a queue without cleanup handling</td></tr>
+<tr><td><code>WdfRequestRetrieveOutputBuffer</code> fails</td><td>Buffer shorter than your minimum — that check is the point</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compare the three dispatch types and say when each is right.</li>
+  <li>Draw the default-plus-manual-queue architecture and explain what it buys.</li>
+  <li>Explain what "power managed" changes, and both failure modes of choosing wrong.</li>
+  <li>State the request ownership rule and its consequence.</li>
+  <li>Write a read callback that completes immediately or parks the request.</li>
+  <li>Retrieve and complete a request from a DPC.</li>
+  <li>Use the cancellable protocol correctly, including both return codes.</li>
+  <li>Explain what <code>EvtIoStop</code> prevents and when it is required.</li>
+  <li>Keep per-handle state and say what the framework does on cleanup.</li>
+  <li>Diagnose stuck requests with <code>!wdfdevicequeues</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

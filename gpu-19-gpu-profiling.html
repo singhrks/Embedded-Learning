@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Profiling and debugging a GPU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Profiling and debugging a GPU</h1>
+<p class="lead">You cannot step through a shader with a breakpoint, and the thing you want to time runs
+asynchronously on another processor. GPU debugging is therefore a different discipline: capture a frame,
+inspect state, and measure with the right counter — in that order.</p>
+
+<h2 id="first">Find the bottleneck before optimising</h2>
+
+<pre class="diagram">   FOUR THINGS CAN LIMIT A FRAME. Optimising the wrong one
+   changes nothing, and this is the most common wasted week in
+   graphics work.
+
+   1. CPU-BOUND
+        GPU idle, waiting for commands.
+        SIGN: GPU busy % well below 100. Frame time tracks CPU
+              time.
+        FIX: fewer draw calls, instancing, multi-threaded
+             recording, fewer PSO switches.
+
+   2. GEOMETRY / VERTEX BOUND
+        SIGN: frame time scales with triangle count; the
+              vertex shader dominates.
+        FIX: LODs, better culling, fewer vertices. On mobile
+             this hits far sooner (chapter 10).
+
+   3. PIXEL / FILL BOUND
+        SIGN: frame time scales with RESOLUTION. Halve the
+              render resolution and it nearly halves.
+        FIX: reduce overdraw, cheaper pixel shaders, smaller
+             render targets, better early-Z.
+
+   4. BANDWIDTH BOUND
+        SIGN: frame time does NOT change when you simplify the
+              shader, but DOES when you shrink texture formats
+              or render-target sizes.
+        FIX: compression, fewer/smaller targets, tighter
+             formats, better locality.
+
+   THE TWO-MINUTE TEST THAT IDENTIFIES ALL FOUR
+
+     halve the resolution   -> much faster? PIXEL or BANDWIDTH
+     replace the pixel
+       shader with
+       return float4(1,0,0,1)  -> much faster? PIXEL
+                               -> no change?   BANDWIDTH or
+                                               GEOMETRY
+     draw half the objects  -> much faster? CPU or GEOMETRY
+     do the same draws but
+       with an empty
+       command list         -> still slow? CPU-BOUND
+
+   Do this before opening a profiler. It takes minutes and it
+   stops you optimising the wrong thing.</pre>
+
+<h2 id="tools">The tools</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>For</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>PIX on Windows</strong></td><td>DX12 frame capture and timing</td><td>The primary DX12 tool.
+Timing captures need hardware counters enabled</td></tr>
+<tr><td><strong>RenderDoc</strong></td><td>Frame capture, state inspection, shader debugging</td><td>Free,
+cross-API, cross-platform. Best for <em>correctness</em>; deliberately not a timing tool</td></tr>
+<tr><td><strong>Nsight Graphics</strong></td><td>NVIDIA: deep pipeline analysis</td><td>Tells you which unit
+is the limiter, per draw</td></tr>
+<tr><td><strong>Nsight Compute</strong></td><td>NVIDIA: CUDA and compute kernels</td><td>Occupancy,
+divergence, memory efficiency, source attribution</td></tr>
+<tr><td><strong>Radeon GPU Profiler</strong></td><td>AMD: wave occupancy timeline</td><td>Shows async compute
+overlap better than anything else</td></tr>
+<tr><td><strong>Arm/Mali Streamline</strong>, <strong>Adreno GPA</strong>, <strong>Xcode GPU
+debugger</strong></td><td>Mobile</td><td>The only way to see tiler-specific costs</td></tr>
+<tr><td><strong>Timestamp queries</strong></td><td>Your own in-engine timings</td><td>Always ship these — they
+work on user machines where no tool is installed</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>RenderDoc for "why is it wrong", PIX for "why is it slow"</b>
+<p>RenderDoc lets you click a draw, see every bound resource, step through a pixel shader for a chosen pixel,
+and view the history of every write to that pixel. That is the fastest way to answer a correctness question.
+PIX and the vendor tools have the hardware counters that answer performance questions. Using the wrong one
+wastes an afternoon.</p>
+</div>
+
+<h2 id="timestamps">Timing it yourself</h2>
+
+<pre><code>/* GPU timestamps: the GPU writes a counter into a buffer at
+   points you choose. You read them back a few frames later -
+   never immediately, or you stall (chapter 16). */
+
+D3D12_QUERY_HEAP_DESC qd = {};
+qd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+qd.Count = 64;                    /* 32 pairs */
+device-&gt;CreateQueryHeap(&amp;qd, IID_PPV_ARGS(&amp;queryHeap));
+
+/* Results land in a READBACK buffer. */
+CreateBuffer(D3D12_HEAP_TYPE_READBACK, 64 * sizeof(UINT64),
+             &amp;readback);
+
+/* The frequency is per-QUEUE and can change with clocks - ask
+   each frame, do not cache it once. */
+UINT64 freq = 0;
+queue-&gt;GetTimestampFrequency(&amp;freq);
+
+/* --- recording --- */
+cmd-&gt;EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    /* EndQuery, even for the "begin" - a timestamp is a point,
+       not a range. Confusing, and it catches everyone once. */
+    DrawShadowPass(cmd);
+cmd-&gt;EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+cmd-&gt;ResolveQueryData(queryHeap.Get(),
+                      D3D12_QUERY_TYPE_TIMESTAMP,
+                      0, 2, readback.Get(), 0);
+
+/* --- reading, N frames later --- */
+UINT64 *ts = nullptr;
+D3D12_RANGE r = { 0, 2 * sizeof(UINT64) };
+readback-&gt;Map(0, &amp;r, (void **)&amp;ts);
+double ms = double(ts[1] - ts[0]) / double(freq) * 1000.0;
+readback-&gt;Unmap(0, nullptr);
+
+/* CAVEATS THAT MAKE NAIVE TIMINGS LIE
+
+   1. The GPU pipelines aggressively. Two adjacent "passes"
+      may overlap, so their measured times sum to more than
+      the frame. Timestamps measure WHEN, not HOW LONG.
+
+   2. Clocks vary. A GPU idling at 300 MHz and boosting to
+      2.5 GHz gives you an 8x spread on the same work. Lock
+      the clocks when benchmarking:
+        nvidia-smi -lgc 1500,1500
+        or use the tool's "stable power state" option.
+
+   3. The first frame after a PSO change includes the
+      compile. Discard the first several frames, always.
+
+   4. Vsync makes everything look like 16.67 ms. Turn it off
+      to measure.                                            */</code></pre>
+
+<h2 id="shaderdebug">Debugging a shader</h2>
+
+<pre><code>/* You cannot printf from a shader. Four techniques, roughly
+   in order of how often they are the right one. */
+
+/* 1. OUTPUT THE VALUE AS COLOUR. Crude, immediate, and it
+      answers most questions. */
+        return float4(frac(worldPos.xyz * 0.1), 1);   /* is my
+                                                         position
+                                                         sane? */
+        return float4(normal * 0.5 + 0.5, 1);         /* normals */
+        return float4(uv, 0, 1);                      /* UVs     */
+        return float4(depth.xxx / 100.0, 1);          /* depth   */
+/* Values outside [0,1] clip to white or black, so scale
+   deliberately - "everything is white" usually means your
+   value is 47, not 0.47. */
+
+/* 2. RENDERDOC PIXEL DEBUGGING. Capture, click the pixel,
+      "Debug this pixel", and step through the shader with all
+      intermediate values shown. This is the closest thing to
+      a real debugger and it is remarkably good. */
+
+/* 3. WRITE TO A UAV and read it back. The GPU's printf. */
+        RWStructuredBuffer&lt;float4&gt; Debug : register(u7);
+        if (all(id.xy == uint2(512, 384)))    /* one pixel only */
+                Debug[0] = float4(computedValue, 0, 0, 1);
+/* Guard it to ONE invocation, or thousands of threads race
+   for slot 0 and you learn nothing. */
+
+/* 4. WARP/WAVE INSPECTION in Nsight or PIX: pause a dispatch
+      and inspect live registers per lane. Heavy, but the only
+      way to see divergence directly. */
+
+/* AND THE STRUCTURAL ONE: bisect the shader. Replace the
+   second half with a constant, see if the artefact persists,
+   and halve again. Four iterations localises almost any
+   shader bug, and it needs no tools at all.               */</code></pre>
+
+<div class="warn">
+<b>Timing captures need permission</b>
+<p>PIX and the vendor profilers read hardware performance counters, which are disabled by default because
+they can leak information between processes. On Windows you need <em>Developer Mode</em> plus, for NVIDIA, the
+"allow access to GPU performance counters" setting in the control panel. The symptom is a capture that opens
+with every timing showing zero, which looks like a tool bug and is a permissions problem.</p>
+</div>
+
+<h2 id="markers">Make captures readable</h2>
+
+<pre><code>/* An unmarked capture is 4,000 anonymous draws. Ten minutes
+   of markers turns it into a readable frame. */
+
+#include &lt;pix3.h&gt;
+
+PIXBeginEvent(cmd, PIX_COLOR(255,0,0), "Shadow Pass");
+    for (auto &amp;light : lights) {
+        PIXBeginEvent(cmd, PIX_COLOR(255,128,0),
+                      "Light %d", light.id);
+        DrawShadowMap(cmd, light);
+        PIXEndEvent(cmd);
+    }
+PIXEndEvent(cmd);
+
+/* An RAII wrapper so an early return cannot unbalance them: */
+struct GpuScope {
+    ID3D12GraphicsCommandList *c;
+    GpuScope(ID3D12GraphicsCommandList *cl, const char *n,
+             UINT col = PIX_COLOR_DEFAULT) : c(cl)
+    { PIXBeginEvent(c, col, n); }
+    ~GpuScope() { PIXEndEvent(c); }
+};
+#define GPU_SCOPE(cmd, name) GpuScope _s##__LINE__(cmd, name)
+
+/* Plus SetName on every resource and PSO (chapter 12).
+   Together these two habits are the difference between a
+   capture you can read and one you cannot. */
+
+/* Vulkan: vkCmdBeginDebugUtilsLabelEXT
+   Metal:  pushDebugGroup / popDebugGroup
+   All three tools understand all three.                    */</code></pre>
+
+<h2 id="counters">Reading the counters that matter</h2>
+
+<pre><code># NVIDIA, a compute kernel:
+$ ncu --set full -o report ./app
+
+  Speed Of Light
+    Compute (SM) Throughput          18.2%
+    Memory Throughput                91.4%     &lt;-- the limiter
+  Occupancy
+    Achieved Occupancy               24.1%
+    Theoretical Occupancy            50.0%     &lt;-- and a gap
+  Memory Workload Analysis
+    L1 Hit Rate                      12.3%
+    Global Load Efficiency           23.0%     &lt;-- uncoalesced
+
+# Read it top-down: memory-bound, poor coalescing, and only
+# half the theoretical occupancy achieved. Fix the access
+# pattern (chapter 4) before touching anything else.
+
+# The gap between achieved and theoretical occupancy is
+# usually load imbalance or the tail effect (chapter 5).
+
+# AMD:
+$ rgp ./app          # then open in Radeon GPU Profiler
+# The wavefront timeline shows async compute overlap directly.
+
+# Mobile:
+$ Streamline / Adreno GPA - look for tile load/store cost
+# above all else (chapter 10).</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Optimised the shader, no change</td><td>Not pixel-bound — run the four-way test first</td></tr>
+<tr><td>Capture shows all timings as zero</td><td>Performance counters not permitted; enable Developer
+Mode</td></tr>
+<tr><td>Pass timings sum to more than the frame</td><td>Passes overlap; timestamps measure when, not how
+long</td></tr>
+<tr><td>Timings vary 3× run to run</td><td>Clock boost — lock the clocks</td></tr>
+<tr><td>First frame is 50× slower</td><td>PSO compilation; discard warm-up frames</td></tr>
+<tr><td>Everything measures 16.67 ms</td><td>Vsync</td></tr>
+<tr><td>Debug UAV output is garbage</td><td>Every thread writing the same slot — guard to one
+invocation</td></tr>
+<tr><td>Debug colour output is entirely white</td><td>Value outside [0,1]; scale it</td></tr>
+<tr><td>Capture is 4,000 unnamed draws</td><td>No debug markers or resource names</td></tr>
+<tr><td>Achieved occupancy far below theoretical</td><td>Load imbalance or the tail effect</td></tr>
+<tr><td>Frame time doubles when another app opens</td><td>VRAM eviction (<a href="gpu-16-dx12-sync.html">chapter
+16</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four possible bottlenecks and the sign of each.</li>
+  <li>Give the four-step test that identifies the bottleneck without a profiler.</li>
+  <li>Say which tool to reach for on a correctness question and which on a performance one.</li>
+  <li>Explain why timestamps measure when rather than how long.</li>
+  <li>Give three reasons a naive GPU timing lies.</li>
+  <li>Name four ways to debug a shader and when each applies.</li>
+  <li>Explain why a debug UAV write must be guarded to one invocation.</li>
+  <li>Say why a capture might show all timings as zero.</li>
+  <li>Read a Speed-of-Light report and say what to fix first.</li>
+  <li>Explain what a gap between achieved and theoretical occupancy usually means.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

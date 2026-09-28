@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the device-tree platform driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the device-tree platform driver</h1>
+<p class="lead">The second project: a driver bound to a real device-tree node, driving MMIO registers,
+handling an interrupt, and exposing samples through a character device. Built and tested on QEMU against a
+device that actually exists — so everything you learn transfers directly to silicon.</p>
+
+<h2 id="target">The target device</h2>
+
+<p>This project moves from a purely software device to one described by the device tree, with real registers, interrupts and clocks. Start with what the hardware is, because everything in the driver follows from it.</p>
+
+<pre class="diagram">We drive the PL031 real-time clock on QEMU's `virt` machine.
+It is a real ARM PrimeCell, documented in a public TRM, present
+on countless boards - and simple enough to fit in one chapter
+while still having every element that matters:
+
+     memory-mapped registers
+     an interrupt
+     a device-tree binding
+     clocks
+     a userspace interface
+
+  REGISTER MAP (base 0x09010000 on qemu virt):
+
+     0x00  RTCDR    data      - the current count (RO)
+     0x04  RTCMR    match     - fire an interrupt at this value
+     0x08  RTCLR    load      - set the counter
+     0x0C  RTCCR    control   - bit 0: enable
+     0x10  RTCIMSC  interrupt mask set/clear
+     0x14  RTCRIS   raw interrupt status
+     0x18  RTCMIS   masked interrupt status
+     0x1C  RTCICR   interrupt clear (write 1)
+     0xFE0 PeriphID0..3  - 0x31, 0x10, 0x14, 0x00
+     0xFF0 PCellID0..3   - 0x0D, 0xF0, 0x05, 0xB1
+
+  WHAT WE BUILD:  /dev/rtcalarm
+
+     read()   blocks until the alarm fires, then returns the
+              timestamp
+     poll()   wakes on the alarm
+     ioctl    set an alarm N seconds ahead; query state
+     sysfs    current time, alarm time, count of alarms fired
+
+  Linux already has a PL031 driver, so we bind to a DIFFERENT
+  compatible string on a node we add ourselves. That keeps the
+  real driver out of the way and teaches the binding mechanics
+  properly.</pre>
+
+<h2 id="dt">Step 1: the device tree</h2>
+
+<p>Nothing in this project happens until the device tree describes the device, because without a node the kernel never creates a device for your driver to bind to.</p>
+
+<pre><code># Get QEMU's own device tree, add our node, and feed it back.
+
+# 1. dump what QEMU generates:
+    qemu-system-aarch64 -M virt,dumpdtb=virt.dtb \
+        -cpu cortex-a57 -nographic
+    dtc -I dtb -O dts virt.dtb > virt.dts
+
+# 2. find the existing pl031 node in virt.dts:
+    pl031@9010000 {
+        clock-names = "apb_pclk";
+        clocks = &lt;0x8000&gt;;
+        interrupts = &lt;0x00 0x02 0x04&gt;;
+        reg = &lt;0x00 0x9010000 0x00 0x1000&gt;;
+        compatible = "arm,pl031", "arm,primecell";
+    };
+
+# 3. CHANGE the compatible so OUR driver claims it, and add a
+#    custom property to read:
+    pl031@9010000 {
+        clock-names = "apb_pclk";
+        clocks = &lt;0x8000&gt;;
+        interrupts = &lt;0x00 0x02 0x04&gt;;
+        reg = &lt;0x00 0x9010000 0x00 0x1000&gt;;
+        compatible = "hub,rtcalarm";           /* &lt;-- ours */
+        hub,default-alarm-seconds = &lt;5&gt;;       /* &lt;-- custom */
+    };
+
+# 4. rebuild and boot with it:
+    dtc -I dts -O dtb -o virt-mod.dtb virt.dts
+    qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512 \
+      -dtb virt-mod.dtb \
+      -kernel Image -initrd initramfs.cpio.gz \
+      -append "console=ttyAMA0 earlycon rdinit=/init" \
+      -nographic
+
+# 5. confirm the device exists but nothing has claimed it:
+    ls /sys/bus/platform/devices/ | grep 9010000
+    ls -l /sys/bus/platform/devices/9010000.pl031/driver
+      # No such file - no driver bound. Good.
+
+# NOTE the interrupt: <0x00 0x02 0x04> = GIC_SPI 2, level high
+# -> INTID 34 (chapter 16's off-by-32). You will see it in
+# /proc/interrupts as hwirq 34.</code></pre>
+
+<h2 id="driver">Step 2: the driver</h2>
+
+<p>The driver follows the standard platform-driver skeleton from chapter 21, with the device-specific parts filled in. Notice how little of it is unique to this device — that repetition is the point.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * rtcalarm - a teaching platform driver for the PL031.
+ *
+ * Locking: d-&gt;lock (spinlock, irqsave) protects alarm_set,
+ * alarm_time, fired and the counters. Taken from both process
+ * context and the interrupt handler, hence irqsave.
+ */
+
+#include &lt;linux/bitops.h&gt;
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/miscdevice.h&gt;
+#include &lt;linux/mod_devicetable.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/poll.h&gt;
+#include &lt;linux/property.h&gt;
+#include &lt;linux/uaccess.h&gt;
+
+#include "rtcalarm.h"
+
+#define RTC_DR          0x00
+#define RTC_MR          0x04
+#define RTC_LR          0x08
+#define RTC_CR          0x0c
+#define  RTC_CR_EN      BIT(0)
+#define RTC_IMSC        0x10
+#define RTC_RIS         0x14
+#define RTC_MIS         0x18
+#define RTC_ICR         0x1c
+#define RTC_PERIPH_ID0  0xfe0
+
+#define PL031_PERIPH_ID0  0x31
+
+struct rtcalarm {
+        struct device      *dev;
+        void __iomem       *base;
+        struct clk         *clk;
+        int                 irq;
+        struct miscdevice   misc;
+
+        spinlock_t          lock;
+        wait_queue_head_t   wq;
+
+        u32                 default_alarm_s;
+        u32                 alarm_time;
+        bool                alarm_set;
+        bool                fired;
+        u32                 fired_time;
+        u64                 alarm_count;
+};
+
+static inline u32 ra_rd(struct rtcalarm *d, u32 reg)
+{
+        return readl(d-&gt;base + reg);
+}
+
+static inline void ra_wr(struct rtcalarm *d, u32 reg, u32 val)
+{
+        writel(val, d-&gt;base + reg);
+}
+
+/* ---- interrupt ------------------------------------------ */
+
+static irqreturn_t rtcalarm_isr(int irq, void *dev_id)
+{
+        struct rtcalarm *d = dev_id;
+        unsigned long flags;
+
+        if (!(ra_rd(d, RTC_MIS) &amp; 1))
+                return IRQ_NONE;        /* not ours (ch. 16) */
+
+        ra_wr(d, RTC_ICR, 1);           /* acknowledge FIRST */
+
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        d-&gt;fired      = true;
+        d-&gt;fired_time = ra_rd(d, RTC_DR);
+        d-&gt;alarm_set  = false;
+        d-&gt;alarm_count++;
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+        ra_wr(d, RTC_IMSC, 0);          /* mask until re-armed */
+        wake_up_interruptible(&amp;d-&gt;wq);
+
+        return IRQ_HANDLED;
+}
+
+/* ---- arming --------------------------------------------- */
+
+static int rtcalarm_arm(struct rtcalarm *d, u32 seconds)
+{
+        unsigned long flags;
+        u32 now, target;
+
+        if (seconds == 0 || seconds &gt; 86400)
+                return -EINVAL;
+
+        now = ra_rd(d, RTC_DR);
+        target = now + seconds;
+
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        d-&gt;alarm_time = target;
+        d-&gt;alarm_set  = true;
+        d-&gt;fired      = false;
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+        ra_wr(d, RTC_MR, target);
+        ra_wr(d, RTC_ICR, 1);           /* clear any stale one */
+        ra_wr(d, RTC_IMSC, 1);          /* unmask */
+
+        dev_dbg(d-&gt;dev, "armed: now=%u target=%u (+%us)\n",
+                now, target, seconds);
+        return 0;
+}
+
+static void rtcalarm_disarm(struct rtcalarm *d)
+{
+        unsigned long flags;
+
+        ra_wr(d, RTC_IMSC, 0);
+        ra_wr(d, RTC_ICR, 1);
+
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        d-&gt;alarm_set = false;
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+}
+
+/* ---- file operations ------------------------------------ */
+
+static struct rtcalarm *to_rtcalarm(struct file *file)
+{
+        struct miscdevice *m = file-&gt;private_data;
+
+        return container_of(m, struct rtcalarm, misc);
+}
+
+static ssize_t rtcalarm_read(struct file *file, char __user *ubuf,
+                             size_t count, loff_t *ppos)
+{
+        struct rtcalarm *d = to_rtcalarm(file);
+        struct ra_event ev;
+        unsigned long flags;
+        int ret;
+
+        if (count &lt; sizeof(ev))
+                return -EINVAL;
+
+        if (file-&gt;f_flags &amp; O_NONBLOCK) {
+                if (!READ_ONCE(d-&gt;fired))
+                        return -EAGAIN;
+        } else {
+                ret = wait_event_interruptible(d-&gt;wq, d-&gt;fired);
+                if (ret)
+                        return -ERESTARTSYS;
+        }
+
+        memset(&amp;ev, 0, sizeof(ev));
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        ev.timestamp = d-&gt;fired_time;
+        ev.count     = d-&gt;alarm_count;
+        d-&gt;fired     = false;           /* consume it */
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+        if (copy_to_user(ubuf, &amp;ev, sizeof(ev)))
+                return -EFAULT;
+
+        return sizeof(ev);
+}
+
+static __poll_t rtcalarm_poll(struct file *file, poll_table *wait)
+{
+        struct rtcalarm *d = to_rtcalarm(file);
+        __poll_t mask = 0;
+
+        poll_wait(file, &amp;d-&gt;wq, wait);
+
+        if (READ_ONCE(d-&gt;fired))
+                mask |= EPOLLIN | EPOLLRDNORM;
+
+        return mask;
+}
+
+static long rtcalarm_ioctl(struct file *file, unsigned int cmd,
+                           unsigned long arg)
+{
+        struct rtcalarm *d = to_rtcalarm(file);
+        void __user *uarg = (void __user *)arg;
+        struct ra_state st;
+        unsigned long flags;
+        u32 seconds;
+
+        switch (cmd) {
+        case RA_SET_ALARM:
+                if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                        return -EBADF;
+                if (copy_from_user(&amp;seconds, uarg, sizeof(seconds)))
+                        return -EFAULT;
+                return rtcalarm_arm(d, seconds);
+
+        case RA_CANCEL_ALARM:
+                if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                        return -EBADF;
+                rtcalarm_disarm(d);
+                return 0;
+
+        case RA_GET_STATE:
+                memset(&amp;st, 0, sizeof(st));
+                st.now = ra_rd(d, RTC_DR);
+
+                spin_lock_irqsave(&amp;d-&gt;lock, flags);
+                st.alarm_time  = d-&gt;alarm_time;
+                st.alarm_set   = d-&gt;alarm_set;
+                st.fired       = d-&gt;fired;
+                st.alarm_count = d-&gt;alarm_count;
+                spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+                if (copy_to_user(uarg, &amp;st, sizeof(st)))
+                        return -EFAULT;
+                return 0;
+
+        default:
+                return -ENOTTY;
+        }
+}
+
+static const struct file_operations rtcalarm_fops = {
+        .owner          = THIS_MODULE,
+        .read           = rtcalarm_read,
+        .poll           = rtcalarm_poll,
+        .unlocked_ioctl = rtcalarm_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,
+        .llseek         = no_llseek,
+};
+
+/* ---- sysfs ---------------------------------------------- */
+
+static ssize_t now_show(struct device *dev,
+                        struct device_attribute *attr, char *buf)
+{
+        struct rtcalarm *d = dev_get_drvdata(dev);
+
+        return sysfs_emit(buf, "%u\n", ra_rd(d, RTC_DR));
+}
+static DEVICE_ATTR_RO(now);
+
+static ssize_t alarm_count_show(struct device *dev,
+                                struct device_attribute *attr,
+                                char *buf)
+{
+        struct rtcalarm *d = dev_get_drvdata(dev);
+        unsigned long flags;
+        u64 n;
+
+        spin_lock_irqsave(&amp;d-&gt;lock, flags);
+        n = d-&gt;alarm_count;
+        spin_unlock_irqrestore(&amp;d-&gt;lock, flags);
+
+        return sysfs_emit(buf, "%llu\n", n);
+}
+static DEVICE_ATTR_RO(alarm_count);
+
+static ssize_t alarm_in_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+        struct rtcalarm *d = dev_get_drvdata(dev);
+        unsigned int seconds;
+        int ret;
+
+        ret = kstrtouint(buf, 0, &amp;seconds);
+        if (ret)
+                return ret;
+
+        ret = rtcalarm_arm(d, seconds);
+        if (ret)
+                return ret;
+
+        return count;           /* chapter 25 */
+}
+static DEVICE_ATTR_WO(alarm_in);
+
+static struct attribute *rtcalarm_attrs[] = {
+        &amp;dev_attr_now.attr,
+        &amp;dev_attr_alarm_count.attr,
+        &amp;dev_attr_alarm_in.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(rtcalarm);
+
+/* ---- probe ---------------------------------------------- */
+
+static int rtcalarm_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct rtcalarm *d;
+        u32 id;
+        int ret;
+
+        d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        d-&gt;dev = dev;
+        spin_lock_init(&amp;d-&gt;lock);
+        init_waitqueue_head(&amp;d-&gt;wq);
+
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(d-&gt;base))
+                return PTR_ERR(d-&gt;base);
+
+        d-&gt;clk = devm_clk_get_enabled(dev, "apb_pclk");
+        if (IS_ERR(d-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;clk),
+                                     "no apb_pclk\n");
+
+        /* IDENTITY CHECK - catches a wrong address, an
+           unclocked block or a denied access, at probe time
+           rather than as mysterious behaviour later
+           (chapter 21)                                      */
+        id = ra_rd(d, RTC_PERIPH_ID0) &amp; 0xff;
+        if (id != PL031_PERIPH_ID0) {
+                dev_err(dev, "unexpected periph id 0x%02x\n", id);
+                return -ENODEV;
+        }
+
+        ret = device_property_read_u32(dev,
+                        "hub,default-alarm-seconds",
+                        &amp;d-&gt;default_alarm_s);
+        if (ret)
+                d-&gt;default_alarm_s = 10;    /* a sane default */
+
+        /* quiesce before requesting the interrupt */
+        ra_wr(d, RTC_IMSC, 0);
+        ra_wr(d, RTC_ICR, 1);
+        ra_wr(d, RTC_CR, RTC_CR_EN);
+
+        d-&gt;irq = platform_get_irq(pdev, 0);
+        if (d-&gt;irq &lt; 0)
+                return d-&gt;irq;
+
+        ret = devm_request_irq(dev, d-&gt;irq, rtcalarm_isr,
+                               IRQF_SHARED, dev_name(dev), d);
+        if (ret)
+                return dev_err_probe(dev, ret, "irq %d\n", d-&gt;irq);
+
+        platform_set_drvdata(pdev, d);
+
+        /* userspace interface LAST (chapter 19) */
+        d-&gt;misc.minor  = MISC_DYNAMIC_MINOR;
+        d-&gt;misc.name   = "rtcalarm";
+        d-&gt;misc.fops   = &amp;rtcalarm_fops;
+        d-&gt;misc.parent = dev;
+
+        ret = misc_register(&amp;d-&gt;misc);
+        if (ret)
+                return ret;
+
+        dev_info(dev, "ready: count=%u default alarm %us\n",
+                 ra_rd(d, RTC_DR), d-&gt;default_alarm_s);
+        return 0;
+}
+
+static void rtcalarm_remove(struct platform_device *pdev)
+{
+        struct rtcalarm *d = platform_get_drvdata(pdev);
+
+        /* exact reverse of probe (chapter 21) */
+        misc_deregister(&amp;d-&gt;misc);     /* no new users */
+        ra_wr(d, RTC_IMSC, 0);         /* stop interrupts
+                                          BEFORE devm frees
+                                          the handler       */
+        ra_wr(d, RTC_ICR, 1);
+        /* devm releases the irq, the clock and the mapping */
+}
+
+/* ---- power management (chapter 32) ---------------------- */
+
+static int rtcalarm_suspend(struct device *dev)
+{
+        struct rtcalarm *d = dev_get_drvdata(dev);
+
+        if (d-&gt;alarm_set &amp;&amp; device_may_wakeup(dev))
+                enable_irq_wake(d-&gt;irq);
+        return 0;
+}
+
+static int rtcalarm_resume(struct device *dev)
+{
+        struct rtcalarm *d = dev_get_drvdata(dev);
+
+        if (device_may_wakeup(dev))
+                disable_irq_wake(d-&gt;irq);
+        return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(rtcalarm_pm_ops,
+                                rtcalarm_suspend, rtcalarm_resume);
+
+/* ---- match ---------------------------------------------- */
+
+static const struct of_device_id rtcalarm_of_match[] = {
+        { .compatible = "hub,rtcalarm" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, rtcalarm_of_match);
+
+static struct platform_driver rtcalarm_driver = {
+        .driver = {
+                .name           = "rtcalarm",
+                .of_match_table = rtcalarm_of_match,
+                .dev_groups     = rtcalarm_groups,
+                .pm             = pm_ptr(&amp;rtcalarm_pm_ops),
+        },
+        .probe  = rtcalarm_probe,
+        .remove = rtcalarm_remove,
+};
+module_platform_driver(rtcalarm_driver);
+
+MODULE_DESCRIPTION("Teaching PL031 alarm platform driver");
+MODULE_AUTHOR("Embedded Learning Hub");
+MODULE_LICENSE("GPL");</code></pre>
+
+<h2 id="uapi">rtcalarm.h</h2>
+
+<p>Again, the interface comes first and separately, in a header both the kernel and user space include so the two definitions cannot drift apart.</p>
+
+<pre><code>/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _UAPI_RTCALARM_H
+#define _UAPI_RTCALARM_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/ioctl.h&gt;
+
+struct ra_event {
+        __u32 timestamp;
+        __u32 _pad;
+        __u64 count;
+};
+
+struct ra_state {
+        __u32 now;
+        __u32 alarm_time;
+        __u8  alarm_set;
+        __u8  fired;
+        __u8  _pad[6];
+        __u64 alarm_count;
+        __u32 reserved[4];
+};
+
+#define RA_IOC_MAGIC     'A'
+#define RA_SET_ALARM     _IOW(RA_IOC_MAGIC, 1, __u32)
+#define RA_CANCEL_ALARM  _IO (RA_IOC_MAGIC, 2)
+#define RA_GET_STATE     _IOR(RA_IOC_MAGIC, 3, struct ra_state)
+
+#endif</code></pre>
+
+<h2 id="run">Step 3: run it</h2>
+
+<p>Now confirm the kernel actually bound the driver to the device. If this step fails, the problem is almost always the device tree rather than the driver code.</p>
+
+<pre><code># Build for the target, install into the initramfs, and boot
+# with the modified DTB from step 1.
+
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+         -C $KDIR M=$PWD modules
+
+# In the guest:
+    insmod rtcalarm.ko
+    dmesg | tail -1
+      rtcalarm 9010000.pl031: ready: count=1718000000 \
+               default alarm 5s
+
+# It bound - confirm through the device model (chapter 19):
+    ls -l /sys/bus/platform/devices/9010000.pl031/driver
+      -&gt; ../../../bus/platform/drivers/rtcalarm
+
+    ls /sys/bus/platform/devices/9010000.pl031/
+      alarm_count  alarm_in  now  driver  of_node  ...
+
+# Drive it entirely from the shell:
+    cat /sys/bus/platform/devices/9010000.pl031/now
+      1718000042
+    echo 3 > /sys/bus/platform/devices/9010000.pl031/alarm_in
+    sleep 4
+    cat /sys/bus/platform/devices/9010000.pl031/alarm_count
+      1
+
+# Watch the interrupt actually arrive (chapter 16):
+    grep rtcalarm /proc/interrupts
+     34:   1   0   0   0  GICv3  34 Level  9010000.pl031
+           ^ it fired once, on CPU0, hwirq 34
+
+# Blocking read:
+    cat /dev/rtcalarm | hexdump -C &amp;
+    echo 2 > /sys/bus/platform/devices/9010000.pl031/alarm_in
+    # two seconds later, 16 bytes appear
+
+# Unbind and rebind - exercises probe and remove (ch. 19):
+    echo 9010000.pl031 > /sys/bus/platform/drivers/rtcalarm/unbind
+    echo 9010000.pl031 > /sys/bus/platform/drivers/rtcalarm/bind</code></pre>
+
+<h2 id="client">The userspace client</h2>
+
+<p>The client program is what proves the interface works from the outside, and doubles as the example anyone else would copy when using your device.</p>
+
+<pre><code>/* ratest.c */
+#include &lt;fcntl.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;unistd.h&gt;
+#include "rtcalarm.h"
+
+int main(int argc, char **argv)
+{
+        unsigned int seconds = (argc &gt; 1) ? atoi(argv[1]) : 3;
+        struct ra_state st;
+        struct ra_event ev;
+        struct pollfd pfd;
+        int fd;
+
+        fd = open("/dev/rtcalarm", O_RDWR);
+        if (fd &lt; 0) { perror("open"); return 1; }
+
+        if (ioctl(fd, RA_GET_STATE, &amp;st) &lt; 0) {
+                perror("RA_GET_STATE");
+                return 1;
+        }
+        printf("now=%u fired=%u count=%llu\n", st.now, st.fired,
+               (unsigned long long)st.alarm_count);
+
+        if (ioctl(fd, RA_SET_ALARM, &amp;seconds) &lt; 0) {
+                perror("RA_SET_ALARM");
+                return 1;
+        }
+        printf("armed for %u seconds; waiting...\n", seconds);
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        if (poll(&amp;pfd, 1, (seconds + 5) * 1000) &lt;= 0) {
+                fprintf(stderr, "timed out - did the interrupt fire?\n");
+                return 1;
+        }
+
+        if (read(fd, &amp;ev, sizeof(ev)) != sizeof(ev)) {
+                perror("read");
+                return 1;
+        }
+        printf("ALARM at %u (alarm #%llu)\n", ev.timestamp,
+               (unsigned long long)ev.count);
+
+        close(fd);
+        return 0;
+}</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="key">
+<b>Break it deliberately, then diagnose from the symptom alone</b>
+<ol>
+<li><strong>Wrong compatible.</strong> Change it to <code>"hub,rtcalarm2"</code> in the driver only. Load
+it. Confirm probe never runs and the device has no <code>driver</code> link
+(<a href="lx-17-device-model.html">ch. 19</a>).</li>
+<li><strong>Wrong address.</strong> Change the <code>reg</code> in the DTS to <code>0x09011000</code>. The
+ID check fires — read the error and understand why an ID check is worth the five lines.</li>
+<li><strong>Remove the clock.</strong> Delete the <code>clocks</code> property. Observe
+<code>-EPROBE_DEFER</code> or a clean failure, and check
+<code>/sys/kernel/debug/devices_deferred</code>.</li>
+<li><strong>Forget the acknowledge.</strong> Delete <code>ra_wr(d, RTC_ICR, 1)</code> from the ISR. Arm an
+alarm. Watch the interrupt storm and the kernel's <code>nobody cared</code> protection
+(<a href="lx-14-interrupts.html">ch. 16</a>).</li>
+<li><strong>Return <code>IRQ_HANDLED</code> unconditionally</strong>, dropping the <code>MIS</code> check.
+Nothing breaks here — then explain why it would on a genuinely shared line.</li>
+<li><strong>Break the teardown order.</strong> Move <code>misc_deregister</code> to the end of
+<code>remove</code>. Hold an fd open, unbind, and use it.</li>
+<li><strong>Leave interrupts enabled in remove.</strong> Unbind with an alarm armed. Watch what happens
+when it fires against a freed handler — with KASAN on, you get a report
+(<a href="lx-27-debugging.html">ch. 34</a>).</li>
+<li><strong>Drop the lock</strong> in the ISR and in <code>read</code>. Arm alarms in a tight loop from
+several processes and watch <code>alarm_count</code> lose increments.</li>
+<li><strong>Add a feature:</strong> a periodic mode that re-arms automatically in the ISR. Decide whether
+the re-arm belongs in the hard handler or a threaded one, and defend the choice
+(<a href="lx-13-deferred-work.html">ch. 15</a>).</li>
+<li><strong>Add a proper binding.</strong> Write <code>hub,rtcalarm.yaml</code> and validate it with
+<code>make dt_binding_check</code> (<a href="lx-18-device-tree.html">ch. 20</a>).</li>
+<li><strong>Convert to regmap</strong> (<a href="lx-23-mmio-regmap.html">ch. 26</a>), marking
+<code>RTC_DR</code>, <code>RTC_RIS</code> and <code>RTC_MIS</code> volatile and <code>RTC_ICR</code>
+appropriately. Then enable the regmap trace events and watch every access.</li>
+<li><strong>Add runtime PM</strong> (<a href="lx-25-power-management.html">ch. 32</a>): suspend the block
+when no alarm is armed, resume on arm. Verify with <code>runtime_status</code>.</li>
+</ol>
+</div>
+
+<h2 id="review">The review pass</h2>
+
+<p>The same discipline as the previous project: read what you wrote against the checklist before deciding it is done.</p>
+
+<pre><code># Before you call it done:
+
+    make check                          # checkpatch
+    make C=1 M=$PWD                     # sparse
+
+# probe/remove cycles under KASAN:
+    for i in $(seq 100); do
+      echo 9010000.pl031 > /sys/bus/platform/drivers/rtcalarm/unbind
+      echo 9010000.pl031 > /sys/bus/platform/drivers/rtcalarm/bind
+    done
+    dmesg | grep -i -e kasan -e warn -e bug
+
+# no leaked resources after unbind:
+    grep 9010000 /proc/iomem              # should be gone
+    grep rtcalarm /proc/interrupts        # should be gone
+
+# module load/unload cycles:
+    for i in $(seq 100); do
+      insmod rtcalarm.ko &amp;&amp; rmmod rtcalarm || break
+    done
+
+# fault injection on probe:
+    echo 20 > /sys/kernel/debug/failslab/probability
+    # then bind repeatedly - no crashes, clean failures only
+
+# the interrupt really fires, every time:
+    for i in $(seq 20); do ./ratest 1; done</code></pre>
+
+<h2 id="transfer">What transfers to real hardware</h2>
+
+<p>Everything structural. Swap the PL031 for your SoC's block and the changes are: a different register map,
+a different compatible string, more clocks and regulators, and probably DMA
+(<a href="lx-24-dma-api.html">chapter 30</a>) instead of a single interrupt. The probe order, the teardown
+order, the locking discipline, the ioctl ABI rules, the sysfs conventions and the review checklist are
+identical.</p>
+
+<p>That is the argument for building this on QEMU first: the parts you get wrong on real silicon are almost
+never the hardware parts. They are the ordering, the concurrency and the error paths — and you can practise
+all three without owning a board.</p>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Modify a device tree, rebuild it, and boot QEMU with your node.</li>
+  <li>Explain how the <code>compatible</code> string binds your driver to that node.</li>
+  <li>Justify the order of every step in probe and remove.</li>
+  <li>Explain why the ID check belongs in probe and what three problems it catches.</li>
+  <li>Explain why the ISR acknowledges before doing anything else.</li>
+  <li>Say why <code>IRQF_SHARED</code> requires the <code>MIS</code> check.</li>
+  <li>Read a custom DT property with a sensible fallback.</li>
+  <li>Drive the device entirely from the shell via sysfs.</li>
+  <li>Confirm the interrupt fires by reading <code>/proc/interrupts</code>.</li>
+  <li>Complete exercises 1 through 8 and describe each symptom.</li>
+  <li>Complete at least one of exercises 9 through 12.</li>
+  <li>Pass the whole review with no findings.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Branch prediction and speculation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Branch prediction and speculation</h1>
+<p class="lead">A modern processor guesses. It guesses which way branches go, executes hundreds of
+instructions past the guess, and throws the work away when wrong. This is why sorted data can be faster than
+unsorted, and it is the mechanism behind Spectre.</p>
+
+<h2 id="problem">The problem</h2>
+
+<p><a href="ca-11-pipelining.html">Chapter 11</a> left us with control hazards. A branch's direction is not
+known until several stages after it is fetched, but the front end must fetch <em>something</em> every cycle.</p>
+
+<pre class="diagram">Cost of getting it wrong, by design depth
+
+  pipeline    branch resolved at    flush penalty
+  ─────────────────────────────────────────────────
+  5-stage     stage 3               ~2 cycles
+  10-stage    stage 7               ~7 cycles
+  15-stage    stage 11              ~15 cycles
+  Pentium 4   stage ~20             ~30 cycles
+
+Branches are ~15-25% of instructions in typical code.
+
+  With a 15-cycle penalty and NO prediction:
+      CPI = 1 + 0.20 × 15 = 4.0
+  With 95% prediction accuracy:
+      CPI = 1 + 0.20 × 0.05 × 15 = 1.15
+
+Prediction is not an optimisation. Without it, deep pipelines are
+pointless — you would spend all your speed on flushes.</pre>
+
+<h2 id="static">Static prediction</h2>
+
+<p>The cheapest approach: decide from the instruction alone, with no history.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Heuristic</th><th>Rationale</th><th>Accuracy</th></tr></thead>
+<tbody>
+<tr><td>Always not-taken</td><td>Simplest; just keep fetching sequentially</td><td>~40%</td></tr>
+<tr><td>Always taken</td><td>Most branches in loops are taken</td><td>~60%</td></tr>
+<tr><td><strong>Backward taken, forward not-taken</strong></td><td>A backward branch is almost always a loop; a forward branch is usually an error path</td><td>~70%</td></tr>
+<tr><td>Compiler hint</td><td>Profile-guided, encoded in the instruction or in layout</td><td>~80%</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Linux and GCC let you supply the hint explicitly */
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+if (unlikely(ptr == NULL))          /* error path: moved out of line     */
+        return -EINVAL;             /* so the fall-through is the common */
+                                    /* case and stays in the I-cache     */
+
+/* what this actually does: the compiler reorders basic blocks so the
+   likely path is contiguous. On modern cores the dynamic predictor
+   outperforms the hint within a few iterations — the real benefit is
+   INSTRUCTION CACHE LAYOUT, not the prediction itself. */</code></pre>
+
+<div class="note">
+<b>Where hints still genuinely matter</b>
+<p>On a small in-order core (Cortex-M, Cortex-A53) with a weak or absent dynamic predictor, and on the very
+first execution of any branch before history exists. In hot loops on a big core, remove them — they add
+noise and the hardware already knows better. Profile before adding one.</p>
+</div>
+
+<h2 id="dynamic">Dynamic prediction</h2>
+
+<h3>One-bit predictor</h3>
+
+<p>Remember what the branch did last time. Keep a table of bits indexed by branch address.</p>
+
+<pre class="diagram">   predict = last outcome
+
+   for (i = 0; i &lt; 10; i++) { ... }
+
+   iterations:  T T T T T T T T T N       (N = the final exit)
+   prediction:  ? T T T T T T T T T
+   correct:     ✗ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✗
+
+   Two mispredicts per loop execution: the exit, and then the first
+   iteration of the NEXT execution, because the table now says "not taken".
+
+   For a nested loop run many times, that doubling is significant.</pre>
+
+<h3>Two-bit saturating counter</h3>
+
+<p>Require two consecutive surprises before changing the prediction. This is the fundamental unit of nearly
+every real predictor.</p>
+
+<pre class="diagram">           taken            taken            taken
+    ┌──────────────►┌──────────────►┌──────────────►┐
+  ┌─┴──┐         ┌──┴─┐         ┌───┴┐         ┌────┴┐
+  │ 00 │         │ 01 │         │ 10 │         │ 11  │
+  │ SN │◄────────│ WN │◄────────│ WT │◄────────│ ST  │
+  └────┘  n-taken└────┘ n-taken └────┘ n-taken └─────┘
+  strongly       weakly          weakly         strongly
+  NOT taken      NOT taken       TAKEN          TAKEN
+
+  predict TAKEN if the high bit is 1.
+
+  Same loop:  T T T T T T T T T N
+  now the single N moves ST → WT, still predicting taken.
+  Next execution starts correct. ONE mispredict per loop, not two.</pre>
+
+<h3>Correlating and tournament predictors</h3>
+
+<p>Two-bit counters cannot capture patterns. Real code has branches that depend on other branches:</p>
+
+<pre><code>if (x &lt; 5)  a = 1;      /* branch A */
+if (y &lt; 3)  b = 1;      /* branch B */
+if (a &amp;&amp; b) c = 1;      /* branch C — fully determined by A and B */</code></pre>
+
+<p>A <strong>global history register</strong> shifts in the outcome of every branch, forming a pattern.
+Indexing the counter table by (branch address XOR global history) lets the predictor learn "when the last
+few branches went TNT, this one is taken".</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Predictor</th><th>Idea</th><th>Typical accuracy</th></tr></thead>
+<tbody>
+<tr><td>2-bit bimodal</td><td>Counter per branch address</td><td>~85%</td></tr>
+<tr><td>gshare</td><td>Index by address XOR global history</td><td>~93%</td></tr>
+<tr><td>Tournament</td><td>Run a local and a global predictor, plus a meta-predictor that learns which to trust per branch</td><td>~95%</td></tr>
+<tr><td>TAGE</td><td>Several tables with different history lengths; the longest matching one wins</td><td>~97–99%</td></tr>
+<tr><td>Perceptron / neural</td><td>A weighted sum over a long history vector</td><td>~97–99%</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Modern cores use TAGE or perceptron variants with thousands of entries and history lengths in the
+hundreds. The predictor can be several percent of core area — it is that valuable.</p>
+
+<h2 id="target">Predicting the target, not just the direction</h2>
+
+<p>Knowing a branch is taken is useless without knowing <em>where</em>. Three structures handle this:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Structure</th><th>Handles</th><th>How</th></tr></thead>
+<tbody>
+<tr><td><strong>BTB</strong> — branch target buffer</td><td>Direct branches</td><td>Cache mapping branch address → last target. Available during fetch, before decode.</td></tr>
+<tr><td><strong>Indirect predictor</strong></td><td><code>BR Xn</code> — virtual calls, switch tables, function pointers</td><td>History-indexed target table; harder, since the target varies</td></tr>
+<tr><td><strong>RAS</strong> — return address stack</td><td><code>RET</code></td><td>A hardware stack: <code>BL</code> pushes, <code>RET</code> pops. Near-perfect, because calls and returns nest.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Two ways software breaks the return address stack</b>
+<p>The RAS assumes calls and returns are balanced. Break that assumption and you lose a near-100% predictor:</p>
+<ul>
+<li><strong>Unbalanced call/return.</strong> <code>setjmp</code>/<code>longjmp</code>, C++ exception unwinding,
+coroutine switches and hand-written context switches all return to somewhere the RAS did not predict. The
+stack stays misaligned for several subsequent returns, so the cost is more than one mispredict.</li>
+<li><strong>Using <code>BL</code> as a plain jump</strong>, or <code>RET</code> as an indirect branch. Some
+hand-written assembly does this to save an instruction; it corrupts the RAS. ARM added <code>BLR</code>
+target hints and <code>RETAA</code> partly to keep these paths honest.</li>
+</ul>
+</div>
+
+<h2 id="speculation">Speculation: acting on the guess</h2>
+
+<p>Prediction only helps if the processor <em>proceeds</em> on it. Modern cores execute far past unresolved
+branches, and beyond that, speculate on more than branch direction:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Kind</th><th>Guess</th><th>Recovery when wrong</th></tr></thead>
+<tbody>
+<tr><td>Control speculation</td><td>Which way a branch goes</td><td>Flush and refetch</td></tr>
+<tr><td>Memory dependence speculation</td><td>That a load does not alias an earlier pending store</td><td>Replay the load and everything after it</td></tr>
+<tr><td>Value prediction</td><td>The result of a long-latency operation</td><td>Rare in shipping designs</td></tr>
+<tr><td>Prefetch speculation</td><td>Which cache lines will be needed</td><td>No correctness impact — just wasted bandwidth</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">How a core stays correct while guessing
+
+  ┌──────────┐   ┌────────┐   ┌────────────┐   ┌──────────┐
+  │  fetch   │──►│ rename │──►│  execute   │──►│  RETIRE  │
+  │(predicted)│  │        │   │(out of     │   │(in order)│
+  └──────────┘   └────────┘   │  order)    │   └──────────┘
+                              └────────────┘         │
+                                                     ▼
+                                        architectural state updated
+                                        ONLY here, and only in
+                                        program order
+
+  The reorder buffer holds results until retirement. A mispredicted or
+  faulting instruction is discarded before it ever retires, so the
+  ARCHITECTURAL state is always exactly correct.
+
+  But microarchitectural state — caches, TLBs, predictor tables —
+  was already changed and is NOT rolled back.</pre>
+
+<h2 id="spectre">Spectre and Meltdown</h2>
+
+<p>That last line is the whole vulnerability class. Speculation is architecturally invisible and
+microarchitecturally loud.</p>
+
+<pre class="diagram">Spectre variant 1 — bounds check bypass
+
+  if (index &lt; array1_size)          ← attacker trains this to predict TAKEN
+          y = array2[array1[index] * 4096];
+
+  1. Attacker calls the function repeatedly with valid indices.
+     The predictor learns: this branch is taken.
+
+  2. Attacker calls with index far out of bounds, having evicted
+     array1_size from cache so the check is SLOW to resolve.
+
+  3. The core speculates "taken", reads array1[index] — memory it
+     must not read — and uses that secret byte to index array2.
+     A cache line in array2 is loaded, chosen by the secret value.
+
+  4. The check resolves. Speculation is discarded. y is never written.
+     Architecturally, nothing happened.
+
+  5. Attacker times reads across array2. One line is fast.
+     Its index reveals the secret byte.
+
+The bounds check was CORRECT. It was simply evaluated too late.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Variant</th><th>Mechanism</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Spectre v1</td><td>Bounds check bypass</td><td>Index masking + <code>CSDB</code>; Linux's <code>array_index_nospec()</code></td></tr>
+<tr><td>Spectre v2</td><td>Branch target injection — poison the indirect predictor</td><td>Retpolines, <code>BHB</code> flushing, hardware <code>CSV2</code></td></tr>
+<tr><td>Meltdown</td><td>Speculative read across the privilege boundary before the permission check retires</td><td>KPTI: unmap the kernel from user page tables. Most ARM cores were never vulnerable.</td></tr>
+<tr><td>MDS / L1TF</td><td>Leakage from internal buffers</td><td>Microcode buffer flushes on transitions</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* the Linux kernel's Spectre-v1 mitigation, and how to read it */
+if (index &lt; size) {
+        index = array_index_nospec(index, size);
+        /* Expands to a data dependency that forces index to 0 when out
+         * of bounds — a mask computed WITHOUT a branch, so speculation
+         * cannot bypass it. On arm64:
+         *     cmp   x1, x2
+         *     csel  x1, x1, xzr, lo     ; a mux, not a branch
+         *     csdb                      ; speculation barrier
+         */
+        val = array[index];
+}
+
+/* ARM's speculation control instructions */
+    CSDB    // consumption of speculative data barrier
+    SSBB    // speculative store bypass barrier
+    SB      // full speculation barrier (ARMv8.5)</code></pre>
+
+<h2 id="practice">Making your code predictable</h2>
+
+<p>Branch prediction is hardware you cannot program directly, but you can write code that is easy or hard for it to predict — and the difference is often several times the execution speed. These are the patterns that matter in practice.</p>
+
+<pre><code>/* The famous case: this loop is ~6x faster when the data is sorted */
+for (i = 0; i &lt; n; i++)
+        if (data[i] &gt;= 128)
+                sum += data[i];
+
+/* Sorted:   the branch goes one way for a long run — near-perfect prediction.
+   Unsorted: 50/50 random — the predictor cannot do better than chance,
+             and every other iteration costs a full flush.
+
+   The fix that makes sorting irrelevant: remove the branch. */
+
+for (i = 0; i &lt; n; i++) {
+        int mask = -(data[i] &gt;= 128);   /* 0 or -1 (all ones) */
+        sum += data[i] &amp; mask;          /* a MUX, chapter 05  */
+}
+/* compiles to CSEL/CSINC on AArch64 — no branch, constant time */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Guideline</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Prefer predictable branches over clever ones</td><td>A branch taken 99% of the time is nearly free; a 50/50 branch is very expensive</td></tr>
+<tr><td>Hoist unpredictable conditions out of hot loops</td><td>Split the loop into two predictable loops rather than one unpredictable one</td></tr>
+<tr><td>Use branchless selection for random conditions</td><td><code>CSEL</code>, arithmetic masks, <code>min</code>/<code>max</code></td></tr>
+<tr><td>Prefer <code>switch</code> over long <code>else if</code> chains</td><td>A jump table is one indirect branch instead of many conditional ones</td></tr>
+<tr><td>Avoid virtual calls in the hottest loops</td><td>Indirect branches are the hardest to predict; devirtualise or batch by type</td></tr>
+<tr><td>In cryptographic code, never branch on secrets</td><td>Timing and predictor state leak the secret — see <a href="cr-19-side-channels.html">crypto chapter 19</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># measure it
+perf stat -e branches,branch-misses ./program
+#   1,204,000,000  branches
+#      63,000,000  branch-misses   #  5.23% of all branches   ← above ~2% is worth investigating
+
+perf record -e branch-misses ./program &amp;&amp; perf report   # find WHICH branch</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Sorted input is several times faster than unsorted</td><td>Branch predictability, not cache behaviour</td></tr>
+<tr><td>A microbenchmark is far faster than production</td><td>The benchmark's branches are trivially predictable; real inputs are not</td></tr>
+<tr><td>Performance collapses after adding a rare error check</td><td>The branch became unpredictable, or the error path polluted the I-cache</td></tr>
+<tr><td>Indirect calls dominate a profile</td><td>Indirect predictor misses; consider devirtualisation</td></tr>
+<tr><td>A big kernel-upgrade slowdown</td><td>Spectre mitigations: retpolines and barriers cost real cycles</td></tr>
+<tr><td>Cryptographic timing varies with the key</td><td>Secret-dependent branching — a genuine vulnerability</td></tr>
+<tr><td><code>setjmp</code>-heavy code has poor branch statistics</td><td>Return address stack corruption</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute CPI for 20% branches with a 15-cycle penalty at 100%, 90% and 99% accuracy.</li>
+  <li>Draw the two-bit saturating counter and explain why it beats one bit on loops.</li>
+  <li>Explain what a global history register adds that a bimodal predictor cannot capture.</li>
+  <li>Name the three target-prediction structures and which branch type each serves.</li>
+  <li>Give two ways software corrupts the return address stack.</li>
+  <li>Explain Spectre v1 in five steps, and say why the bounds check was not the bug.</li>
+  <li>Rewrite a data-dependent conditional sum as branchless code.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

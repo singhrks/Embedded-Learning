@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loaders, PIE and address space layout | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Loaders, PIE and address space layout</h1>
+<p class="lead">From an executable file to a running process: what the kernel maps, what the dynamic loader
+does before <code>main</code>, and how position-independent code makes address space randomisation possible.
+</p>
+
+<h2 id="exec">What happens on exec</h2>
+
+<pre class="diagram">   execve("./prog", argv, envp)
+        |
+   KERNEL:
+     · parse the ELF header, check the magic and machine
+     · tear down the old address space
+     · MAP the PT_LOAD segments at their requested addresses,
+       with the requested permissions
+     · set up the stack: argv, envp, and the AUXILIARY VECTOR
+     · if there is a PT_INTERP segment, ALSO map the
+       interpreter named in it - normally
+       /lib/ld-linux-aarch64.so.1
+     · set PC to the INTERPRETER's entry point, not the
+       program's
+        |
+   DYNAMIC LOADER (ld.so):
+     · relocate ITSELF first
+     · read DT_NEEDED from the executable: which libraries
+     · find and map each one, recursively
+     · perform RELOCATIONS across all of them
+     · initialise TLS
+     · run each library's initialisers, then the
+       executable's
+     · jump to the executable's entry point
+        |
+   _start  (in crt1.o)
+     · set up the frame, align the stack
+     · call __libc_start_main(main, argc, argv, ...)
+        |
+   __libc_start_main
+     · initialise libc: stdio, locale, the heap
+     · register the atexit handler for destructors
+     · call the .init_array constructors
+     · call main(argc, argv, envp)
+     · call exit(main's return value)
+
+   FOR A STATIC BINARY there is no PT_INTERP, so the kernel
+   jumps straight to _start and the whole loader phase does
+   not exist. That is most of the startup-time difference.
+
+   WATCH IT:  LD_DEBUG=all ./prog 2>&1 | less
+              strace ./prog</pre>
+
+<h2 id="aslr">Position independence and ASLR</h2>
+
+<pre><code>/* THREE KINDS OF BINARY: */
+
+   ET_EXEC       fixed load address, baked into the file.
+                 Cannot be randomised. Historical default.
+
+   ET_DYN + PIE  POSITION INDEPENDENT EXECUTABLE. Can be
+                 loaded anywhere. The default on every modern
+                 distribution.
+
+   ET_DYN        a shared library. Always position
+                 independent.
+
+/* BUILD THEM: */
+        gcc -fPIE -pie prog.c -o prog       ; PIE (default)
+        gcc -fno-pie -no-pie prog.c -o prog ; fixed
+        gcc -fPIC -shared foo.c -o libfoo.so
+
+/* WHY PIE MATTERS: ADDRESS SPACE LAYOUT RANDOMISATION. If the
+   attacker does not know where your code is, return-oriented
+   programming becomes far harder - they cannot construct a
+   chain of gadget addresses without an information leak
+   first.
+
+   WHAT GETS RANDOMISED on Linux:
+        the executable itself   (only if PIE)
+        every shared library
+        the heap (brk)
+        mmap regions
+        the stack
+        vdso
+
+   CHECK:
+        cat /proc/sys/kernel/randomize_va_space
+             0 = off, 1 = partial, 2 = full (the default)
+        cat /proc/self/maps          ; twice - the addresses
+                                     ; differ
+        setarch -R ./prog            ; run with ASLR disabled,
+                                     ; for reproducible
+                                     ; debugging
+
+/* THE COST: PIE code must reach its own globals without
+   absolute addresses. On AArch64 that costs almost nothing -
+   `adrp`+`add` is PC-relative and already the normal idiom
+   (chapter 11). On 32-bit x86 it cost a dedicated register
+   and 5-10% performance, which is why the transition took so
+   long there and was trivial on ARM.                     */</code></pre>
+
+<h2 id="got">The GOT and the PLT</h2>
+
+<pre class="diagram">A call to a function in another shared object cannot be a
+direct branch: the address is unknown until load time, and the
+code page must stay read-only and shared between processes.
+
+  THE SOLUTION: indirection through two tables.
+
+   GOT   Global Offset Table - in .data, WRITABLE. Holds
+         resolved ADDRESSES.
+   PLT   Procedure Linkage Table - in .text, executable. A
+         small stub per external function.
+
+  CALLING printf:
+
+     your code:
+         bl   printf@plt
+
+     printf@plt:                    (in .plt)
+         adrp x16, :got:printf
+         ldr  x17, [x16, :got_lo12:printf]   ; load from GOT
+         br   x17                            ; jump there
+
+     GOT entry for printf:
+         initially -> the PLT resolver stub
+         after the first call -> the real address of printf
+
+  LAZY BINDING: the first call goes to the resolver, which
+  finds printf, WRITES its address into the GOT, and jumps to
+  it. Every later call loads the now-correct address and goes
+  straight there.
+
+  WHY LAZY: a program using 5,000 library functions but
+  calling 200 of them resolves only 200. Startup is faster.
+
+  WHY YOU MIGHT NOT WANT IT:
+        LD_BIND_NOW=1 ./prog
+        gcc -Wl,-z,now -Wl,-z,relro
+  Resolve everything at startup, then make the GOT READ-ONLY
+  (RELRO). This closes "GOT overwrite" attacks, in which an
+  attacker with an arbitrary write redirects a library call.
+  FULL RELRO is standard hardening and costs a little startup
+  time.
+
+  CHECK IT:
+        readelf -d prog | grep -E 'BIND_NOW|FLAGS'
+        checksec --file=prog</pre>
+
+<h2 id="tls">Thread-local storage</h2>
+
+<pre><code>        __thread int counter;           /* GNU */
+        _Thread_local int counter;      /* C11 */
+        thread_local int counter;       /* C++11 */
+
+/* Each thread gets its own instance. The implementation
+   depends on how much the compiler knows at compile time -
+   there are four MODELS, from fastest to most general: */
+
+   LOCAL-EXEC       the variable is in the main executable.
+                    Its offset from the thread pointer is
+                    known at LINK time.
+                        mrs  x0, tpidr_el0
+                        add  x0, x0, #:tprel_hi12:counter
+                        add  x0, x0, #:tprel_lo12_nc:counter
+                    TWO instructions. The fastest.
+
+   INITIAL-EXEC     in a library loaded at startup. The offset
+                    comes from the GOT.
+                        mrs  x0, tpidr_el0
+                        adrp x1, :gottprel:counter
+                        ldr  x1, [x1, :gottprel_lo12:counter]
+                        add  x0, x0, x1
+
+   LOCAL-DYNAMIC    several variables in a dlopen'd library.
+   GENERAL-DYNAMIC  the fully general case. Calls
+                    __tls_get_addr - a FUNCTION CALL for every
+                    access.
+
+/* SELECT ONE: */
+        gcc -ftls-model=initial-exec ...
+        __attribute__((tls_model("initial-exec")))
+
+/* THE PRACTICAL POINT: a `__thread` variable in a library
+   that might be dlopen'd uses general-dynamic and costs a
+   function call per access. In a hot path that is
+   significant, and forcing initial-exec is the fix - at the
+   cost of the library no longer being dlopen-able.
+
+   ON AARCH64 the thread pointer is TPIDR_EL0, readable from
+   user mode with one instruction, which is why local-exec TLS
+   is nearly free.                                          */</code></pre>
+
+<h2 id="init">Constructors and destructors</h2>
+
+<pre><code>/* Code that runs before main and after it returns. */
+
+        __attribute__((constructor))
+        static void my_init(void) { ... }
+
+        __attribute__((destructor))
+        static void my_fini(void) { ... }
+
+        __attribute__((constructor(101)))   /* priority:
+                                               lower runs
+                                               first          */
+        static void very_early(void) { ... }
+
+/* HOW: pointers are placed in .init_array / .fini_array, and
+   the loader (or __libc_csu_init for a static binary) walks
+   the array.
+
+        readelf -x .init_array prog
+
+/* C++ STATIC INITIALISATION uses the same mechanism: a
+   constructor for every namespace-scope object with a
+   non-constant initialiser.
+
+/* THE STATIC INITIALISATION ORDER FIASCO: the order of
+   constructors ACROSS translation units is UNSPECIFIED. So: */
+
+        /* a.cpp */  Logger logger;
+        /* b.cpp */  Config config{logger};   /* MAY run first,
+                                                 using an
+                                                 unconstructed
+                                                 logger        */
+
+/* THE FIX - construct on first use, which is guaranteed to be
+   ordered by the dependency itself: */
+        Logger &amp;get_logger(void)
+        {
+                static Logger instance;   /* constructed on the
+                                             first call, and
+                                             thread-safe since
+                                             C++11             */
+                return instance;
+        }
+
+/* AND IN A SHARED LIBRARY, constructors run at dlopen and
+   destructors at dlclose - so a library that registers itself
+   with a constructor works, and one that assumes main() has
+   already run does not.                                   */</code></pre>
+
+<h2 id="maps">The process address space</h2>
+
+<pre><code>$ cat /proc/self/maps
+
+aaaab2340000-aaaab2341000 r-xp 00000000 fe:01 12345 /bin/cat
+aaaab2350000-aaaab2351000 r--p 00000000 fe:01 12345 /bin/cat
+aaaab2351000-aaaab2352000 rw-p 00001000 fe:01 12345 /bin/cat
+aaaad4f60000-aaaad4f81000 rw-p 00000000 00:00 0     [heap]
+ffff8a100000-ffff8a280000 r-xp 00000000 fe:01 23456 /lib/libc.so.6
+ffff8a280000-ffff8a290000 r--p 00180000 fe:01 23456 /lib/libc.so.6
+ffff8a290000-ffff8a292000 rw-p 00190000 fe:01 23456 /lib/libc.so.6
+ffff8a2a0000-ffff8a2c0000 r-xp 00000000 fe:01 34567 /lib/ld-linux-aarch64.so.1
+ffffc4d20000-ffffc4d41000 rw-p 00000000 00:00 0     [stack]
+ffffa3b40000-ffffa3b41000 r-xp 00000000 00:00 0     [vdso]
+
+/* READ THE PERMISSIONS COLUMN:
+     r-xp   code: readable, executable, NOT writable
+     r--p   read-only data, including relocated-then-RELRO
+     rw-p   writable data
+     p      private (copy-on-write); s would be shared
+
+   NO SEGMENT IS BOTH `w` AND `x`. That is W^X, and it is
+   what makes injected shellcode unusable without a further
+   step. A binary that needs writable-executable memory - a
+   JIT - must mprotect explicitly, and hardened systems
+   forbid it.
+
+/* [vdso] - a page the kernel maps into every process
+   containing fast implementations of gettimeofday,
+   clock_gettime and getcpu, which read the clock directly
+   without a syscall. That is why clock_gettime costs about
+   25 ns rather than 500 (ARM chapter 32).
+
+/* THE FILE OFFSETS reveal the segment structure: libc appears
+   three times, at offsets 0, 0x180000 and 0x190000 - the
+   same file mapped three times with different permissions,
+   which is exactly the PT_LOAD segments from chapter 11. */</code></pre>
+
+<div class="key">
+<b>Hardening flags, and what each stops</b>
+<pre><code>-fstack-protector-strong    stack smashing
+-D_FORTIFY_SOURCE=2         buffer overflows in libc calls
+-fPIE -pie                  enables ASLR of the executable
+-Wl,-z,relro,-z,now         GOT overwrite
+-Wl,-z,noexecstack          executable stack
+-fstack-clash-protection    stack-guard-page jumping
+-fcf-protection / -mbranch-protection=standard
+                            ROP/JOP, via BTI and PAC on ARMv8.3+
+</code></pre>
+<p>Check what a binary actually has with <code>checksec --file=prog</code>. On ARMv8.3 and later,
+<code>-mbranch-protection=standard</code> enables pointer authentication and branch target identification,
+which are the strongest of these and cost very little.</p>
+</div>
+
+<h2 id="dlopen">Loading at run time</h2>
+
+<pre><code>#include &lt;dlfcn.h&gt;
+
+        void *h = dlopen("libplugin.so", RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+                fprintf(stderr, "%s\n", dlerror());
+                return -1;
+        }
+
+        /* the cast is ugly and POSIX-required */
+        void (*fn)(int) = (void (*)(int))dlsym(h, "plugin_run");
+        if (!fn) { ... }
+
+        fn(42);
+        dlclose(h);
+
+/* THE FLAGS:
+     RTLD_NOW     resolve everything at dlopen. Fails
+                  immediately on a missing symbol.
+     RTLD_LAZY    resolve on first use. Fails LATER, at the
+                  call - much harder to diagnose.
+     RTLD_GLOBAL  the library's symbols become available to
+                  subsequently loaded libraries
+     RTLD_LOCAL   they do not. The safe default.
+     RTLD_NODELETE  never unload
+
+/* PREFER RTLD_NOW | RTLD_LOCAL. Lazy binding in a plugin
+   means a typo in an exported name crashes in production
+   rather than failing at load.
+
+/* THE C++ PROBLEM: dlsym takes a mangled name. Export plugin
+   entry points as extern "C", or provide a single registration
+   function.
+
+/* AND THE UNLOAD HAZARD: after dlclose, every pointer into
+   the library - function pointers, vtables, static data,
+   string literals - is dangling. A callback registered with
+   another subsystem and never unregistered becomes a crash
+   at an arbitrary later moment. Plugin systems commonly use
+   RTLD_NODELETE for exactly this reason.               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"cannot open shared object file"</td><td>Not on the search path — <code>LD_DEBUG=libs</code> shows where it looked</td></tr>
+<tr><td>Wrong library version loaded</td><td>Search order; check <code>ldd</code> and <code>LD_LIBRARY_PATH</code></td></tr>
+<tr><td>Addresses differ every run</td><td>ASLR — use <code>setarch -R</code> for reproducible debugging</td></tr>
+<tr><td>Crash at a call, long after a successful <code>dlopen</code></td><td><code>RTLD_LAZY</code> hid a missing symbol</td></tr>
+<tr><td>Crash after <code>dlclose</code></td><td>A dangling pointer into the unloaded library</td></tr>
+<tr><td><code>dlsym</code> returns NULL for a C++ function</td><td>Name mangling — use <code>extern "C"</code></td></tr>
+<tr><td>Static object used before construction</td><td>Static initialisation order fiasco — construct on first use</td></tr>
+<tr><td>Thread-local access is slow</td><td>General-dynamic TLS model — try <code>initial-exec</code></td></tr>
+<tr><td>Startup is slow</td><td>Many libraries and relocations; consider static linking or prelinking</td></tr>
+<tr><td>Exploit mitigations absent</td><td>Check with <code>checksec</code>; the flags are not all on by default</td></tr>
+<tr><td>JIT fails with a permission error</td><td>W^X — the page must be <code>mprotect</code>ed, and hardened systems may refuse</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Trace execution from <code>execve</code> to <code>main</code>, naming each participant.</li>
+  <li>Explain what changes for a statically linked binary.</li>
+  <li>Distinguish ET_EXEC, PIE and shared objects, and say why PIE enables ASLR.</li>
+  <li>Explain the GOT and PLT and how lazy binding works.</li>
+  <li>Explain RELRO and the attack it prevents.</li>
+  <li>Name the four TLS models and the cost of each.</li>
+  <li>Explain how constructors are implemented and the static initialisation order fiasco.</li>
+  <li>Read <code>/proc/self/maps</code> and explain the permissions and repeated file mappings.</li>
+  <li>Explain what the vdso is for.</li>
+  <li>List six hardening flags and what each stops.</li>
+  <li>Use <code>dlopen</code> safely and name three hazards.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

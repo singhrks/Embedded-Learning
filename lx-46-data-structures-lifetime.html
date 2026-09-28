@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel data structures and object lifetime | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Kernel data structures and object lifetime</h1>
+<p class="lead">You cannot read kernel source without these. Almost every structure in the kernel is on a
+linked list, and almost every shared object is reference-counted — and both are done in a way that looks
+backwards the first time you see it. This chapter is the toolkit: the lists, trees and ID maps the kernel
+gives you, and the answer to the question that causes more crashes than any other, <em>who frees this, and
+when?</em></p>
+
+<h2 id="intrusive">Lists are inside-out compared with what you know</h2>
+
+<p>The kernel's linked lists work in the opposite direction from the ones you have probably written before, and the difference is not stylistic. Once you see why they are built this way, a great deal of kernel code stops looking strange.</p>
+
+<pre class="diagram">   IN USER-SPACE C, A LINKED LIST USUALLY HOLDS POINTERS TO
+   YOUR DATA. Each node is a separate little allocation:
+
+     +--------+      +--------+      +--------+
+     | node   |----&gt;| node   |----&gt;| node   |
+     | data*  |      | data*  |      | data*  |
+     +---|----+      +---|----+      +---|----+
+         v               v               v
+     your struct     your struct     your struct
+
+   THE KERNEL DOES THE OPPOSITE. The list node lives INSIDE
+   your structure, as an ordinary member:
+
+     struct my_device {
+             int              id;
+             char             name[16];
+             struct list_head list;      &lt;-- the node IS a
+     };                                       member
+
+     +---------------------+     +---------------------+
+     | my_device           |     | my_device           |
+     |   id, name          |     |   id, name          |
+     |   list.next --------|----&gt;|   list.next --------|--&gt;
+     |   list.prev &lt;-------|-----|-- list.prev         |
+     +---------------------+     +---------------------+
+
+   THIS IS CALLED AN INTRUSIVE LIST, and the kernel uses it
+   everywhere for three reasons:
+
+     · NO EXTRA ALLOCATION. Adding an object to a list cannot
+       fail, because there is nothing to allocate - which
+       matters enormously in code that may be holding a
+       spinlock or running out of memory (chapter 07).
+     · ONE IMPLEMENTATION FOR EVERY TYPE. C has no generics,
+       so a pointer-based list would need casting or macros
+       per type. Here list.c is written once and works for
+       every structure in the kernel.
+     · AN OBJECT CAN BE ON SEVERAL LISTS AT ONCE simply by
+       having several list_head members - a device can be on
+       its bus's list and on a global list simultaneously.
+
+   THE PRICE: given a `struct list_head *`, you are pointing
+   at the MIDDLE of someone's structure and you need a way to
+   get back to the start. That is what container_of does.</pre>
+
+<h2 id="containerof">container_of: the trick that makes it work</h2>
+
+<p>The inside-out design leaves one problem to solve: if you are holding a pointer to a member in the middle of a structure, how do you get back to the structure itself? The answer is a small piece of pointer arithmetic you will see everywhere.</p>
+
+<pre><code>/* You have a pointer to the member. You want a pointer to
+   the structure containing it. The compiler knows the
+   member's OFFSET inside the type, so the answer is simple
+   arithmetic:                                              */
+
+        container_of(ptr, type, member)
+
+/* which expands to roughly:
+
+        (type *)( (char *)ptr - offsetof(type, member) )
+
+   "take the address of the member, step BACKWARDS by however
+   many bytes into the struct that member sits, and call the
+   result a pointer to the whole struct."                   */
+
+struct my_device {
+        int              id;         /* offset 0            */
+        char             name[16];   /* offset 4            */
+        struct list_head list;       /* offset 24, say      */
+};
+
+        struct list_head *p = ...;              /* points at
+                                                   offset 24 */
+        struct my_device *d =
+                container_of(p, struct my_device, list);
+        /* p minus 24 = the start of my_device. Done.       */
+
+/* YOU HAVE ALREADY SEEN THIS WITHOUT NOTICING. It is how a
+   driver gets from the generic object the kernel handed it
+   back to its OWN state:
+
+     to_platform_device(dev)   is container_of on struct device
+     gpiochip_get_data(gc)     does the equivalent (chapter 29)
+     from_timer(d, t, timer)   the same, for timers (ch. 15)
+
+   Every subsystem that hands you a generic pointer expects
+   you to walk back to your own structure this way. It is not
+   a trick used occasionally - it is the fundamental idiom of
+   kernel C.                                                */</code></pre>
+
+<h2 id="listapi">The list API you will actually use</h2>
+
+<p>The API is small and you will use perhaps six of its calls constantly. The one thing to read carefully is the difference between the two iteration macros, because choosing wrongly produces a bug that does not crash immediately.</p>
+
+<pre><code>#include &lt;linux/list.h&gt;
+
+struct my_driver_state {
+        struct list_head devices;   /* the list HEAD        */
+        struct mutex     lock;      /* protects the list    */
+};
+
+struct my_device {
+        int              id;
+        struct list_head node;      /* the list MEMBER      */
+};
+
+/* CREATE - two ways, depending on where it lives */
+        LIST_HEAD(global_list);                  /* static  */
+        INIT_LIST_HEAD(&amp;state-&gt;devices);         /* dynamic */
+
+/* ADD - and note this can never fail */
+        list_add(&amp;dev-&gt;node, &amp;state-&gt;devices);       /* front */
+        list_add_tail(&amp;dev-&gt;node, &amp;state-&gt;devices);  /* back  */
+
+/* ITERATE - this is the one you will type most.
+   Note it gives you `dev` directly, already container_of'd. */
+        struct my_device *dev;
+
+        list_for_each_entry(dev, &amp;state-&gt;devices, node) {
+                pr_info("device %d\n", dev-&gt;id);
+        }
+
+/* ITERATE WHILE DELETING - you MUST use the _safe form.
+   The plain version reads dev-&gt;node.next to advance, and if
+   you freed dev, that read is a use-after-free. The _safe
+   form stashes the next pointer BEFORE running the body,
+   which is exactly what makes deletion legal.              */
+        struct my_device *dev, *tmp;
+
+        list_for_each_entry_safe(dev, tmp, &amp;state-&gt;devices, node) {
+                list_del(&amp;dev-&gt;node);
+                kfree(dev);
+        }
+
+/* REMOVE */
+        list_del(&amp;dev-&gt;node);        /* poisons the pointers -
+                                        touching them after this
+                                        oopses LOUDLY, on
+                                        purpose                */
+        list_del_init(&amp;dev-&gt;node);   /* leaves it valid+empty,
+                                        so list_empty() works  */
+
+/* TEST */
+        if (list_empty(&amp;state-&gt;devices))
+                ...
+
+/* THE LIST IS NOT THREAD-SAFE. list_add and list_del are
+   plain pointer writes with no locking whatsoever. YOU hold
+   the lock (chapter 12), or you use the RCU variants
+   (list_add_rcu / list_for_each_entry_rcu, chapter 14) for
+   read-mostly lists.                                       */</code></pre>
+
+<div class="warn">
+<b>The most common list bug, and why <code>_safe</code> exists</b>
+<p>Deleting entries inside a plain <code>list_for_each_entry()</code> loop is the classic beginner mistake and
+it produces a use-after-free that may not crash until much later, somewhere unrelated. The loop advances by
+reading <code>dev-&gt;node.next</code> <em>after</em> your loop body has run — so if the body freed
+<code>dev</code>, that read touches freed memory. Use <code>list_for_each_entry_safe()</code> whenever the body
+might delete or free, and turn on <code>CONFIG_DEBUG_LIST</code> and KASAN in development
+(<a href="lx-16-building.html">chapter 18</a>), which catch exactly this.</p>
+</div>
+
+<h2 id="others">The rest of the toolkit, and when to reach for each</h2>
+
+<p>Lists are the default and cover most needs, but the kernel provides several other structures for cases
+where a linear scan is the wrong shape. Each of these exists because a real subsystem needed it, and knowing
+they exist stops you from hand-rolling a worse version.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Structure</th><th>Use it when</th><th>Header</th></tr></thead>
+<tbody>
+<tr><td><code>list_head</code></td><td>The default. Iteration, small collections, anything you walk end to
+end</td><td><code>linux/list.h</code></td></tr>
+<tr><td><code>hlist_head</code></td><td>Hash-table buckets — a smaller head (one pointer, not two), which
+matters when you have thousands of them</td><td><code>linux/list.h</code></td></tr>
+<tr><td><code>rb_root</code> (red-black tree)</td><td>You need entries kept <em>sorted</em>, or lookups by key
+in a large set. Used by the scheduler and by VMA lookup</td><td><code>linux/rbtree.h</code></td></tr>
+<tr><td><code>struct xarray</code></td><td>Mapping an integer ID to a pointer — minor numbers, handles, tags.
+Handles allocation of the IDs for you</td><td><code>linux/xarray.h</code></td></tr>
+<tr><td><code>struct idr</code></td><td>The older ID-to-pointer API; you will read it in existing code, but
+new code should prefer <code>xarray</code></td><td><code>linux/idr.h</code></td></tr>
+<tr><td><code>kfifo</code></td><td>A ring buffer between one producer and one consumer — needs no lock in the
+single-producer/single-consumer case</td><td><code>linux/kfifo.h</code></td></tr>
+<tr><td><code>DECLARE_HASHTABLE</code></td><td>A fixed-size hash table when a linear list scan has become the
+bottleneck</td><td><code>linux/hashtable.h</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* kfifo is worth showing, because chapters 07 and 12 both
+   USE it and neither stops to explain it. It is a ring
+   buffer with the index arithmetic already correct:       */
+
+#include &lt;linux/kfifo.h&gt;
+
+struct my_dev {
+        DECLARE_KFIFO(fifo, struct my_event, 128);  /* MUST be
+                                                       a power
+                                                       of two  */
+};
+        INIT_KFIFO(d-&gt;fifo);
+
+        /* producer - returns 0 if full, never blocks */
+        if (!kfifo_put(&amp;d-&gt;fifo, event))
+                dev_warn(dev, "fifo full, event dropped\n");
+
+        /* consumer - returns 0 if empty */
+        while (kfifo_get(&amp;d-&gt;fifo, &amp;event))
+                handle(event);
+
+/* WITH EXACTLY ONE PRODUCER AND ONE CONSUMER, kfifo needs no
+   lock at all - the two sides touch different indices and
+   the barriers are inside. With more than one of either, you
+   lock it yourself. This is why it is so common between an
+   interrupt handler (producer) and a workqueue or read()
+   (consumer) - chapters 15 and 36.                         */</code></pre>
+
+<h2 id="lifetime">Object lifetime: who frees this, and when?</h2>
+
+<p>Now the second half of the chapter, and a question that causes more crashes than any other in driver work: when several parts of the kernel hold a pointer to the same object, which of them is responsible for freeing it?</p>
+
+<pre class="diagram">   THE PROBLEM, IN ITS SIMPLEST FORM:
+
+     Your driver allocates a struct my_device.
+     It is on a list. An interrupt handler has a pointer to
+     it. A workqueue item has a pointer to it. A user process
+     has it open through a file descriptor.
+
+     NOW THE DEVICE IS UNPLUGGED. Who calls kfree?
+
+   IF THE ANSWER IS "remove() does", YOU HAVE A BUG. remove()
+   runs when the device goes away, but the workqueue item may
+   still be queued and the user's file descriptor is still
+   open. Freeing now means every one of those becomes a
+   use-after-free.
+
+   THE ANSWER IS REFERENCE COUNTING: the object is freed by
+   WHOEVER PUTS THE LAST REFERENCE, which may be any of them,
+   and nobody needs to know which one they are.
+
+     get  ->  "I am keeping a pointer; do not free this"
+     put  ->  "I am done with my pointer"
+     when the count reaches zero, the object frees itself.</pre>
+
+<pre><code>/* refcount_t - a plain counter, when YOU still control the
+   freeing. It is an atomic_t that SATURATES instead of
+   wrapping: overflow and use-after-free-by-underflow are
+   detected and warn, rather than silently corrupting.     */
+
+        refcount_t users;
+        refcount_set(&amp;d-&gt;users, 1);
+        refcount_inc(&amp;d-&gt;users);
+        if (refcount_dec_and_test(&amp;d-&gt;users))
+                kfree(d);              /* the last one frees */
+
+/* NEVER use a plain int for this, and prefer refcount_t over
+   atomic_t for counts that control lifetime - the saturation
+   behaviour is a real security property, not a nicety.    */
+
+
+/* kref - the same idea, packaged with the release callback,
+   so the freeing rule lives in ONE place instead of at every
+   put site.                                               */
+
+#include &lt;linux/kref.h&gt;
+
+struct my_device {
+        struct kref      refcount;
+        struct list_head node;
+        void            *buffer;
+};
+
+static void my_device_release(struct kref *kref)
+{
+        struct my_device *d =
+                container_of(kref, struct my_device, refcount);
+        /* container_of again - the kref does not know what
+           contains it, so we walk back.                    */
+
+        kfree(d-&gt;buffer);
+        kfree(d);
+}
+
+        /* creation: the count starts at 1, held by whoever
+           created it                                       */
+        kref_init(&amp;d-&gt;refcount);
+
+        /* anyone taking a lasting pointer */
+        kref_get(&amp;d-&gt;refcount);
+
+        /* everyone, when finished. Only the LAST one causes
+           my_device_release to run.                        */
+        kref_put(&amp;d-&gt;refcount, my_device_release);
+
+/* THE RULE THAT MAKES IT CORRECT: take the reference BEFORE
+   publishing the pointer anywhere another thread could find
+   it, and drop it only after you can no longer reach it.
+   A get() that happens after the object is already
+   discoverable is a race, not a reference.                */</code></pre>
+
+<div class="key">
+<b>Where you have already been using this without knowing</b>
+<p><code>struct device</code> contains a <code>kobject</code>, which contains a reference count — which is why
+<code>get_device()</code> and <code>put_device()</code> exist and why a device's <code>release</code> callback,
+not <code>remove()</code>, is what finally frees it. The same applies to <code>struct file</code>
+(<a href="lx-36-vfs.html">chapter 41</a>: the inode outlives the last name because open descriptors hold
+references) and to modules (<code>.owner = THIS_MODULE</code> in
+<a href="lx-40-example-char-driver.html">chapter 24</a> takes a reference on your module while a file is open).
+Reference counting is not an advanced technique you graduate to — it is already underneath everything you have
+written so far.</p>
+</div>
+
+<h2 id="devm">Why <code>devm_</code> does not remove the need for this</h2>
+
+<p><a href="lx-26-error-handling.html">Chapter 33</a>'s managed allocations free themselves when the device
+unbinds, which covers the common case completely and is why most driver code needs no explicit refcounting at
+all. What <code>devm_</code> cannot do is keep an object alive <em>past</em> unbind — and that is exactly the
+situation reference counting exists for. If a user process can still hold your object open after the device is
+gone, or a work item can still be queued against it, then unbind is not the right moment to free it, and
+<code>devm_</code> is the wrong tool for that particular allocation.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Crash while iterating a list, often long after the loop</td><td>Entries freed inside a plain
+<code>list_for_each_entry</code> — use the <code>_safe</code> form</td></tr>
+<tr><td>Oops on a suspiciously repetitive pointer such as <code>0x100100</code></td><td>List poison — something
+touched a node after <code>list_del()</code>, exactly as intended to be loud</td></tr>
+<tr><td><code>list_empty()</code> is never true after removing everything</td><td><code>list_del()</code> was
+used where <code>list_del_init()</code> was needed</td></tr>
+<tr><td>Two CPUs corrupt a list simultaneously</td><td>No lock — the list API does no locking of its own</td></tr>
+<tr><td>Use-after-free when a device is unplugged while in use</td><td>Freed at <code>remove()</code> instead
+of when the last reference was dropped</td></tr>
+<tr><td>Object never freed at all</td><td>An unbalanced <code>get</code> — one path takes a reference and some
+error path never puts it</td></tr>
+<tr><td><code>refcount_t: underflow</code> warning in dmesg</td><td>More puts than gets — a double free that
+<code>refcount_t</code> caught instead of letting it corrupt memory</td></tr>
+<tr><td>A hand-rolled ring buffer has rare, unreproducible corruption</td><td>Use <code>kfifo</code>; the index
+and barrier arithmetic is already correct there</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why kernel lists put the node inside your structure, and name two advantages.</li>
+  <li>Explain what <code>container_of</code> does, in terms of pointer arithmetic.</li>
+  <li>Write a loop that iterates a list and frees every entry, correctly.</li>
+  <li>Explain why the plain iteration macro cannot be used when deleting.</li>
+  <li>Say which structure you would use for an ID-to-pointer map, and which for sorted lookup.</li>
+  <li>Explain when <code>kfifo</code> needs no lock, and when it does.</li>
+  <li>Explain why freeing an object in <code>remove()</code> can be a use-after-free.</li>
+  <li>Write a <code>kref</code> release function, and explain why it uses <code>container_of</code>.</li>
+  <li>Explain when <code>devm_</code> is <em>not</em> sufficient and refcounting is required.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

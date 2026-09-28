@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atomics: exclusives and LSE | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Atomics: exclusives and LSE</h1>
+<p class="lead">Because ARM is load/store, atomicity needs dedicated instructions. Two generations exist —
+the original retry-loop exclusives and the newer single-instruction atomics — and the difference between them
+is the difference between a system that scales to 64 cores and one that collapses at eight.</p>
+
+<h2 id="problem">Why dedicated instructions</h2>
+
+<p>An ordinary read-modify-write is three separate steps, and another core can act between them. Every atomic mechanism in this chapter exists to close that window.</p>
+
+<pre><code>/* From chapter 03: read-modify-write is three instructions. */
+        ldr     w1, [x0]
+        add     w1, w1, #1
+        str     w1, [x0]
+/* Any other core can interleave. One increment is lost.      */
+
+/* You cannot fix this with barriers — a barrier orders accesses,
+   it does not make a sequence indivisible. You need hardware
+   that can detect interference.                              */</code></pre>
+
+<h2 id="exclusives">Load-exclusive / store-exclusive</h2>
+
+<p>The original ARM approach does not lock anything. It makes a reservation, performs the work, and then checks whether the reservation survived — retrying if it did not, which is why atomic code here is always a loop.</p>
+
+<pre class="diagram">The mechanism: an EXCLUSIVE MONITOR watches an address.
+
+   LDXR  marks the address as exclusively reserved by this PE
+   STXR  succeeds ONLY if the reservation is still valid, and
+         reports success or failure in a register
+
+   The reservation is CLEARED by:
+      · any store to the same reservation granule by any observer
+      · a STXR from this PE (success or failure)
+      · a CLREX instruction
+      · an exception entry or return
+      · a context switch
+      · sometimes, spuriously — the architecture permits it
+
+So the pattern is always a RETRY LOOP:</pre>
+
+<pre><code>/* atomic increment */
+1:      ldaxr   w1, [x0]        /* load-acquire exclusive          */
+        add     w1, w1, #1
+        stlxr   w2, w1, [x0]    /* store-release exclusive:
+                                   w2 = 0 success, 1 failure       */
+        cbnz    w2, 1b          /* retry on failure                */
+
+/* compare and swap, built from the same primitive */
+1:      ldaxr   w1, [x0]
+        cmp     w1, w_expected
+        b.ne    2f
+        stlxr   w2, w_desired, [x0]
+        cbnz    w2, 1b
+2:      clrex                   /* release the reservation if we
+                                   are abandoning the sequence     */
+
+/* The ordered variants (LDAXR/STLXR) combine exclusivity with
+   acquire/release semantics — one instruction instead of an
+   exclusive plus a barrier (chapter 21).                    */</code></pre>
+
+<div class="danger">
+<b>Rules for exclusive loops</b>
+<ul>
+<li><strong>Keep the body tiny.</strong> Only register operations between LDXR and STXR. Any memory access,
+function call or exception can clear the monitor and cause an infinite retry.</li>
+<li><strong>Never take an exception inside one.</strong> Exception entry clears the reservation, so a loop
+that is interrupted every iteration never completes — a livelock that looks like a hang.</li>
+<li><strong>Always <code>CLREX</code> when abandoning</strong> a sequence, or a stale reservation can make an
+unrelated later STXR succeed when it should not.</li>
+<li><strong>They do not work on Device memory.</strong> Undefined behaviour — the monitor requires cacheable
+memory (<a href="arm-11-memory-types.html">chapter 11</a>).</li>
+<li><strong>They need shareable memory</strong> for cross-core correctness — the global monitor only
+participates for Inner or Outer Shareable pages (<a href="arm-19-shareability.html">chapter 19</a>).</li>
+</ul>
+</div>
+
+<h2 id="granule">The reservation granule</h2>
+
+<p>The reservation covers a region rather than a single address, and its size is implementation-defined. That has a direct and surprising consequence for unrelated variables that happen to sit near each other.</p>
+
+<pre><code>/* The monitor tracks a GRANULE, not a single address. Its size is
+   in CTR_EL0.ERG — typically 64 or 128 bytes.                */
+
+static unsigned exclusives_granule(void)
+{
+        uint64_t ctr;
+        asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        return 4U &lt;&lt; ((ctr &gt;&gt; 20) &amp; 0xF);      /* ERG field */
+}
+
+/* CONSEQUENCE: two independent locks inside one granule interfere.
+   Each STXR clears the other's reservation, so both loops retry
+   endlessly under contention — a livelock-like collapse that
+   looks like terrible lock performance.                     */
+
+struct bad {
+        spinlock_t lock_a;      /* same granule */
+        spinlock_t lock_b;      /* → they fight */
+};
+
+struct good {
+        spinlock_t lock_a __attribute__((aligned(128)));
+        spinlock_t lock_b __attribute__((aligned(128)));
+};
+
+/* This is the same class of problem as cache-line false sharing
+   (CA chapter 15), one level down. Pad to the LARGER of the
+   cache line size and the reservation granule.              */</code></pre>
+
+<h2 id="lse">Large System Extensions</h2>
+
+<p>Newer cores add genuine single-instruction atomics, which scale far better under contention than a retry loop. On a large system the difference is not marginal.</p>
+
+<pre><code>/* ARMv8.1 added single-instruction atomics. No loop, no monitor,
+   no retries.                                                */
+
+        ldadd   w1, w2, [x0]     /* atomic add; w2 = OLD value    */
+        ldclr   w1, w2, [x0]     /* atomic AND NOT (bit clear)    */
+        ldeor   w1, w2, [x0]     /* atomic XOR                    */
+        ldset   w1, w2, [x0]     /* atomic OR (bit set)           */
+        ldsmax, ldsmin, ldumax, ldumin
+        swp     w1, w2, [x0]     /* atomic exchange               */
+        cas     w1, w2, [x0]     /* compare and swap              */
+        casp    x0, x1, x2, x3, [x4]   /* 128-bit CAS             */
+
+/* Each has ordering variants: */
+        ldadda   /* acquire */    ldaddl   /* release */
+        ldaddal  /* both    */    ldadd    /* relaxed */
+        casal, swpal, ...
+
+/* And a store-only form when the old value is not needed —
+   cheaper, because no result must be returned:              */
+        stadd   w1, [x0]         /* == ldadd with wzr as dest    */</code></pre>
+
+<div class="key">
+<b>Why LSE scales and exclusives do not</b>
+<p>An exclusive loop requires the line to be brought into <em>this</em> core's cache in an exclusive state. Under
+contention, N cores fight over one line: it ping-pongs, most STXRs fail, and throughput <em>decreases</em> as
+cores are added.</p>
+<p>An LSE atomic can be executed <strong>near memory</strong> — at the point of coherency, in the interconnect
+or a system cache. The line never moves. Contention becomes a queue at one place rather than a fight between
+N caches. Measured difference on a heavily contended counter at 64 cores can be an order of magnitude.</p>
+</div>
+
+<h2 id="detect">Detecting and using LSE</h2>
+
+<p>Since not every core has them, code that wants to use them must either detect support at run time or be built for a target that guarantees it. Both approaches are in common use.</p>
+
+<pre><code>/* Query ID_AA64ISAR0_EL1.Atomic (bits [23:20]) &gt;= 2 */
+
+static bool has_lse(void)
+{
+        uint64_t isar0;
+        asm volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+        return ((isar0 &gt;&gt; 20) &amp; 0xF) &gt;= 2;
+}
+
+/* Linux PATCHES ITSELF at boot: the same kernel image contains
+   both an exclusive loop and an LSE instruction, and the
+   alternatives framework replaces one with the other based on
+   what the CPU reports. One binary, optimal everywhere.     */
+
+/* Building for LSE explicitly: */
+gcc -march=armv8.1-a           /* or +lse */
+gcc -moutline-atomics          /* the DEFAULT since GCC 10:
+                                  emits calls to runtime-dispatched
+                                  helper functions, so one binary
+                                  works on both, with a small
+                                  call overhead                  */
+
+# check what your distro built with
+readelf -a /lib/aarch64-linux-gnu/libc.so.6 | grep -i lse
+grep -o 'atomics' /proc/cpuinfo | head -1     # "atomics" = LSE present</code></pre>
+
+<h2 id="c11">From C</h2>
+
+<p>In practice you write atomics in C, and the compiler chooses the instructions. Knowing what it generates for each memory-order argument is what connects the language to the hardware.</p>
+
+<pre><code>#include &lt;stdatomic.h&gt;
+
+atomic_int counter = 0;
+
+atomic_fetch_add(&amp;counter, 1);                    /* → ldaddal */
+atomic_fetch_add_explicit(&amp;counter, 1,
+                          memory_order_relaxed);   /* → ldadd   */
+
+int expected = old;
+atomic_compare_exchange_strong(&amp;v, &amp;expected, desired);   /* → casal */
+
+/* _weak may fail spuriously and is cheaper inside a loop —
+   it maps directly onto the exclusive retry pattern:      */
+do {
+        old = atomic_load_explicit(&amp;v, memory_order_relaxed);
+        new = f(old);
+} while (!atomic_compare_exchange_weak_explicit(
+                &amp;v, &amp;old, new,
+                memory_order_release, memory_order_relaxed));
+
+/* Choose the WEAKEST correct memory order. seq_cst is the default
+   and the most expensive; relaxed is free for a statistics
+   counter nobody synchronises on (chapter 20).            */
+
+/* Is it actually lock-free? Check — a large atomic may be
+   implemented with a hidden mutex, which is a correctness
+   problem in a signal handler or an interrupt context:    */
+atomic_is_lock_free(&amp;obj);
+ATOMIC_LLONG_LOCK_FREE          /* compile-time: 2 = always */</code></pre>
+
+<h2 id="128">128-bit atomics</h2>
+
+<p>Some algorithms need to update a pointer and a counter together, atomically, which requires a wider operation than the machine word. The architecture provides one, with restrictions.</p>
+
+<pre><code>/* Needed for lock-free structures that must update a pointer and
+   a tag together — the standard ABA defence (OS chapter 10).  */
+
+        casp    x0, x1, x2, x3, [x4]      /* LSE, ARMv8.1        */
+        ldxp    x0, x1, [x2]              /* exclusive pair       */
+        stxp    w3, x4, x5, [x2]
+
+/* In C: */
+struct alignas(16) tagged_ptr {
+        void    *ptr;
+        uint64_t tag;
+};
+_Atomic struct tagged_ptr head;
+/* atomic_compare_exchange on this compiles to CASP if LSE is
+   present, LDXP/STXP otherwise. The 16-byte ALIGNMENT is
+   mandatory — an unaligned 128-bit atomic is not atomic.   */
+
+/* ARMv8.4 adds LSE2, which guarantees that ordinary aligned
+   128-bit loads and stores are atomic — removing the need for
+   the pair instructions in some cases.                     */</code></pre>
+
+<h2 id="locks">Building a spinlock</h2>
+
+<p>With the primitives understood, a spinlock is a short piece of code — and writing one correctly is the standard exercise that proves you understand both the atomics and the memory model.</p>
+
+<pre><code>/* A minimal correct spinlock, showing acquire/release placement */
+
+void spin_lock(uint32_t *lock)
+{
+        uint32_t tmp;
+        asm volatile(
+        "       sevl\n"                  /* prime the event register */
+        "1:     wfe\n"                   /* sleep until an event     */
+        "2:     ldaxr   %w0, [%1]\n"     /* load-ACQUIRE exclusive   */
+        "       cbnz    %w0, 1b\n"       /* held? go back to sleep   */
+        "       stxr    %w0, %w2, [%1]\n"
+        "       cbnz    %w0, 2b\n"       /* lost the race, retry     */
+        : "=&amp;r"(tmp)
+        : "r"(lock), "r"(1)
+        : "memory", "cc");
+}
+
+void spin_unlock(uint32_t *lock)
+{
+        asm volatile("stlr wzr, [%0]"    /* store-RELEASE            */
+                     :: "r"(lock) : "memory");
+        /* STLR on the exclusive monitor's granule generates an
+           EVENT, waking the WFE sleepers. No explicit SEV needed. */
+}
+
+/* Note WFE: spinners sleep in a low-power state instead of
+   burning cycles. This is why ARM spinlocks are far more power-
+   efficient than a naive busy loop (chapter 07).
+
+   Real kernels use a QUEUED spinlock (qspinlock) instead: each
+   waiter spins on its OWN cache line, so the coherence traffic
+   does not grow with the number of waiters — the same insight
+   as MCS locks (OS chapter 10).                            */</code></pre>
+
+<h2 id="performance">Measuring atomic performance</h2>
+
+<p>Atomic operations cost very little uncontended and a great deal when several cores fight over the same line. Measuring that difference is what tells you whether a data structure will scale.</p>
+
+<pre><code># uncontended vs contended is the whole story
+perf stat -e instructions,cycles ./bench
+
+# on ARM, the relevant PMU events
+perf stat -e ldrex_spec,strex_spec,strex_fail_spec ./prog
+#   a high strex_FAIL ratio means heavy contention and exclusive
+#   retry storms — the signal to switch to LSE, or to reduce
+#   sharing entirely
+
+perf stat -e mem_access,bus_access,l2d_cache_wb ./prog
+perf c2c record ./prog          # which lines are contended
+
+# a quick empirical check: plot throughput against thread count.
+#   flat or rising  → fine
+#   FALLING         → the line is ping-ponging; look for false
+#                     sharing, granule collisions, or exclusives
+#                     under contention</code></pre>
+
+<div class="tip">
+<b>The ordering of remedies</b>
+<p>When atomic operations are the bottleneck, in order of effectiveness: <strong>(1) stop sharing</strong> —
+per-CPU or per-thread counters aggregated later; <strong>(2) reduce frequency</strong> — batch updates;
+<strong>(3) weaken the memory order</strong> — a statistics counter needs only <code>relaxed</code>;
+<strong>(4) use LSE</strong>; <strong>(5) use a better lock</strong> — queued rather than test-and-set. Most
+real wins come from (1), not from micro-optimising the atomic itself.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Counter loses increments</td><td>Plain read-modify-write instead of an atomic</td></tr>
+<tr><td>Exclusive loop never completes</td><td>An exception or memory access inside the loop clearing the monitor</td></tr>
+<tr><td>Two adjacent locks perform terribly together</td><td>Same reservation granule — pad them apart</td></tr>
+<tr><td>Throughput falls as cores are added</td><td>Exclusive contention; try LSE and reduce sharing</td></tr>
+<tr><td>Atomics do not work on a shared region</td><td>Memory is Device, or Non-shareable</td></tr>
+<tr><td>Lock lets two threads in</td><td>Non-shareable memory — no global monitor</td></tr>
+<tr><td>128-bit atomic is not atomic</td><td>Not 16-byte aligned</td></tr>
+<tr><td>Same binary slow on a newer CPU</td><td>Built without LSE and without <code>-moutline-atomics</code></td></tr>
+<tr><td>Lock-free structure corrupts under load</td><td>ABA — needs a tagged pointer or safe reclamation</td></tr>
+<tr><td>Atomic in a signal handler deadlocks</td><td>Not lock-free; check <code>atomic_is_lock_free</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why atomicity needs dedicated instructions on a load/store architecture.</li>
+  <li>Describe the exclusive monitor and list four things that clear a reservation.</li>
+  <li>Give three rules for writing an exclusive retry loop.</li>
+  <li>Explain the reservation granule and the bug two adjacent locks can cause.</li>
+  <li>Explain why LSE scales better than exclusives under contention.</li>
+  <li>Say how Linux ships one binary that uses LSE only where available.</li>
+  <li>Explain <code>compare_exchange_weak</code> versus <code>strong</code> and which maps to what.</li>
+  <li>Explain the role of <code>WFE</code> in a spinlock and why unlock needs no <code>SEV</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

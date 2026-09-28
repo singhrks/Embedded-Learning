@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NT architecture | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>NT architecture</h1>
+<p class="lead">Windows solves the same problems as Linux with a different structure, different names, and
+a different philosophy about stability. This chapter is the map — and because you have just finished the
+Linux track, the comparisons will do most of the teaching.</p>
+
+<h2 id="layers">The layers</h2>
+
+<p>Windows is built in layers, and almost every confusing thing about driver development comes from not knowing which one you are standing in. The names below recur constantly in documentation, headers and crash dumps, so it is worth fixing them in place before anything else.</p>
+
+<pre class="diagram">   USER MODE
+   +-------------------------------------------------------+
+   | applications                                          |
+   +-------------------------------------------------------+
+   | subsystem DLLs:  kernel32.dll  user32.dll  advapi32   |
+   +-------------------------------------------------------+
+   | ntdll.dll        the syscall stubs. NtCreateFile etc.  |
+   +--------------------------+----------------------------+
+                              |  syscall (SVC on arm64)
+   ==========================================================
+   KERNEL MODE                |
+   +--------------------------v----------------------------+
+   |  ntoskrnl.exe  -  THE EXECUTIVE                        |
+   |                                                        |
+   |   Ob  object manager     Io  I/O manager               |
+   |   Mm  memory manager     Ps  process/thread manager    |
+   |   Cc  cache manager      Se  security reference monitor|
+   |   Cm  configuration      Ex  executive support         |
+   |       (registry)         Po  power manager             |
+   |   Pnp plug and play      Rtl runtime library           |
+   +--------------------------------------------------------+
+   |  KERNEL (Ke)  -  scheduling, interrupts, spinlocks,    |
+   |                  DPCs, IRQL. The lowest software layer.|
+   +--------------------------------------------------------+
+   |  HAL  -  hardware abstraction layer                    |
+   |          interrupt controller, timers, bus access      |
+   +--------------------------------------------------------+
+   |  DRIVERS  -  loaded into the same address space,       |
+   |              at the same privilege, as everything above|
+   +--------------------------------------------------------+
+
+  THE PREFIXES ARE THE MAP. Every kernel function begins with
+  the two- or three-letter tag of the component that owns it:
+
+     ObReferenceObjectByHandle    object manager
+     IoCreateDevice               I/O manager
+     MmGetSystemAddressForMdlSafe memory manager
+     KeAcquireSpinLock            kernel
+     ExAllocatePool2              executive
+     PsGetCurrentProcessId        process manager
+     RtlCopyMemory                runtime library
+     ZwCreateFile                 the kernel-mode syscall entry
+
+  Learn the prefixes and you can guess where to look for
+  almost anything - which is the Windows equivalent of knowing
+  the Linux source tree layout (Linux ch. 01).</pre>
+
+<h2 id="vslinux">Against Linux</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Linux</th><th>Windows</th></tr></thead>
+<tbody>
+<tr><td>Driver ABI</td><td><strong>Unstable</strong> — rebuild every version</td><td><strong>Stable</strong> — a 2015 driver often still loads</td></tr>
+<tr><td>Source</td><td>Open; upstream or perish</td><td>Closed; drivers ship as binaries</td></tr>
+<tr><td>Driver model</td><td>One: <code>struct device_driver</code></td><td>Several: WDM, KMDF, UMDF</td></tr>
+<tr><td>Hardware description</td><td>Device tree</td><td>ACPI and the registry</td></tr>
+<tr><td>Installation</td><td>Copy a <code>.ko</code>, <code>modprobe</code></td><td>An INF file, driver store, PnP</td></tr>
+<tr><td>Signing</td><td>Optional (<a href="lx-15-modules.html">ch. 17</a>)</td><td><strong>Mandatory</strong> on x64 and arm64</td></tr>
+<tr><td>Priority discipline</td><td>Context (process/softirq/hardirq)</td><td><strong>IRQL</strong>, a numeric level</td></tr>
+<tr><td>Sleeping rule</td><td>"Am I in atomic context?"</td><td>"Is IRQL &lt;= PASSIVE_LEVEL?"</td></tr>
+<tr><td>Request object</td><td><code>struct bio</code>, <code>struct urb</code>, ad hoc</td><td><strong>The IRP</strong>, universally</td></tr>
+<tr><td>Layering</td><td>Subsystem-specific</td><td><strong>The device stack</strong>, universal</td></tr>
+<tr><td>Allocation</td><td><code>kmalloc(size, GFP_*)</code></td><td><code>ExAllocatePool2(flags, size, tag)</code></td></tr>
+<tr><td>Debugging</td><td>printk, ftrace, KASAN</td><td>WinDbg, Driver Verifier, WPP</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The one difference that shapes everything else</b>
+<p>Windows guarantees a <strong>stable kernel driver ABI</strong>. That single decision explains the closed
+driver ecosystem, the INF/driver-store installation model, mandatory signing, the WDF frameworks, and why
+Microsoft invests so heavily in verification tools: they cannot fix your driver during a refactor, because
+they never see it. Linux made the opposite trade — churn the API freely, and fix every in-tree driver when
+you do.</p>
+<p>Neither is wrong. They are consistent answers to "who is responsible for keeping drivers working".</p>
+</div>
+
+<h2 id="syscall">A syscall, end to end</h2>
+
+<p>The clearest way to see the layers cooperating is to follow one ordinary operation from an application all the way into the kernel. Every abstraction in this track sits somewhere along this path, and knowing the path is what lets you place a new concept the moment you meet it.</p>
+
+<pre class="diagram">  application:  ReadFile(hFile, buf, len, &amp;read, NULL);
+        |
+        v
+  kernel32.dll: parameter marshalling, then
+        |
+        v
+  ntdll.dll:    NtReadFile
+                  mov  x8, #0x06        ; the syscall number
+                  svc  #0               ; (arm64)
+        |
+        v  =============== kernel mode ===============
+        |
+  KiSystemService -> the SSDT -> NtReadFile in ntoskrnl
+        |
+        v
+  I/O MANAGER (Io):
+        · validate the handle    -&gt; ObReferenceObjectByHandle
+        · find the FILE_OBJECT and its DEVICE_OBJECT
+        · BUILD AN IRP: IRP_MJ_READ, with the buffer, length
+          and offset
+        · IoCallDriver(deviceObject, irp)
+        |
+        v
+  THE TOP DRIVER in the stack
+        · may complete it, or pass it down
+        |
+        v
+  ... each lower driver in turn ...
+        |
+        v
+  THE FUNCTION DRIVER (yours)
+        · does the work, or queues the IRP and returns
+          STATUS_PENDING
+        |
+        v
+  IoCompleteRequest(irp, IO_NO_INCREMENT)
+        · completion routines run, bottom-up
+        · the I/O manager copies results back
+        · the waiting thread is woken
+        |
+        v
+  ReadFile returns TRUE
+
+  COMPARE Linux: read() -&gt; vfs_read -&gt; f_op-&gt;read on your
+  file_operations. One indirection, one driver.
+
+  Windows routes EVERYTHING through a self-contained REQUEST
+  OBJECT (the IRP) that travels down a STACK of drivers, and
+  may complete asynchronously at any level. That is more
+  machinery, and it is what makes filter drivers, layered
+  storage, and asynchronous I/O uniform rather than
+  per-subsystem.</pre>
+
+<h2 id="objects">Everything is an object</h2>
+
+<p>Windows models almost everything nameable — files, devices, processes, events, registry keys — with one shared mechanism. That uniformity is deliberate: it means one set of rules for naming, security and lifetime serves the entire system, and learning it once pays off everywhere.</p>
+
+<pre><code>/* The object manager (Ob) is the closest Windows analogue to
+   Linux's VFS-plus-everything, and it is more general.     */
+
+   \                        the root
+   \Device\                 device objects
+   \Device\HarddiskVolume1
+   \Driver\                 loaded drivers
+   \DosDevices\  (\??\)     symbolic links: C: -&gt; \Device\...
+   \BaseNamedObjects\       named events, mutexes, sections
+   \Windows\                windowing
+   \REGISTRY\               the registry, as objects
+   \KernelObjects\
+
+/* EVERY object has:
+     a header with a type, a NAME (optionally), a reference
+     count, a handle count, and a security descriptor
+     a body specific to its type
+
+   TYPES: Process, Thread, File, Device, Driver, Event,
+   Mutant, Semaphore, Timer, Section, Key, Token, Job, ...
+
+   HANDLES are per-process indices into a handle table, with
+   an access mask. A handle is NOT a pointer, and converting
+   one is an explicit, checked operation:                   */
+
+        status = ObReferenceObjectByHandle(handle,
+                                           FILE_READ_DATA,
+                                           *IoFileObjectType,
+                                           UserMode,   /* CHECK
+                                                          ACCESS */
+                                           &amp;fileObject,
+                                           NULL);
+        ...
+        ObDereferenceObject(fileObject);
+
+/* THE `UserMode` ARGUMENT IS A SECURITY CONTROL: it tells the
+   object manager to enforce the access mask as if a user-mode
+   caller asked. Passing KernelMode skips those checks - and
+   passing it while handling a user request is a classic
+   privilege-escalation bug (chapter 04).                  */
+
+/* SEE IT: the WinObj tool from Sysinternals browses the whole
+   namespace. Run it once; it makes the model concrete.   */</code></pre>
+
+<h2 id="registry">The registry, not the device tree</h2>
+
+<p>If you have come from Linux, this is the substitution that matters most. Windows has no device tree; hardware description, driver configuration and service settings all live in one hierarchical database that the kernel itself reads at boot.</p>
+
+<pre><code>; Where a driver's configuration lives:
+
+HKLM\SYSTEM\CurrentControlSet\Services\MyDriver
+    ImagePath     = \SystemRoot\System32\drivers\mydriver.sys
+    Type          = 1          ; SERVICE_KERNEL_DRIVER
+    Start         = 3          ; 0=boot 1=system 2=auto
+                               ; 3=demand 4=disabled
+    ErrorControl  = 1
+    Group         = Extended Base
+
+HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1234&amp;DEV_5678\...
+    Service       = MyDriver   ; which driver claims it
+    ClassGUID     = {...}
+    HardwareID    = PCI\VEN_1234&amp;DEV_5678
+    Driver        = {class}\0001
+
+; Per-device settings, the closest thing to DT properties:
+HKLM\SYSTEM\CurrentControlSet\Enum\...\Device Parameters
+    FifoDepth     = 32
+    SampleRate    = 48000
+
+/* READING them from a driver, via WDF: */
+        WDFKEY key;
+        ULONG  value;
+        DECLARE_CONST_UNICODE_STRING(name, L"FifoDepth");
+
+        status = WdfDeviceOpenRegistryKey(device,
+                        PLUGPLAY_REGKEY_DEVICE,
+                        KEY_READ, WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;key);
+        if (NT_SUCCESS(status)) {
+                status = WdfRegistryQueryULong(key, &amp;name,
+                                               &amp;value);
+                WdfRegistryClose(key);
+        }
+        if (!NT_SUCCESS(status))
+                value = DEFAULT_FIFO_DEPTH;   /* always have a
+                                                 default      */
+
+/* WHERE THE VALUES COME FROM: the INF file writes them at
+   install time (chapter 20). So the INF plays the role the
+   device tree plays on Linux - describing this particular
+   device - but it is applied once, into the registry, rather
+   than parsed at every boot.
+
+   ON ARM64 WINDOWS, hardware enumeration comes from ACPI
+   rather than a device tree: the ACPI namespace describes the
+   devices, and the PnP manager creates a device object for
+   each.                                                    */</code></pre>
+
+<h2 id="status">NTSTATUS</h2>
+
+<p>Kernel functions do not set <code>errno</code> and do not throw. They return a status code, and the single most common beginner mistake in Windows driver code is testing it the wrong way — the correct test is not a comparison against zero.</p>
+
+<pre><code>/* Windows kernel functions return NTSTATUS, not a negative
+   errno.                                                    */
+
+        NTSTATUS status;
+
+        status = SomeFunction();
+        if (!NT_SUCCESS(status))
+                return status;
+
+/* THE ENCODING - bits 31:30 are the severity: */
+        0x0.......   SUCCESS
+        0x4.......   INFORMATIONAL
+        0x8.......   WARNING
+        0xC.......   ERROR
+
+        NT_SUCCESS(s)       s &gt;= 0     (severity 0 or 1)
+        NT_INFORMATION(s)
+        NT_WARNING(s)
+        NT_ERROR(s)
+
+/* NOTE NT_SUCCESS IS TRUE FOR WARNINGS. A function returning
+   STATUS_BUFFER_OVERFLOW (0x80000005) passes NT_SUCCESS().
+   Checking `status == STATUS_SUCCESS` and checking
+   `NT_SUCCESS(status)` are DIFFERENT tests, and choosing the
+   wrong one is a real bug. Be deliberate.                 */
+
+/* THE ONES YOU WILL SEE CONSTANTLY: */
+        STATUS_SUCCESS
+        STATUS_PENDING                 /* async, will complete
+                                          later - not an error */
+        STATUS_INVALID_PARAMETER
+        STATUS_INSUFFICIENT_RESOURCES  /* = -ENOMEM */
+        STATUS_BUFFER_TOO_SMALL
+        STATUS_INVALID_DEVICE_REQUEST  /* = -ENOTTY */
+        STATUS_DEVICE_NOT_READY
+        STATUS_ACCESS_DENIED
+        STATUS_NOT_SUPPORTED
+        STATUS_CANCELLED
+        STATUS_TIMEOUT
+        STATUS_UNSUCCESSFUL            /* the last resort */
+
+/* Win32 error codes are DIFFERENT again; user mode sees those
+   via GetLastError(). The I/O manager translates. So one
+   failure has two names, and the WinDbg command
+   `!error &lt;value&gt;` decodes either.                        */</code></pre>
+
+<h2 id="strings">UNICODE_STRING</h2>
+
+<p>Kernel strings are not C strings. They are counted, UTF-16, and frequently not NUL-terminated, which means the string functions you know will read past the end of the buffer. This catches everyone exactly once, and the traps below are worth reading before you write any string code.</p>
+
+<pre><code>/* Kernel strings are counted UTF-16, not NUL-terminated
+   char*. This catches every newcomer once.                */
+
+typedef struct _UNICODE_STRING {
+        USHORT Length;           /* in BYTES, not characters */
+        USHORT MaximumLength;    /* in BYTES */
+        PWSTR  Buffer;           /* NOT necessarily
+                                    NUL-terminated!          */
+} UNICODE_STRING, *PUNICODE_STRING;
+
+/* CREATING one: */
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&amp;name, L"\\Device\\MyDevice");
+
+        /* or, for a constant, with no runtime cost: */
+        DECLARE_CONST_UNICODE_STRING(name,
+                                     L"\\Device\\MyDevice");
+
+/* WORKING with them: */
+        RtlCopyUnicodeString(&amp;dst, &amp;src);        /* truncates */
+        RtlAppendUnicodeStringToString(&amp;dst, &amp;src);
+        RtlCompareUnicodeString(&amp;a, &amp;b, TRUE);   /* case-insens */
+        RtlEqualUnicodeString(&amp;a, &amp;b, TRUE);
+        RtlUnicodeStringToAnsiString(&amp;ansi, &amp;uni, TRUE);
+
+/* PRINTING one - the %wZ specifier takes a POINTER: */
+        DbgPrint("name: %wZ\n", &amp;name);
+
+/* THE TRAPS:
+     · Length is in BYTES. A 5-character string has
+       Length == 10. Off-by-two-times is common.
+     · the buffer may not be NUL-terminated, so wcslen() and
+       friends can run off the end. Use Length.
+     · a UNICODE_STRING from user mode has an attacker-chosen
+       Length AND Buffer. Validate both, and probe the buffer
+       (chapter 08).                                        */</code></pre>
+
+<h2 id="lists">LIST_ENTRY and CONTAINING_RECORD</h2>
+
+<p>The other idiom you will meet on the first page of almost any driver, and the one that looks backwards until
+someone explains it. Kernel lists do not hold pointers to your data — the list node lives <em>inside</em> your
+structure, as an ordinary member, which is why adding something to a list can never fail and why one
+implementation serves every type in the system.</p>
+
+<pre><code>/* YOUR structure contains the node, not the other way round: */
+
+typedef struct _MY_REQUEST {
+        ULONG       Id;
+        LIST_ENTRY  Link;        /* &lt;-- the node IS a member */
+        PVOID       Payload;
+} MY_REQUEST, *PMY_REQUEST;
+
+/* THE HEAD is just another LIST_ENTRY, pointing at itself
+   when the list is empty: */
+        LIST_ENTRY  Head;
+        InitializeListHead(&amp;Head);
+
+        InsertTailList(&amp;Head, &amp;req-&gt;Link);    /* never fails */
+        InsertHeadList(&amp;Head, &amp;req-&gt;Link);
+        RemoveEntryList(&amp;req-&gt;Link);
+        if (IsListEmpty(&amp;Head)) { ... }
+
+/* WALKING IT - you get a pointer to the MEMBER, in the middle
+   of someone's structure, and need to get back to the start.
+   That is what CONTAINING_RECORD does, with the same pointer
+   arithmetic Linux spells container_of():                   */
+
+        PLIST_ENTRY entry = Head.Flink;
+
+        while (entry != &amp;Head) {
+                PMY_REQUEST req =
+                        CONTAINING_RECORD(entry, MY_REQUEST, Link);
+                /*  = (PMY_REQUEST)((PCHAR)entry -
+                       FIELD_OFFSET(MY_REQUEST, Link))        */
+
+                DoSomething(req);
+                entry = entry-&gt;Flink;
+        }
+
+/* REMOVING WHILE WALKING - capture the next pointer BEFORE
+   you free, or you read freed memory to advance:           */
+        entry = Head.Flink;
+        while (entry != &amp;Head) {
+                PLIST_ENTRY next = entry-&gt;Flink;      /* first! */
+                PMY_REQUEST req =
+                        CONTAINING_RECORD(entry, MY_REQUEST, Link);
+                RemoveEntryList(entry);
+                ExFreePoolWithTag(req, MYDRV_TAG);
+                entry = next;
+        }
+
+/* THE LIST DOES NO LOCKING. InsertTailList and
+   RemoveEntryList are plain pointer writes. YOU hold the
+   right lock for the IRQL involved (chapter 10) - or use
+   ExInterlockedInsertTailList, which takes a spinlock for
+   you.
+
+   YOU HAVE ALREADY SEEN CONTAINING_RECORD without noticing:
+   it is how a driver gets from a generic object the system
+   handed it back to its own state, and WDF's typed context
+   accessors (chapter 14) do exactly the same arithmetic
+   behind a generated function.                             */</code></pre>
+
+<h2 id="build">Getting set up</h2>
+
+<p>Before writing a line, you need a build environment and a way to run a driver without destroying your own machine. The standard arrangement is two machines — or two virtual machines — with a debugger attached from one to the other.</p>
+
+<pre><code># WHAT YOU NEED:
+#   Visual Studio 2022 (Community is fine)
+#     + "Desktop development with C++"
+#     + the Windows SDK
+#   The Windows Driver Kit (WDK), matching the SDK version
+#   The WDK's Visual Studio extension
+#
+# https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk
+
+# NEW PROJECT -> "Kernel Mode Driver, Empty (KMDF)"
+# That template gives you a .sys, a .inf, and the signing and
+# packaging steps already wired up.
+
+# A TEST MACHINE IS NOT OPTIONAL. A driver bug bugchecks the
+# machine, and you do not want that to be your development
+# box. Use a VM:
+#   Hyper-V, VMware or VirtualBox
+#   with a serial or network kernel-debugging connection to
+#   the host (chapter 23)
+
+# ENABLE TEST SIGNING on the target, so unsigned-by-Microsoft
+# builds will load (chapter 21):
+    bcdedit /set testsigning on
+    bcdedit /set nointegritychecks off
+    shutdown /r /t 0
+# A "Test Mode" watermark appears on the desktop. That is
+# expected.
+
+# AND SET UP KERNEL DEBUGGING on the target now, before you
+# need it:
+    bcdedit /debug on
+    bcdedit /dbgsettings net hostip:192.168.1.10 port:50000 \
+            key:1.2.3.4</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Driver will not load, "digitally signed" error</td><td>Test signing not enabled (<a href="win-20-signing.html">ch. 21</a>)</td></tr>
+<tr><td>Bugcheck immediately on load</td><td>Almost always IRQL or a bad pointer (<a href="win-02-irql.html">ch. 03</a>)</td></tr>
+<tr><td>String prints as garbage</td><td>Used <code>%s</code> instead of <code>%wZ</code>, or a non-terminated buffer</td></tr>
+<tr><td>Buffer overrun in string handling</td><td><code>Length</code> is bytes, not characters</td></tr>
+<tr><td>Code treats a warning as success</td><td><code>NT_SUCCESS</code> is true for <code>0x8...</code> — check the specific status</td></tr>
+<tr><td>Access check bypassed</td><td>Passed <code>KernelMode</code> where <code>UserMode</code> was required</td></tr>
+<tr><td>Device never appears</td><td>INF did not match the hardware ID (<a href="win-19-inf.html">ch. 20</a>)</td></tr>
+<tr><td>Registry value not found</td><td>The INF did not write it; always have a default</td></tr>
+<tr><td>Debugging the dev box, box is dead</td><td>Use a VM — this is the first lesson everyone learns twice</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the executive components and their function prefixes.</li>
+  <li>List eight differences between Linux and Windows driver architecture.</li>
+  <li>Explain why a stable driver ABI leads to signing, INFs and WDF.</li>
+  <li>Trace <code>ReadFile</code> from the application to a driver and back.</li>
+  <li>Explain what an IRP is and how it differs from Linux's per-subsystem request types.</li>
+  <li>Describe the object manager namespace and what a handle is.</li>
+  <li>Explain why <code>UserMode</code> versus <code>KernelMode</code> matters in an object reference.</li>
+  <li>Say where a driver's per-device configuration lives and how it got there.</li>
+  <li>Explain the NTSTATUS severity encoding and the <code>NT_SUCCESS</code> trap.</li>
+  <li>Use <code>UNICODE_STRING</code> correctly and name its three traps.</li>
+  <li>Explain why kernel lists put the node inside your structure, and what
+  <code>CONTAINING_RECORD</code> does to get back out.</li>
+  <li>Write a loop that walks a <code>LIST_ENTRY</code> list and frees every entry, correctly.</li>
+  <li>Set up a VM with test signing and kernel debugging enabled.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zero-cost abstraction: reading the generated assembly | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Zero-cost abstraction: reading the generated assembly</h1>
+<p class="lead">C++'s central claim is that its abstractions cost nothing you would not have paid by hand.
+That claim is checkable in about thirty seconds per case, and this chapter is a series of those checks — the
+ones that hold, and the ones that do not.</p>
+
+<h2 id="claim">The claim, stated precisely</h2>
+
+<p>"You don't pay for what you don't use" is C++'s central promise, and it is largely true and frequently misquoted. Stating it precisely is what lets you tell which features to adopt freely and which to weigh.</p>
+
+<pre class="diagram">   Stroustrup's formulation:
+
+     "What you don't use, you don't pay for. And what you do
+      use, you couldn't hand-code any better."
+
+   THE FIRST HALF IS ABOUT ABSENCE: a program that uses no
+   virtual functions carries no vtables; one that throws no
+   exceptions pays nothing on the happy path.
+
+   THE SECOND HALF IS ABOUT PRESENCE: an abstraction whose
+   types are known at compile time is compiled away entirely.
+
+   WHAT MAKES AN ABSTRACTION FREE:
+     · the type is known at compile time
+     · the function is visible for inlining
+     · no indirection the compiler cannot see through
+     · no allocation
+
+   WHAT MAKES ONE COST:
+     · TYPE ERASURE - virtual, std::function, dynamic_cast.
+       The compiler cannot know the target, so it cannot
+       inline.
+     · ALLOCATION - vector, string, shared_ptr, exceptions
+     · ATOMIC OPERATIONS - shared_ptr's refcount
+     · CODE the abstraction adds that you would not have
+       written: bounds checks, refcounts, unwind tables
+
+   THE METHOD FOR THE REST OF THIS CHAPTER: write both
+   versions, compile both at -O2 for aarch64, and diff the
+   assembly (compilers chapter 16).</pre>
+
+<h2 id="free">The ones that are free</h2>
+
+<p>These features genuinely compile away to the same code you would have written by hand in C. Adopting them costs nothing at run time and buys real safety and clarity.</p>
+
+<pre><code>/* --- std::array versus a C array ------------------------ */
+        int sum_c(const int *a, size_t n) {
+                int s = 0;
+                for (size_t i = 0; i &lt; n; i++) s += a[i];
+                return s;
+        }
+        int sum_cpp(const std::array&lt;int, 4&gt;&amp; a) {
+                return std::accumulate(a.begin(), a.end(), 0);
+        }
+/* -O2: sum_cpp is BETTER - the size is known, so it fully
+   unrolls:
+        ldp  w1, w2, [x0]
+        ldp  w3, w4, [x0, #8]
+        add  w1, w1, w2
+        add  w3, w3, w4
+        add  w0, w1, w3
+        ret
+   Five instructions, no loop. The C version cannot do this
+   because n is a runtime value.
+
+/* --- unique_ptr versus new/delete ----------------------- */
+        void f_c()   { Widget *p = new Widget; use(p);
+                       delete p; }
+        void f_cpp() { auto p = std::make_unique&lt;Widget&gt;();
+                       use(p.get()); }
+/* IDENTICAL assembly. Byte for byte.
+
+/* --- a class wrapper around a register ------------------ */
+        class Reg {
+                volatile uint32_t *p_;
+        public:
+                explicit Reg(uintptr_t a)
+                        : p_(reinterpret_cast&lt;volatile uint32_t *&gt;(a)) {}
+                uint32_t read() const  { return *p_; }
+                void write(uint32_t v) { *p_ = v; }
+        };
+        void f(Reg r) { r.write(r.read() | 1); }
+/* -&gt;  ldr  w1, [x0]
+        orr  w1, w1, #1
+        str  w1, [x0]
+        ret
+   Identical to the C version. The class does not exist at run
+   time.
+
+/* --- a strong type (chapter 07) ------------------------- */
+        void delay_c(uint32_t ms);
+        void delay_cpp(Milliseconds ms);
+        delay_cpp(100_ms);
+/* -&gt;  mov  w0, #100
+        b    delay
+   The literal suffix, the class, the constructor - all gone.
+
+/* --- a lambda in an algorithm --------------------------- */
+        auto n = std::count_if(v.begin(), v.end(),
+                               [](int x){ return x &gt; 10; });
+/* Compiles to the same loop as a hand-written one, and often
+   vectorises where a function pointer would not - because
+   the predicate is INLINED and therefore visible to the
+   vectoriser (compilers chapter 07).
+
+/* --- CRTP versus virtual (chapter 06) ------------------- */
+        struct Base { virtual int f() = 0; };
+        struct D : Base { int f() override { return 42; } };
+        int use_virt(Base&amp; b) { return b.f() + 1; }
+/* -&gt;  ldr  x8, [x0]        ; vptr
+        ldr  x8, [x8]        ; slot
+        blr  x8              ; INDIRECT CALL
+        add  w0, w0, #1
+
+        template&lt;typename D&gt; struct CBase {
+                int f() { return static_cast&lt;D&amp;&gt;(*this).impl(); }
+        };
+        struct CD : CBase&lt;CD&gt; { int impl() { return 42; } };
+        int use_crtp(CD&amp; d) { return d.f() + 1; }
+/* -&gt;  mov  w0, #43
+        ret
+   The entire call chain constant-folded away.           */</code></pre>
+
+<div class="key">
+<b>Check it yourself, in thirty seconds</b>
+<p>Open <a href="https://godbolt.org">godbolt.org</a>, set the compiler to <em>armv8-a clang</em> or
+<em>ARM64 gcc</em>, flags to <code>-O2</code>, and paste both versions side by side. Every claim in this
+chapter is verifiable that way, and the habit of verifying rather than believing is the actual skill being
+taught.</p>
+</div>
+
+<h2 id="notfree">The ones that are not</h2>
+
+<p>These do have a cost, and the cost is not always obvious from the source — a hidden allocation, a run-time lookup, or code the linker cannot remove.</p>
+
+<pre><code>/* --- std::function --------------------------------------- */
+        void apply_fn(std::function&lt;int(int)&gt; f, int x)
+                { use(f(x)); }
+/* -&gt;  a call through a type-erased vtable, plus possibly a
+        heap allocation when the std::function was
+        constructed. NOT inlinable.
+
+        template&lt;typename F&gt;
+        void apply_tmpl(F f, int x) { use(f(x)); }
+        apply_tmpl([](int y){ return y * 2; }, 5);
+/* -&gt;  mov  w0, #10
+        b    use
+   Fully inlined and folded. The SAME lambda, two orders of
+   magnitude apart, purely because of type erasure.
+
+   THE EMBEDDED-FRIENDLY MIDDLE GROUND - a fixed-capacity
+   inplace_function, or simply a function pointer plus a
+   context pointer (the C ops-table idiom, chapter 11).
+
+/* --- shared_ptr ------------------------------------------ */
+        void f(std::shared_ptr&lt;Widget&gt; p) { use(*p); }
+/* Passing by value: an ATOMIC increment on entry and an
+   atomic decrement on exit, each a full barrier on ARM. Pass
+   `const shared_ptr&amp;` or, better, `Widget&amp;`.
+
+/* --- std::string ----------------------------------------- */
+        void log_cpp(const std::string&amp; s);
+        log_cpp("literal");
+/* Constructs a temporary std::string: possibly an allocation,
+   a copy, and a destruction. Use string_view (chapter 08):
+        void log_sv(std::string_view s);
+        log_sv("literal");
+   -&gt;  two immediates - a pointer and a length. No
+        allocation, no strlen at run time.
+
+/* --- .at() versus operator[] ----------------------------- */
+        int a(std::vector&lt;int&gt;&amp; v, size_t i) { return v.at(i); }
+/* -&gt;  a comparison, a branch, and a call to
+        __throw_out_of_range - plus the unwind machinery.
+        int b(std::vector&lt;int&gt;&amp; v, size_t i) { return v[i]; }
+/* -&gt;  one `ldr`.
+   Both are correct choices; know which you are paying for.
+
+/* --- iostreams ------------------------------------------- */
+        std::cout &lt;&lt; "value: " &lt;&lt; x &lt;&lt; '\n';
+/* Pulls in locale, facets, the whole formatting machinery -
+   commonly 100 KB+ on a bare-metal target. std::format
+   (C++20) is smaller but still substantial; a hand-rolled
+   printf-style function or std::to_chars is what embedded
+   code should use.
+        std::to_chars(buf, buf + n, x);   /* no allocation, no
+                                             locale, fast     */</code></pre>
+
+<h2 id="measuring">Measuring properly</h2>
+
+<p>The only way to settle whether an abstraction was free is to look at what the compiler emitted. These are the tools, and using them turns the question from a debate into an observation.</p>
+
+<pre><code># --- CODE SIZE, per symbol ---
+    nm --size-sort -S -C prog.elf | tail -20
+    bloaty prog.elf -d symbols,compileunits
+    size -A prog.elf
+
+# --- DIFF TWO VERSIONS ---
+    g++ -O2 -S -o a.s a.cpp
+    g++ -O2 -S -o b.s b.cpp
+    diff -u a.s b.s
+
+# --- COUNT INSTRUCTIONS IN A FUNCTION ---
+    objdump -d prog.elf | awk '/&lt;myfunc&gt;:/,/^$/' | wc -l
+
+# --- PROVE NO ALLOCATION HAPPENS ---
+    /* on bare metal, simply do not provide operator new:
+       any accidental allocation becomes a LINK ERROR - the
+       strongest guarantee available */
+
+    /* on a hosted system, count them: */
+    static std::atomic&lt;size_t&gt; g_allocs{0};
+    void *operator new(size_t n) { g_allocs++; return malloc(n); }
+    void operator delete(void *p) noexcept { free(p); }
+
+    size_t before = g_allocs;
+    hot_path();
+    assert(g_allocs == before);         /* in a test */
+
+# --- PROVE A TYPE IS WHAT YOU THINK ---
+    static_assert(sizeof(Wrapper) == sizeof(uint32_t));
+    static_assert(std::is_trivially_copyable_v&lt;Message&gt;);
+    static_assert(std::is_standard_layout_v&lt;RegBlock&gt;);
+    static_assert(alignof(Buffer) == 64);
+
+# --- AND ACTUAL TIME, which is the only thing that
+#     ultimately matters ---
+    perf stat -r 10 ./prog
+    /* cycles, instructions, IPC, cache-misses,
+       branch-misses (compilers chapter 16) */</code></pre>
+
+<h2 id="whenlost">When the abstraction is not free</h2>
+
+<p>Abstractions that are normally free stop being free under specific, identifiable conditions. Knowing what breaks the optimisation is what lets you avoid it.</p>
+
+<pre><code>/* Usually because inlining did not happen. The causes, in
+   order of frequency: */
+
+   1. THE DEFINITION IS NOT VISIBLE.
+        A member function defined in a .cpp cannot be inlined
+        into another translation unit without LTO
+        (compilers chapter 12). Define small functions in the
+        HEADER.
+
+   2. IT IS TOO LARGE for the inliner's threshold.
+        Split it: a small inlinable wrapper around a large
+        out-of-line body.
+                inline int fast_path(int x) {
+                        if (likely(x &lt; 16)) return table[x];
+                        return slow_path(x);   /* not inlined,
+                                                  and that is
+                                                  fine       */
+                }
+
+   3. IT IS VIRTUAL and the type is not provable.
+        Mark the class or the function `final` (chapter 11),
+        or use a template.
+
+   4. IT IS CALLED THROUGH A FUNCTION POINTER or
+      std::function.
+
+   5. THE ADDRESS OF A LOCAL ESCAPED, so the variable cannot
+      be promoted to a register (compilers chapter 05).
+
+   6. -O0. Nothing is inlined; measuring there tells you
+      nothing.
+
+/* FORCE IT, when you have measured a reason: */
+        __attribute__((always_inline)) inline void f();
+        [[gnu::always_inline]] inline void f();
+/* AND FORBID IT, for cold paths that would pollute the
+   I-cache: */
+        __attribute__((noinline)) void error_path();
+
+/* ASK WHY IT DID NOT HAPPEN: */
+        clang -Rpass-missed=inline -Rpass-analysis=inline
+        gcc -fopt-info-inline-missed
+/* which prints the reason per call site - "cost exceeds
+   threshold", "function not inlinable", "recursive". That
+   output is the answer far more often than guessing.    */</code></pre>
+
+<h2 id="worked">A worked comparison</h2>
+
+<p>Here is the whole argument on one concrete example, from source through generated assembly, so the claim can be checked rather than believed.</p>
+
+<pre><code>/* A realistic embedded case: a GPIO abstraction. */
+
+/* --- C --- */
+        #define GPIO_BASE 0x40020000
+        #define GPIO_ODR  (*(volatile uint32_t *)(GPIO_BASE + 0x14))
+        static inline void gpio_set(int pin)
+                { GPIO_ODR |= (1u &lt;&lt; pin); }
+
+/* --- C++ --- */
+template&lt;uintptr_t Base&gt;
+class GpioPort {
+        struct Regs {
+                volatile uint32_t MODER, OTYPER, OSPEEDR,
+                                  PUPDR, IDR, ODR;
+        };
+        static Regs *regs()
+                { return reinterpret_cast&lt;Regs *&gt;(Base); }
+public:
+        template&lt;uint8_t Pin&gt;
+        class Pin_t {
+                static_assert(Pin &lt; 16, "invalid pin");
+        public:
+                static void set()    { regs()-&gt;ODR |=  (1u &lt;&lt; Pin); }
+                static void clear()  { regs()-&gt;ODR &amp;= ~(1u &lt;&lt; Pin); }
+                static bool read()   { return regs()-&gt;IDR &amp;
+                                              (1u &lt;&lt; Pin); }
+        };
+};
+        using PortA = GpioPort&lt;0x40020000&gt;;
+        using LedPin = PortA::Pin_t&lt;5&gt;;
+
+        LedPin::set();
+
+/* BOTH COMPILE TO: */
+        movz w8, #0x2000, lsl #16       ; the base
+        movk w8, #0x14                  ; + ODR offset
+        ldr  w9, [x8]
+        orr  w9, w9, #0x20              ; bit 5
+        str  w9, [x8]
+
+/* IDENTICAL. And the C++ version additionally gives you:
+     · a static_assert on the pin number - an invalid pin is
+       a BUILD error
+     · named, typed registers instead of offsets
+     · LedPin as a TYPE, passable to templates
+     · no macros, so no namespace pollution and no
+       double-evaluation hazard
+     · the port and pin cannot be mismatched, because they
+       are one type
+
+   THAT IS THE ARGUMENT for C++ in firmware, in one example:
+   the same instructions, with errors moved from run time to
+   compile time.                                          */</code></pre>
+
+<h2 id="checklist">A verification checklist</h2>
+
+<p>Rather than reasoning about each feature from scratch, this reduces the chapter to a procedure you can apply to any abstraction you are considering.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Claim</th><th>How to check</th></tr></thead>
+<tbody>
+<tr><td>"This wrapper is free"</td><td>Diff the assembly against the raw version</td></tr>
+<tr><td>"No allocation in this path"</td><td>Instrument <code>operator new</code>, or omit it entirely</td></tr>
+<tr><td>"This type is one word"</td><td><code>static_assert(sizeof(T) == ...)</code></td></tr>
+<tr><td>"This is inlined"</td><td>Look for the <code>bl</code>; or <code>-Rpass=inline</code></td></tr>
+<tr><td>"This call is devirtualised"</td><td>A named <code>bl</code> rather than <code>ldr</code>+<code>blr</code></td></tr>
+<tr><td>"This is computed at compile time"</td><td>It is in <code>.rodata</code>; <code>readelf -x</code></td></tr>
+<tr><td>"This loop vectorises"</td><td><code>v</code> registers in the output; <code>-fopt-info-vec</code></td></tr>
+<tr><td>"Exceptions cost nothing here"</td><td><code>size -A</code> with and without <code>-fno-exceptions</code></td></tr>
+<tr><td>"This is faster"</td><td><code>perf stat -r 10</code> — the only claim that needs timing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>An abstraction that should be free is not</td><td>Inlining did not happen — ask the compiler why</td></tr>
+<tr><td>A wrapper adds instructions</td><td>Definition not visible; needs to be in the header or LTO</td></tr>
+<tr><td>Unexpected <code>bl</code> to <code>operator new</code></td><td>A hidden allocation — <code>string</code>, <code>function</code>, <code>vector</code></td></tr>
+<tr><td>Indirect call where you expected direct</td><td>Virtual and not devirtualised — mark <code>final</code></td></tr>
+<tr><td>A lambda is not inlined</td><td>Stored in <code>std::function</code> — pass as a template parameter</td></tr>
+<tr><td>Binary grew after adding one header</td><td>iostreams, or a heavy template instantiation</td></tr>
+<tr><td>Measured at <code>-O0</code> and concluded C++ is slow</td><td>Measure at the level you ship</td></tr>
+<tr><td>A benchmark shows zero time</td><td>The whole thing was optimised away — the result is unused</td></tr>
+<tr><td>Assembly identical but the program is slower</td><td>Memory bound, not code bound — check <code>perf stat</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the zero-cost claim precisely and say what makes an abstraction free.</li>
+  <li>Verify on godbolt that <code>unique_ptr</code>, <code>array</code> and a register wrapper are
+  free.</li>
+  <li>Show that a lambda as a template parameter is free and in <code>std::function</code> is not.</li>
+  <li>Name five abstractions that cost, and what each costs.</li>
+  <li>Prove a code path performs no allocation.</li>
+  <li>List six reasons inlining fails, and ask the compiler which applies.</li>
+  <li>Write a templated GPIO abstraction and prove it matches the C version.</li>
+  <li>Say what that abstraction buys beyond the identical instructions.</li>
+  <li>Work the verification checklist against a claim in your own code.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The vCPU and the world switch | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The vCPU and the world switch</h1>
+<p class="lead">A vCPU is a data structure plus a promise: that whenever it runs, the physical CPU looks
+exactly the way that vCPU last left it. Keeping that promise is the world switch, and its length in
+instructions is the tax every guest pays on every exit.</p>
+
+<h2 id="what">What a vCPU is</h2>
+
+<p>A vCPU is a data structure and a thread, and being precise about what it does and does not contain explains most of what the switch code has to do.</p>
+
+<pre class="diagram">   struct vcpu - conceptually, three groups of state:
+
+   +-----------------------------------------------------------+
+   |  GUEST CPU STATE - must be identical on resume            |
+   |    x0-x30, SP_EL0, SP_EL1, PC (in ELR_EL2), PSTATE         |
+   |    FP/SIMD/SVE register file                               |
+   |    SCTLR_EL1 TTBR0_EL1 TTBR1_EL1 TCR_EL1 MAIR_EL1          |
+   |    VBAR_EL1 ESR_EL1 FAR_EL1 ELR_EL1 SPSR_EL1 AMAIR_EL1     |
+   |    CONTEXTIDR_EL1 TPIDR_EL0 TPIDRRO_EL0 TPIDR_EL1          |
+   |    CPACR_EL1 PAR_EL1 CSSELR_EL1 ...                        |
+   +-----------------------------------------------------------+
+   |  VIRTUAL HARDWARE - state of the devices this vCPU owns    |
+   |    vGIC CPU interface + list registers  (chapter 11)       |
+   |    virtual timer: CNTV_CTL, CNTV_CVAL, CNTVOFF (chapter 13)|
+   |    virtual PMU counters                                    |
+   |    MPIDR / MIDR the guest should see (VMPIDR/VPIDR_EL2)    |
+   +-----------------------------------------------------------+
+   |  HYPERVISOR BOOKKEEPING - never seen by the guest          |
+   |    pointer to the owning VM (and thus to VTTBR/VMID)       |
+   |    exit reason, exit counters                              |
+   |    pending interrupt injections                            |
+   |    the host thread this vCPU is running on                 |
+   |    run state: runnable / halted (WFI) / stopped            |
+   +-----------------------------------------------------------+
+
+   In KVM this structure lives in the host kernel and is
+   reachable from user space through a per-vCPU file
+   descriptor and a shared page (kvm_run).</pre>
+
+<div class="key">
+<b>A vCPU is a thread</b>
+<p>In KVM, one vCPU is one host thread that spends its life in a loop: <code>ioctl(vcpu_fd, KVM_RUN)</code>
+enters the guest, returns when something needs handling, user space or the kernel handles it, repeat. Every
+consequence of that follows: vCPUs are scheduled by the ordinary Linux scheduler, they can be pinned with
+<code>taskset</code>, they show up in <code>top</code>, and a vCPU blocked in <code>WFI</code> is a thread
+blocked on a wait queue.</p>
+</div>
+
+<h2 id="loop">The run loop</h2>
+
+<p>The run loop is the heart of a hypervisor and is shorter than expected. Everything else in this track is an elaboration of one of its branches.</p>
+
+<pre><code>/* User space (QEMU, crosvm, cloud-hypervisor): one thread per vCPU */
+
+void *vcpu_thread(void *arg)
+{
+        struct vcpu *v = arg;
+
+        for (;;) {
+                ioctl(v-&gt;fd, KVM_RUN, 0);     /* blocks in the guest */
+
+                switch (v-&gt;kvm_run-&gt;exit_reason) {
+
+                case KVM_EXIT_MMIO:
+                        /* the guest touched an address we model  */
+                        mmio_dispatch(v-&gt;kvm_run-&gt;mmio.phys_addr,
+                                      v-&gt;kvm_run-&gt;mmio.data,
+                                      v-&gt;kvm_run-&gt;mmio.len,
+                                      v-&gt;kvm_run-&gt;mmio.is_write);
+                        break;
+
+                case KVM_EXIT_HYPERCALL:
+                        handle_hypercall(v);
+                        break;
+
+                case KVM_EXIT_SYSTEM_EVENT:   /* PSCI shutdown/reset */
+                        return handle_system_event(v);
+
+                case KVM_EXIT_INTR:           /* a host signal       */
+                        break;                /* just re-enter       */
+
+                case KVM_EXIT_FAIL_ENTRY:
+                        die("entry failed, hw error 0x%llx",
+                            v-&gt;kvm_run-&gt;fail_entry.hardware_entry_failure_reason);
+                }
+        }
+}
+
+/* Note what is ABSENT from that list: stage-2 translation
+   faults, timer interrupts, GIC accesses, WFI. Those never
+   reach user space - the kernel handles them and re-enters the
+   guest without ever returning from the ioctl. That is the
+   difference between a "light exit" and a "heavy exit", and it
+   is roughly a factor of ten.                                 */</code></pre>
+
+<h2 id="switch">The world switch itself</h2>
+
+<p>The switch itself is the most performance-critical code in the system, and every line of it exists because something must be saved or something must be restored.</p>
+
+<pre class="diagram">   HOST context                                 GUEST context
+
+   kvm_arch_vcpu_ioctl_run()
+        |
+        v
+   +--------------------------------------+
+   | 1. disable interrupts, preempt off   |
+   | 2. flush pending vGIC state into the |
+   |    list registers                    |
+   | 3. save HOST unbanked state:         |
+   |      callee-saved x19-x30, SP        |
+   |      (host EL1 sysregs stay put in   |
+   |       VHE; must be saved in nVHE)    |
+   | 4. write VTTBR_EL2 = table | VMID    |
+   | 5. write HCR_EL2 = guest flags       |
+   | 6. restore GUEST sysregs             |
+   | 7. restore GUEST x0-x30, SP_EL0      |
+   | 8. write ELR_EL2 = guest PC          |
+   |    write SPSR_EL2 = guest PSTATE     |
+   | 9. ERET                              |
+   +--------------------------------------+
+        |
+        +------------------------------------> guest runs
+                                                    |
+                                                    | trap
+        &lt;---------------------------------------+---+
+        |
+   +--------------------------------------+
+   | 10. save GUEST x0-x30 immediately    |
+   |     (you have no free registers -    |
+   |      this is why TPIDR_EL2 holds the |
+   |      per-CPU host context pointer)   |
+   | 11. read ESR_EL2 - why are we here?  |
+   | 12. save guest sysregs IF the exit   |
+   |     will be long                     |
+   | 13. restore host state               |
+   | 14. return to C, handle the exit     |
+   +--------------------------------------+
+
+   Steps 6 and 12 are the expensive ones: roughly 30-40 MSR/MRS
+   pairs, each with pipeline cost. The whole switch is a few
+   thousand cycles.</pre>
+
+<h2 id="lazy">Every optimisation is a form of laziness</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Technique</th><th>Idea</th><th>Saves</th></tr></thead>
+<tbody>
+<tr><td><strong>Lazy FP/SIMD</strong></td><td>Set <code>CPTR_EL2</code> to trap the first FP instruction. Only
+save and restore the register file if the guest actually used it</td><td>~1000 cycles per switch for guests
+that never touch FP; much more with SVE, where the file can be kilobytes</td></tr>
+<tr><td><strong>Light exits</strong></td><td>Handle the exit in EL2 without restoring host EL1 state at
+all</td><td>Most of steps 12–13. A trapped timer read need not touch guest sysregs</td></tr>
+<tr><td><strong>VHE</strong></td><td>Host runs at EL2 so its EL1-style registers are already the ones in
+use</td><td>The entire host sysreg save/restore. See <a href="virt-09-vhe.html">chapter 09</a></td></tr>
+<tr><td><strong>VMID tagging</strong></td><td>TLB entries carry the VM identity</td><td>A full TLB flush per
+switch — this is enormous</td></tr>
+<tr><td><strong>Deferred vGIC sync</strong></td><td>Only read back the list registers if the guest could have
+changed them</td><td>Several register reads per exit</td></tr>
+<tr><td><strong>Pinned vCPUs</strong></td><td>Stop the host scheduler moving a vCPU between physical
+cores</td><td>Cache and TLB warmth, and cross-core IPIs</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>Why <code>TPIDR_EL2</code> matters</b>
+<p>On entry from the guest, every general-purpose register belongs to the guest and must not be clobbered
+before it is saved. The handler therefore needs one register's worth of scratch and a way to find its own
+per-CPU data. <code>TPIDR_EL2</code> is that anchor: it holds the address of this physical CPU's host
+context. Read it, stash a register, save the rest. Corrupt it and the hypervisor cannot find itself.</p>
+</div>
+
+<h2 id="wfi">WFI, WFE and the idle guest</h2>
+
+<p>An idle guest is a scheduling opportunity, and how the hypervisor treats these two instructions decides whether the host can use it.</p>
+
+<pre><code>/* A guest with nothing to do executes WFI. On bare metal that
+   parks the core until an interrupt arrives. Under a
+   hypervisor that would waste a physical CPU, so HCR_EL2.TWI
+   traps it.                                                  */
+
+  guest: WFI
+     -> trap to EL2, ESR_EL2.EC = 0x01
+     -> KVM: kvm_vcpu_halt()
+          the vCPU THREAD blocks on a wait queue.
+          the physical CPU runs something else - another vCPU,
+          a host process, or genuinely idles.
+
+  later: a virtual interrupt becomes pending for this vCPU
+     -> wake the thread
+     -> re-enter the guest
+     -> the guest's WFI "completes" and it takes the interrupt
+
+/* WFE is different and subtler. A guest spinlock does:
+
+       1: LDAXR w1, [x0]
+          CBNZ  w1, 2f
+          STXR  w2, w3, [x0]
+          CBNZ  w2, 1b
+          ... critical section ...
+       2: WFE                 // sleep until someone SEVs
+          B     1b
+
+   If two vCPUs of the same guest are time-sharing ONE physical
+   CPU, and the lock holder is descheduled, the waiter spins
+   for its entire time slice waiting for a vCPU that cannot
+   run. This is LOCK-HOLDER PREEMPTION, and it is the single
+   worst pathology in overcommitted virtualisation.
+
+   Trapping WFE turns the spin into a yield: KVM marks the vCPU
+   as yielding and tries to schedule a sibling vCPU of the same
+   VM - preferably the one holding the lock. That is
+   kvm_vcpu_on_spin(), and it is why HCR_EL2.TWE is set.
+
+   The real fix is not to overcommit vCPUs on a latency-
+   sensitive workload. Paravirtualised queued spinlocks help
+   on x86; on arm64 the WFE trap plus pinning is the practical
+   answer.                                                    */</code></pre>
+
+<h2 id="smp">Bringing up a multi-vCPU guest</h2>
+
+<p>Bringing up secondary vCPUs involves a protocol between guest and hypervisor that is easy to overlook until a guest hangs waiting for CPUs that never arrive.</p>
+
+<pre><code>/* The guest cannot power on a CPU - there is no CPU to power
+   on. It asks, via PSCI, and the hypervisor creates the
+   illusion.                                                   */
+
+  guest CPU0:  HVC  x0=PSCI_CPU_ON, x1=target MPIDR,
+                    x2=entry point,  x3=context id
+        |
+        v
+  EL2: find the vCPU whose VMPIDR_EL2 matches x1
+       if it is already on          -> return ALREADY_ON
+       set its PC = x2, x0 = x3
+       set its state = runnable
+       wake its host thread
+       return SUCCESS
+        |
+        v
+  guest CPU1 begins executing at x2, with x0 = context id,
+  MMU off, at EL1.
+
+/* Two details that bite:
+
+   1. VMPIDR_EL2 is what the guest reads as MPIDR_EL1. YOU
+      choose the affinity topology. If you hand out MPIDRs that
+      imply 4 clusters of 1 CPU, the guest's scheduler builds
+      its domains accordingly and may perform badly. Model a
+      topology that matches reality, or a flat one.
+
+   2. The PSCI conduit must match. The guest's device tree says
+      method = "hvc" (under KVM) or "smc" (bare metal). A
+      mismatch means CPU_ON sails past EL2 to EL3, where TF-A
+      tries to power on a real core for a virtual request.
+      Symptom: guest hangs with "CPU1: failed to boot: -110".  */</code></pre>
+
+<h2 id="measure">Measuring the switch</h2>
+
+<p>The cost of a world switch is a number you can measure rather than estimate, and having it makes the performance chapter concrete.</p>
+
+<pre><code># How many exits, and how expensive?
+
+$ sudo perf kvm --host stat live
+# live per-exit-reason breakdown, updated continuously
+
+$ sudo perf stat -e kvm:kvm_entry,kvm:kvm_exit -a sleep 10
+
+# Time in the guest vs time in the host, per vCPU thread:
+$ ps -T -p $(pgrep -f 'qemu.*mymachine') -o comm,pid,tid,pcpu
+COMMAND          PID    TID %CPU
+qemu-system-aar 4211   4211  3.1     # main/IO thread
+CPU 0/KVM       4211   4219 74.2     # vCPU 0
+CPU 1/KVM       4211   4220 71.8     # vCPU 1
+
+# Pin them and watch the exit rate change:
+$ taskset -cp 2 4219
+$ taskset -cp 3 4220
+
+# The microbenchmark that isolates switch cost: a guest loop
+# that does nothing but trap.
+#   guest:  1: hvc #0 ; b 1b
+# Time N iterations, divide. On modern arm64 with VHE expect
+# roughly 1-2 us per round trip if the hypercall is handled in
+# the kernel, 10x that if it reaches user space.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest FP results are wrong, but only sometimes</td><td>Lazy FP save/restore lost the register file — the
+trap fired but the state was not saved before reuse</td></tr>
+<tr><td>Guest thread-local storage corrupts across a migration</td><td><code>TPIDR_EL0</code>/
+<code>TPIDRRO_EL0</code> not in the save list</td></tr>
+<tr><td>Hypervisor crashes with a wild pointer on guest exit</td><td><code>TPIDR_EL2</code> clobbered — EL2 lost
+its per-CPU anchor</td></tr>
+<tr><td>Guest is slow only when the host is busy</td><td>Lock-holder preemption; vCPUs oversubscribed on
+physical cores</td></tr>
+<tr><td>Idle guest consumes a full physical core</td><td><code>HCR_EL2.TWI</code> not set, so guest
+<code>WFI</code> parks real hardware</td></tr>
+<tr><td>Guest hangs bringing up CPU1, <code>failed to boot: -110</code></td><td>PSCI conduit mismatch or the
+target MPIDR does not match any vCPU's <code>VMPIDR_EL2</code></td></tr>
+<tr><td>Guest scheduler behaves oddly with many vCPUs</td><td>Fabricated MPIDR topology implies a cluster
+layout that does not exist</td></tr>
+<tr><td><code>KVM_EXIT_FAIL_ENTRY</code></td><td>The CPU refused <code>ERET</code> into the guest — usually an
+illegal <code>SPSR_EL2</code>, or stage-2 not configured</td></tr>
+<tr><td>Enormous exit count with a tiny amount of work done</td><td>A heavy exit path being taken for something
+that should be handled in EL2 — check <code>perf kvm stat</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the three categories of state a vCPU holds and give three examples of each.</li>
+  <li>Explain the statement "a vCPU is a thread" and name three consequences.</li>
+  <li>Walk through the world switch in order and identify the two most expensive steps.</li>
+  <li>Explain why the guest's general-purpose registers must be saved before anything else on exit, and what
+  <code>TPIDR_EL2</code> has to do with it.</li>
+  <li>Describe lazy FP save/restore and the register that enables it.</li>
+  <li>Distinguish a light exit from a heavy exit and give an example of each.</li>
+  <li>Explain what trapping <code>WFI</code> achieves, and separately what trapping <code>WFE</code>
+  achieves.</li>
+  <li>Define lock-holder preemption and give two mitigations.</li>
+  <li>Describe how a guest brings up its secondary CPUs and name two ways it goes wrong.</li>
+  <li>Measure the exit rate of a running VM and identify the dominant exit reason.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

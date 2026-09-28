@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Linux device model | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The Linux device model</h1>
+<p class="lead">Buses, devices and drivers, and the matching process that brings them together. Once you can
+see this structure, every driver in the tree has the same shape — and the answer to "why does my probe never
+run" becomes a three-command investigation.</p>
+
+<h2 id="three">Three objects, one relationship</h2>
+
+<p>The device model is the machinery that connects a piece of hardware to the code that drives it. It rests on three objects and one relationship between them, and once that relationship is clear, most of what the kernel does at boot stops looking like magic.</p>
+
+<pre class="diagram">   struct bus_type            "platform", "i2c", "spi", "pci"
+        |     owns the MATCH function and the probe/remove
+        |     protocol for everything on it
+        |
+        +-- struct device_driver     code that can drive
+        |        · a name                 something
+        |        · a match table (of_match_table, id_table)
+        |        · .probe / .remove
+        |
+        +-- struct device            a thing that exists
+                 · a parent (the topology)
+                 · a bus
+                 · resources: reg, irq, clocks, DMA config
+                 · a driver, once bound
+
+   THE CORE LOOP, in drivers/base/:
+
+     a DEVICE is registered   -&gt; try every driver on its bus
+     a DRIVER is registered   -&gt; try every unbound device on
+                                 its bus
+
+     for each candidate:  bus-&gt;match(dev, drv)
+                                |
+                          matched? -&gt; drv-&gt;probe(dev)
+                                          |
+                                    0     -&gt; BOUND
+                                    -EPROBE_DEFER -&gt; retry later
+                                    other -&gt; not bound
+
+   That is the entire mechanism. Everything else is detail.
+
+   YOU SUBCLASS the generic structures:
+
+     struct platform_device  { struct device dev; ... }
+     struct i2c_client       { struct device dev; ... }
+     struct spi_device       { struct device dev; ... }
+
+   and get back to yours with container_of(), or with the
+   helpers each bus provides (to_platform_device(dev)).</pre>
+
+<h2 id="where">Where devices come from</h2>
+
+<p>A <code>struct device</code> never appears from nothing — something in the kernel decided a piece of hardware
+exists and called <code>device_register()</code> on its behalf, and which mechanism did that decides how the
+device gets discovered, what identifies it to a driver, and whether it can appear after boot at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Source</th><th>Bus</th><th>How</th></tr></thead>
+<tbody>
+<tr><td><strong>Device tree</strong></td><td>platform, i2c, spi</td><td><code>of_platform_populate()</code> walks the tree at boot. <strong>The embedded default.</strong></td></tr>
+<tr><td>ACPI</td><td>platform, pci</td><td>Firmware tables. Arm servers, some laptops.</td></tr>
+<tr><td>Enumeration</td><td>PCI, USB</td><td>The bus itself reports what is plugged in, with vendor/product IDs.</td></tr>
+<tr><td>Parent driver</td><td>Any</td><td>An MFD or a controller registers its children.</td></tr>
+<tr><td>Board file</td><td>platform</td><td>Static C tables. Legacy; replaced by DT on arm64.</td></tr>
+<tr><td>Userspace</td><td>Any</td><td>Device tree overlays, or a bus-specific <code>new_device</code> sysfs file.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="match">Matching</h2>
+
+<p>Matching is the moment the kernel decides that <em>this</em> driver is the one for <em>that</em> device. Each kind of bus answers that question differently — by name, by a string from the device tree, by a numeric vendor and product ID — but the outcome is always the same.</p>
+
+<pre><code>/* Each bus decides what "match" means. For platform devices
+   (drivers/base/platform.c), it tries in order:              */
+
+   1. OF: does dev->of_node's `compatible` appear in the
+          driver's of_match_table?          &lt;-- what you use
+   2. ACPI match table
+   3. the platform id_table
+   4. plain strcmp of driver->name against device->name
+
+/* THE OF WAY, which is what an embedded driver writes: */
+
+static const struct of_device_id my_of_match[] = {
+        { .compatible = "vendor,my-device-v2",
+          .data = &amp;v2_config },          /* per-variant data */
+        { .compatible = "vendor,my-device",
+          .data = &amp;v1_config },
+        { }                              /* SENTINEL - the
+                                            empty entry is
+                                            REQUIRED         */
+};
+MODULE_DEVICE_TABLE(of, my_of_match);   /* so modprobe can
+                                           autoload this
+                                           module for this
+                                           compatible        */
+
+static struct platform_driver my_driver = {
+        .driver = {
+                .name           = "my-driver",
+                .of_match_table = my_of_match,
+                .pm             = &amp;my_pm_ops,
+        },
+        .probe  = my_probe,
+        .remove = my_remove,
+};
+module_platform_driver(my_driver);       /* generates
+                                            module_init and
+                                            module_exit      */
+
+/* USING THE MATCH DATA to support several variants with one
+   driver - the standard pattern: */
+static int my_probe(struct platform_device *pdev)
+{
+        const struct my_config *cfg;
+
+        cfg = of_device_get_match_data(&amp;pdev-&gt;dev);
+        if (!cfg)
+                return -EINVAL;
+
+        d-&gt;nr_channels = cfg-&gt;nr_channels;
+        d-&gt;has_dma     = cfg-&gt;has_dma;
+        ...
+}
+
+/* THE SENTINEL MATTERS: the match loop runs until it finds an
+   entry with an empty compatible string. Omit it and the
+   kernel reads past the array - which manifests as a random
+   crash during boot, or a driver that matches something
+   absurd.                                                  */</code></pre>
+
+<h2 id="probe">A probe function, annotated</h2>
+
+<p><code>probe()</code> is the function you will write most often and the one where most driver bugs live. It is called once per device the kernel decided you own, and its job is to acquire everything the device needs, prove the hardware is really there, and publish an interface.</p>
+
+<pre><code>static int my_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct my_dev *d;
+        int ret;
+
+        /* 1. allocate the driver's per-device state, managed
+              so it is freed automatically (chapter 33)      */
+        d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+        d-&gt;dev = dev;
+
+        /* 2. MMIO - maps AND reserves the region */
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(d-&gt;base))
+                return PTR_ERR(d-&gt;base);
+
+        /* 3. clocks. May defer if the clock driver is late. */
+        d-&gt;clk = devm_clk_get_enabled(dev, "core");
+        if (IS_ERR(d-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;clk),
+                                     "no core clock\n");
+
+        /* 4. regulators, resets, GPIOs, phys - same shape */
+        d-&gt;vdd = devm_regulator_get(dev, "vdd");
+        if (IS_ERR(d-&gt;vdd))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;vdd),
+                                     "no vdd supply\n");
+        ret = regulator_enable(d-&gt;vdd);
+        if (ret)
+                return ret;
+
+        /* 5. DT properties specific to this device */
+        ret = device_property_read_u32(dev, "vendor,fifo-depth",
+                                       &amp;d-&gt;fifo_depth);
+        if (ret)
+                d-&gt;fifo_depth = 16;      /* a sane default */
+
+        /* 6. per-device locks and structures */
+        mutex_init(&amp;d-&gt;lock);
+        init_waitqueue_head(&amp;d-&gt;wq);
+        INIT_WORK(&amp;d-&gt;work, my_work_fn);
+
+        /* 7. the interrupt - LAST among resources, because
+              from here on the hardware can call into us     */
+        d-&gt;irq = platform_get_irq(pdev, 0);
+        if (d-&gt;irq &lt; 0)
+                return d-&gt;irq;
+
+        ret = devm_request_threaded_irq(dev, d-&gt;irq, NULL,
+                                        my_thread_fn,
+                                        IRQF_ONESHOT,
+                                        dev_name(dev), d);
+        if (ret)
+                return dev_err_probe(dev, ret, "irq %d\n",
+                                     d-&gt;irq);
+
+        /* 8. stash it so remove() and the fops can find it */
+        platform_set_drvdata(pdev, d);
+
+        /* 9. initialise the hardware */
+        ret = my_hw_init(d);
+        if (ret)
+                return ret;
+
+        /* 10. LAST: expose it to userspace. Nothing before
+               this point could be used by anyone, so there is
+               no window in which a half-set-up device is
+               reachable.                                    */
+        ret = misc_register(&amp;d-&gt;misc);
+        if (ret)
+                return ret;
+
+        dev_info(dev, "ready, %u channels\n", d-&gt;nr_channels);
+        return 0;
+}
+
+/* THE TWO ORDERING RULES that matter:
+     · acquire resources before enabling anything that can
+       generate events
+     · register the userspace interface LAST, and unregister
+       it FIRST in remove()                                 */</code></pre>
+
+<div class="key">
+<b><code>dev_err_probe()</code> in one line</b>
+<p>It logs the error <em>with the device name</em>, records the deferral reason where
+<code>/sys/kernel/debug/devices_deferred</code> can show it, downgrades <code>-EPROBE_DEFER</code> to a
+debug message so your logs are not flooded during normal boot, and returns the error code so you can
+<code>return</code> it directly. Use it for every resource acquisition in probe; there is no reason not
+to.</p>
+</div>
+
+<h2 id="defer">Deferred probe, properly understood</h2>
+
+<p>Here is behaviour that looks like a bug the first time you see it: your <code>probe()</code> runs, fails because a clock is not available yet, and then runs again later and succeeds. That is deliberate, it is the standard solution to a genuinely hard ordering problem, and fighting it is a mistake.</p>
+
+<pre><code>/* The problem: drivers probe in an order nobody controls, and
+   your device needs a clock from a driver that has not loaded.
+
+   The mechanism:
+
+     probe returns -EPROBE_DEFER
+        -&gt; the device goes on the DEFERRED LIST
+        -&gt; every time ANY driver probes successfully, the
+           whole deferred list is retried
+        -&gt; eventually the provider appears and you succeed
+
+   So ordering becomes self-organising. No initcall levels, no
+   Makefile ordering, no retry loops.                       */
+
+/* WHICH APIs RETURN IT: essentially every resource getter -
+   clk_get, regulator_get, gpiod_get, reset_control_get,
+   dma_request_chan, phy_get, of_find_i2c_device_by_node...
+
+   JUST PROPAGATE IT. Never swallow it:                    */
+        if (IS_ERR(clk))
+                return PTR_ERR(clk);     /* right */
+
+        if (IS_ERR(clk)) {
+                dev_err(dev, "no clock\n");
+                return -ENODEV;          /* WRONG - destroys
+                                            the deferral, and
+                                            the device never
+                                            probes           */
+        }
+
+/* WHEN IT NEVER RESOLVES: */
+        cat /sys/kernel/debug/devices_deferred
+        1c000000.my-device      platform: wait for supplier
+                                /soc/clock-controller@1b000000
+
+/* That names both the waiting device and what it waits for.
+   If the supplier never appears:
+     · its driver is not enabled in the config
+     · its DT node is missing or has a typo in `compatible`
+     · its own probe is failing - look further up the log
+
+   AND THE END-OF-BOOT REPORT:
+        deferred_probe_timeout=10        # cmdline
+   After the timeout, remaining deferrals are converted to
+   real failures and logged - which turns a silent
+   never-probes into a visible error.                      */</code></pre>
+
+<h2 id="sysfs">The device model in sysfs</h2>
+
+<p>Everything described above is visible as a directory tree. Being able to walk it is the fastest way to answer the question every stuck driver raises: did the device appear, did a driver claim it, and if not, which half is missing?</p>
+
+<pre><code># Every device, by bus:
+    ls /sys/bus/platform/devices/
+    ls /sys/bus/i2c/devices/
+
+# Every driver, and what it has bound:
+    ls /sys/bus/platform/drivers/my-driver/
+      bind  unbind  uevent  1c000000.my-device -> ...
+
+# The physical topology:
+    ls /sys/devices/platform/soc/1c000000.my-device/
+      driver -> ../../../bus/platform/drivers/my-driver
+      of_node -> ...
+      power/
+      uevent
+      modalias
+
+# MANUAL BIND AND UNBIND - the most useful debugging tool in
+# this chapter:
+    echo 1c000000.my-device > \
+         /sys/bus/platform/drivers/my-driver/unbind
+    echo 1c000000.my-device > \
+         /sys/bus/platform/drivers/my-driver/bind
+
+# This re-runs remove() and probe() without unloading the
+# module or rebooting. It exercises exactly the paths that
+# leak and race, and it is how you test error handling: make
+# probe fail, unbind, fix, bind.
+
+# What device tree node produced a device:
+    cat /sys/devices/platform/.../of_node/compatible
+
+# Which driver would autoload:
+    cat /sys/devices/platform/.../modalias
+      of:Nmy-deviceT(null)Cvendor,my-device
+# udev matches this against MODULE_DEVICE_TABLE entries.</code></pre>
+
+<h2 id="classes">Classes and the userspace view</h2>
+
+<p>Devices are also grouped by what they <em>are</em>, independently of how they are wired. That grouping is what lets user space find every temperature sensor on a machine without knowing whether they sit on I2C, SPI or USB.</p>
+
+<pre><code>/* A device's place in /sys/devices is its PHYSICAL topology.
+   A CLASS gives it a FUNCTIONAL identity:                  */
+
+        /sys/class/net/eth0
+        /sys/class/tty/ttyS0
+        /sys/class/gpio/
+        /sys/class/thermal/thermal_zone0
+        /sys/class/misc/my-device
+
+/* Registering with the right class is what makes generic
+   userspace tools work with your device. A driver that
+   registers as an IIO device gets libiio, a hwmon device gets
+   `sensors`, an input device gets evdev - for free.
+
+   THE ADVICE: before writing a character device with a custom
+   ioctl interface (chapter 23), check whether a SUBSYSTEM
+   already exists for your device class:
+
+        IIO        sensors, ADCs, DACs
+        hwmon      temperature, voltage, fan
+        input      buttons, touch, keyboards
+        rtc        real-time clocks
+        watchdog   watchdogs
+        pwm, led, gpio, regulator, clk, thermal
+        v4l2       video capture
+        ALSA       audio
+        MTD        raw flash
+        crypto     accelerators
+        tee        trusted execution (isolation ch. 12)
+
+   Using the right subsystem means: a stable, documented
+   userspace ABI you did not have to design; existing tools;
+   power management and buffering handled for you; and a much
+   easier upstreaming path (chapter 45). Writing a bespoke
+   char device for a temperature sensor is the most common
+   avoidable mistake in embedded driver work.             */</code></pre>
+
+<h2 id="remove">Remove, the mirror image</h2>
+
+<p>Everything <code>probe()</code> did has to be undone, in reverse, when the device goes away or the module is unloaded. This path gets far less testing than probe and is where drivers that work perfectly in normal use fall over.</p>
+
+<pre><code>static void my_remove(struct platform_device *pdev)
+{
+        struct my_dev *d = platform_get_drvdata(pdev);
+
+        /* EXACT REVERSE of probe: */
+
+        /* 1. userspace interface first - no new users */
+        misc_deregister(&amp;d-&gt;misc);
+
+        /* 2. stop the hardware generating events */
+        writel(0, d-&gt;base + REG_INT_ENABLE);
+
+        /* 3. wait for anything in flight (chapter 15) */
+        cancel_work_sync(&amp;d-&gt;work);
+
+        /* 4. quiesce the device */
+        my_hw_shutdown(d);
+
+        /* 5. devm_ handles the irq, ioremap, clk and the
+              allocation itself - in reverse order,
+              automatically                                  */
+
+        /* 6. what devm does NOT handle: anything you enabled
+              or initialised by hand                         */
+        regulator_disable(d-&gt;vdd);
+}
+
+/* NOTE remove() returns void in modern kernels (6.11+). It
+   used to return int, and the return value was ignored
+   anyway - because there is no meaningful way to refuse to
+   remove a device that is going away.                     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Probe never runs</td><td>No matching <code>compatible</code>; check the DT node and <code>of_match_table</code></td></tr>
+<tr><td>Device in <code>/sys/bus/platform/devices</code> with no <code>driver</code> link</td><td>No driver matched — compare strings character by character</td></tr>
+<tr><td>Device not in sysfs at all</td><td>DT node has <code>status = "disabled"</code>, or is not under a populated bus</td></tr>
+<tr><td>Probe runs, returns <code>-517</code> forever</td><td>Supplier never appears — check <code>devices_deferred</code></td></tr>
+<tr><td>Device never probes and nothing is logged</td><td>Deferral swallowed and converted to another error</td></tr>
+<tr><td>Random crash during boot enumeration</td><td>Missing sentinel in the match table</td></tr>
+<tr><td>Module does not autoload</td><td>Missing <code>MODULE_DEVICE_TABLE</code></td></tr>
+<tr><td>Crash on unbind</td><td>Teardown order wrong, or missing <code>_sync</code> cancellations</td></tr>
+<tr><td>Leak across bind/unbind cycles</td><td>Something acquired by hand and never released</td></tr>
+<tr><td>Userspace sees a half-initialised device</td><td>Registered the interface before finishing setup</td></tr>
+<tr><td>Wrong variant behaviour on a similar board</td><td>Match data not used; hard-coded per-SoC values</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the bus/device/driver relationship and the core matching loop.</li>
+  <li>Name six sources of devices and which dominates on embedded arm64.</li>
+  <li>Write an <code>of_match_table</code> with variant data, and explain the sentinel.</li>
+  <li>Explain what <code>MODULE_DEVICE_TABLE</code> enables.</li>
+  <li>Write a probe function in the correct order and justify each step's position.</li>
+  <li>Explain everything <code>dev_err_probe</code> does.</li>
+  <li>Explain deferred probe and why swallowing <code>-EPROBE_DEFER</code> is fatal.</li>
+  <li>Use <code>devices_deferred</code> to diagnose a device that never probes.</li>
+  <li>Use unbind/bind to exercise probe and remove without rebooting.</li>
+  <li>Name six kernel subsystems and say why using one beats a custom char device.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging access-control failures | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging access-control failures</h1>
+<p class="lead">The last chapter of the track, and the one you will actually use. Something is being
+refused, or worse, silently ignored. Here is how to find out what, who, and why — starting from the two
+symptoms that look nothing like an access-control problem.</p>
+
+<h2 id="symptoms">The two faces of a denial</h2>
+
+<p>Access-control failures rarely announce themselves as permission errors. They appear as a device that does not work, a read that returns zeros, or a hang — which is why they are so often misattributed.</p>
+
+<pre class="diagram">  LOUD: an abort.
+
+     Linux:  "Synchronous External Abort" / "SError Interrupt"
+     TF-A:   an EL3 crash dump
+     DMA:    a channel error, a device timeout
+     SMMU:   an event in the event queue (chapter 06)
+
+     Annoying, but honest. You get an address and often a
+     master.
+
+  SILENT: reads return 0, writes vanish.
+
+     "The device isn't present."
+     "The ID register reads 0x00000000."
+     "DMA completes but the buffer is unchanged."
+     "It works on the dev board."
+
+     THIS is the one that costs a week. There is no error
+     anywhere in the system, and every layer reports success.
+     The driver author reasonably concludes the hardware is
+     broken or the address is wrong.
+
+  THE TELL for the silent case:
+
+     an MMIO read returning EXACTLY 0x00000000 or 0xFFFFFFFF
+     from a register that should have a fixed non-zero value -
+     an ID, a version, a revision - is an access problem until
+     proven otherwise. Real hardware that is present and
+     clocked almost never reads back all-zeros from its ID
+     register.
+
+     0x00000000  usually: RAZ/WI denial, or the block is in
+                 reset, or unclocked
+     0xFFFFFFFF  usually: nothing decodes this address at all,
+                 or the bus returned an error that got
+                 swallowed</pre>
+
+<h2 id="triage">Triage: five questions in order</h2>
+
+<p>Given an unexplained failure, a short ordered set of questions distinguishes an access-control denial from an ordinary driver bug quickly.</p>
+
+<pre><code>/* Work down this list. Each step is cheap and eliminates a
+   large class.                                              */
+
+1. IS THE BLOCK POWERED, CLOCKED, AND OUT OF RESET?
+      By far the most common cause of all-zero reads, and it is
+      not an access-control problem at all.
+      -&gt; check the clock and reset drivers, /sys/kernel/debug/clk,
+         and the power domain state. Enable the clock by hand
+         and read again.
+
+2. IS THE ADDRESS RIGHT?
+      Compare the DT reg property against the TRM. Check you
+      are reading the right instance - SoCs have four UARTs and
+      three of them are wired to nothing.
+      -&gt; devmem2 / busybox devmem from userspace, on a
+         neighbouring register you know the value of.
+
+3. IS THIS ACCESS DENIED?
+      Now the interesting question. Read the XPU fault
+      registers, the SMMU event queue, the TZASC fail status.
+      -&gt; details below.
+
+4. WHICH MASTER, AND WHICH REGION?
+      A fault register usually gives you both. If not,
+      bisect - see "when there is no fault register".
+
+5. IS THE POLICY WRONG, OR IS THE CODE WRONG?
+      A denial is often CORRECT: the driver really is touching
+      something it should not, using the wrong buffer, or
+      running on the wrong master. Fix the code before you
+      widen the policy. Widening is the last resort, not the
+      first.                                                */</code></pre>
+
+<div class="key">
+<b>The instinct to resist</b>
+<p>When a denial appears, the fastest way to make it go away is to open the region. That is almost always
+the wrong fix, and it is how policies rot (<a href="sec-19-xpu-policy.html">chapter 19</a>). Ask first:
+<em>why is this master touching this address?</em> Half the time the honest answer reveals a bug — a stale
+pointer, a buffer allocated from the wrong pool, a DMA descriptor never updated — and the XPU has just done
+you a large favour.</p>
+</div>
+
+<h2 id="cpu">Decoding a CPU abort</h2>
+
+<p>When the processor is the blocked master, the fault arrives through the ordinary exception path — and decoding it is the ARM track's syndrome register work applied here.</p>
+
+<pre><code>Unhandled fault: synchronous external abort (0x96000010)
+  at 0xffff800008a01000
+[0000000000000000] ESR = 0x96000010
+
+/* ESR_EL1 = 0x96000010, decoded (ARM chapter 29):
+
+     EC   = 0b100101 (0x25)  Data Abort, same EL
+     ISV  = 0                no instruction syndrome
+     DFSC = 0b010000 (0x10)  SYNCHRONOUS EXTERNAL ABORT,
+                             not on a translation table walk
+
+   DFSC 0x10 means: the MMU translated it fine, the transaction
+   went out to the bus, AND SOMETHING OUT THERE SAID NO.
+
+   That "something" is an XPU, a TZASC, a peripheral that does
+   not decode the address, or a slave in reset. The CPU cannot
+   tell you which - it only knows the bus said no.
+
+   FAR_EL1 holds the virtual address. Convert it to physical:
+        virt_to_phys(), or read the translation with AT S1E1R
+        and TTBR-walk it, or just look at the ioremap that
+        produced it.                                         */
+
+/* SYNCHRONOUS vs ASYNCHRONOUS - and this matters a lot:
+
+   Synchronous external abort (DFSC 0x10)
+        the faulting instruction is in ELR. Device memory
+        (nGnRnE/nGnRE) accesses fault synchronously, so MMIO
+        denials point straight at the offending line.
+
+   SError / asynchronous
+        a WRITE to Normal memory was posted and completed long
+        ago from the CPU's point of view. The abort arrives
+        whenever the write finally reached the denier - which
+        may be thousands of instructions later, in unrelated
+        code, on a different task.
+        -&gt; the reported PC IS NOT THE CULPRIT. Do not spend a
+           day analysing it.
+
+   TAMING AN SError: insert `dsb sy` after the suspect writes to
+   force them to complete, and the abort becomes synchronous
+   enough to localise. Or bisect by disabling one master at a
+   time.                                                     */</code></pre>
+
+<h2 id="xpufault">Reading XPU fault registers</h2>
+
+<p>When a non-CPU master is blocked, the access control unit itself records what happened. Finding and reading that record is the equivalent of reading an SMMU event.</p>
+
+<pre><code>/* Every XPU worth using latches the FIRST fault. Read it. */
+
+void xpu_dump_fault(uintptr_t xpu)
+{
+        uint32_t st = mmio_read32(xpu + XPU_ERR_STATUS);
+        uint64_t addr;
+
+        if (!(st &amp; XPU_ERR_VALID)) {
+                INFO("xpu: no fault latched\n");
+                return;
+        }
+
+        addr  = (uint64_t)mmio_read32(xpu + XPU_ERR_ADDR_HI) &lt;&lt; 32;
+        addr |= mmio_read32(xpu + XPU_ERR_ADDR_LO);
+
+        ERROR("XPU FAULT\n"
+              "  address   : 0x%016llx\n"
+              "  master ID : 0x%02x (%s)\n"
+              "  direction : %s\n"
+              "  security  : %s\n"
+              "  privileged: %s\n"
+              "  multiple  : %s\n",
+              addr,
+              mmio_read32(xpu + XPU_ERR_MASTER),
+              master_name(mmio_read32(xpu + XPU_ERR_MASTER)),
+              (st &amp; XPU_ERR_WRITE)  ? "write" : "read",
+              (st &amp; XPU_ERR_NS)     ? "non-secure" : "secure",
+              (st &amp; XPU_ERR_PRIV)   ? "privileged" : "unprivileged",
+              (st &amp; XPU_ERR_OVF)    ? "yes - more faults occurred"
+                                    : "no");
+
+        mmio_write32(xpu + XPU_ERR_CLEAR, 1);   /* re-arm */
+}
+
+/* THE OVERFLOW BIT MATTERS. Only the first fault is latched;
+   later ones set overflow and are lost. So:
+
+     · clear the fault as soon as you have logged it
+     · if overflow is set, you are seeing one of many - fix
+       that one, re-run, and look again
+     · a repeating fault at 60 Hz is a display or DMA loop;
+       one fault at boot is a probe.
+
+/* WIRE THE INTERRUPT UP. An XPU fault interrupt handled in EL3
+   that prints this block is worth more than any amount of
+   after-the-fact analysis. Do it once, at the start of a
+   project, and every subsequent access bug takes minutes.  */</code></pre>
+
+<h2 id="others">The other reporters</h2>
+
+<p>Several other blocks on an SoC can also report a denied access, and knowing which reporters exist on your platform saves searching the wrong log.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Block</th><th>Where the evidence is</th></tr></thead>
+<tbody>
+<tr><td><strong>SMMU</strong></td><td>The event queue: StreamID, SubstreamID, IOVA, fault reason. See <a href="sec-06-smmu-faults.html">chapter 06</a> — richest source on the SoC.</td></tr>
+<tr><td><strong>TZC-400</strong></td><td><code>FAIL_ADDRESS_LOW/HIGH</code>, <code>FAIL_CONTROL</code> (direction, NS, privilege), <code>FAIL_ID</code> (master), per filter unit.</td></tr>
+<tr><td><strong>Interconnect</strong></td><td>Some NoCs have error probes logging the initiator, target, opcode and a timestamp — check whether yours does before building a bisect harness.</td></tr>
+<tr><td><strong>TF-A</strong></td><td>Its exception handlers print an EL3 crash dump with all the ESR/FAR context.</td></tr>
+<tr><td><strong>Linux</strong></td><td><code>dmesg</code>: external aborts, SErrors, <code>arm-smmu</code> fault lines, <code>rcu</code> stalls if the secure world hung.</td></tr>
+<tr><td><strong>The DMA engine</strong></td><td>Per-channel error status, often with the descriptor address that failed — which tells you the buffer, not just the address.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="nofault">When there is no fault register</h2>
+
+<p>The hardest case: a denial that reports nothing at all, because the hardware was configured to return zeros silently. This is how to find those.</p>
+
+<pre><code>/* RAZ/WI denials with no logging. You have no evidence, so
+   MANUFACTURE some.                                         */
+
+/* TECHNIQUE 1: switch to error responses.
+   Most blocks can be told to abort instead of ignoring, even
+   if production ships quiet. One build flag turns a
+   week-long mystery into a stack trace.                    */
+        mmio_write32(xpu + XPU_CTRL, ctrl | XPU_CTRL_ERR_RESP);
+
+/* TECHNIQUE 2: probe from a known-good master.
+   Read the same address from EL3 firmware, which is usually
+   allowed everything. If EL3 sees the right value and Linux
+   sees zeros, it is a policy question, not a hardware one. */
+
+/* TECHNIQUE 3: bisect the policy.
+   Open regions one at a time until it works. The one that
+   fixes it names the resource; the failing master follows from
+   which driver you were exercising. Crude, always works.   */
+
+/* TECHNIQUE 4: bisect the masters.
+   Hold subsystems in reset, or disable their DT nodes, one at
+   a time. When the corruption stops, the last one you disabled
+   is the culprit. This is the standard way to find a rogue
+   DMA writer with no XPU at all.                           */
+
+/* TECHNIQUE 5: a canary region.
+   Fill a page with a pattern, deny everyone, and scan it
+   periodically. If it changes, something is writing where it
+   must not - and now you know it exists, which is most of the
+   battle.                                                   */
+
+/* TECHNIQUE 6: read a neighbour.
+   If register 0x00 reads zero, read 0x04, 0x08, an adjacent
+   block's ID register. All zero across a whole peripheral -&gt;
+   clock, reset or a whole-block denial. Only one register
+   zero -&gt; that register really is zero, and this was never an
+   access problem.                                          */</code></pre>
+
+<h2 id="worked">A worked example</h2>
+
+<p>A complete investigation from symptom to root cause, tying together the triage, the registers and the policy — which is what the chapter has been building toward.</p>
+
+<pre><code># SYMPTOM
+#   New video decoder driver. probe() succeeds, but every
+#   decode returns an empty frame. No errors anywhere.
+
+# 1. clocked and out of reset?
+   cat /sys/kernel/debug/clk/clk_summary | grep vdec
+     vdec_core   1  1  0  300000000        -&gt; yes, enabled
+
+# 2. address right? read the ID register from userspace:
+   devmem 0x1c000000
+     0x00000000                             -&gt; suspicious.
+   devmem 0x1c000004
+     0x00000000
+   devmem 0x1c000008
+     0x00000000                             -&gt; the whole block.
+#  TRM says ID should read 0x56444543. So: not present, not
+#  clocked (but clk says it is), or DENIED.
+
+# 3. any faults latched? From the TF-A debug console:
+   tfa&gt; xpu_dump 0
+     XPU FAULT
+       address   : 0x000000001c000000
+       master ID : 0x04 (CPU_NS)
+       direction : read
+       security  : non-secure
+     -&gt; DENIED. The CPU, non-secure, may not read the decoder's
+        registers.
+
+# 4. why? Check the policy:
+   grep -A4 vdec platform_policy.yaml
+     - name: vdec_regs
+       base: 0x1C000000
+       access: { secure: rw }
+     -&gt; the decoder was classified as a SECURE resource,
+        because an earlier product used it for DRM.
+
+# 5. policy wrong, or code wrong?
+#  Talk to the team. Conclusion: this product decodes
+#  non-protected content on the AP, so the AP legitimately
+#  needs the registers - but the PROTECTED OUTPUT BUFFER must
+#  still be unreadable by the AP. So the fix is to split the
+#  resource, not to open it:
+
+     - name: vdec_regs
+       base: 0x1C000000
+       access: { ap: rw, secure: rw }       # control plane
+     - name: vdec_protected_out
+       base: 0xC8000000
+       access: { media: w, secure: rw }     # data plane:
+                                            # codec writes,
+                                            # AP never reads
+
+# 6. regenerate, rebuild firmware, re-run.
+#    AND add the negative test:
+     { "AP reads protected video output", M_CPU_NS,
+       PROT_VIDEO, false },
+#    so the day someone widens this by accident, CI says so.</code></pre>
+
+<div class="note">
+<b>Notice what step 5 did</b>
+<p>The lazy fix — <code>access: { ap: rw }</code> on the whole subsystem — would have worked, shipped, and
+quietly handed the application processor read access to protected video. Splitting control plane from data
+plane took ten extra minutes and preserved the property the policy existed for. That distinction, between
+"make the error go away" and "understand what the error was protecting", is the whole skill.</p>
+</div>
+
+<h2 id="toolkit">The toolkit</h2>
+
+<p>The tools and register views worth having to hand before you need them, since several are only accessible from firmware or a debugger rather than from Linux.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td><code>devmem</code> / <code>devmem2</code></td><td>Poke physical addresses from userspace. First thing to reach for.</td></tr>
+<tr><td><code>dmesg</code>, <code>/sys/kernel/debug/clk/clk_summary</code></td><td>Aborts, SMMU faults, clock and reset state.</td></tr>
+<tr><td>TF-A debug console</td><td>Read XPU/TZC registers from EL3, where everything is allowed.</td></tr>
+<tr><td>JTAG</td><td>Halt and inspect — but remember <code>SPIDEN</code> gating (<a href="sec-10-hw-enforcement.html">ch. 10</a>).</td></tr>
+<tr><td>Bus trace / NoC probes</td><td>Ground truth on who issued what, if your SoC has them.</td></tr>
+<tr><td>A logic analyser on the reset and clock lines</td><td>When the software's view of power state is not believable.</td></tr>
+<tr><td>The negative test suite</td><td>Not a debugging tool — a tool for knowing the bug never comes back.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>First check</th></tr></thead>
+<tbody>
+<tr><td>Whole block reads 0x00000000</td><td>Unclocked, in reset, or wholly denied</td><td>Clock summary, then XPU fault register</td></tr>
+<tr><td>Whole block reads 0xFFFFFFFF</td><td>Address decodes to nothing</td><td>DT <code>reg</code> against the TRM</td></tr>
+<tr><td>Synchronous external abort, DFSC 0x10</td><td>Bus-level denial on MMIO</td><td>FAR, then the XPU/TZC fail address</td></tr>
+<tr><td>SError at an unrelated instruction</td><td>A posted write denied long after issue</td><td><code>dsb sy</code> to localise, then bisect masters</td></tr>
+<tr><td>DMA "succeeds", buffer unchanged</td><td>Writes ignored</td><td>Switch the block to error responses</td></tr>
+<tr><td>Works from EL3, not from Linux</td><td>Policy denies the non-secure master</td><td>The access matrix</td></tr>
+<tr><td>Works for small buffers only</td><td>Larger buffer crosses a region boundary</td><td>Region base and limit vs the allocation</td></tr>
+<tr><td>Intermittent, allocation-dependent</td><td>Same, but only some allocations cross</td><td>Print the physical address on failure</td></tr>
+<tr><td>Fault overflow bit set</td><td>Many faults; you are seeing one</td><td>Fix, clear, re-run, look again</td></tr>
+<tr><td>Random corruption, no attribution</td><td>A master with no XPU coverage at all</td><td>Canary region, then master bisection</td></tr>
+<tr><td>Fails only on production silicon</td><td>Lifecycle state; debug gating; a tighter production policy</td><td>Compare the two policy builds directly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the two faces of a denial and say which costs more time.</li>
+  <li>Explain what an all-zero ID register read tells you, and what it does not.</li>
+  <li>Run the five triage questions in order on a real symptom.</li>
+  <li>Decode <code>ESR = 0x96000010</code> and say what it does and does not identify.</li>
+  <li>Explain why an SError's reported PC is not the culprit, and how to localise it.</li>
+  <li>Write a fault-register dump, and explain why the overflow bit matters.</li>
+  <li>Give three techniques for finding a denial with no fault register.</li>
+  <li>Work the video decoder example and explain why splitting the resource beat widening it.</li>
+  <li>Say what you would add to a new project on day one to make all of this take minutes.</li>
+</ul>
+
+<div class="tip">
+<b>End of the isolation and security track</b>
+<p>You have gone from the threat model of an SoC, through the SMMU, TrustZone, the TEE stack, secure boot,
+real attacks, and access control, to debugging the whole thing. Next comes
+<a href="track.html?t=lx">Linux kernel and drivers</a>, where much of this becomes concrete: DMA APIs
+against a real SMMU, reserved memory against a real policy, and a driver you write yourself.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

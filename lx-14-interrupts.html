@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interrupt handling in Linux | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Interrupt handling in Linux</h1>
+<p class="lead">From the GIC delivering an exception to your handler being called: the number spaces, the
+device-tree description, the registration API, and the handful of mistakes that produce interrupt storms
+and missed events.</p>
+
+<h2 id="path">The path from wire to handler</h2>
+
+<p>Between a wire changing voltage and your C function running, a surprising amount happens: hardware signals a controller, the controller decides which CPU should take it, the CPU switches privilege level and vectors into the kernel, and only then is your handler looked up and called. Knowing the path matters because an interrupt that never arrives can be lost at any point along it.</p>
+
+<pre class="diagram">   device asserts its interrupt line
+        |
+        v
+   GIC distributor -&gt; redistributor -&gt; CPU interface
+        |  (ARM ch. 23-24: priority, targeting, grouping)
+        v
+   CPU takes an IRQ exception -&gt; VBAR_EL1 + 0x280
+        |  (ARM ch. 27-28)
+        v
+   arch/arm64/kernel/entry.S  el1_irq / el0_irq
+        |
+        v
+   handle_arch_irq  -&gt;  gic_handle_irq()
+        |
+        |  read GICC_IAR / ICC_IAR1_EL1 -> the hardware INTID
+        v
+   irq_find_mapping(domain, hwirq)  ->  the LINUX IRQ NUMBER
+        |
+        v
+   generic_handle_irq(virq)
+        |
+        v
+   handle_level_irq() / handle_edge_irq()   the FLOW HANDLER
+        |    mask, ack, or eoi as the type requires
+        v
+   for each action on this irq:
+        your_handler(irq, dev_id)
+        |
+        v
+   IRQ_HANDLED / IRQ_WAKE_THREAD / IRQ_NONE
+        |
+        v
+   EOI to the GIC, return from exception
+
+  TWO NUMBER SPACES, and confusing them wastes hours:
+
+     HWIRQ    the hardware number. SPI 42, or "bit 3 of GPIO
+              controller 2". Meaningful only to that
+              controller. This is what the DEVICE TREE says.
+
+     VIRQ     the Linux irq number. A global integer allocated
+              by the kernel. What you pass to request_irq().
+              What /proc/interrupts shows.
+
+  The IRQ DOMAIN maps between them, per controller. That is
+  what makes nested controllers work: a GPIO chip is an
+  interrupt controller whose own interrupt comes from the GIC,
+  and each of its pins gets a virq of its own.</pre>
+
+<h2 id="dt">Describing an interrupt in the device tree</h2>
+
+<p>Your driver does not choose which interrupt line it gets — that is a property of how the chip is wired to the board, so like everything else about the board it comes from the device tree. Getting this description wrong is the single most common reason a handler never fires.</p>
+
+<pre><code>/* GIC SPI, the common case: */
+
+        my_device: device@1c000000 {
+                compatible = "vendor,my-device";
+                reg = &lt;0x0 0x1c000000 0x0 0x1000&gt;;
+                interrupts = &lt;GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH&gt;;
+                interrupt-parent = &lt;&amp;gic&gt;;   /* often inherited */
+        };
+
+/* THREE CELLS for a GICv2/v3:
+     cell 1: GIC_SPI (0) or GIC_PPI (1)
+     cell 2: the interrupt number WITHIN that type.
+             SPI n in DT = INTID (n + 32) in the GIC.
+             THIS OFF-BY-32 CATCHES EVERYONE. The TRM says
+             "INTID 74"; the device tree says 42.
+     cell 3: the trigger type:
+                IRQ_TYPE_EDGE_RISING     1
+                IRQ_TYPE_EDGE_FALLING    2
+                IRQ_TYPE_LEVEL_HIGH      4
+                IRQ_TYPE_LEVEL_LOW       8
+
+/* NAMED interrupts, when a device has several - always prefer
+   this over relying on index order: */
+        interrupts = &lt;GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH&gt;,
+                     &lt;GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH&gt;;
+        interrupt-names = "tx", "rx";
+
+/* A GPIO used as an interrupt - a NESTED controller: */
+        interrupt-parent = &lt;&amp;gpio2&gt;;
+        interrupts = &lt;7 IRQ_TYPE_EDGE_FALLING&gt;;
+        /* two cells here, because that is what gpio2's
+           #interrupt-cells says. Every controller defines its
+           own cell format - check its binding.            */
+
+/* GETTING THE VIRQ IN YOUR DRIVER: */
+        irq = platform_get_irq(pdev, 0);           /* by index */
+        irq = platform_get_irq_byname(pdev, "rx"); /* by name  */
+        if (irq &lt; 0)
+                return irq;      /* it already logged the error
+                                    and may be -EPROBE_DEFER  */
+
+/* platform_get_irq() does the whole domain translation for
+   you. Never hard-code a number.                          */</code></pre>
+
+<div class="warn">
+<b>The SPI off-by-32</b>
+<p>GIC interrupt IDs 0–15 are SGIs, 16–31 are PPIs, and SPIs start at 32. The device tree's
+<code>GIC_SPI n</code> means INTID <code>n + 32</code>. A datasheet quoting "interrupt 74" almost always
+means INTID 74, which you write as <code>GIC_SPI 42</code>. Getting this wrong gives you a driver whose
+interrupt never fires, or — worse — one that steals another device's.</p>
+</div>
+
+<h2 id="register">Registering a handler</h2>
+
+<p>Registering is where you tell the kernel which function to call, and — just as importantly — what kind of handler it is. The choice you make here determines what your code is allowed to do when it runs.</p>
+
+<pre><code>/* The managed form. Use it. */
+
+        ret = devm_request_irq(&amp;pdev-&gt;dev, irq,
+                               my_handler,
+                               0,                 /* flags */
+                               dev_name(&amp;pdev-&gt;dev),
+                               d);                /* dev_id */
+        if (ret)
+                return dev_err_probe(&amp;pdev-&gt;dev, ret,
+                                     "cannot request irq %d\n",
+                                     irq);
+
+/* Or threaded (chapter 15), which is usually what you want: */
+        ret = devm_request_threaded_irq(&amp;pdev-&gt;dev, irq,
+                                        my_hardirq, my_thread,
+                                        IRQF_ONESHOT,
+                                        dev_name(&amp;pdev-&gt;dev), d);
+
+/* THE FLAGS:
+     IRQF_SHARED       the line is shared with other devices
+     IRQF_ONESHOT      keep masked until the thread finishes
+     IRQF_TRIGGER_*    override the DT trigger type. Do not -
+                       fix the device tree instead.
+     IRQF_NO_SUSPEND   keep enabled across suspend
+     IRQF_PERCPU       a per-CPU interrupt (a PPI)
+     IRQF_NOBALANCING  exclude from irqbalance
+
+/* dev_id MUST be unique and non-NULL for a shared interrupt -
+   it is how free_irq() knows which action to remove, and it
+   is what your handler receives. Pass your device struct.
+
+/* THE HANDLER: */
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+        struct my_dev *d = dev_id;
+        u32 status;
+
+        status = readl(d-&gt;base + REG_STATUS);
+
+        /* ON A SHARED LINE THIS CHECK IS MANDATORY: */
+        if (!(status &amp; d-&gt;irq_mask))
+                return IRQ_NONE;        /* not mine */
+
+        writel(status, d-&gt;base + REG_STATUS);   /* ack */
+        ... handle ...
+
+        return IRQ_HANDLED;
+}
+
+/* RETURN VALUES:
+     IRQ_HANDLED       it was mine and I dealt with it
+     IRQ_NONE          not mine. On a shared line, essential.
+     IRQ_WAKE_THREAD   run the threaded handler
+
+   IF EVERY handler on a line returns IRQ_NONE repeatedly, the
+   kernel disables the interrupt and prints:
+        "irq 42: nobody cared (try booting with irqpoll)"
+        "Disabling IRQ #42"
+   which is the spurious-interrupt protection saving your
+   system from a livelock. It means the interrupt is asserted
+   and nobody is clearing it.                              */</code></pre>
+
+<h2 id="edge">Edge versus level: the failure modes differ</h2>
+
+<p>Interrupts signal in one of two ways: a momentary change, or a level held until you clear it. This sounds like a hardware detail with no software consequence, and it is in fact the difference between a lost interrupt and an interrupt storm.</p>
+
+<pre class="diagram">LEVEL-TRIGGERED: the line stays asserted until the device is
+serviced.
+
+  · If your handler does not CLEAR the condition in the
+    device, the interrupt fires again immediately, forever.
+    -&gt; interrupt storm, system livelock, "nobody cared".
+  · Cannot be missed: if it is still asserted, it will be
+    taken.
+  · Safe with sharing.
+  · Needs IRQF_ONESHOT with a threaded handler.
+
+EDGE-TRIGGERED: a transition latches a pending bit.
+
+  · CAN BE MISSED. The classic race:
+
+       handler reads STATUS       -&gt; sees event A
+       ... device raises event B, edge occurs ...
+       handler clears STATUS      -&gt; clears BOTH
+       handler returns
+       -&gt; event B is lost, and no further edge will come
+          because the device is now waiting for you
+
+    THE FIX - loop until the device is genuinely idle:
+
+       do {
+               status = readl(d->base + REG_STATUS);
+               if (!status)
+                       break;
+               writel(status, d->base + REG_STATUS); /* ack */
+               handle(status);
+       } while (1);
+
+    Bound the loop if the hardware might never settle.
+
+  · Also: clear the condition BEFORE re-enabling, or you
+    latch your own acknowledgement.
+
+  THE SYMPTOM of getting edge handling wrong is a device that
+  works fine and then stops responding forever under load -
+  one lost edge and it waits for an event that will never be
+  re-signalled.</pre>
+
+<h2 id="control">Controlling interrupts</h2>
+
+<p>Occasionally a driver needs to stop an interrupt from firing while it manipulates shared state. There are several ways to do that, they differ in how much of the system they affect, and reaching for the heaviest one by reflex is a common cause of latency problems.</p>
+
+<pre><code>        disable_irq(irq);          /* waits for handlers to
+                                      finish. NOT from inside
+                                      the handler - deadlock. */
+        disable_irq_nosync(irq);   /* returns immediately */
+        enable_irq(irq);           /* must MATCH the number of
+                                      disables - they nest    */
+
+        /* from within the handler, to mask your own line: */
+        disable_irq_nosync(irq);
+
+        /* wake-up capability, for suspend (chapter 32): */
+        enable_irq_wake(irq);
+        disable_irq_wake(irq);
+
+/* LOCAL interrupt control - almost never right in a driver: */
+        local_irq_disable();       /* this CPU only */
+        local_irq_enable();
+        local_irq_save(flags);
+        local_irq_restore(flags);
+
+/* Use spin_lock_irqsave() instead (chapter 12). Bare
+   local_irq_disable() in a driver is a red flag: it does not
+   protect against other CPUs, it hurts system latency, and it
+   is almost always a lock in disguise.                    */
+
+/* AFFINITY (chapter 11): */
+        irq_set_affinity_hint(irq, cpumask_of(2));</code></pre>
+
+<h2 id="proc">Reading /proc/interrupts</h2>
+
+<p>The kernel keeps a running count of every interrupt, per line and per CPU. This one file answers most "is it firing at all?" questions immediately, and comparing two readings a second apart tells you the rate.</p>
+
+<pre><code>$ cat /proc/interrupts
+            CPU0       CPU1       CPU2       CPU3
+   3:      12043      11982          0          0  GICv3  30 Level arch_timer
+  42:       8471          0          0          0  GICv3  74 Level 1c000000.my-device
+  43:          0          0          0          0  GICv3  75 Edge  1c000000.my-device
+  56:     102394          0          0          0  GICv3  88 Level eth0
+ IPI0:      4821       5102       4993       4877  Rescheduling interrupts
+
+# COLUMN BY COLUMN:
+#   42        the LINUX irq (virq)
+#   counts    per CPU. This is the useful part.
+#   GICv3     the controller
+#   74        the HWIRQ - note 42 in DT became INTID 74
+#   Level     the trigger type ACTUALLY configured
+#   name      what you passed to request_irq
+
+# WHAT TO LOOK FOR:
+#   count is ZERO         -> the interrupt never fires. Wrong
+#                            number, wrong trigger type, device
+#                            not enabled, or pin not muxed.
+#   count climbs wildly   -> a storm; the condition is not
+#                            being cleared.
+#   count on one CPU only -> normal unless you expected
+#                            balancing.
+#   your device missing   -> request_irq never succeeded.
+#   trigger type differs from your DT -> something overrode it
+#                            with IRQF_TRIGGER_*.
+
+# Watch it live:
+    watch -d -n1 'grep my-device /proc/interrupts'</code></pre>
+
+<h2 id="debug">When the interrupt does not fire</h2>
+
+<p>An interrupt that does not arrive is one of the more frustrating bring-up problems, because there is no error message — nothing happens at all. Working through the path in order turns it from guesswork into a short checklist.</p>
+
+<pre><code># Work down this list. It is almost always one of these.
+
+# 1. Does the count in /proc/interrupts move at all?
+#    No -> the interrupt is not reaching the CPU.
+
+# 2. Is the device actually enabled?
+    devmem 0x1c000004        # read the interrupt-enable reg
+#    Many devices need BOTH a global enable and a per-source
+#    unmask, and drivers commonly set only one.
+
+# 3. Is the pin muxed as an interrupt?
+    cat /sys/kernel/debug/pinctrl/*/pinmux-pins | grep ...
+#    A GPIO-based interrupt with the pin in the wrong function
+#    is silent.
+
+# 4. Is the number right?
+    cat /sys/kernel/debug/irq/domains/*        # the mappings
+    cat /sys/kernel/debug/irq/irqs/42          # this one
+#    Compare hwirq against the TRM, remembering the +32.
+
+# 5. Is the trigger type right?
+#    A level-high device described as edge-rising fires once
+#    at most. Check the "Level"/"Edge" column.
+
+# 6. Is it masked at the GIC?
+    cat /sys/kernel/debug/irq/irqs/42
+      handler:  handle_level_irq
+      status:   0x00000000
+      istate:   0x00000000
+      ddepth:   1                 &lt;-- DISABLED. Someone called
+                                      disable_irq and did not
+                                      re-enable.
+      wdepth:   0
+
+# 7. Is the clock to the device running? An unclocked
+#    peripheral cannot assert anything.
+
+# TRACING, once it does fire:
+    echo 1 > /sys/kernel/tracing/events/irq/enable
+    cat /sys/kernel/tracing/trace_pipe
+      irq_handler_entry: irq=42 name=1c000000.my-device
+      irq_handler_exit:  irq=42 ret=handled</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Count stays at 0</td><td>Wrong number, wrong trigger, device not enabled, pin not muxed, or clock off</td></tr>
+<tr><td>Device not in <code>/proc/interrupts</code></td><td><code>request_irq</code> failed — check the probe return</td></tr>
+<tr><td><code>nobody cared, disabling IRQ</code></td><td>Condition never cleared, or the wrong device is being blamed on a shared line</td></tr>
+<tr><td>System livelocks on the first interrupt</td><td>Level-triggered and not acknowledged; missing <code>IRQF_ONESHOT</code></td></tr>
+<tr><td>Fires once, then never again</td><td>Level source described as edge, or the ack sequence is wrong</td></tr>
+<tr><td>Works, then stops under load</td><td>Lost edge — handler does not loop until the device is idle</td></tr>
+<tr><td><code>request_irq</code> returns <code>-EBUSY</code></td><td>Line already claimed without <code>IRQF_SHARED</code>, or trigger types conflict</td></tr>
+<tr><td>Deadlock in <code>disable_irq</code></td><td>Called from within the handler — use <code>_nosync</code></td></tr>
+<tr><td>Interrupt stays disabled</td><td>Unbalanced <code>disable_irq</code>/<code>enable_irq</code> — check <code>ddepth</code></td></tr>
+<tr><td>Handler crashes on <code>dev_id</code></td><td>Passed NULL, or the device struct was already freed</td></tr>
+<tr><td>Interrupt does not wake the system</td><td><code>enable_irq_wake()</code> not called</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Trace an interrupt from the GIC to your handler.</li>
+  <li>Explain hwirq versus virq and what an IRQ domain does.</li>
+  <li>Write an <code>interrupts</code> property and explain the SPI off-by-32.</li>
+  <li>Use named interrupts and <code>platform_get_irq_byname</code>.</li>
+  <li>Write a handler that behaves correctly on a shared line.</li>
+  <li>Explain what <code>IRQ_NONE</code> is for and what "nobody cared" means.</li>
+  <li>Contrast the failure modes of edge and level triggering.</li>
+  <li>Write an edge handler that cannot lose an event.</li>
+  <li>Read every column of <code>/proc/interrupts</code>.</li>
+  <li>Work the seven-step checklist for an interrupt that never fires.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

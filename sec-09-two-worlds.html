@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustZone: the two worlds and EL3 | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TrustZone: the two worlds and EL3</h1>
+<p class="lead">One bit splits the machine into two parallel software stacks, each with its own exception
+levels, page tables and interrupts. Between them sits EL3 — the only code that exists in both, and the most
+security-critical software on the chip.</p>
+
+<h2 id="picture">The full picture</h2>
+
+<p>The complete arrangement — two worlds, four exception levels, and the monitor that switches between them — in one place. Everything else in this chapter is a detail hung off this structure.</p>
+
+<pre class="diagram">   NORMAL WORLD (NS=1)              SECURE WORLD (NS=0)
+   ===================              ===================
+
+   EL0  applications                S-EL0  trusted applications
+        browser, banking app               keymaster, DRM,
+        games                              fingerprint matcher
+          |                                  |
+   EL1  rich OS kernel              S-EL1  trusted OS
+        Linux, Windows                     OP-TEE, Trusty, QSEE
+        drivers, TEE client                small, auditable
+          |                                  |
+   EL2  hypervisor (optional)       S-EL2  secure partition mgr
+        KVM, Xen, Hyper-V                  Hafnium (ARMv8.4+)
+          |                                  |
+          +----------------+-----------------+
+                           |
+   EL3  +--------------------------------------------------+
+        |  SECURE MONITOR — ARM Trusted Firmware, BL31      |
+        |  · owns SCR_EL3.NS                                |
+        |  · saves and restores BOTH worlds' state          |
+        |  · dispatches every SMC                            |
+        |  · routes secure interrupts                        |
+        |  · the ONLY path between the worlds                |
+        +--------------------------------------------------+
+                           |
+        +--------------------------------------------------+
+        |  HARDWARE ENFORCEMENT (chapter 10)                |
+        |  TZASC · TZPC · GIC groups · SMMU secure streams  |
+        |  eFuses · secure debug gating                     |
+        +--------------------------------------------------+
+
+  EL3 belongs to NEITHER world. It is the gatekeeper.</pre>
+
+<h2 id="why">Why put anything in the secure world</h2>
+
+<p>Before any mechanism, the design question: what belongs in a secure world at all. The answer is narrower than most projects assume, and putting too much there is itself a security problem.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Reason</th><th>Concretely</th></tr></thead>
+<tbody>
+<tr><td><strong>The rich OS is too big to trust</strong></td><td>30 M lines with a continuous CVE stream. Assume compromise; keep the secrets elsewhere.</td></tr>
+<tr><td><strong>Some secrets must survive kernel compromise</strong></td><td>Attestation keys, disk encryption keys, DRM keys, biometric templates, payment credentials</td></tr>
+<tr><td><strong>Some operations need a trusted path</strong></td><td>"Confirm this payment" must display on a screen the normal world cannot fake and read input it cannot inject</td></tr>
+<tr><td><strong>Boot integrity needs an anchor</strong></td><td>Secure boot verification runs before the normal world exists at all</td></tr>
+<tr><td><strong>Certification requirement</strong></td><td>Payment, DRM and eSIM schemes mandate a certified TEE or secure element</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="el3">What EL3 actually does</h2>
+
+<p>The secure monitor is the only software that sees both worlds, which makes it both the mechanism that makes TrustZone work and the most security-critical code on the device.</p>
+
+<pre><code>/* BL31 — the resident EL3 firmware — has four jobs and should
+   have no others.                                            */
+
+/* 1. WORLD SWITCHING. Save one world's state, flip SCR_EL3.NS,
+      restore the other's, ERET. Chapter 11.                  */
+
+/* 2. SMC DISPATCH. Decode the function ID and route it:
+        PSCI            power management (ARM chapter 33)
+        SiP             silicon-vendor-specific services
+        Trusted OS      forward to S-EL1
+        Standard        Arm-defined services (SDEI, RAS, TRNG)  */
+
+/* 3. SECURE INTERRUPT ROUTING. SCR_EL3.{IRQ,FIQ,EA} decide
+      which interrupts come to EL3 rather than the current
+      world.                                                   */
+
+/* 4. PLATFORM INITIALISATION that must happen once, at the
+      highest privilege: TZASC regions, TZPC assignments, SMMU
+      secure configuration — then LOCK them.                   */
+
+/* What EL3 must NOT do:
+     · parse untrusted input
+     · implement a filesystem, a network stack, or crypto
+       protocols beyond what boot verification needs
+     · grow. TF-A's BL31 is tens of thousands of lines and that
+       is a deliberate ceiling.
+
+   Every line at EL3 can compromise BOTH worlds. It is the one
+   place where "keep it small" is not a style preference.   */</code></pre>
+
+<h2 id="scr">SCR_EL3</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bit</th><th>Name</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td>0</td><td><code>NS</code></td><td><strong>The security state of the world below.</strong> 0 = Secure, 1 = Non-secure.</td></tr>
+<tr><td>1</td><td><code>IRQ</code></td><td>Route IRQ to EL3</td></tr>
+<tr><td>2</td><td><code>FIQ</code></td><td>Route FIQ to EL3 — normally set, so secure interrupts reach the monitor</td></tr>
+<tr><td>3</td><td><code>EA</code></td><td>Route External Aborts and SError to EL3</td></tr>
+<tr><td>7</td><td><code>SMD</code></td><td>Disable <code>SMC</code> entirely — it becomes undefined</td></tr>
+<tr><td>8</td><td><code>HCE</code></td><td>Enable <code>HVC</code>. Cleared means no hypervisor calls.</td></tr>
+<tr><td>10</td><td><code>RW</code></td><td>Execution state below: 1 = AArch64</td></tr>
+<tr><td>11</td><td><code>ST</code></td><td>Allow secure EL1 access to the secure timer</td></tr>
+<tr><td>12/13</td><td><code>TWI</code>/<code>TWE</code></td><td>Trap <code>WFI</code>/<code>WFE</code> to EL3</td></tr>
+<tr><td>18</td><td><code>SIF</code></td><td><strong>Secure Instruction Fetch</strong>: forbid the secure world fetching instructions from Non-secure memory</td></tr>
+<tr><td>19</td><td><code>EEL2</code></td><td>Enable Secure EL2 (ARMv8.4+)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b><code>SCR_EL3.SIF</code> is a defence worth knowing</b>
+<p>Without it, secure software tricked into branching to a Non-secure address would execute normal-world code
+<em>with secure privilege</em> — total compromise from one corrupted function pointer. Setting <code>SIF</code>
+makes such a fetch fault. It is the secure world's equivalent of <code>PXN</code> on user pages
+(<a href="arm-14-descriptors.html">ARM 14</a>), and it should always be set.</p>
+</div>
+
+<h2 id="stack">The software stack, end to end</h2>
+
+<p>A secure world is not one program but a small software stack with its own privilege levels, its own scheduler and its own drivers — effectively a second operating system.</p>
+
+<pre class="diagram">NORMAL WORLD                          SECURE WORLD
+------------                          ------------
+ Client Application (EL0)
+   TEEC_InitializeContext()
+   TEEC_OpenSession(uuid)
+   TEEC_InvokeCommand()
+        |  GlobalPlatform TEE Client API
+        v
+ libteec.so
+        |  ioctl() on /dev/tee0
+        v
+ tee_core + optee driver (EL1)
+   builds an SMC message,
+   allocates SHARED memory
+        |
+        |  smc #0
+        v
+====== EL3 · TF-A · OP-TEE dispatcher ==================
+        |
+        v
+                                      OP-TEE OS (S-EL1)
+                                        find/load the TA by UUID
+                                        VERIFY its signature
+                                        set up its S-EL0 space
+                                             |
+                                             v
+                                      Trusted Application (S-EL0)
+                                        TA_InvokeCommandEntryPoint()
+                                        uses the crypto engine,
+                                        secure storage, the
+                                        hardware unique key
+                                             |
+                                             v
+                                        result -> shared memory
+        |<---------------------------- smc return
+        v
+ back through the driver, libteec, to the application</pre>
+
+<h2 id="implementations">Who implements what</h2>
+
+<p>Several trusted OS implementations exist, differing in licensing, certification and scale. Which one a device uses is usually decided by the silicon vendor rather than by the product team.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Component</th><th>Runs at</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>TF-A</strong> (Trusted Firmware-A)</td><td>EL3, BL31</td><td>The open-source reference monitor. Also provides PSCI. Almost universal.</td></tr>
+<tr><td><strong>OP-TEE</strong></td><td>S-EL1</td><td>Open source, GlobalPlatform-compliant. <strong>Runs on QEMU</strong> — the best way to learn.</td></tr>
+<tr><td><strong>Trusty</strong></td><td>S-EL1</td><td>Google's, used in Android</td></tr>
+<tr><td><strong>QSEE / TEEGRIS / Kinibi</strong></td><td>S-EL1</td><td>Qualcomm, Samsung, Trustonic. Closed source.</td></tr>
+<tr><td><strong>Hafnium</strong></td><td>S-EL2</td><td>Secure Partition Manager — isolates secure partitions from each other</td></tr>
+<tr><td><strong>SPMC / FF-A</strong></td><td>S-EL1 or S-EL2</td><td>Arm's Firmware Framework: a standard for secure partitions, replacing ad-hoc TEE interfaces</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="sel2">Secure EL2 and partitions</h2>
+
+<p>Newer implementations add a hypervisor level inside the secure world, which allows several mutually distrusting secure partitions rather than one monolithic trusted OS.</p>
+
+<pre class="diagram">The original design had ONE secure OS. That is a problem when
+several vendors each want a trusted component:
+
+   a payment applet from a bank
+   a DRM component from a content provider
+   a biometric matcher from the OEM
+   an eSIM applet from a carrier
+
+  With one S-EL1 OS, all four are mutually trusting. A bug in
+  any one compromises the others — and the whole secure world.
+
+  ARMv8.4's SECURE EL2 fixes this: a Secure Partition Manager at
+  S-EL2 gives each component its own stage-2 translation, so
+  they are isolated from each other exactly as VMs are.
+
+   S-EL0   TA          TA          TA
+   S-EL1   [partition A] [partition B] [partition C]
+   S-EL2   Secure Partition Manager (Hafnium)
+                stage-2 isolation between partitions
+   EL3     monitor
+
+  FF-A standardises the messaging between partitions and the
+  normal world, replacing the vendor-specific SMC interfaces
+  that came before.
+
+  Practically: it is how a modern phone runs several vendors'
+  trusted code without any of them reading the others' keys.</pre>
+
+<h2 id="shared">Shared memory: the interesting part</h2>
+
+<p>The two worlds must exchange data, and the region they share is the most security-sensitive memory on the device — it is the one place normal-world input reaches secure-world code.</p>
+
+<pre><code>/* The two worlds must exchange data. The pattern is always the
+   same, and getting it wrong is the classic TEE vulnerability. */
+
+/* 1. The NORMAL world allocates a buffer in NON-SECURE memory */
+        shm = tee_shm_alloc(ctx, size, TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
+
+/* 2. It passes the PHYSICAL ADDRESS in the SMC arguments      */
+
+/* 3. The SECURE world maps it with NS=1 in its own page tables
+      (chapter 08) and copies data in and out.                 */</code></pre>
+
+<div class="danger">
+<b>Secure code must never trust a normal-world pointer</b>
+<p>Before dereferencing an address supplied by the normal world, secure software must verify that the
+<em>entire</em> range lies inside non-secure memory. Otherwise the normal world hands the TEE a pointer to
+<em>secure</em> memory and has the TEE read or write it on its behalf.</p>
+<p>That is a <strong>confused deputy</strong> attack, and it is behind a substantial number of real TEE CVEs.
+The check must cover the whole range and must handle integer overflow in <code>base + length</code>.</p>
+<pre><code>static bool ns_range_ok(paddr_t base, size_t len)
+{
+        paddr_t end;
+
+        if (len == 0)                      return false;
+        if (ADD_OVERFLOW(base, len, &amp;end)) return false;  /* wrap! */
+        if (!core_pbuf_is(CORE_MEM_NON_SEC, base, len))
+                return false;              /* the WHOLE range */
+        return true;
+}</code></pre>
+</div>
+
+<pre><code>/* And the TOCTOU rule: COPY FIRST, then validate the copy.
+
+   WRONG — validating shared memory in place: */
+        if (req-&gt;len &gt; MAX)  return TEE_ERROR_BAD_PARAMETERS;
+        process(req-&gt;buf, req-&gt;len);
+        /* the normal world can change req->len between the two
+           reads, because it still has the memory mapped       */
+
+/* RIGHT — one copy into secure memory, then validate: */
+        struct req local;
+        memcpy(&amp;local, ns_req, sizeof local);   /* from NS memory */
+        if (local.len &gt; MAX)  return TEE_ERROR_BAD_PARAMETERS;
+        process(local.buf, local.len);          /* the COPY       */</code></pre>
+
+<h2 id="cost">What a world switch costs</h2>
+
+<p>A world switch is a full context switch through the most privileged software on the chip, twice. Knowing roughly what it costs is what stops a design from putting a secure call in a hot path.</p>
+
+<pre class="diagram">   SMC instruction                        ~20 cycles
+   exception entry to EL3                 ~30 cycles
+   save the outgoing world's state        ~200-1000 cycles
+     X0-X30, FP/SIMD if used, any
+     non-banked system registers
+   dispatch the function ID               ~50 cycles
+   restore the incoming world's state     ~200-1000 cycles
+   ERET                                   ~20 cycles
+   ---------------------------------------------------
+   ONE WAY                                ~500-2000 cycles
+
+   A round trip is 1,000-10,000 cycles, and on most designs the
+   calling core is unavailable for the whole period.
+
+  CONSEQUENCES for design:
+     · never put an SMC in a hot path
+     · BATCH work into one call rather than many small ones
+     · never call from an interrupt handler or with a spinlock
+       held
+     · a TEE operation needed at high frequency is probably in
+       the wrong place
+
+  Compare: a system call is ~50-500 ns; a VM exit ~500-2000
+  cycles. A world switch is the most expensive boundary
+  crossing on the chip.</pre>
+
+<h2 id="interrupts">Interrupts across the boundary</h2>
+
+<p>Interrupts must be routed to the correct world, and an interrupt arriving while the other world is executing needs handling that neither world can subvert. That routing is part of the GIC's security model.</p>
+
+<pre><code>/* The GIC assigns every interrupt to a GROUP (ARM chapter 23),
+   and the group plus SCR_EL3 routing decides where it lands.  */
+
+   Group 0            -> FIQ, always to EL3
+                         secure firmware's own interrupts
+   Secure Group 1     -> IRQ in the secure world,
+                         FIQ in the non-secure world
+                         the trusted OS's interrupts
+   Non-secure Group 1 -> IRQ
+                         the normal OS's interrupts
+
+/* THE KEY PROPERTY: a Non-secure OS clearing PSTATE.I cannot
+   mask secure interrupts, because they arrive as FIQ and route
+   to EL3. The secure world can ALWAYS preempt the normal world.
+
+   That is what makes a TEE's timing guarantees meaningful.  */
+
+/* The reverse case: a normal-world interrupt arriving while the
+   SECURE world is running. The monitor must either
+     · hold it until the secure operation completes — simple,
+       but adds latency to the normal world, or
+     · return to the normal world with an "operation preempted,
+       call again" status, so long secure operations do not
+       block the OS.
+
+   OP-TEE does the latter, via RPC returns. That is why a TEE
+   call can return a retry status the client must handle.   */</code></pre>
+
+<h2 id="hands-on">Running the whole stack on QEMU</h2>
+
+<p>All of this can be run without special hardware, which makes it far more approachable than its reputation suggests.</p>
+
+<pre><code># A complete TrustZone system — TF-A at EL3, OP-TEE at S-EL1,
+# Linux at EL1 — on your laptop, no hardware needed. The single
+# best way to make this chapter concrete.
+
+mkdir optee &amp;&amp; cd optee
+repo init -u https://github.com/OP-TEE/manifest.git -m qemu_v8.xml
+repo sync -j8
+cd build
+make toolchains -j4
+make run -j$(nproc)
+
+# TWO consoles appear: the normal world (Linux) and the secure
+# world (OP-TEE's log). Watch both.
+
+# in the Linux console:
+xtest                          # the OP-TEE conformance suite
+optee_example_hello_world
+optee_example_secure_storage
+optee_example_acipher
+
+# Watch the SECURE console while running these: the TA loading,
+# the command dispatch, and the return, live.</code></pre>
+
+<div class="tip">
+<b>Read <code>optee_examples/hello_world/</code></b>
+<p>About 150 lines split between a normal-world client (TEE Client API) and a Trusted Application (with
+<code>TA_InvokeCommandEntryPoint</code>). Tracing one command through both halves — client,
+<code>ioctl</code>, driver, SMC, monitor, trusted OS, TA, and back — teaches more than any amount of
+reading.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>SMC</code> causes an undefined instruction</td><td>EL3 not implemented, or <code>SCR_EL3.SMD</code> set</td></tr>
+<tr><td>TEE calls are very slow</td><td>World switch cost — batch the work</td></tr>
+<tr><td>System stalls during a TEE operation</td><td>No preemption path for normal-world interrupts</td></tr>
+<tr><td>One TA can read another's secrets</td><td>No S-EL2 partitioning — all TAs are mutually trusting</td></tr>
+<tr><td>Normal world crashes the TEE with a bad pointer</td><td>Missing non-secure range validation — confused deputy</td></tr>
+<tr><td>A validated length changes before use</td><td>TOCTOU — validated in shared memory instead of after copying</td></tr>
+<tr><td>Secure world executes normal-world code</td><td><code>SCR_EL3.SIF</code> not set</td></tr>
+<tr><td>Linux cannot mask an interrupt</td><td>It is a secure Group 0 or Secure Group 1 interrupt</td></tr>
+<tr><td>TEE client receives a retry status</td><td>The operation was preempted to service a normal-world interrupt — retry is correct</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the two worlds with their exception levels and say what runs at each.</li>
+  <li>Give EL3's four jobs and three things it must not do.</li>
+  <li>Explain what <code>SCR_EL3.NS</code>, <code>SMD</code> and <code>SIF</code> each control.</li>
+  <li>Explain why <code>SIF</code> exists and what it prevents.</li>
+  <li>Trace a TEE call from client application to trusted application and back.</li>
+  <li>Explain what Secure EL2 adds and the problem it solves.</li>
+  <li>Give the confused deputy pattern and write a correct range check, including the overflow case.</li>
+  <li>Explain the TOCTOU rule for shared memory.</li>
+  <li>Say why a secure interrupt cannot be masked by the normal OS.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

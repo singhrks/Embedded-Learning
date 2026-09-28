@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the user-mode client | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the user-mode client</h1>
+<p class="lead">The other half of the Windows project: finding the device by interface GUID, driving it
+synchronously and with overlapped I/O, watching for arrival and removal, and measuring what the asynchronous
+path is actually worth.</p>
+
+<h2 id="discover">Finding the device</h2>
+
+<p>An application does not open a driver by a fixed path. It asks the system which devices expose a given interface GUID and opens whichever it finds — which is what makes the same program work with one device or several.</p>
+
+<pre><code>/* rbtest.c - build with:
+     cl /W4 /Zi rbtest.c setupapi.lib cfgmgr32.lib   */
+
+#include &lt;windows.h&gt;
+#include &lt;setupapi.h&gt;
+#include &lt;cfgmgr32.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include "../ringbuf.h"
+
+/* Open by INTERFACE GUID, not by a hard-coded name
+   (chapter 06). This works for any number of instances and
+   survives the device moving.                             */
+static HANDLE RbOpen(BOOL overlapped)
+{
+        HDEVINFO info;
+        SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail = NULL;
+        DWORD needed = 0;
+        HANDLE h = INVALID_HANDLE_VALUE;
+        DWORD flags = FILE_ATTRIBUTE_NORMAL;
+
+        if (overlapped)
+                flags |= FILE_FLAG_OVERLAPPED;
+
+        info = SetupDiGetClassDevsW(&amp;GUID_DEVINTERFACE_RINGBUF,
+                        NULL, NULL,
+                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (info == INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "SetupDiGetClassDevs: %lu\n",
+                        GetLastError());
+                return INVALID_HANDLE_VALUE;
+        }
+
+        if (!SetupDiEnumDeviceInterfaces(info, NULL,
+                        &amp;GUID_DEVINTERFACE_RINGBUF, 0, &amp;ifData)) {
+                fprintf(stderr, "no device present (%lu)\n",
+                        GetLastError());
+                goto out;
+        }
+
+        /* two-call idiom: ask the size, then fetch */
+        SetupDiGetDeviceInterfaceDetailW(info, &amp;ifData, NULL, 0,
+                                         &amp;needed, NULL);
+        detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)
+                        malloc(needed);
+        if (!detail)
+                goto out;
+
+        detail-&gt;cbSize =
+                sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        if (!SetupDiGetDeviceInterfaceDetailW(info, &amp;ifData,
+                        detail, needed, &amp;needed, NULL)) {
+                fprintf(stderr, "GetDetail: %lu\n",
+                        GetLastError());
+                goto out;
+        }
+
+        wprintf(L"opening %s\n", detail-&gt;DevicePath);
+
+        h = CreateFileW(detail-&gt;DevicePath,
+                        GENERIC_READ | GENERIC_WRITE,
+                        0, NULL, OPEN_EXISTING, flags, NULL);
+        if (h == INVALID_HANDLE_VALUE)
+                fprintf(stderr, "CreateFile: %lu\n",
+                        GetLastError());
+
+out:
+        free(detail);
+        SetupDiDestroyDeviceInfoList(info);
+        return h;
+}
+
+/* THE TWO-CALL IDIOM appears throughout the Windows API: call
+   once with a NULL buffer to learn the size, allocate, call
+   again. It returns ERROR_INSUFFICIENT_BUFFER on the first
+   call, which is expected, not a failure.                */</code></pre>
+
+<h2 id="sync">Synchronous use</h2>
+
+<p>The simplest way to use a device: issue a request and wait for it. Perfectly correct, and the right choice until the waiting itself becomes the bottleneck.</p>
+
+<pre><code>static void ShowStats(HANDLE h)
+{
+        RB_STATS st;
+        DWORD returned;
+
+        if (!DeviceIoControl(h, IOCTL_RB_GET_STATS,
+                             NULL, 0,
+                             &amp;st, sizeof(st),
+                             &amp;returned, NULL)) {
+                fprintf(stderr, "GET_STATS: %lu\n",
+                        GetLastError());
+                return;
+        }
+
+        printf("cap=%u used=%u written=%llu read=%llu "
+               "drops=%llu ticks=%llu pending=%u\n",
+               st.Capacity, st.Used,
+               (unsigned long long)st.BytesWritten,
+               (unsigned long long)st.BytesRead,
+               (unsigned long long)st.Drops,
+               (unsigned long long)st.TimerTicks,
+               st.PendingReads);
+}
+
+static void TestRoundTrip(void)
+{
+        HANDLE h = RbOpen(FALSE);
+        BYTE out[256], in[256];
+        DWORD written, read;
+
+        if (h == INVALID_HANDLE_VALUE)
+                return;
+
+        memset(out, 'A', sizeof(out));
+
+        if (!WriteFile(h, out, sizeof(out), &amp;written, NULL))
+                fprintf(stderr, "WriteFile: %lu\n",
+                        GetLastError());
+        else
+                printf("wrote %lu\n", written);
+
+        if (!ReadFile(h, in, sizeof(in), &amp;read, NULL))
+                fprintf(stderr, "ReadFile: %lu\n",
+                        GetLastError());
+        else
+                printf("read %lu\n", read);
+
+        ShowStats(h);
+        CloseHandle(h);
+}
+
+static void TestConfig(void)
+{
+        HANDLE h = RbOpen(FALSE);
+        RB_CONFIG cfg;
+        DWORD returned;
+
+        if (h == INVALID_HANDLE_VALUE)
+                return;
+
+        memset(&amp;cfg, 0, sizeof(cfg));   /* zero the reserved
+                                           fields - the ABI
+                                           requires it       */
+        cfg.Overwrite     = 1;
+        cfg.TimerPeriodMs = 50;
+
+        if (!DeviceIoControl(h, IOCTL_RB_SET_CONFIG,
+                             &amp;cfg, sizeof(cfg), NULL, 0,
+                             &amp;returned, NULL))
+                fprintf(stderr, "SET_CONFIG: %lu\n",
+                        GetLastError());
+
+        /* NEGATIVE TEST: an out-of-range value must be
+           refused (chapter 17)                             */
+        cfg.TimerPeriodMs = 99999;
+        if (DeviceIoControl(h, IOCTL_RB_SET_CONFIG,
+                            &amp;cfg, sizeof(cfg), NULL, 0,
+                            &amp;returned, NULL))
+                fprintf(stderr, "BUG: bad config accepted\n");
+        else
+                printf("bad config refused: %lu (expect 87)\n",
+                       GetLastError());
+
+        CloseHandle(h);
+}</code></pre>
+
+<div class="key">
+<b>Win32 errors, not NTSTATUS</b>
+<p>User mode sees Win32 error codes; the I/O manager translates. <code>STATUS_INVALID_PARAMETER</code>
+becomes <code>ERROR_INVALID_PARAMETER</code> (87), <code>STATUS_BUFFER_TOO_SMALL</code> becomes
+<code>ERROR_INSUFFICIENT_BUFFER</code> (122), <code>STATUS_INVALID_DEVICE_REQUEST</code> becomes
+<code>ERROR_INVALID_FUNCTION</code> (1). When a test asserts on an error code, assert on the Win32 one — and
+use <code>!error</code> in WinDbg to translate either direction.</p>
+</div>
+
+<h2 id="async">Overlapped I/O</h2>
+
+<p>Overlapped I/O lets an application issue many requests and collect the results as they finish, which is how a single thread can keep a device saturated. It is also where most application-side bugs live.</p>
+
+<pre><code>static void TestOverlapped(void)
+{
+        HANDLE h = RbOpen(TRUE);        /* FILE_FLAG_OVERLAPPED */
+        OVERLAPPED ov = { 0 };
+        BYTE buf[64];
+        DWORD transferred;
+
+        if (h == INVALID_HANDLE_VALUE)
+                return;
+
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+        printf("issuing an async read...\n");
+
+        if (!ReadFile(h, buf, sizeof(buf), NULL, &amp;ov)) {
+                DWORD err = GetLastError();
+
+                if (err != ERROR_IO_PENDING) {
+                        fprintf(stderr, "ReadFile: %lu\n", err);
+                        goto out;
+                }
+                printf("pending - doing other work\n");
+        }
+
+        /* THIS IS THE POINT: we are free while the driver
+           waits for data. In the synchronous version the
+           thread would be blocked here.                   */
+        Sleep(50);
+        printf("...other work done, now waiting\n");
+
+        if (WaitForSingleObject(ov.hEvent, 5000) != WAIT_OBJECT_0) {
+                fprintf(stderr, "timed out\n");
+                CancelIoEx(h, &amp;ov);     /* exercises the
+                                           driver's
+                                           cancellation path */
+                goto out;
+        }
+
+        if (GetOverlappedResult(h, &amp;ov, &amp;transferred, FALSE))
+                printf("async read completed: %lu bytes\n",
+                       transferred);
+        else
+                fprintf(stderr, "GetOverlappedResult: %lu\n",
+                        GetLastError());
+
+out:
+        CloseHandle(ov.hEvent);
+        CloseHandle(h);
+}
+
+/* THE ERROR_IO_PENDING CONVENTION catches everyone once:
+   ReadFile returns FALSE and GetLastError() is
+   ERROR_IO_PENDING. That is SUCCESS. Treating FALSE as
+   failure means your first async client never works.     */</code></pre>
+
+<h2 id="iocp">An I/O completion port</h2>
+
+<p>For many concurrent operations, a completion port is the scalable mechanism Windows provides: a small pool of threads servicing completions as they arrive, without one thread per outstanding request.</p>
+
+<pre><code>/* The scalable pattern: several outstanding requests, one
+   thread servicing all completions.                       */
+
+#define RB_DEPTH  8
+
+typedef struct _RB_OP {
+        OVERLAPPED Overlapped;      /* MUST be first */
+        BYTE       Buffer[64];
+        int        Index;
+} RB_OP;
+
+static void TestCompletionPort(int seconds)
+{
+        HANDLE h = RbOpen(TRUE);
+        HANDLE iocp;
+        RB_OP ops[RB_DEPTH];
+        ULONGLONG deadline;
+        ULONG64 total = 0, count = 0;
+        int i;
+
+        if (h == INVALID_HANDLE_VALUE)
+                return;
+
+        iocp = CreateIoCompletionPort(h, NULL, 0, 1);
+        if (!iocp) {
+                fprintf(stderr, "CreateIoCompletionPort: %lu\n",
+                        GetLastError());
+                CloseHandle(h);
+                return;
+        }
+
+        /* keep RB_DEPTH reads outstanding at all times */
+        for (i = 0; i &lt; RB_DEPTH; i++) {
+                memset(&amp;ops[i], 0, sizeof(ops[i]));
+                ops[i].Index = i;
+                if (!ReadFile(h, ops[i].Buffer,
+                              sizeof(ops[i].Buffer), NULL,
+                              &amp;ops[i].Overlapped) &amp;&amp;
+                    GetLastError() != ERROR_IO_PENDING) {
+                        fprintf(stderr, "ReadFile %d: %lu\n", i,
+                                GetLastError());
+                        goto out;
+                }
+        }
+
+        deadline = GetTickCount64() + (ULONGLONG)seconds * 1000;
+
+        while (GetTickCount64() &lt; deadline) {
+                DWORD transferred;
+                ULONG_PTR key;
+                LPOVERLAPPED pov;
+                RB_OP *op;
+
+                if (!GetQueuedCompletionStatus(iocp,
+                                &amp;transferred, &amp;key, &amp;pov, 1000)) {
+                        if (pov == NULL)
+                                continue;      /* timeout */
+                        fprintf(stderr, "completion error %lu\n",
+                                GetLastError());
+                        break;
+                }
+
+                op = CONTAINING_RECORD(pov, RB_OP, Overlapped);
+                total += transferred;
+                count++;
+
+                /* re-issue immediately */
+                memset(&amp;op-&gt;Overlapped, 0,
+                       sizeof(op-&gt;Overlapped));
+                if (!ReadFile(h, op-&gt;Buffer, sizeof(op-&gt;Buffer),
+                              NULL, &amp;op-&gt;Overlapped) &amp;&amp;
+                    GetLastError() != ERROR_IO_PENDING)
+                        break;
+        }
+
+        printf("%llu completions, %llu bytes in %d s "
+               "(%.1f completions/s)\n",
+               (unsigned long long)count,
+               (unsigned long long)total, seconds,
+               (double)count / seconds);
+
+out:
+        CancelIoEx(h, NULL);        /* cancel everything
+                                       outstanding          */
+        CloseHandle(iocp);
+        CloseHandle(h);
+}
+
+/* CONTAINING_RECORD recovers your structure from the
+   OVERLAPPED pointer - the Windows equivalent of
+   container_of. That is why OVERLAPPED must be the first
+   member, or at a known offset.                          */
+
+/* AND THE CANCELIOEX AT THE END is not tidiness: it makes
+   the driver's cancellation path run on every test, which is
+   how you find the bugs in it.                            */</code></pre>
+
+<h2 id="notify">Watching for arrival and removal</h2>
+
+<p>Devices appear and disappear while your application runs. Rather than polling, you can ask the system to tell you — which is what makes an application handle a device being unplugged gracefully.</p>
+
+<pre><code>/* React when the device appears or disappears, rather than
+   polling for it.                                          */
+
+static DWORD CALLBACK
+RbNotifyCallback(HCMNOTIFICATION notify, PVOID context,
+                 CM_NOTIFY_ACTION action,
+                 PCM_NOTIFY_EVENT_DATA data, DWORD size)
+{
+        UNREFERENCED_PARAMETER(notify);
+        UNREFERENCED_PARAMETER(context);
+        UNREFERENCED_PARAMETER(size);
+
+        switch (action) {
+        case CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL:
+                wprintf(L"device arrived: %s\n",
+                        data-&gt;u.DeviceInterface.SymbolicLink);
+                break;
+        case CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL:
+                wprintf(L"device removed\n");
+                break;
+        case CM_NOTIFY_ACTION_DEVICEQUERYREMOVE:
+                wprintf(L"query remove - close your handles\n");
+                /* RETURN ERROR_SUCCESS to allow it. Returning
+                   an error VETOES the removal, which the user
+                   sees as "the device is in use". Only veto if
+                   you genuinely cannot stop.              */
+                break;
+        case CM_NOTIFY_ACTION_DEVICEREMOVECOMPLETE:
+                wprintf(L"remove complete\n");
+                break;
+        }
+        return ERROR_SUCCESS;
+}
+
+static void WatchDevice(void)
+{
+        CM_NOTIFY_FILTER filter = { 0 };
+        HCMNOTIFICATION notify = NULL;
+        CONFIGRET cr;
+
+        filter.cbSize = sizeof(filter);
+        filter.FilterType =
+                CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+        filter.u.DeviceInterface.ClassGuid =
+                GUID_DEVINTERFACE_RINGBUF;
+
+        cr = CM_Register_Notification(&amp;filter, NULL,
+                                      RbNotifyCallback, &amp;notify);
+        if (cr != CR_SUCCESS) {
+                fprintf(stderr, "CM_Register_Notification: %d\n",
+                        cr);
+                return;
+        }
+
+        printf("watching - disable/enable the device in Device "
+               "Manager. Enter to stop.\n");
+        getchar();
+
+        CM_Unregister_Notification(notify);
+}
+
+/* THIS IS HOW A REAL APPLICATION handles hot-plug: it
+   registers for the interface class, opens the device on
+   arrival, and closes its handles on query-remove. An
+   application that keeps a handle open through a removal
+   attempt is what makes "Windows cannot stop this device"
+   dialogs appear.                                        */</code></pre>
+
+<h2 id="bench">Measuring the difference</h2>
+
+<p>The claim that asynchronous I/O is faster deserves measurement rather than assumption. This harness makes the difference visible, and the result is often more nuanced than expected.</p>
+
+<pre><code>static void Benchmark(void)
+{
+        HANDLE h;
+        BYTE buf[64];
+        DWORD read;
+        LARGE_INTEGER freq, start, end;
+        int i;
+        const int N = 2000;
+
+        QueryPerformanceFrequency(&amp;freq);
+
+        /* --- synchronous --- */
+        h = RbOpen(FALSE);
+        if (h == INVALID_HANDLE_VALUE)
+                return;
+
+        QueryPerformanceCounter(&amp;start);
+        for (i = 0; i &lt; N; i++) {
+                if (!ReadFile(h, buf, sizeof(buf), &amp;read, NULL))
+                        break;
+        }
+        QueryPerformanceCounter(&amp;end);
+        CloseHandle(h);
+
+        printf("sync:  %d reads in %.1f ms (%.1f us each)\n",
+               i,
+               (end.QuadPart - start.QuadPart) * 1000.0
+                       / freq.QuadPart,
+               (end.QuadPart - start.QuadPart) * 1e6
+                       / freq.QuadPart / (i ? i : 1));
+
+        /* --- the completion-port version, for comparison --- */
+        TestCompletionPort(2);
+}
+
+/* WHAT YOU WILL SEE: with the driver's 100 ms timer, the
+   synchronous loop is limited to roughly one read per timer
+   tick, because each read blocks until data arrives. The
+   completion-port version keeps eight requests outstanding
+   and drains a whole tick's data at once.
+
+   THE LESSON, and it is the reason asynchronous I/O exists:
+   the bottleneck is not CPU time, it is the round trip. Depth
+   hides latency. Exactly the argument for batching across any
+   expensive boundary - the same one as SMC calls in isolation
+   chapter 11.                                              */
+
+int main(int argc, char **argv)
+{
+        const char *what = (argc &gt; 1) ? argv[1] : "all";
+
+        if (!strcmp(what, "all") || !strcmp(what, "sync")) {
+                printf("--- round trip ---\n");  TestRoundTrip();
+                printf("--- config ---\n");      TestConfig();
+        }
+        if (!strcmp(what, "all") || !strcmp(what, "async")) {
+                printf("--- overlapped ---\n");  TestOverlapped();
+                printf("--- iocp ---\n");        TestCompletionPort(3);
+        }
+        if (!strcmp(what, "all") || !strcmp(what, "bench")) {
+                printf("--- benchmark ---\n");   Benchmark();
+        }
+        if (!strcmp(what, "watch"))
+                WatchDevice();
+
+        return 0;
+}</code></pre>
+
+<h2 id="run">Running it</h2>
+
+<p>Putting the pieces together: install the driver, run the client, and confirm the whole path from application to hardware and back actually works.</p>
+
+<pre><code># Build (from a Developer Command Prompt):
+    cl /W4 /Zi rbtest.c setupapi.lib cfgmgr32.lib
+
+# With the driver installed (chapter 25):
+    rbtest.exe
+      opening \\?\root#system#0000#{8f3a2b1c-...}
+      --- round trip ---
+      wrote 256
+      read 256
+      cap=4096 used=0 written=256 read=256 drops=0 ticks=41 pending=0
+      --- config ---
+      bad config refused: 87 (expect 87)
+      --- overlapped ---
+      issuing an async read...
+      pending - doing other work
+      ...other work done, now waiting
+      async read completed: 64 bytes
+      --- iocp ---
+      152 completions, 9728 bytes in 3 s (50.7 completions/s)
+
+# NOTE the completion rate tracks the driver's timer period -
+# 50 ms in the config test means ~20 ticks/second, times the
+# bytes per tick divided by the read size. If your numbers do
+# not line up, work out why: that arithmetic is a good check
+# that you understand what the driver is doing.
+
+# Hot-plug behaviour:
+    rbtest.exe watch
+    ; then, in another window:
+    devcon disable root\ringbuf
+    devcon enable root\ringbuf
+
+# ACCESS CONTROL - confirm the SDDL works (chapter 25):
+    ; as a standard user, not an administrator:
+    rbtest.exe
+      CreateFile: 5           ; ERROR_ACCESS_DENIED - correct</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="key">
+<b>Client-side exercises</b>
+<ol>
+<li><strong>Handle removal properly.</strong> Extend <code>WatchDevice</code> to close its handle on
+query-remove and reopen on arrival. Verify the device can then be disabled without a "device in use"
+dialog.</li>
+<li><strong>Vary the queue depth</strong> in the completion-port test from 1 to 32 and plot completions per
+second. Find where it stops improving, and explain why.</li>
+<li><strong>Cancel deliberately.</strong> Issue ten reads, then <code>CancelIoEx</code> them all. Confirm
+each completes with <code>ERROR_OPERATION_ABORTED</code>, and check the driver's stats for
+consistency.</li>
+<li><strong>Kill the process</strong> with reads outstanding. Confirm the process terminates promptly —
+this exercises the driver's cleanup path (<a href="win-04-irps.html">chapter 05</a>).</li>
+<li><strong>Two processes at once.</strong> Run two clients reading concurrently. Observe how the ring's
+single read position makes them compete — then decide whether that is the semantics you want, which is
+exercise 10 of <a href="win-23-project-driver.html">chapter 25</a>.</li>
+<li><strong>Fuzz it yourself.</strong> Send random control codes, random buffer sizes, and NULL pointers.
+With Driver Verifier on, anything that bugchecks is a driver bug.</li>
+<li><strong>Add a 32-bit build</strong> of the client and run it against the 64-bit driver. Confirm the
+structs still work — that is what the fixed-width types in <code>ringbuf.h</code> bought you
+(<a href="win-16-ioctls.html">chapter 17</a>).</li>
+</ol>
+</div>
+
+<h2 id="compare">Linux and Windows, side by side</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Task</th><th>Linux (<a href="lx-28-project-ringbuf.html">ch. 36</a>)</th><th>Windows (<a href="win-23-project-driver.html">ch. 25</a>)</th></tr></thead>
+<tbody>
+<tr><td>Find the device</td><td>Fixed path <code>/dev/ringbuf</code></td><td>Enumerate by interface GUID</td></tr>
+<tr><td>Open</td><td><code>open()</code></td><td><code>CreateFileW</code></td></tr>
+<tr><td>Blocking read</td><td><code>wait_event_interruptible</code></td><td>Forward to a manual queue</td></tr>
+<tr><td>Wake the reader</td><td><code>wake_up_interruptible</code></td><td><code>WdfIoQueueRetrieveNextRequest</code> + complete</td></tr>
+<tr><td>Readiness notification</td><td><code>poll()</code> / <code>.poll</code></td><td>Overlapped I/O + completion port</td></tr>
+<tr><td>Control interface</td><td><code>ioctl</code> with <code>_IOR</code>/<code>_IOW</code></td><td><code>DeviceIoControl</code> with <code>CTL_CODE</code></td></tr>
+<tr><td>Access control</td><td>udev rule on the node</td><td>SDDL in the INF + the IOCTL Access field</td></tr>
+<tr><td>Per-open state</td><td><code>file-&gt;private_data</code></td><td>WDFFILEOBJECT context</td></tr>
+<tr><td>Cancellation</td><td>Signal interrupts the wait</td><td><code>CancelIoEx</code>, handled by the queue</td></tr>
+<tr><td>Cleanup on exit</td><td><code>release()</code></td><td><code>IRP_MJ_CLEANUP</code>, automatic in WDF</td></tr>
+<tr><td>Install</td><td><code>insmod</code></td><td>INF + <code>pnputil</code> + signing</td></tr>
+<tr><td>Verification</td><td>KASAN, lockdep, sparse</td><td>Driver Verifier, SDV, Code Analysis</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The two drivers solve an identical problem, and the differences are almost entirely about <em>who is
+responsible for what</em>: Linux gives you primitives and expects the driver to compose them; Windows gives
+you a framework that owns the protocol and calls you at the right moments. Neither is better in the
+abstract — but knowing both makes the trade-offs in each visible, which is exactly what
+<a href="win-25-linux-vs-windows.html">the next chapter</a> is about.</p>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Open a device by interface GUID, using the two-call idiom correctly.</li>
+  <li>Explain why Win32 error codes differ from NTSTATUS and how to translate.</li>
+  <li>Issue an overlapped read and handle <code>ERROR_IO_PENDING</code> correctly.</li>
+  <li>Build a completion-port loop that keeps N requests outstanding.</li>
+  <li>Explain <code>CONTAINING_RECORD</code> and why <code>OVERLAPPED</code> comes first.</li>
+  <li>Register for device arrival and removal, and respond to query-remove correctly.</li>
+  <li>Measure synchronous versus asynchronous throughput and explain the gap.</li>
+  <li>Verify the driver's access control from a non-administrator account.</li>
+  <li>Complete at least four of the seven exercises.</li>
+  <li>Fill in the Linux/Windows comparison table from memory.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

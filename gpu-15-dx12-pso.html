@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DX12: root signatures and pipeline state | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DX12: root signatures and pipeline state</h1>
+<p class="lead">Two objects that between them replace all of DX11's state setting. The root signature is the
+function signature of your shaders; the pipeline state object is everything the driver needs to compile a
+shader ahead of time instead of mid-frame. Getting both right is what removes stutter.</p>
+
+<h2 id="rootsig">The root signature is a function signature</h2>
+
+<pre class="diagram">   Think of your shader as a function. The root signature
+   declares its parameters.
+
+     void PSMain(cbuffer b0,            &lt;- root parameter 0
+                 Texture2D t0[],        &lt;- root parameter 1
+                 SamplerState s0)       &lt;- static sampler
+
+   THREE KINDS OF ROOT PARAMETER, in cost order:
+
+   1. ROOT CONSTANTS          cost: 1 DWORD each
+        values inlined directly into the command list. No
+        indirection at all - the fastest possible way to get
+        a handful of numbers to a shader.
+        Use for: an object index, a material id, a few floats.
+
+   2. ROOT DESCRIPTORS        cost: 2 DWORDs
+        a raw GPU virtual address of ONE buffer. One
+        indirection. No descriptor heap involved.
+        Use for: a per-object constant buffer.
+        NOTE: no bounds checking, and only for buffers -
+        textures cannot be root descriptors.
+
+   3. DESCRIPTOR TABLES       cost: 1 DWORD
+        a pointer INTO the bound descriptor heap, plus a
+        range. Two indirections.
+        Use for: textures, and anything in bulk.
+
+   THE BUDGET: 64 DWORDs total. That is the whole thing.
+
+        64 root constants, or
+        32 root descriptors, or
+        64 descriptor tables, or any mix.
+
+   AND SMALLER IS FASTER: the root signature is copied on
+   every draw. On some hardware the first 16 DWORDs live in
+   registers and the rest spill to memory. Aim for well under
+   16 DWORDs.</pre>
+
+<pre><code>/* A practical root signature. */
+
+D3D12_ROOT_PARAMETER1 params[3] = {};
+
+/* 0: root constants - an object index. 1 DWORD. */
+params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+params[0].Constants.ShaderRegister = 0;      /* b0             */
+params[0].Constants.Num32BitValues = 1;
+params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+/* 1: root CBV - the per-frame constant buffer. 2 DWORDs. */
+params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+params[1].Descriptor.ShaderRegister = 1;     /* b1             */
+params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+/* 2: a table of textures. 1 DWORD. */
+D3D12_DESCRIPTOR_RANGE1 range = {};
+range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+range.NumDescriptors     = 8;                /* t0..t7         */
+range.BaseShaderRegister = 0;
+range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
+              /* promises the data will not change while in
+                 use - lets the driver optimise. Use
+                 DATA_VOLATILE if it might. */
+params[2].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+params[2].DescriptorTable.NumDescriptorRanges = 1;
+params[2].DescriptorTable.pDescriptorRanges   = &amp;range;
+params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        /* Restricting visibility is FREE performance: the
+           driver need not copy this parameter to stages that
+           cannot see it. Never leave everything on ALL. */
+
+/* STATIC SAMPLERS cost NOTHING from the 64-DWORD budget and
+   are baked into the signature. Almost every sampler you use
+   should be static. */
+D3D12_STATIC_SAMPLER_DESC samp = {};
+samp.Filter           = D3D12_FILTER_ANISOTROPIC;
+samp.MaxAnisotropy    = 16;
+samp.AddressU = samp.AddressV = samp.AddressW =
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+samp.MaxLOD           = D3D12_FLOAT32_MAX;
+samp.ShaderRegister   = 0;                   /* s0             */
+samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
+desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+desc.Desc_1_1.NumParameters     = 3;
+desc.Desc_1_1.pParameters       = params;
+desc.Desc_1_1.NumStaticSamplers = 1;
+desc.Desc_1_1.pStaticSamplers   = &amp;samp;
+desc.Desc_1_1.Flags =
+    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+  | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS
+  | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS
+  | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+    /* DENY flags for stages you do not use are also free
+       performance. */
+
+ComPtr&lt;ID3DBlob&gt; blob, err;
+D3D12SerializeVersionedRootSignature(&amp;desc, &amp;blob, &amp;err);
+device-&gt;CreateRootSignature(0, blob-&gt;GetBufferPointer(),
+                            blob-&gt;GetBufferSize(),
+                            IID_PPV_ARGS(&amp;rootSig));</code></pre>
+
+<div class="key">
+<b>Order root parameters by how often they change</b>
+<p>Setting a root parameter invalidates everything after it on some hardware. Put the things that change
+least often first — per-frame, then per-material, then per-object — so a per-object update does not force the
+driver to re-emit the per-frame bindings. It is a five-minute reordering that costs nothing and is measurable
+in draw-heavy scenes.</p>
+</div>
+
+<h2 id="pso">The pipeline state object</h2>
+
+<pre><code>/* Everything that could affect shader compilation, frozen
+   into one immutable object. This is the whole point: the
+   driver compiles ONCE, at load time, at a moment you chose. */
+
+D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+pso.pRootSignature = rootSig.Get();
+pso.VS = { vsBlob-&gt;GetBufferPointer(), vsBlob-&gt;GetBufferSize() };
+pso.PS = { psBlob-&gt;GetBufferPointer(), psBlob-&gt;GetBufferSize() };
+
+D3D12_INPUT_ELEMENT_DESC layout[] = {
+  { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+  { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+  { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+};
+pso.InputLayout = { layout, _countof(layout) };
+/* The semantic names here must match the vertex shader's
+   input semantics EXACTLY (chapter 7). */
+
+pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+pso.RasterizerState.FrontCounterClockwise = FALSE;
+pso.RasterizerState.DepthClipEnable       = TRUE;
+
+pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
+pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+
+pso.DepthStencilState.DepthEnable    = TRUE;
+pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+pso.DepthStencilState.DepthFunc      =
+        D3D12_COMPARISON_FUNC_GREATER_EQUAL;   /* reversed-Z    */
+
+pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+pso.NumRenderTargets = 1;
+pso.RTVFormats[0]    = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+pso.DSVFormat        = DXGI_FORMAT_D32_FLOAT;
+pso.SampleMask       = UINT_MAX;      /* forgetting this gives
+                                         a black screen - it
+                                         defaults to 0, which
+                                         masks out every sample */
+pso.SampleDesc.Count = 1;
+
+device-&gt;CreateGraphicsPipelineState(&amp;pso, IID_PPV_ARGS(&amp;pipeline));
+
+/* WHAT IS *NOT* IN THE PSO - the state you still set per draw:
+     viewport, scissor          RSSetViewports/ScissorRects
+     render targets             OMSetRenderTargets
+     primitive topology         IASetPrimitiveTopology
+       (TYPE is in the PSO; LIST vs STRIP is not)
+     vertex/index buffers       IASetVertexBuffers
+     descriptor heaps           SetDescriptorHeaps
+     root arguments             SetGraphicsRoot*
+     stencil ref, blend factor  OMSetStencilRef, OMSetBlendFactor  */</code></pre>
+
+<div class="warn">
+<b>PSO count is the thing that surprises teams</b>
+<p>A PSO is the <em>combination</em> of shaders, blend, depth, formats and layout. Ten shaders × three blend
+modes × two depth modes × two render-target formats is 120 PSOs, and each takes 1–50 ms to create. Real games
+have thousands and spend real effort on this — which is why they show a "compiling shaders" screen on first
+run and ship a pipeline cache. Enumerate the combinations you will actually use; do not create them
+lazily.</p>
+</div>
+
+<pre><code>/* CACHING - so the second run is fast. */
+
+/* 1. Per-PSO blob: */
+ComPtr&lt;ID3DBlob&gt; cached;
+pipeline-&gt;GetCachedBlob(&amp;cached);
+WriteFile("pso_042.bin", cached);
+/* next run: */
+pso.CachedPSO = { data, size };     /* driver skips the compile */
+
+/* 2. Better - a whole-library cache: */
+ComPtr&lt;ID3D12PipelineLibrary&gt; lib;
+device-&gt;CreatePipelineLibrary(diskBlob, diskSize,
+                              IID_PPV_ARGS(&amp;lib));
+lib-&gt;LoadGraphicsPipeline(L"OpaqueLit", &amp;pso,
+                          IID_PPV_ARGS(&amp;pipeline));
+if (!pipeline) {
+    device-&gt;CreateGraphicsPipelineState(&amp;pso, IID_PPV_ARGS(&amp;pipeline));
+    lib-&gt;StorePipeline(L"OpaqueLit", pipeline.Get());
+}
+/* At shutdown, serialise the library to disk. */
+
+/* THE CACHE IS INVALIDATED BY: a driver update, a different
+   GPU, a different OS build. Always be able to fall back to
+   compiling, and never treat a cache miss as an error. */
+
+/* 3. Create them in PARALLEL - PSO creation is thread-safe
+      and CPU-bound, so it scales almost linearly: */
+   parallel_for(0, psoDescs.size(), [&amp;](size_t i) {
+       device-&gt;CreateGraphicsPipelineState(&amp;psoDescs[i],
+                                           IID_PPV_ARGS(&amp;psos[i]));
+   });
+/* A load screen that takes 40 s single-threaded takes 4 s on
+   a modern CPU. This is worth doing on day one. */</code></pre>
+
+<h2 id="draw">Putting it together in a draw</h2>
+
+<pre><code>cmd-&gt;SetPipelineState(pipeline.Get());
+cmd-&gt;SetGraphicsRootSignature(rootSig.Get());
+    /* Setting a root signature RESETS all root arguments.
+       Set it first, then the arguments - the other order
+       silently loses them. */
+
+ID3D12DescriptorHeap *heaps[] = { srvHeap.Get() };
+cmd-&gt;SetDescriptorHeaps(1, heaps);          /* once per list */
+
+cmd-&gt;SetGraphicsRootConstantBufferView(1, frameCB-&gt;GetGPUVirtualAddress());
+cmd-&gt;SetGraphicsRootDescriptorTable(2, srvHeap.Gpu(0));
+
+cmd-&gt;IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+cmd-&gt;IASetVertexBuffers(0, 1, &amp;vbv);
+cmd-&gt;IASetIndexBuffer(&amp;ibv);
+
+for (uint32_t i = 0; i &lt; objectCount; i++) {
+    cmd-&gt;SetGraphicsRoot32BitConstant(0, i, 0);   /* 1 DWORD  */
+    cmd-&gt;DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+}
+/* The inner loop is now ONE root constant and one draw -
+   which is close to the minimum possible CPU cost per
+   object, and why DX12 reaches tens of thousands of draws. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Black screen, no errors</td><td><code>SampleMask</code> left at 0</td></tr>
+<tr><td>Root arguments appear not to take effect</td><td>Root signature set <em>after</em> them — it resets
+them all</td></tr>
+<tr><td>PSO creation fails with a vague message</td><td>Input layout semantics do not match the vertex shader,
+or formats do not match the render targets</td></tr>
+<tr><td>Debug layer: root signature mismatch</td><td>The shader was compiled against a different signature
+than the PSO uses</td></tr>
+<tr><td>Root signature will not serialise</td><td>Over the 64-DWORD budget</td></tr>
+<tr><td>First appearance of an effect stutters</td><td>PSO created lazily — enumerate and pre-create</td></tr>
+<tr><td>Load times of tens of seconds</td><td>PSOs created serially; parallelise</td></tr>
+<tr><td>Cache gives no benefit after a driver update</td><td>Expected — the cache is driver-specific</td></tr>
+<tr><td>Draw calls cost more than expected</td><td>Root signature too large, or parameters ordered so
+per-object updates invalidate per-frame ones</td></tr>
+<tr><td>Geometry renders inside-out or not at all</td><td>Cull mode versus winding order in the rasteriser
+state</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the root signature as a function signature, and name its three parameter kinds with their
+  costs.</li>
+  <li>State the root signature budget and what happens when you exceed it.</li>
+  <li>Say why static samplers are preferable, and what they cost.</li>
+  <li>Explain why shader visibility and DENY flags are free performance.</li>
+  <li>Give the rule for ordering root parameters and why it matters.</li>
+  <li>List six pieces of state that go in a PSO and five that do not.</li>
+  <li>Explain why <code>SampleMask</code> is a classic black-screen bug.</li>
+  <li>Estimate a PSO count from shader and state combinations, and say why it matters.</li>
+  <li>Describe two levels of PSO caching and what invalidates them.</li>
+  <li>Explain why the root signature must be set before its arguments.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shaders and the programmable stages | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Shaders and the programmable stages</h1>
+<p class="lead">A shader is a small program run millions of times a frame with no memory of the last
+invocation. Learning the language takes an afternoon; learning what it may and may not do — and how it gets
+from source to silicon — is the part that matters.</p>
+
+<h2 id="languages">The languages, and the IRs beneath them</h2>
+
+<pre class="diagram">   HLSL   ---> DXBC        DX11 and earlier
+          ---> DXIL        DX12 Shader Model 6+, LLVM-based
+          ---> SPIR-V      via DXC, for Vulkan
+
+   GLSL   ---> SPIR-V      OpenGL 4.6, Vulkan
+   MSL    ---> AIR         Metal
+   WGSL   ---> whatever    WebGPU
+   Slang  ---> all of them a newer language that targets
+                           everything; increasingly common
+
+   THE TWO-STAGE COMPILE, and it explains a lot:
+
+     OFFLINE     your HLSL -> DXIL/SPIR-V.  Portable IR, but
+                 still not machine code. Ships in your app.
+     AT RUNTIME  the DRIVER compiles IR -> the actual ISA of
+                 the installed GPU.
+
+   CONSEQUENCES
+
+     * you cannot ship machine code: the ISA differs per
+       vendor, per generation, and is often undocumented.
+     * the FIRST use of a shader triggers a driver compile,
+       which is why games stutter on new effects and why
+       "shader pre-caching" screens exist.
+     * a driver update can change your shader's performance
+       without you rebuilding anything.
+     * two GPUs disagreeing about your shader is usually two
+       different back-end compilers, not a spec violation.
+
+   PIPELINE STATE OBJECTS (chapter 15) exist largely to give
+   the driver everything it needs to do this compile ONCE, at
+   a time you choose, instead of mid-frame.</pre>
+
+<pre><code>// HLSL, the whole language you need for a first shader.
+
+cbuffer PerObject : register(b0)      // constant buffer
+{
+    float4x4 WorldViewProj;
+    float4   Tint;
+};
+
+Texture2D    Albedo  : register(t0);  // SRV
+SamplerState Linear  : register(s0);  // sampler
+
+struct VSIn {
+    float3 pos    : POSITION;         // SEMANTICS bind these
+    float3 normal : NORMAL;           // to vertex buffer
+    float2 uv     : TEXCOORD0;        // elements
+};
+
+struct VSOut {
+    float4 pos    : SV_Position;      // SV_ = SYSTEM VALUE,
+    float3 normal : NORMAL;           // meaningful to the
+    float2 uv     : TEXCOORD0;        // fixed-function stages
+};
+
+VSOut VSMain(VSIn i)
+{
+    VSOut o;
+    o.pos    = mul(float4(i.pos, 1.0), WorldViewProj);
+    o.normal = i.normal;
+    o.uv     = i.uv;
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target       // -> render target 0
+{
+    float3 n = normalize(i.normal);      // renormalise: linear
+                                         // interpolation of
+                                         // unit vectors does
+                                         // NOT preserve length
+    float  ndl = saturate(dot(n, float3(0, 1, 0)));
+    float4 base = Albedo.Sample(Linear, i.uv);
+    return base * Tint * (ndl * 0.8 + 0.2);
+}</code></pre>
+
+<div class="key">
+<b>Semantics are the wiring</b>
+<p>There are no linkers between shader stages. <code>TEXCOORD0</code> out of the vertex shader connects to
+<code>TEXCOORD0</code> in the pixel shader <em>by name</em>, and the input layout binds
+<code>POSITION</code> to a byte offset in the vertex buffer <em>by name</em>. A mismatched or missing
+semantic is the commonest reason a mesh renders as garbage, and it usually produces no error — just wrong
+data.</p>
+</div>
+
+<h2 id="types">Types and what is actually fast</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Cost</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>float</code>, <code>float2/3/4</code></td><td>1 lane-op</td><td>The native type. A
+<code>float4</code> is <em>not</em> a SIMD vector on modern GPUs — it is four scalar ops</td></tr>
+<tr><td><code>half</code> / <code>min16float</code></td><td>Often 2× throughput</td><td>Real win on mobile
+and on tensor-heavy work; on desktop often just converted</td></tr>
+<tr><td><code>double</code></td><td>1/32 to 1/64 rate on consumer parts</td><td>Effectively unusable outside
+compute-focused hardware</td></tr>
+<tr><td><code>int</code> / <code>uint</code></td><td>~same as float</td><td>Integer division and modulo are
+<em>very</em> slow — use bit ops for powers of two</td></tr>
+<tr><td><code>rcp</code>, <code>rsqrt</code>, <code>exp2</code>, <code>log2</code>, <code>sin</code></td><td>1
+SFU op, ~4× slower issue rate</td><td>Still cheap. <code>rsqrt</code> is faster than
+<code>1.0/sqrt()</code></td></tr>
+<tr><td><code>pow(x, y)</code></td><td><code>exp2(y * log2(x))</code></td><td>Two SFU ops; and it is
+<em>wrong</em> for negative <code>x</code></td></tr>
+<tr><td><code>normalize</code></td><td><code>rsqrt</code> + 3 muls</td><td>Cheap. Do it in the pixel shader
+after interpolation</td></tr>
+<tr><td>Branching</td><td>See <a href="gpu-03-warps-divergence.html">chapter 3</a></td><td>Free if the whole
+wave agrees</td></tr>
+<tr><td>Texture sample</td><td>~100s of cycles, latency-hidden</td><td>The dependent-sample chain is what
+actually costs you</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Things that are slower than they look. */
+
+  a / b            -> reciprocal + multiply. Fine.
+  a % b   (int)    -> genuinely slow. If b is a power of two,
+                      use a &amp; (b-1).
+  a / b   (int)    -> same. Use a >> log2(b).
+  pow(x, 2)        -> use x * x. The compiler often catches
+                      this; do not rely on it.
+  length(v) &lt; r    -> compare SQUARED lengths and skip the
+                      sqrt entirely: dot(v,v) &lt; r*r
+  sin/cos of the
+    same angle     -> sincos(x, s, c) computes both at once
+
+/* Things that are faster than they look. */
+
+  saturate(x)      -> FREE. It is an output modifier on the
+                      preceding instruction, not an operation.
+                      Prefer it to clamp(x, 0, 1).
+  mad / fma        -> a*b+c is ONE instruction. Write your
+                      arithmetic so it factors that way.
+  lerp(a, b, t)    -> one mad.
+  swizzles         -> free. v.xyzw, v.wwww, v.xz cost nothing.
+  abs and negate   -> free input modifiers.
+
+/* The general rule: the ALU is nearly free; MEMORY and
+   DIVERGENCE are what cost. Optimising arithmetic in a shader
+   that is texture-bound is wasted effort - measure first. */</code></pre>
+
+<h2 id="constraints">What a shader may not do</h2>
+
+<pre class="diagram">   NO recursion            the stack is finite and tiny.
+                           (Ray-tracing shaders are the one
+                           exception, with a bounded depth.)
+
+   NO function pointers    everything is inlined. There is no
+                           call in the final ISA.
+
+   NO dynamic allocation   no malloc, no new. All storage is
+                           declared up front.
+
+   NO pointers, mostly     buffers are indexed, not chased.
+                           (DX12 has descriptor indexing, and
+                           newer models add buffer pointers.)
+
+   NO cross-invocation
+     communication         except within a wave (chapter 2) or
+                           a compute workgroup via groupshared.
+                           Two pixels cannot talk.
+
+   NO guaranteed order     pixel shader invocations complete in
+                           any order. Blending is ordered by
+                           fixed-function hardware, not by you.
+
+   LOOPS must be bounded   or the compiler unrolls until it
+                           gives up. An unbounded while loop
+                           driven by a texture value will
+                           either fail to compile or produce a
+                           multi-megabyte shader.
+
+   [loop]     forces a real loop (smaller code, more
+              divergence)
+   [unroll]   forces unrolling (bigger code, more registers,
+              often much faster)
+   [branch]   real branch
+   [flatten]  evaluate both sides and select
+
+   These attributes matter: a [unroll] on a 4-iteration loop
+   is usually a clear win, and a missing [loop] on a long one
+   can blow your register budget and destroy occupancy
+   (chapter 5).</pre>
+
+<h2 id="quad">Derivatives, and why pixels come in quads</h2>
+
+<pre><code>/* The rasteriser ALWAYS shades 2x2 quads, even for a triangle
+   covering one pixel. The other three lanes are "helper
+   invocations": they run, they compute, their output is
+   discarded.
+
+   WHY: mip level selection needs to know how fast the texture
+   coordinate is changing across the screen, and the only way
+   to know that is to compare with your neighbour.          */
+
+        float2 dx = ddx(uv);       /* difference with the pixel
+                                      to the right             */
+        float2 dy = ddy(uv);       /* ... and below            */
+        /* Texture.Sample() calls these implicitly to pick a
+           mip level.                                         */
+
+/* THREE CONSEQUENCES
+
+   1. SMALL TRIANGLES ARE EXPENSIVE. A triangle covering one
+      pixel still costs four pixel-shader invocations - 4x
+      the shading for the same coverage. This is why dense
+      meshes tank performance long before the vertex cost
+      matters, and the main problem meshlets and variable-rate
+      shading exist to address.
+
+   2. YOU CANNOT SAMPLE WITH IMPLICIT MIPS IN DIVERGENT FLOW.
+      If half the quad took the other branch, its derivative
+      is undefined. The compiler will either hoist the sample
+      out of the branch or warn you. Use SampleLevel() or
+      SampleGrad() to supply the mip yourself:              */
+        if (someCondition)
+                c = tex.Sample(s, uv);         /* UNDEFINED    */
+        c = tex.SampleLevel(s, uv, 0);         /* fine anywhere */
+
+   3. DERIVATIVES ARE PER-QUAD, so ddx of a value that varies
+      per-pixel is a 2x2 approximation, not a true gradient.
+      Screen-space effects built on ddx are blocky at 2x2
+      granularity by construction.                          */</code></pre>
+
+<div class="warn">
+<b>The dense-mesh trap</b>
+<p>Quad overshading means a mesh tessellated to sub-pixel triangles can cost <em>four times</em> the pixel
+shading of the same silhouette drawn with larger triangles — while every profiler tells you the pixel shader
+is the bottleneck, which it is, for a reason that has nothing to do with the shader. Check triangle size
+before optimising shader code on a highly detailed asset.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Mesh renders as garbage, no errors</td><td>Semantic mismatch between input layout and vertex
+shader</td></tr>
+<tr><td>Lighting is subtly wrong across a triangle</td><td>Normal not renormalised after
+interpolation</td></tr>
+<tr><td>First frame with a new effect stutters</td><td>Driver compiling the shader on demand — pre-warm the
+PSOs</td></tr>
+<tr><td>Works on NVIDIA, artefacts on AMD</td><td>Different back-end compilers; often uninitialised values or
+undefined behaviour you got away with</td></tr>
+<tr><td>Shader compile takes minutes</td><td>An unrolled loop with a large or unbounded trip count</td></tr>
+<tr><td>Occupancy collapses after a small edit</td><td>Register pressure from unrolling</td></tr>
+<tr><td>Blurry or aliased textures in a branch</td><td>Implicit-mip sample inside divergent flow</td></tr>
+<tr><td>High-poly model far slower than expected</td><td>Quad overshading on sub-pixel triangles</td></tr>
+<tr><td><code>pow</code> returns NaN</td><td>Negative base — <code>pow</code> is
+<code>exp2(y*log2(x))</code></td></tr>
+<tr><td>Integer modulo dominates the profile</td><td>Use a bitmask if the divisor is a power of two</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the two-stage shader compile and name three consequences.</li>
+  <li>Explain what semantics do and why a mismatch produces no error.</li>
+  <li>Say why a <code>float4</code> is not a SIMD vector on modern GPUs.</li>
+  <li>Name four operations that are slower than they look and four that are free.</li>
+  <li>Explain why <code>saturate</code> costs nothing.</li>
+  <li>List five things a shader may not do.</li>
+  <li>Explain what <code>[unroll]</code> and <code>[loop]</code> trade against each other.</li>
+  <li>Explain why pixels are shaded in 2×2 quads.</li>
+  <li>Give the three consequences of quad shading, including the one about dense meshes.</li>
+  <li>Say why <code>Sample</code> is undefined in divergent flow and what to use instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

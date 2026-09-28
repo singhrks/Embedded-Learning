@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taking and returning from an exception | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Taking and returning from an exception</h1>
+<p class="lead">The single most important flow in system software. Six things happen in hardware, atomically,
+before your first instruction runs — and everything else is software's responsibility. Get this sequence
+wrong and you corrupt the program you interrupted, in ways that surface far from the cause.</p>
+
+<h2 id="hardware">What hardware does</h2>
+
+<p>Before your handler executes a single instruction, the processor has already done a fixed sequence of things. Knowing precisely what — and what it deliberately did <em>not</em> do — defines what your stub is responsible for.</p>
+
+<pre class="diagram">   EL0 executing:  svc #0
+        │          (or an IRQ arrives, or a load faults)
+        ▼
+  ═══════ HARDWARE, ATOMICALLY — nothing you wrote runs here ═══════
+
+   1. ELR_EL1   ← the address to return to
+                  · for SVC:      the instruction AFTER the svc
+                  · for a fault:  the FAULTING instruction, so it
+                                  can be retried after the OS
+                                  fixes the mapping
+                  · for an IRQ:   the next instruction to execute
+
+   2. SPSR_EL1  ← the entire PSTATE: NZCV, DAIF, the source EL,
+                  SPSel, nRW, PAN, and the rest
+
+   3. ESR_EL1   ← the syndrome: exception class + details
+                  (chapter 29)
+
+   4. FAR_EL1   ← the faulting virtual address
+                  (aborts and watchpoints only; stale otherwise)
+
+   5. PSTATE    → EL = 1
+                  SPSel = 1        (switch to SP_EL1)
+                  D, A, I, F ALL MASKED
+                  PAN set, if SCTLR_EL1.SPAN says so
+
+   6. PC        ← VBAR_EL1 + the vector offset for
+                  (source EL, exception type)
+
+  ═════════════════════════════════════════════════════════════════
+        │
+        ▼
+   your handler's first instruction</pre>
+
+<div class="danger">
+<b>Notice what is NOT saved</b>
+<p><code>X0</code>–<code>X30</code> are untouched. AArch64 has <strong>no banked general-purpose
+registers</strong> (<a href="arm-04-register-file.html">chapter 04</a>). Your handler begins executing with the
+interrupted code's register values still live, and every one of them must be preserved by software before you
+can use it.</p>
+<p>That saved set is <code>struct pt_regs</code> in Linux and the trap frame in Windows, and building it
+correctly is the entire job of the vector stub.</p>
+</div>
+
+<h2 id="stub">The entry stub</h2>
+
+<p>The entry stub's job is to turn the minimal state the hardware provided into something C code can run on. It is short, it is the same in every kernel, and every line of it is load-bearing.</p>
+
+<div class="codewrap"><div class="code-title">the shape every AArch64 OS has, simplified from Linux's entry.S</div>
+<pre><code>el0_sync:
+        /* SP is now SP_EL1 — the kernel stack for this thread.
+           The hardware switched it for us because SPSel became 1.
+           This is exactly why per-EL stack pointers exist: a
+           corrupt user SP cannot take the kernel down.        */
+
+        sub     sp, sp, #S_FRAME_SIZE       /* room for pt_regs   */
+
+        /* save the general-purpose registers, in pairs */
+        stp     x0,  x1,  [sp, #16 * 0]
+        stp     x2,  x3,  [sp, #16 * 1]
+        stp     x4,  x5,  [sp, #16 * 2]
+        /* ... x6 through x27 ... */
+        stp     x28, x29, [sp, #16 * 14]
+
+        /* now capture the exception state — BEFORE unmasking
+           anything, because a nested exception would overwrite
+           these single registers                              */
+        mrs     x21, sp_el0                 /* the USER stack ptr */
+        mrs     x22, elr_el1                /* where to return    */
+        mrs     x23, spsr_el1               /* PSTATE to restore  */
+
+        stp     x30, x21, [sp, #16 * 15]
+        stp     x22, x23, [sp, #16 * 16]
+
+        /* only NOW is it safe to enable interrupts, if we want
+           nesting */
+        msr     daifclr, #2                 /* unmask IRQ         */
+
+        /* dispatch on the syndrome */
+        mrs     x25, esr_el1
+        lsr     x24, x25, #26               /* EC = ESR[31:26]    */
+        cmp     x24, #0x15                  /* SVC from AArch64   */
+        b.eq    el0_svc
+        cmp     x24, #0x24                  /* data abort, lower EL */
+        b.eq    el0_da
+        cmp     x24, #0x20                  /* instruction abort   */
+        b.eq    el0_ia
+        b       el0_inv
+
+el0_svc:
+        mov     x0, sp                      /* pass pt_regs to C  */
+        bl      do_el0_svc
+        b       ret_to_user</code></pre></div>
+
+<div class="key">
+<b>The ordering rule</b>
+<p><strong>Save <code>ELR</code> and <code>SPSR</code> before unmasking interrupts.</strong> They are single
+registers, not a stack. A nested exception arriving between entry and the save overwrites the return address,
+and the interrupted program is unrecoverable.</p>
+<p>This is why hardware masks DAIF on entry, and why the mask is cleared only after the save is complete.</p>
+</div>
+
+<h2 id="return">The return path</h2>
+
+<p>Returning is not simply a branch. One instruction restores the program counter and the whole of PSTATE together, which is what makes the transition atomic and safe.</p>
+
+<pre><code>ret_to_user:
+        /* mask interrupts again — the restore must be atomic with
+           respect to a new exception                            */
+        msr     daifset, #2
+
+        /* work that must happen before returning to userspace */
+        ldr     x1, [tsk, #TSK_TI_FLAGS]
+        and     x2, x1, #_TIF_WORK_MASK
+        cbnz    x2, work_pending            /* signals? resched?  */
+
+finish_ret_to_user:
+        /* restore the exception state */
+        ldp     x21, x22, [sp, #16 * 16]
+        msr     elr_el1,  x21
+        msr     spsr_el1, x22
+
+        ldp     x30, x23, [sp, #16 * 15]
+        msr     sp_el0,   x23               /* the user stack     */
+
+        /* restore the general registers */
+        ldp     x0,  x1,  [sp, #16 * 0]
+        /* ... through x28, x29 ... */
+
+        add     sp, sp, #S_FRAME_SIZE
+
+        eret                                /* back to EL0        */
+
+/* ERET restores PC from ELR_EL1 and PSTATE from SPSR_EL1,
+   ATOMICALLY. That atomicity is the point: there is no window in
+   which the privilege has changed but the PC has not, or vice
+   versa. Any such window would be exploitable.               */</code></pre>
+
+<h2 id="elr">The ELR subtlety</h2>
+
+<p>There is no single rule for what address <code>ELR_ELx</code> holds — it depends entirely on whether the
+instruction that caused the exception is meant to be considered <em>finished</em> or <em>not yet
+attempted</em>, and the architecture picks whichever makes the handler's job possible. A supervisor call has
+already done its job by the time the exception is taken, so resuming means moving on to the next instruction. A
+data abort, by contrast, points at the faulting instruction itself, because the entire point of a page fault
+handler is to fix the mapping and then <em>retry the exact same instruction</em> — pointing anywhere else would
+lose the memory access that needs to happen. An undefined instruction or a trapped register access also point
+at themselves, but for a different reason: something above this level intends to interpret or emulate that
+instruction, and it cannot do so without seeing which instruction it was.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Exception</th><th><code>ELR</code> points at</th><th>Because</th></tr></thead>
+<tbody>
+<tr><td><code>SVC</code>, <code>HVC</code>, <code>SMC</code></td><td>The instruction <strong>after</strong></td><td>The call completed; resume past it</td></tr>
+<tr><td>Data abort, instruction abort</td><td><strong>The faulting instruction</strong></td><td>The OS fixes the mapping and <em>retries</em> it</td></tr>
+<tr><td>IRQ, FIQ</td><td>The next instruction to execute</td><td>Nothing failed; resume normally</td></tr>
+<tr><td>Undefined instruction</td><td>The undefined instruction</td><td>So an emulator can inspect and emulate it</td></tr>
+<tr><td>Trapped register access</td><td>The trapped instruction</td><td>The hypervisor emulates it</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* CONSEQUENCE: if you EMULATE an instruction, you must advance
+   ELR yourself, or you will re-execute it forever.          */
+
+        mrs     x0, elr_el2
+        add     x0, x0, #4              /* A64 is fixed-width */
+        msr     elr_el2, x0
+        eret
+
+/* This is the single most common hypervisor and emulation bug —
+   an infinite loop that looks like a hang, with the guest
+   apparently frozen on one instruction. Chapter 31.
+
+   For AArch32 the step is 2 or 4 depending on Thumb, which is
+   why compat emulation code reads SPSR to decide.          */</code></pre>
+
+<h2 id="nesting">Nesting</h2>
+
+<p>An exception can arrive while you are handling another one. Whether that is safe depends entirely on what you have done with the saved state and the interrupt masks by that point.</p>
+
+<pre class="diagram">Interrupts CAN nest, once the handler has saved ELR and SPSR:
+
+   EL0 running
+        │ IRQ (priority 0x80)
+        ▼
+   el0_irq: save regs, save ELR/SPSR
+            msr daifclr, #2          ← now nesting is permitted
+            handle interrupt A
+        │ higher-priority IRQ arrives (priority 0x40)
+        ▼
+   el1_irq: save regs, save ELR_EL1/SPSR_EL1 to THIS stack frame
+            handle interrupt B
+            restore, eret
+        │
+        ▼ back in interrupt A's handler
+            finish, restore, eret
+        │
+        ▼ back to EL0
+
+  Note the second entry used the "current EL, SP_ELx" vector at
+  0x280, not the "lower EL" one at 0x480 — which is exactly why
+  the table is split by source (chapter 27). The second handler
+  does NOT need to switch stacks or save SP_EL0.
+
+  The GIC's priority mechanism decides whether B preempts A
+  (chapter 24). Linux by default does NOT nest ordinary
+  interrupts — it keeps them masked and relies on short handlers
+  plus threaded IRQs instead. Nesting is used for pseudo-NMIs.</pre>
+
+<h2 id="drop">Dropping to a lower level</h2>
+
+<p>Moving to a lower privilege level is done by returning to it rather than by calling into it — which is initially counter-intuitive and is how a bootloader hands control to a kernel.</p>
+
+<pre><code>/* The same ERET mechanism is used to LAUNCH software at a lower
+   level — which is how every boot handover works (OS ch. 18). */
+
+/* EL3 firmware handing off to a kernel at EL1: */
+        mov     x0, #(1 &lt;&lt; 10)          /* SCR.RW = AArch64 below  */
+        orr     x0, x0, #(1 &lt;&lt; 0)       /* SCR.NS = Non-secure     */
+        msr     scr_el3, x0
+
+        mov     x0, #0x3C5              /* SPSR.M = 0b0101 = EL1h  */
+                                        /* DAIF all masked         */
+        msr     spsr_el3, x0
+
+        ldr     x0, =kernel_entry
+        msr     elr_el3, x0
+
+        /* the kernel's boot contract: x0 = DTB, x1-x3 = 0 */
+        ldr     x0, =dtb_address
+        mov     x1, xzr
+        mov     x2, xzr
+        mov     x3, xzr
+
+        eret
+
+/* Note there is no "jump to EL1" instruction. ERET is the only
+   way down, and it takes its target from SPSR and ELR. Which
+   means firmware must construct a plausible "saved state" for a
+   context that never actually ran.                         */</code></pre>
+
+<h2 id="cost">The cost</h2>
+
+<p>Every exception costs cycles even when the handler does nothing. Knowing roughly how many explains why system call overhead matters and why avoiding the trap entirely is worth so much.</p>
+
+<pre class="diagram">   hardware entry (steps 1-6)          ~10-20 cycles
+   save 31 registers + 3 system regs   ~35 stores, ~20-40 cycles
+   dispatch on ESR                     ~5-10 cycles
+   ─────────────────────────────────────────────────
+   entry total                         ~50-100 cycles
+
+   ...handler...
+
+   restore + ERET                      ~50-100 cycles
+
+   Plus the INDIRECT costs, which usually dominate:
+     · pipeline flush on entry and on ERET
+     · I-cache and branch predictor now hold handler state
+     · with KPTI, TWO address-space switches per syscall
+     · Spectre-BHB mitigation sequences in the vector
+
+   Which is why a "null" syscall costs 50-500 ns rather than the
+   ~30 cycles the register saving suggests, and why io_uring and
+   the vDSO exist (OS chapter 03).
+
+  OPTIMISATIONS real kernels use:
+     · save only what is needed on the fast path (Linux saves
+       everything, for simplicity and for ptrace)
+     · a dedicated fast path for SVC that skips fault-handling
+       setup
+     · the vDSO, removing the exception entirely for
+       clock_gettime and similar</pre>
+
+<h2 id="stacks">Stack handling</h2>
+
+<p>Which stack an exception handler runs on is configurable, and choosing correctly is a security matter: a handler running on a stack the faulting code controlled is a vulnerability.</p>
+
+<pre><code>/* Three stack pointers are in play on a user-to-kernel entry:
+
+     SP_EL0   the user stack. Saved into pt_regs, and RESTORED on
+              return. The kernel never runs on it.
+     SP_EL1   the kernel stack for THIS THREAD. The hardware
+              switches to it automatically (SPSel = 1).
+     the IRQ stack (Linux)  a separate per-CPU stack that deep
+              interrupt handling switches to, so a deeply nested
+              interrupt cannot overflow the thread's 16 KB stack.
+
+   And the OVERFLOW stack: Linux reserves a per-CPU stack used
+   ONLY when a kernel stack overflow is detected via the guard
+   page. Without it, the overflow fault handler would itself fail
+   to push a frame, producing an infinite fault loop with no
+   diagnostic. With it, you get a readable oops.           */
+
+/* The kernel stack pointer for a thread is established at
+   context switch time, from the task structure. `current` is
+   read from SP_EL0 while at EL1 — the register is otherwise
+   unused there, so Linux repurposes it as a per-CPU pointer to
+   the current task (OS chapter 04).                       */</code></pre>
+
+<h2 id="debug">Debugging entry and exit</h2>
+
+<p>Problems in entry and exit code are unusually hard to debug, because the machinery you would normally use is exactly what is broken. These are the techniques that still work.</p>
+
+<pre><code># Linux prints the saved state in an oops
+dmesg | grep -A25 'Internal error'
+#   pc : do_something+0x48/0x120
+#   lr : caller+0xb4/0x1f0
+#   sp : ffff800009abc000
+#   x29: ...  x28: ...  x27: ...
+#   Call trace:
+#     do_something+0x48/0x120
+#     ...
+#     el0_svc_common+0x88/0x1a0      ← arrived via a syscall
+#   pstate: 60400009 (nZCv daif +PAN -UAO)   ← chapter 05
+
+# in gdb on a kernel target
+p/x $ELR_EL1
+p/x $SPSR_EL1
+p/x $ESR_EL1
+p/x $SP_EL0
+
+# breakpoint on the vector itself
+b *($VBAR_EL1 + 0x400)      # lower EL, synchronous
+
+# trace syscall entry and exit
+echo 1 &gt; /sys/kernel/debug/tracing/events/raw_syscalls/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# measure the cost
+perf bench syscall basic
+perf stat -e raw_syscalls:sys_enter ./prog</code></pre>
+
+<div class="tip">
+<b>Reading which vector was taken</b>
+<p>In a crash dump, <code>SPSR</code>'s low bits tell you the source context — <code>0b0000</code> is EL0t (a
+user-mode exception, so the 0x400 group), <code>0b0101</code> is EL1h (a kernel-mode one, the 0x200 group).
+Combined with <code>ESR</code>'s exception class this pins down exactly which of the sixteen entries ran,
+which usually identifies the bug immediately.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Interrupted program corrupted after an interrupt</td><td>Vector stub failed to save all general registers</td></tr>
+<tr><td>Corrupted return address in a nested exception</td><td>Unmasked interrupts before saving <code>ELR</code>/<code>SPSR</code></td></tr>
+<tr><td>Emulated instruction executes forever</td><td><code>ELR</code> not advanced past it</td></tr>
+<tr><td>Page fault loops on the same address</td><td>Correct — until the OS fixes the mapping; if it never does, the OS bug is elsewhere</td></tr>
+<tr><td>Returns to the wrong exception level</td><td>Wrong <code>M[3:0]</code> in <code>SPSR</code></td></tr>
+<tr><td>User stack corrupted after a syscall</td><td><code>SP_EL0</code> not saved and restored</td></tr>
+<tr><td>Infinite fault loop with no output</td><td>Stack overflow with no separate overflow stack</td></tr>
+<tr><td>Signals never delivered</td><td>No work-pending check on the return path</td></tr>
+<tr><td>Syscalls unexpectedly slow after a kernel update</td><td>KPTI or Spectre mitigations in the entry path</td></tr>
+<tr><td>TLS broken after a hand-written context switch</td><td><code>TPIDR_EL0</code> not restored</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List, in order, the six things hardware does on exception entry.</li>
+  <li>Explain why general-purpose registers are not saved and what software must do.</li>
+  <li>State the ordering rule about <code>ELR</code>/<code>SPSR</code> and unmasking, and why.</li>
+  <li>Say where <code>ELR</code> points for an <code>SVC</code>, a data abort and an emulated instruction.</li>
+  <li>Explain why <code>ERET</code> must be atomic.</li>
+  <li>Explain how nesting works and which vector entry the second exception uses.</li>
+  <li>Show how firmware uses <code>ERET</code> to launch a kernel at a lower level.</li>
+  <li>Explain why an overflow stack exists and what happens without one.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

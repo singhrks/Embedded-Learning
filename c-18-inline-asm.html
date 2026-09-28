@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inline assembly and compiler intrinsics | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Inline assembly and compiler intrinsics</h1>
+<p class="lead">Sometimes C cannot express what you need: a system register, a barrier, an atomic sequence, a
+SIMD instruction. Inline assembly is the escape hatch — and the most dangerous construct in the language,
+because a wrong constraint produces code that works until the register allocator changes its mind.</p>
+
+<h2 id="ladder">Try these first</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Need</th><th>Reach for</th><th>Before</th></tr></thead>
+<tbody>
+<tr><td>Bit counting, byte swap</td><td><code>__builtin_popcount</code>, <code>__builtin_bswap32</code>, <code>&lt;stdbit.h&gt;</code></td><td>asm</td></tr>
+<tr><td>Atomics</td><td><code>&lt;stdatomic.h&gt;</code>, <code>__atomic_*</code></td><td>asm</td></tr>
+<tr><td>Overflow checks</td><td><code>__builtin_add_overflow</code></td><td>asm</td></tr>
+<tr><td>SIMD</td><td>Auto-vectorisation, then <code>&lt;arm_neon.h&gt;</code> intrinsics</td><td>asm</td></tr>
+<tr><td>Barriers</td><td><code>atomic_thread_fence</code>, kernel <code>smp_mb()</code></td><td>asm</td></tr>
+<tr><td>Cache and TLB maintenance</td><td>Kernel/vendor helper functions</td><td>asm</td></tr>
+<tr><td>System registers</td><td>Kernel accessors (<code>read_sysreg()</code>)</td><td>asm</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The rule</b>
+<p>Inline assembly is a last resort. Intrinsics and builtins give the compiler full visibility — it can
+schedule, allocate registers, constant-fold and vectorise around them. An <code>asm</code> block is opaque:
+the compiler must trust your description of it, and if that description is wrong, the bug appears only at
+certain optimisation levels or after unrelated edits.</p>
+</div>
+
+<h2 id="syntax">GCC extended asm</h2>
+
+<p>GCC's inline assembly syntax is dense and unforgiving, and the reason is that you are not merely inserting instructions — you are describing to the compiler exactly what those instructions read, write and disturb, so that it can keep optimising safely around them.</p>
+
+<pre class="diagram">   asm [volatile] ( "template"
+                  : output operands
+                  : input operands
+                  : clobbers
+                  );
+
+   %0, %1, %2 ...   refer to operands in order, outputs first
+   %w0              32-bit view of operand 0 (aarch64)
+   %x0              64-bit view
+
+   Constraint letters (aarch64):
+     "r"   general register
+     "m"   memory operand
+     "i"   immediate constant
+     "w"   SIMD/FP register
+     "0"   must use the same register as operand 0
+
+   Modifiers:
+     "=r"  write-only output   (assume the old value is dead)
+     "+r"  read-write output
+     "&amp;r"  EARLYCLOBBER — written before all inputs are consumed</pre>
+
+<pre><code>/* read a system register */
+static inline uint64_t read_sctlr(void)
+{
+        uint64_t v;
+        asm volatile("mrs %0, sctlr_el1" : "=r"(v));
+        return v;
+}
+
+/* write one, then synchronise the pipeline */
+static inline void write_sctlr(uint64_t v)
+{
+        asm volatile("msr sctlr_el1, %0\n\t"
+                     "isb"
+                     :: "r"(v) : "memory");
+}
+
+/* a barrier: no operands at all, only a clobber */
+#define dmb_ish()  asm volatile("dmb ish" ::: "memory")
+
+/* arithmetic with input and output */
+static inline uint32_t rev32(uint32_t x)
+{
+        uint32_t r;
+        asm("rev %w0, %w1" : "=r"(r) : "r"(x));
+        return r;
+}
+/* ...though you should just use __builtin_bswap32(x). */</code></pre>
+
+<h2 id="mistakes">The four mistakes</h2>
+
+<div class="danger">
+<b>1. Forgetting <code>volatile</code></b>
+<p>Without it, the compiler may delete an <code>asm</code> whose outputs are unused, hoist it out of a loop,
+or execute it fewer times than written. Any asm with a <em>side effect</em> — writing a system register,
+touching hardware, a barrier — must be <code>volatile</code>.</p>
+<pre><code>asm("msr daifset, #2");              /* may be DELETED — no outputs */
+asm volatile("msr daifset, #2");     /* correct                     */
+
+/* Conversely, a pure computation should NOT be volatile, so the
+   compiler can hoist it out of loops and CSE it: */
+asm("rev %w0, %w1" : "=r"(r) : "r"(x));   /* pure — leave it hoistable */</code></pre>
+</div>
+
+<div class="danger">
+<b>2. Missing the <code>"memory"</code> clobber</b>
+<p>Tells the compiler that the asm reads or writes memory it cannot see, so it must not cache values in
+registers across the block, and must not reorder memory accesses past it. Every barrier, every cache
+operation, and any asm that dereferences a pointer needs it.</p>
+<pre><code>/* WRONG: the compiler may keep *p in a register across the barrier */
+asm volatile("dsb sy");
+
+/* RIGHT */
+asm volatile("dsb sy" ::: "memory");
+
+/* A compiler-only barrier, with no instruction at all: */
+#define barrier() asm volatile("" ::: "memory")
+/* This is exactly what Linux's barrier() is, and what READ_ONCE
+   and WRITE_ONCE are built on.                                  */</code></pre>
+</div>
+
+<div class="danger">
+<b>3. Not declaring clobbered registers</b>
+<p>If your asm writes a register the compiler thinks holds a live value, that value is silently destroyed.
+The symptom is corruption in unrelated code, appearing only at certain optimisation levels.</p>
+<pre><code>/* WRONG: x9 is clobbered but not declared */
+asm volatile("mov x9, #0\n\t"
+             "add %0, %1, x9" : "=r"(r) : "r"(x));
+
+/* RIGHT */
+asm volatile("mov x9, #0\n\t"
+             "add %0, %1, x9" : "=r"(r) : "r"(x) : "x9");
+
+/* BETTER: let the compiler choose the scratch register */
+uint64_t tmp;
+asm volatile("mov %1, #0\n\t"
+             "add %0, %2, %1" : "=r"(r), "=&amp;r"(tmp) : "r"(x));
+
+/* Also clobber "cc" if you modify the condition flags: */
+asm volatile("subs %0, %1, #1" : "=r"(r) : "r"(x) : "cc");</code></pre>
+</div>
+
+<div class="danger">
+<b>4. Missing earlyclobber</b>
+<p>By default the compiler may assign an output and an input to the <em>same</em> register, assuming inputs
+are fully consumed before outputs are written. If your asm writes the output before reading all inputs, you
+need <code>&amp;</code>.</p>
+<pre><code>/* WRONG: %0 and %1 may be the same register, so writing %0 first
+   destroys the input.                                          */
+asm("mov %0, #0\n\t"
+    "add %0, %0, %1" : "=r"(out) : "r"(in));
+
+/* RIGHT */
+asm("mov %0, #0\n\t"
+    "add %0, %0, %1" : "=&amp;r"(out) : "r"(in));
+
+/* The bug is invisible until register pressure changes — which is
+   why it typically appears months later after an unrelated edit. */</code></pre>
+</div>
+
+<h2 id="examples">Worked examples</h2>
+
+<p>With the syntax established, these are the forms you will actually write in systems code: reading a system register, issuing a barrier, performing an operation the compiler has no way to express.</p>
+
+<pre><code>/* Interrupt masking — the shape used in every RTOS and kernel */
+static inline unsigned long irq_save(void)
+{
+        unsigned long flags;
+        asm volatile("mrs %0, daif\n\t"
+                     "msr daifset, #2"      /* mask IRQ */
+                     : "=r"(flags) :: "memory");
+        return flags;
+}
+static inline void irq_restore(unsigned long flags)
+{
+        asm volatile("msr daif, %0" :: "r"(flags) : "memory");
+}
+
+/* An atomic increment with exclusives — for illustration; in real
+   code use &lt;stdatomic.h&gt;, which also selects LSE on newer cores. */
+static inline void atomic_inc(int *p)
+{
+        unsigned long tmp;
+        int val;
+        asm volatile("1: ldaxr %w0, %2\n\t"
+                     "   add   %w0, %w0, #1\n\t"
+                     "   stlxr %w1, %w0, %2\n\t"
+                     "   cbnz  %w1, 1b"
+                     : "=&amp;r"(val), "=&amp;r"(tmp), "+Q"(*p)
+                     :: "memory");
+}
+/* Note: "+Q" is a memory operand with no offset — required for
+   exclusives. "1:" and "1b" are LOCAL LABELS, mandatory in inline
+   asm because the block may be duplicated by inlining or
+   unrolling; a named label would then be defined twice.        */
+
+/* SIMD is far better expressed with intrinsics */
+#include &lt;arm_neon.h&gt;
+void vadd(float *c, const float *a, const float *b, size_t n)
+{
+        for (size_t i = 0; i + 4 &lt;= n; i += 4)
+                vst1q_f32(c + i, vaddq_f32(vld1q_f32(a + i),
+                                            vld1q_f32(b + i)));
+}
+/* Intrinsics are typed, schedulable, and the compiler can still
+   register-allocate around them. Prefer them universally.     */</code></pre>
+
+<h2 id="goto">asm goto and basic asm</h2>
+
+<p>Assembly that can branch to a C label is how the kernel implements static branches and exception tables. It has restrictions the ordinary form does not, and they follow from what the compiler can still reason about.</p>
+
+<pre><code>/* Basic asm — no operands. Only safe at FILE SCOPE or when the block
+   truly touches nothing. Inside a function it is a trap, because
+   the compiler assumes it does nothing.                          */
+asm(".section .rodata\n\t.asciz \"build-id\"\n\t.previous");
+
+/* asm goto — can branch to a C label. This is what makes Linux's
+   static keys (runtime-patchable branches) possible.            */
+static inline bool feature_enabled(void)
+{
+        asm goto("1: nop\n\t"
+                 ".pushsection __jump_table, \"aw\"\n\t"
+                 ".quad 1b, %l[l_yes]\n\t"
+                 ".popsection"
+                 :::: l_yes);
+        return false;
+l_yes:
+        return true;
+}
+/* The nop is rewritten to a branch at runtime when the feature is
+   toggled — zero cost when disabled, and no indirect call.     */</code></pre>
+
+<h2 id="naked">Naked functions and startup code</h2>
+
+<p>A function with no compiler-generated prologue or epilogue is occasionally necessary — an exception vector, a context switch — and everything the compiler would normally do becomes your responsibility.</p>
+
+<pre><code>/* A naked function has no prologue or epilogue. Used for reset
+   handlers and context switches, where the ABI does not apply. */
+__attribute__((naked)) void Reset_Handler(void)
+{
+        asm volatile(
+                "ldr r0, =_stack_top\n\t"
+                "mov sp, r0\n\t"
+                "bl  SystemInit\n\t"
+                "bl  main\n\t"
+                "b   .");
+}
+/* Rules: the body must be ENTIRELY asm. No local variables, no C
+   statements, no return — the compiler generates nothing around
+   it, so anything else has undefined behaviour.               */
+
+/* For anything longer than a few instructions, use a separate .S
+   file instead. It is easier to read, easier to debug, and the
+   assembler gives better diagnostics.                          */</code></pre>
+
+<h2 id="verify">Verify what you wrote</h2>
+
+<p>Inline assembly errors often produce code that works until the optimiser changes its mind. The only reliable check is to read what the compiler actually emitted.</p>
+
+<pre><code># ALWAYS read the generated code after writing inline asm.
+gcc -O2 -S file.c -o - | less
+gcc -O2 -c file.c &amp;&amp; objdump -d file.o
+
+# check at several optimisation levels — constraint bugs are
+# optimisation-dependent by nature
+for O in 0 1 2 3 s; do gcc -O$O -S f.c -o f.$O.s; done
+
+# godbolt.org (Compiler Explorer) is the fastest way to iterate:
+# paste, see the assembly instantly, switch compilers and flags.
+
+# in a running kernel or program
+gdb ./prog
+(gdb) disassemble /s my_function
+(gdb) layout asm</code></pre>
+
+<div class="tip">
+<b>Testing checklist for any inline asm</b>
+<ul>
+<li>Compiles and behaves correctly at <code>-O0</code>, <code>-O2</code>, <code>-Os</code>.</li>
+<li>Correct when inlined into several different call sites.</li>
+<li>Correct inside a loop (checks <code>volatile</code> and clobbers).</li>
+<li>Correct under high register pressure — call it with many live variables around it.</li>
+<li>Correct with LTO enabled.</li>
+<li>Read the disassembly at least once and confirm the register assignment is what you expect.</li>
+</ul>
+</div>
+
+<h2 id="portability">Portability</h2>
+
+<p>Inline assembly is the least portable thing you can write, so the question is how to isolate it — which is a matter of structure rather than of the assembly itself.</p>
+
+<pre><code>/* GCC/Clang syntax is not MSVC syntax. MSVC removed inline asm for
+   x64 entirely and offers only intrinsics.                     */
+
+#if defined(__GNUC__)
+        asm volatile("dmb ish" ::: "memory");
+#elif defined(_MSC_VER)
+        __dmb(_ARM64_BARRIER_ISH);      /* MSVC intrinsic */
+#endif
+
+/* Isolate every asm block behind a small inline wrapper in one
+   header. Then the platform conditionals live in ONE file and the
+   rest of the codebase calls a normal-looking function.        */
+
+/* arch.h */
+static inline void arch_barrier(void);
+static inline uint64_t arch_read_cycles(void);
+static inline void arch_irq_disable(void);</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>asm block disappears from the output</td><td>Missing <code>volatile</code> with unused outputs</td></tr>
+<tr><td>Barrier has no effect on ordering</td><td>Missing <code>"memory"</code> clobber</td></tr>
+<tr><td>Unrelated variable corrupted</td><td>Undeclared register clobber</td></tr>
+<tr><td>Works at <code>-O0</code>, breaks at <code>-O2</code></td><td>Wrong constraints; register allocation changed</td></tr>
+<tr><td>Wrong result when an input equals an output</td><td>Missing earlyclobber <code>&amp;</code></td></tr>
+<tr><td>"symbol already defined" after inlining</td><td>Named label in asm; use local labels <code>1:</code> / <code>1b</code></td></tr>
+<tr><td>Condition flags wrong after the block</td><td>Missing <code>"cc"</code> clobber</td></tr>
+<tr><td>Crash entering a naked function</td><td>Non-asm statements in the body</td></tr>
+<tr><td>Fails only with LTO</td><td>Cross-TU inlining changed the surrounding register state</td></tr>
+<tr><td>32-bit operation on a 64-bit register</td><td>Used <code>%0</code> where <code>%w0</code> was needed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three alternatives to try before writing inline assembly.</li>
+  <li>Explain when <code>volatile</code> is required and when it should be omitted.</li>
+  <li>Explain what the <code>"memory"</code> clobber tells the compiler.</li>
+  <li>Write a system-register read with the correct constraints.</li>
+  <li>Explain earlyclobber and construct a case that needs it.</li>
+  <li>Explain why inline asm must use local labels.</li>
+  <li>Say why intrinsics are preferable to asm for SIMD.</li>
+  <li>List the optimisation levels and conditions you would test an asm block under.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

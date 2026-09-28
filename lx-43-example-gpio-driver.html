@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Example: GPIO, as a consumer and as a provider | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Example: GPIO, as a consumer and as a provider</h1>
+<p class="lead">GPIO is the one subsystem almost every driver touches — a reset line, an enable pin, an
+interrupt from a button — and the one most often used wrongly, because the modern API deliberately hides
+whether a pin is high or low. This chapter is both halves: <em>using</em> a GPIO from a driver, which is what
+you will do constantly, and <em>providing</em> GPIOs from a chip driver, which is what makes an expander work.</p>
+
+<h2 id="model">The model: logical lines, not voltages</h2>
+
+<p>Before any code: the GPIO subsystem deliberately hides whether a pin is electrically high or low, and that design decision explains almost every question people have about it. Understanding this one idea first makes the rest of the chapter obvious.</p>
+
+<pre class="diagram">   THE SINGLE MOST IMPORTANT IDEA IN THE GPIO SUBSYSTEM:
+
+     YOUR DRIVER SAYS WHAT IT MEANS.
+     THE DEVICE TREE SAYS HOW IT IS WIRED.
+
+   A reset line that is active-low on your board and
+   active-high on the next one is the SAME DRIVER CODE:
+
+        gpiod_set_value(d-&gt;reset, 1);    /* ASSERT reset */
+
+   "1" here means ASSERTED, not "drive the pin high". The
+   GPIO core consults the flag from the device tree and
+   drives the physical line whichever way actually asserts
+   it:
+
+     reset-gpios = &lt;&amp;gpio1 17 GPIO_ACTIVE_LOW&gt;;
+                                  |
+                                  +-&gt; gpiod_set_value(d,1)
+                                      drives the pin LOW
+
+     reset-gpios = &lt;&amp;gpio1 17 GPIO_ACTIVE_HIGH&gt;;
+                                  |
+                                  +-&gt; gpiod_set_value(d,1)
+                                      drives the pin HIGH
+
+   THIS IS WHY THE OLD INTEGER API (gpio_set_value on a bare
+   number) IS DEPRECATED: it had no idea what asserted meant,
+   so every driver open-coded the polarity, and every board
+   with the opposite wiring needed a patched driver.
+
+   THE ONE EXCEPTION: gpiod_set_raw_value() bypasses the
+   polarity logic entirely. If you find yourself reaching for
+   it, you are almost always fixing the wrong layer - the
+   correct fix is the flag in the device tree.</pre>
+
+<h2 id="consumer">Part 1 — the consumer: using a GPIO from your driver</h2>
+
+<p>This is the part you will use constantly — almost every driver has a reset or enable line. It is also short, because the subsystem does the board-specific thinking for you.</p>
+
+<pre><code>/* Device tree for the board:
+
+     &amp;i2c1 {
+             mysensor@48 {
+                     compatible = "vendor,mysensor";
+                     reg = &lt;0x48&gt;;
+
+                     reset-gpios  = &lt;&amp;gpio1 17 GPIO_ACTIVE_LOW&gt;;
+                     enable-gpios = &lt;&amp;gpio1 18 GPIO_ACTIVE_HIGH&gt;;
+                     irq-gpios    = &lt;&amp;gpio1 19 GPIO_ACTIVE_LOW&gt;;
+             };
+     };
+
+   The driver asks for these BY NAME. The "-gpios" suffix is
+   added by the core, so "reset" finds reset-gpios.        */
+
+#include &lt;linux/gpio/consumer.h&gt;
+
+struct mysensor {
+        struct gpio_desc *reset;
+        struct gpio_desc *enable;
+        int irq;
+};
+
+static int mysensor_probe(struct i2c_client *client)
+{
+        struct device *dev = &amp;client-&gt;dev;
+        struct mysensor *d;
+        int ret;
+
+        d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        /* REQUIRED line. GPIOD_OUT_HIGH means "request as an
+           output, initially ASSERTED" - again logical, not
+           physical.                                          */
+        d-&gt;reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+        if (IS_ERR(d-&gt;reset))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;reset),
+                                     "failed to get reset gpio\n");
+
+        /* OPTIONAL line. Returns NULL - not an error - when the
+           property is absent, and every gpiod_* call on NULL is
+           a safe no-op. That is what makes this pattern clean:
+           no "if (d-&gt;enable)" guards scattered through the
+           driver.                                            */
+        d-&gt;enable = devm_gpiod_get_optional(dev, "enable",
+                                            GPIOD_OUT_LOW);
+        if (IS_ERR(d-&gt;enable))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;enable),
+                                     "failed to get enable gpio\n");
+
+        /* A reset pulse. _cansleep because this driver sits on
+           I2C and the GPIO itself might be on an expander -
+           see the warning below.                             */
+        gpiod_set_value_cansleep(d-&gt;reset, 1);   /* assert   */
+        usleep_range(10000, 12000);              /* 10 ms    */
+        gpiod_set_value_cansleep(d-&gt;reset, 0);   /* release  */
+        gpiod_set_value_cansleep(d-&gt;enable, 1);
+
+        /* A GPIO used as an interrupt source: convert the
+           descriptor to an IRQ number, then request it like any
+           other interrupt (chapter 16).                      */
+        d-&gt;irq = gpiod_to_irq(desc_for_irq_line);
+        if (d-&gt;irq &lt; 0)
+                return dev_err_probe(dev, d-&gt;irq, "no irq\n");
+
+        ret = devm_request_threaded_irq(dev, d-&gt;irq,
+                                        NULL, mysensor_thread,
+                                        IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
+                                        "mysensor", d);
+        if (ret)
+                return dev_err_probe(dev, ret, "irq request\n");
+
+        return 0;
+}</code></pre>
+
+<div class="warn">
+<b><code>_cansleep</code> is not optional decoration</b>
+<p>A GPIO on the SoC is a memory-mapped register write — instant, safe anywhere. A GPIO on an I2C or SPI
+expander requires a bus transaction that <em>sleeps</em> (<a href="lx-41-example-i2c-driver.html">chapter
+27</a>). Your driver usually cannot tell which kind it got, because that is the board's choice, not yours.
+So: in process context always call the <code>_cansleep</code> variants — they work correctly for both kinds.
+The plain <code>gpiod_set_value()</code> is only for atomic context, and it will <code>WARN</code> loudly if
+handed a sleeping GPIO. The reverse mistake — <code>_cansleep</code> inside a spinlock or a hard IRQ handler —
+is the "scheduling while atomic" bug from <a href="lx-11-locking.html">chapter 12</a>.</p>
+</div>
+
+<h2 id="provider">Part 2 — the provider: writing a gpio_chip</h2>
+
+<p>The other side of the relationship: instead of using GPIO lines, your driver <em>supplies</em> them. This is what a GPIO expander chip does, and it is how the lines used in Part 1 come to exist in the first place.</p>
+
+<pre><code>/* An 8-bit I2C GPIO expander. This is the other side of the
+   relationship: everything in Part 1 was CONSUMING lines that
+   a chip like this one PROVIDES.                           */
+
+#include &lt;linux/gpio/driver.h&gt;
+
+#define REG_INPUT   0x00
+#define REG_OUTPUT  0x01
+#define REG_CONFIG  0x03      /* 1 = input, 0 = output */
+
+struct myexp {
+        struct gpio_chip gc;
+        struct regmap   *regmap;
+};
+
+static int myexp_get(struct gpio_chip *gc, unsigned int off)
+{
+        struct myexp *e = gpiochip_get_data(gc);
+        unsigned int val;
+        int ret;
+
+        ret = regmap_read(e-&gt;regmap, REG_INPUT, &amp;val);
+        if (ret)
+                return ret;
+
+        return !!(val &amp; BIT(off));   /* 0 or 1, never the raw
+                                        register              */
+}
+
+static void myexp_set(struct gpio_chip *gc, unsigned int off,
+                      int val)
+{
+        struct myexp *e = gpiochip_get_data(gc);
+
+        regmap_update_bits(e-&gt;regmap, REG_OUTPUT,
+                           BIT(off), val ? BIT(off) : 0);
+        /* regmap_update_bits is a read-modify-write with its
+           own locking - doing this by hand with a read, an OR
+           and a write would race with another line's setter. */
+}
+
+static int myexp_get_direction(struct gpio_chip *gc,
+                               unsigned int off)
+{
+        struct myexp *e = gpiochip_get_data(gc);
+        unsigned int cfg;
+        int ret;
+
+        ret = regmap_read(e-&gt;regmap, REG_CONFIG, &amp;cfg);
+        if (ret)
+                return ret;
+
+        return (cfg &amp; BIT(off)) ? GPIO_LINE_DIRECTION_IN
+                                : GPIO_LINE_DIRECTION_OUT;
+}
+
+static int myexp_direction_input(struct gpio_chip *gc,
+                                 unsigned int off)
+{
+        struct myexp *e = gpiochip_get_data(gc);
+
+        return regmap_update_bits(e-&gt;regmap, REG_CONFIG,
+                                  BIT(off), BIT(off));
+}
+
+static int myexp_direction_output(struct gpio_chip *gc,
+                                  unsigned int off, int val)
+{
+        struct myexp *e = gpiochip_get_data(gc);
+        int ret;
+
+        /* SET THE VALUE FIRST, THEN THE DIRECTION. Doing it the
+           other way round drives whatever was already in the
+           output register onto the pin for a few microseconds -
+           a glitch that has reset more than one downstream chip
+           at exactly the wrong moment.                       */
+        myexp_set(gc, off, val);
+
+        ret = regmap_update_bits(e-&gt;regmap, REG_CONFIG,
+                                 BIT(off), 0);
+        return ret;
+}
+
+static int myexp_probe(struct i2c_client *client)
+{
+        struct device *dev = &amp;client-&gt;dev;
+        struct myexp *e;
+
+        e = devm_kzalloc(dev, sizeof(*e), GFP_KERNEL);
+        if (!e)
+                return -ENOMEM;
+
+        e-&gt;regmap = devm_regmap_init_i2c(client, &amp;myexp_regmap_config);
+        if (IS_ERR(e-&gt;regmap))
+                return dev_err_probe(dev, PTR_ERR(e-&gt;regmap),
+                                     "regmap\n");
+
+        e-&gt;gc.label             = "myexp";
+        e-&gt;gc.parent            = dev;
+        e-&gt;gc.owner             = THIS_MODULE;
+        e-&gt;gc.base              = -1;    /* DYNAMIC numbering.
+                                            Never hard-code a
+                                            base in new code.  */
+        e-&gt;gc.ngpio             = 8;
+        e-&gt;gc.can_sleep         = true;  /* I2C - this is what
+                                            makes the core
+                                            enforce _cansleep
+                                            on consumers.      */
+        e-&gt;gc.get               = myexp_get;
+        e-&gt;gc.set               = myexp_set;
+        e-&gt;gc.get_direction     = myexp_get_direction;
+        e-&gt;gc.direction_input   = myexp_direction_input;
+        e-&gt;gc.direction_output  = myexp_direction_output;
+
+        /* The devm_ form unregisters on unbind, and passing `e`
+           as the data pointer is what gpiochip_get_data()
+           returns in every callback above.                   */
+        return devm_gpiochip_add_data(dev, &amp;e-&gt;gc, e);
+}</code></pre>
+
+<div class="note">
+<b>These prototypes have genuinely changed across releases</b>
+<p>The <code>gpio_chip</code> callback signatures are a live example of <a
+href="lx-02-kernel-vs-user.html">chapter 02</a>'s rule that the kernel has no stable internal API — the setter
+in particular has been reworked to report failures, which matters precisely for sleeping expanders like this
+one, where a write genuinely can fail. Before writing a provider, open
+<code>include/linux/gpio/driver.h</code> in the tree you are actually building against and match what is there;
+the structure and the responsibilities below stay the same, only the exact prototypes move.</p>
+</div>
+
+<h2 id="irqchip">Providing interrupts as well as levels</h2>
+
+<p>Many GPIO chips can also raise an interrupt when a line changes, which makes them an interrupt controller as well as a GPIO provider. There is one design decision here that the hardware forces on you rather than leaving to preference.</p>
+
+<pre class="diagram">   A GPIO CHIP WHOSE LINES CAN INTERRUPT is a gpio_chip AND
+   an irq_chip at once. The extra piece is a struct
+   gpio_irq_chip embedded in the gpio_chip:
+
+        struct gpio_irq_chip *girq = &amp;e-&gt;gc.irq;
+        girq-&gt;chip          = &amp;myexp_irq_chip;
+        girq-&gt;parent_handler = NULL;    /* nested, not chained */
+        girq-&gt;num_parents    = 0;
+        girq-&gt;default_type   = IRQ_TYPE_NONE;
+        girq-&gt;handler        = handle_level_irq;
+        girq-&gt;threaded       = true;    /* I2C again           */
+
+   CHAINED vs NESTED, and the choice is forced by the bus:
+
+     CHAINED   the parent IRQ handler runs in HARD interrupt
+               context and demultiplexes to the child. Only
+               possible if reading the chip's status register
+               does NOT sleep - i.e. a memory-mapped SoC
+               controller.
+
+     NESTED    the parent is a THREADED irq; the handler may
+               sleep, so it can read status over I2C or SPI.
+               Any expander on a slow bus must use this.
+
+   GETTING THIS WRONG gives you "scheduling while atomic" the
+   first time the line fires - the same class of bug as
+   calling _cansleep in an atomic context, arriving from the
+   other direction.</pre>
+
+<h2 id="debug">Seeing what is really there</h2>
+
+<p>GPIO problems are usually questions of ownership — is the line already claimed, is it muxed to the right function, is it configured as an input. All of that is directly inspectable, which makes these tools worth reaching for before reading any code.</p>
+
+<pre><code># Which GPIO chips exist, and how many lines each has:
+$ gpiodetect
+gpiochip0 [1c20800.pinctrl] (94 lines)
+gpiochip1 [myexp]           (8 lines)
+
+# Every line, its name, direction, and WHO HAS CLAIMED IT:
+$ gpioinfo gpiochip1
+gpiochip1 - 8 lines:
+        line   0:  unnamed  "mysensor reset"  output  active-low  [used]
+        line   1:  unnamed  unused            input   active-high
+#                             ^^^^^^^^^^^^^^^^ the consumer name
+#                             from devm_gpiod_get - which is why
+#                             naming your GPIOs well pays off here
+
+# The kernel's own view, including chips with no userspace ABI:
+$ sudo cat /sys/kernel/debug/gpio
+gpiochip1: GPIOs 504-511, parent: i2c/1-0020, myexp, can sleep:
+ gpio-504 (           |mysensor reset      ) out lo
+
+# Toggle a line from userspace to prove the hardware works
+# BEFORE blaming your driver (chapter 12 of the Pi track):
+$ gpioset --mode=time --usec=100000 gpiochip1 2=1</code></pre>
+
+<div class="tip">
+<b><code>/sys/class/gpio</code> is deprecated — do not build anything new on it</b>
+<p>The old sysfs interface exported GPIOs under a single global number space with no concept of ownership:
+any process could export any line, nothing recorded which driver had claimed it, and the numbers shifted
+between kernel versions as chips were probed in a different order. The character device interface
+(<code>/dev/gpiochip*</code>, driven by <code>gpiod</code> tools or libgpiod) replaced it with per-chip line
+offsets, real ownership, and file-descriptor lifetimes that release lines automatically when a process dies.
+<a href="rpi-11-gpio-libgpiod.html">The Pi track's GPIO chapter</a> covers that userspace side in full.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>The line drives the opposite way from what you expect</td><td>The polarity flag in the device tree —
+fix it there, not with <code>_raw_</code> calls in the driver</td></tr>
+<tr><td><code>WARN</code>: "invalid access to sleeping GPIO"</td><td>Plain <code>gpiod_set_value()</code> used
+on an expander line — use the <code>_cansleep</code> variant</td></tr>
+<tr><td>"scheduling while atomic" the first time a GPIO IRQ fires</td><td>A chained handler on a chip whose
+status read sleeps — it must be nested/threaded</td></tr>
+<tr><td><code>devm_gpiod_get</code> returns <code>-EBUSY</code></td><td>Another driver already claimed the
+line — check <code>gpioinfo</code> for the current consumer</td></tr>
+<tr><td><code>devm_gpiod_get</code> returns <code>-EPROBE_DEFER</code></td><td>Expected and healthy — the GPIO
+controller has not probed yet; return the error and let the core retry (<a
+href="lx-17-device-model.html">ch. 19</a>)</td></tr>
+<tr><td><code>-ENOENT</code> for a line you are sure exists</td><td>Property-name mismatch — the core appends
+<code>-gpios</code>, so <code>"reset"</code> looks for <code>reset-gpios</code></td></tr>
+<tr><td>A downstream chip glitches during probe</td><td>Direction was set to output before the value —
+set the value first</td></tr>
+<tr><td>The pin does nothing at all, and no error appears</td><td>pinctrl has not muxed that pad to its GPIO
+function — a device-tree pinmux problem, not a GPIO one</td></tr>
+<tr><td>GPIO numbers shift after a kernel upgrade</td><td>Something depends on the global numbering — use chip
+plus offset, never absolute numbers</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why <code>gpiod_set_value(d, 1)</code> can drive a pin low, and where that is decided.</li>
+  <li>Explain why the old integer GPIO API was deprecated.</li>
+  <li>Explain when you must use the <code>_cansleep</code> variants, and what happens if you do not.</li>
+  <li>Explain what <code>devm_gpiod_get_optional</code> returns when the property is absent, and why that
+  simplifies the driver.</li>
+  <li>Name the five callbacks a minimal <code>gpio_chip</code> provides.</li>
+  <li>Explain why <code>direction_output</code> sets the value before the direction.</li>
+  <li>Explain the difference between a chained and a nested GPIO interrupt, and what forces the choice.</li>
+  <li>Use <code>gpioinfo</code> to find which driver has claimed a given line.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

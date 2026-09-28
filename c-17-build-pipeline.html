@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compiling and linking in practice | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Compiling and linking in practice</h1>
+<p class="lead">Most C build problems are link problems, and most link problems come from not knowing what the
+linker actually does. This chapter walks the pipeline from source to running image, with the diagnostic
+commands for each stage.</p>
+
+<h2 id="pipeline">The pipeline</h2>
+
+<p>Turning source into an executable is four distinct programs, not one. Knowing which stage produced an error tells you immediately where to look, and most build confusion is misattributing an error to the wrong stage.</p>
+
+<pre class="diagram">   main.c   util.c   startup.S
+      |        |         |
+   [ preprocess ]        |          gcc -E    -> .i
+      |        |         |
+   [  compile   ]        |          gcc -S    -> .s   (assembly)
+      |        |         |
+   [ assemble  ]  [ assemble ]      gcc -c    -> .o   (object, with
+      |        |         |                             relocations)
+      +--------+---------+
+               |
+          [   LINK   ]              ld / gcc  -> executable or .elf
+               |                    resolves symbols, assigns final
+               |                    addresses, applies relocations
+               v
+          program.elf
+               |
+      [ objcopy -O binary ]         -> program.bin (raw image to flash)
+               |
+      [ load / flash / exec ]
+
+Each arrow can fail in a characteristic way, and knowing which stage
+you are in tells you which tool to reach for.</pre>
+
+<pre><code># run one stage at a time when something is wrong
+gcc -E  main.c -o main.i     # preprocessed source — macro problems
+gcc -S  main.c -o main.s     # assembly            — codegen questions
+gcc -c  main.c -o main.o     # object              — syntax/type errors
+gcc main.o util.o -o prog    # link                — symbol errors
+
+gcc -v main.c                # show every subprocess and its arguments
+gcc -### main.c              # ...without running them
+gcc -save-temps main.c       # keep .i, .s and .o alongside the output</code></pre>
+
+<h2 id="objects">Inside an object file</h2>
+
+<p>An object file is not machine code ready to run — it is machine code plus a table of names it defines and names it still needs. Understanding that table is understanding the linker.</p>
+
+<pre class="diagram">An ELF object contains SECTIONS and a SYMBOL TABLE.
+
+  .text      machine code
+  .rodata    read-only data: literals, const tables
+  .data      initialised writable data
+  .bss       zero-initialised data — size only, no bytes in the file
+  .symtab    symbols: name, section, offset, size, binding, type
+  .rela.*    RELOCATIONS: "patch this offset with the address of
+             symbol S once you know it"
+  .debug_*   DWARF debug information
+
+Symbol bindings:
+  GLOBAL   visible to the linker, may be referenced elsewhere
+  LOCAL    file-scope `static` — invisible outside this object
+  WEAK     may be overridden by a strong definition elsewhere
+
+Symbol types you will see in nm output:
+  T  in .text (defined)          t  local .text
+  D  in .data                    d  local .data
+  B  in .bss                     b  local .bss
+  R  in .rodata
+  U  UNDEFINED — needs to come from somewhere else
+  W  weak</pre>
+
+<pre><code># inspect objects
+nm util.o                       # symbol table
+nm -C --defined-only prog       # only what this file defines
+nm prog | grep ' U '            # everything still undefined
+nm --size-sort -S prog | tail   # the biggest symbols
+
+readelf -h prog                 # ELF header: type, machine, entry point
+readelf -S prog                 # section headers with addresses/sizes
+readelf -s prog                 # symbol table, verbose
+readelf -d prog                 # dynamic section: NEEDED libraries, RPATH
+readelf -r util.o               # relocations
+
+objdump -d prog                 # disassemble
+objdump -d --source prog        # interleave source (needs -g)
+objdump -t prog                 # symbol table
+objdump -s -j .rodata prog      # hex dump of one section
+
+size prog                       # text/data/bss totals — the embedded
+                                # build-gate metric</code></pre>
+
+<h2 id="link-errors">The two link errors, and how to read them</h2>
+
+<p>Linker errors are famously unhelpful, but they come in a small number of kinds and each has a characteristic cause. Recognising the kind is most of the diagnosis.</p>
+
+<h3>Undefined reference</h3>
+
+<pre><code>/tmp/ccXXXX.o: in function `main':
+main.c:(.text+0x18): undefined reference to `helper'</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Cause</th><th>Check</th></tr></thead>
+<tbody>
+<tr><td>The .c file defining it was not compiled or linked</td><td>Is <code>util.o</code> on the command line?</td></tr>
+<tr><td>It is <code>static</code> in the defining file</td><td><code>nm util.o | grep helper</code> — lower-case <code>t</code> means local</td></tr>
+<tr><td>Name mismatch — a typo, or C++ name mangling</td><td><code>nm -C</code>; wrap C headers in <code>extern "C"</code></td></tr>
+<tr><td>Library not linked</td><td>Add <code>-lfoo</code></td></tr>
+<tr><td>Library listed <em>before</em> its user</td><td><strong>Order matters</strong> — see below</td></tr>
+<tr><td>Declared but never defined anywhere</td><td>Prototype in a header with no implementation</td></tr>
+<tr><td>Wrong architecture object</td><td><code>file util.o</code></td></tr>
+<tr><td>Compiler generated a call you did not write</td><td><code>memcpy</code>/<code>memset</code> in freestanding builds</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>Link order is not commutative</b>
+<pre><code>gcc -lm main.c        # FAILS: at the time libm is processed, nothing
+                      # needs sqrt yet, so it is discarded
+gcc main.c -lm        # works
+
+/* The traditional linker makes ONE pass, left to right. When it
+   reaches an archive (.a) it pulls in only the members that resolve
+   currently-undefined symbols, then moves on. A library placed
+   before its user contributes nothing.
+
+   RULE: objects first, then libraries, in dependency order
+   (users before providers).
+
+   For circular dependencies between static libraries: */
+gcc main.o -la -lb -la               # repeat
+gcc main.o -Wl,--start-group -la -lb -Wl,--end-group   # or group them
+
+/* Shared libraries do not have this problem in the same way, but
+   keeping the order correct is still the habit to build.       */</code></pre>
+</div>
+
+<h3>Multiple definition</h3>
+
+<pre><code>/usr/bin/ld: util.o:(.bss+0x0): multiple definition of `counter';
+             main.o:(.bss+0x0): first defined here</code></pre>
+
+<pre><code>/* Almost always: a variable DEFINED in a header. */
+
+/* WRONG — every including file gets its own definition */
+/* config.h */  int verbose = 0;
+
+/* RIGHT */
+/* config.h */  extern int verbose;
+/* config.c */  int verbose = 0;
+
+/* GCC 10 made -fno-common the default, so tentative definitions
+   across translation units now error instead of silently merging.
+   If an old codebase suddenly fails to link after a toolchain
+   upgrade, this is why. The fix is the pattern above, not
+   -fcommon.                                                      */
+
+/* Also caused by:
+     - a function DEFINED in a header without `static inline`
+     - the same .c file listed twice in the build
+     - a name colliding with libc (e.g. defining your own `index`) */</code></pre>
+
+<h2 id="libraries">Static and shared libraries</h2>
+
+<p>The two kinds of library differ in when they are combined with your program, which affects binary size, update behaviour, startup cost and debugging. The choice has real consequences beyond convenience.</p>
+
+<pre><code># static library — an archive of object files
+ar rcs libfoo.a a.o b.o c.o
+ar t libfoo.a                   # list members
+gcc main.o -L. -lfoo -o prog    # members are COPIED into prog
+
+# shared library — loaded at runtime
+gcc -fPIC -c a.c b.c            # position-independent code, required
+gcc -shared a.o b.o -o libfoo.so.1.0
+ln -s libfoo.so.1.0 libfoo.so.1
+ln -s libfoo.so.1 libfoo.so
+gcc main.o -L. -lfoo -o prog
+
+# runtime lookup
+ldd prog                        # which shared objects it needs
+LD_LIBRARY_PATH=. ./prog        # development only
+gcc ... -Wl,-rpath,'$ORIGIN/../lib'   # embed a relative search path
+ldconfig -p | grep foo          # the system cache</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Static (.a)</th><th>Shared (.so / .dll)</th></tr></thead>
+<tbody>
+<tr><td>Binary size</td><td>Larger — code is copied in</td><td>Smaller</td></tr>
+<tr><td>Memory across processes</td><td>One copy each</td><td>Shared text pages</td></tr>
+<tr><td>Deployment</td><td>Single self-contained file</td><td>Must ship and version the library</td></tr>
+<tr><td>Updating the library</td><td>Requires relinking everything</td><td>Drop-in, if the ABI is stable</td></tr>
+<tr><td>Startup cost</td><td>None</td><td>Dynamic symbol resolution</td></tr>
+<tr><td>Call cost</td><td>Direct</td><td>Through the PLT/GOT — one indirection</td></tr>
+<tr><td>Typical in embedded</td><td><strong>Yes</strong> — determinism, no loader</td><td>Rare on small systems</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="symbols">Controlling visibility</h2>
+
+<p>Controlling which symbols are visible outside a translation unit or a shared library matters for correctness, for build time and for the size of the final binary.</p>
+
+<pre><code>/* By default every non-static symbol in a shared library is
+   exported. That is slow (large dynamic symbol table), fragile
+   (accidental ABI), and prevents optimisation.                */
+
+gcc -fvisibility=hidden -shared ...     /* hide everything by default */
+
+#define API __attribute__((visibility("default")))
+API int  public_function(void);          /* explicitly exported       */
+static   int private_helper(void);       /* not even in .symtab       */
+
+/* A version script gives finer control and is what real libraries use */
+/* libfoo.map */
+FOO_1.0 {
+    global: foo_init; foo_run; foo_free;
+    local:  *;
+};
+gcc -shared -Wl,--version-script=libfoo.map ...
+
+/* Benefits: smaller symbol table, faster load, a real ABI boundary,
+   and the linker can inline and optimise across hidden symbols.  */</code></pre>
+
+<h2 id="lto">Link-time optimisation</h2>
+
+<p>Link-time optimisation lets the compiler optimise across translation units by deferring code generation to link time. It brings real gains and a set of new ways for things to go wrong.</p>
+
+<pre><code># Without LTO the compiler sees one translation unit at a time and
+# cannot inline across files. LTO defers codegen to link time.
+gcc -flto -O2 -c a.c b.c
+gcc -flto -O2 a.o b.o -o prog
+
+# Typical gains: 5-20% speed, and often smaller binaries because
+# unused code across the whole program can be eliminated.
+# Costs: much slower and more memory-hungry links; harder debugging;
+# occasionally exposes latent UB that was previously hidden by the
+# TU boundary.
+
+# also worth knowing
+-ffunction-sections -fdata-sections -Wl,--gc-sections
+# puts each function and object in its own section so the linker can
+# discard unreferenced ones. Essential in embedded builds; often
+# saves 20-40% of image size.
+
+-Wl,--print-gc-sections    # show what was discarded
+-Wl,-Map=out.map           # a full map file: what ended up where
+                           # THE tool for "why is my binary so big?"</code></pre>
+
+<h2 id="ldscript">Linker scripts</h2>
+
+<p>On an embedded target you control exactly where each section lands in memory, and the linker script is how. It is the file that connects your code to the memory map in the datasheet.</p>
+
+<pre><code>/* On a hosted OS the default script is invisible. On bare metal you
+   write it, and it defines the entire memory layout.           */
+
+MEMORY {
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+ENTRY(Reset_Handler)
+
+SECTIONS {
+  .text : {
+    KEEP(*(.vectors))          /* KEEP survives --gc-sections */
+    *(.text*)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;                /* symbols the C code can reference */
+  } &gt; FLASH
+
+  .data : AT (_etext) {        /* LIVES in RAM, STORED in FLASH */
+    _data_start = .;
+    *(.data*)
+    . = ALIGN(4);
+    _data_end = .;
+  } &gt; RAM
+
+  .bss : {
+    _bss_start = .;
+    *(.bss*) *(COMMON)
+    . = ALIGN(4);
+    _bss_end = .;
+  } &gt; RAM
+
+  _stack_top = ORIGIN(RAM) + LENGTH(RAM);
+}
+
+/* The `AT` directive is why startup code has a copy loop: the
+   initial values of .data must be stored somewhere non-volatile,
+   then copied to RAM before main(). Chapter 20 shows that loop. */</code></pre>
+
+<h2 id="make">Build systems, minimally</h2>
+
+<p>Build systems exist to rebuild only what changed, and to get that right they must know the dependencies — including header dependencies, which is the part hand-written makefiles usually get wrong.</p>
+
+<pre><code># A Makefile that regenerates header dependencies automatically —
+# the single most important correctness property of a C build.
+CC      := aarch64-linux-gnu-gcc
+CFLAGS  := -std=c11 -Wall -Wextra -O2 -MMD -MP
+SRCS    := $(wildcard src/*.c)
+OBJS    := $(SRCS:.c=.o)
+DEPS    := $(OBJS:.o=.d)
+
+prog: $(OBJS)
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+-include $(DEPS)        # pulls in "main.o: main.c foo.h bar.h"
+
+clean:
+	rm -f $(OBJS) $(DEPS) prog
+
+# -MMD -MP makes the compiler emit a .d file listing every header
+# the object depends on. Without it, editing a header does NOT
+# trigger a rebuild, and you debug a stale binary. This is the most
+# common cause of "impossible" behaviour in hand-written Makefiles.</code></pre>
+
+<pre><code># generate compile_commands.json so clangd, clang-tidy and IDEs work
+bear -- make
+# or with CMake
+cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON</code></pre>
+
+<h2 id="flags">A baseline flag set</h2>
+
+<p>Compiler flags are not a matter of taste. These are the ones that change correctness, catch bugs, or matter on an embedded target, with what each actually does.</p>
+
+<pre><code># warnings — turn them on and treat them as errors
+-Wall -Wextra -Wpedantic
+-Wshadow -Wconversion -Wsign-conversion
+-Wcast-align -Wcast-qual -Wpointer-arith
+-Wstrict-prototypes -Wmissing-prototypes -Wold-style-definition
+-Wwrite-strings -Wredundant-decls -Wnull-dereference
+-Wdouble-promotion -Wformat=2
+-Werror                    # in CI, at minimum
+
+# hardening for anything that touches untrusted input
+-D_FORTIFY_SOURCE=3 -O2
+-fstack-protector-strong
+-fstack-clash-protection
+-fPIE -pie
+-Wl,-z,relro,-z,now
+-Wl,-z,noexecstack
+-mbranch-protection=standard      # aarch64: PAC + BTI
+
+# development and test builds
+-g3 -fno-omit-frame-pointer
+-fsanitize=address,undefined
+-fanalyzer
+
+# embedded
+-ffunction-sections -fdata-sections -Wl,--gc-sections
+-ffreestanding -nostdlib -fno-builtin
+-Wl,-Map=out.map</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"undefined reference" to a function you can see</td><td>Not linked, <code>static</code>, or library order wrong</td></tr>
+<tr><td>"undefined reference to <code>sqrt</code>"</td><td><code>-lm</code> missing, or placed before the user</td></tr>
+<tr><td>"multiple definition"</td><td>Variable or non-inline function defined in a header</td></tr>
+<tr><td>Link fails only after a toolchain upgrade</td><td><code>-fno-common</code> became the default</td></tr>
+<tr><td>Edits to a header have no effect</td><td>Missing <code>-MMD -MP</code> dependency generation</td></tr>
+<tr><td>Binary far larger than expected</td><td>No <code>--gc-sections</code>; read the map file</td></tr>
+<tr><td>Runs on the build machine, "library not found" elsewhere</td><td><code>LD_LIBRARY_PATH</code> dependency; set an RPATH or link statically</td></tr>
+<tr><td>Crash before <code>main</code> on bare metal</td><td>Linker script or startup copy loop wrong</td></tr>
+<tr><td>Symbol resolves to the wrong library's version</td><td>Search order; check with <code>ldd</code> and <code>-Wl,--trace</code></td></tr>
+<tr><td>LTO build fails or misbehaves</td><td>Latent UB previously hidden by the TU boundary</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five pipeline stages and the flag that stops after each.</li>
+  <li>Say what a relocation is and why object files need them.</li>
+  <li>Explain why <code>gcc -lm main.c</code> fails and <code>gcc main.c -lm</code> works.</li>
+  <li>Give three causes of "undefined reference" and the command that distinguishes them.</li>
+  <li>Explain why defining a variable in a header causes "multiple definition".</li>
+  <li>Compare static and shared libraries on four axes.</li>
+  <li>Explain what <code>--gc-sections</code> needs from the compiler to be effective.</li>
+  <li>Explain why <code>.data</code> is stored in flash but lives in RAM.</li>
+  <li>Say what <code>-MMD -MP</code> does and what breaks without it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

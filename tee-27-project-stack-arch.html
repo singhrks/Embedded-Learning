@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the four-layer stack — architecture and seams | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the four-layer stack — architecture and seams</h1>
+<p class="lead">One request, four layers, three trust boundaries: an ordinary application asks for a signature,
+a kernel driver carries the request into the secure world, a trusted application performs it, and a driver
+<em>inside</em> the secure world drives the hardware that does the arithmetic. This chapter is the architecture
+and the contracts at each seam; the next three build every line of it.</p>
+
+<h2 id="stack">The four layers, and why each exists</h2>
+
+<p>Each layer below exists because the one above it cannot be trusted with something. Reading the stack as a
+sequence of trust reductions — rather than as an arbitrary number of hops — is what makes the design decisions
+in the rest of the project obvious.</p>
+
+<pre class="diagram">   LAYER 1   secsign-cli                    NORMAL WORLD
+             an ordinary unprivileged program     EL0
+                  │  ioctl(/dev/secsign, ...)
+                  │  ── SEAM A: the UAPI ──
+                  ▼
+   LAYER 2   secsign.ko                     NORMAL WORLD
+             a Linux misc-device driver           EL1
+             · validates and bounds the request
+             · owns the TEE session
+             · is the ONLY thing that may talk to the TA
+                  │  tee_client_invoke_func()
+                  │  ── SEAM B: the TEE client ABI ──
+                  │     (ioctl → driver → SMC → EL3 → S-EL1)
+                  ▼
+   LAYER 3   secsign TA                     SECURE WORLD
+             a trusted application               S-EL0
+             · holds the private key; it never leaves
+             · re-validates EVERYTHING from layer 2
+             · asks for a hash, then signs it
+                  │  TEE_DigestDoFinal()
+                  │  ── SEAM C: OP-TEE crypto dispatch ──
+                  ▼
+   LAYER 4   hwsha driver                   SECURE WORLD
+             an OP-TEE core driver               S-EL1
+             · MMIO to a hash accelerator that the
+               NORMAL world cannot address at all
+
+   WHAT EACH BOUNDARY BUYS:
+
+     A  process isolation  — the app cannot touch the
+                             device or the session directly
+     B  world isolation    — the kernel cannot read the key
+                             even though it makes the request
+     C  privilege + MMIO   — S-EL0 cannot reach the
+                             accelerator's registers; only
+                             S-EL1 can</pre>
+
+<div class="key">
+<b>Why a kernel driver at all, when an application can open <code>/dev/tee0</code> directly?</b>
+<p>It is a fair question, and for many designs the answer is that you should not add one. A kernel driver earns
+its place here for three specific reasons. First, <strong>policy</strong>: the kernel can decide <em>which</em>
+processes may sign, using credentials the TA cannot see. Second, <strong>session ownership</strong>: the secure
+world has a small fixed number of contexts (<a href="tee-05-core-architecture.html">chapter 5</a>), and one
+kernel-held session serialising many callers is far more robust than every process opening its own. Third,
+<strong>in-kernel users</strong>: once the driver exists, other kernel subsystems — a disk-encryption layer, a
+firmware-update path — can use the same service without going out to user space and back. If none of those
+apply to your design, the application should talk to <code>/dev/tee0</code> itself and you have one less layer
+to secure.</p>
+</div>
+
+<h2 id="what">What the finished thing does</h2>
+
+<p>Deliberately one operation, so the plumbing is visible rather than buried. A realistic product would add
+key management and a richer interface; none of that changes the shape below.</p>
+
+<pre class="diagram">   secsign-cli sign &lt;file&gt;
+
+     1. reads the file into a buffer
+     2. ioctl(SECSIGN_IOC_SIGN, { data, len, sig_out })
+     3. gets back a 64-byte ECDSA P-256 signature
+     4. writes it to &lt;file&gt;.sig
+
+   secsign-cli pubkey
+
+     returns the public key, so anybody can verify the
+     signature WITHOUT the secure world being involved -
+     which is the whole point of using a signature rather
+     than a MAC.
+
+   THE PROPERTY WE ARE BUILDING, stated precisely:
+
+     The private key exists only inside the secure world.
+     Neither the application, nor the kernel, nor an attacker
+     with root, nor an attacker who has compromised the
+     kernel entirely, can extract it. They can ask for
+     signatures while they have that access; they cannot
+     take the key with them.
+
+   THAT DISTINCTION IS THE ENTIRE VALUE. A compromise becomes
+   temporary rather than permanent.</pre>
+
+<h2 id="seams">The three seams, and the contract at each</h2>
+
+<p>Almost every bug in a stack like this lives at a boundary rather than inside a layer. Writing down what
+each seam guarantees — and what it explicitly does not — is what makes the validation code in later chapters
+look necessary rather than paranoid.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Seam</th><th>Mechanism</th><th>Trust direction</th><th>What the lower side must assume</th></tr></thead>
+<tbody>
+<tr><td><strong>A</strong> app ↔ kernel</td><td>ioctl on a misc device</td><td>Kernel does not trust the
+app</td><td>Pointers are user addresses; lengths are attacker-chosen; the buffer can change under you</td></tr>
+<tr><td><strong>B</strong> kernel ↔ TA</td><td>TEE client API → SMC</td><td>TA does not trust the
+kernel</td><td>Shared memory is normal-world memory; it can change after you validate it</td></tr>
+<tr><td><strong>C</strong> TA ↔ core driver</td><td>OP-TEE crypto dispatch</td><td>Both sides are secure; the
+driver still validates</td><td>Length and alignment, because a TA bug should not become an MMIO fault</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>Seam B is the one that matters, and it is the one people get wrong</b>
+<p>It is tempting to think the kernel is "more trusted" than the application and therefore that the TA can
+relax. The opposite is true: the entire reason the secure world exists is that the kernel might be compromised.
+A TA that trusts its caller because the caller is the kernel has thrown away the property the whole design was
+built for. Every parameter arriving at layer 3 is attacker-controlled, exactly as
+<a href="tee-20-ta-security.html">chapter 20</a> insists — and the buffer lives in memory the normal world can
+still write while you are reading it, which is why layer 3 copies before it validates.</p>
+</div>
+
+<h2 id="threat">What this design does and does not defend against</h2>
+
+<p>Being precise here is what separates a security design from security theatre, and it is worth doing before
+any code exists rather than after.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Attacker</th><th>Outcome</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Unprivileged local process</td><td><strong>Blocked</strong></td><td>Cannot open the device; file
+permissions and the kernel's policy check</td></tr>
+<tr><td>Root</td><td><strong>Can request signatures; cannot extract the key</strong></td><td>The key never
+crosses seam B in either direction</td></tr>
+<tr><td>Fully compromised kernel</td><td><strong>Same</strong> — signatures while resident, no key</td><td>
+World isolation is enforced by hardware, not by the kernel</td></tr>
+<tr><td>Attacker who can flash firmware</td><td><strong>Not blocked by this design</strong></td><td>Needs
+secure boot and anti-rollback (<a href="sec-14-secure-boot.html">isolation ch. 14</a>)</td></tr>
+<tr><td>Physical attacker with fault injection</td><td><strong>Not blocked</strong></td><td>Out of scope here;
+see <a href="sec-16-tee-attacks.html">isolation ch. 16</a></td></tr>
+<tr><td>Attacker exploiting a bug in the TA itself</td><td><strong>Not blocked</strong></td><td>Which is why
+layer 3 is deliberately tiny and validates everything</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<div class="note">
+<b>The same project exists for Windows</b>
+<p>Every design decision on this page is repeated in
+<a href="win-41-project-vbs-arch.html">Windows chapters 40–43</a>, built on VBS enclaves and VTL1 instead of
+TrustZone. Reading both is the cheapest way to tell which parts of this architecture are genuinely necessary
+and which are an accident of the platform — and that chapter's closing table sets them side by side.</p>
+</div>
+
+<h2 id="files">The files you will create</h2>
+
+<p>Four components in three build systems, which is the genuinely awkward part of this kind of project. Laying
+the tree out this way keeps each piece buildable on its own.</p>
+
+<pre><code>secsign/
+├── uapi/
+│   └── secsign_uapi.h        SEAM A - shared by layers 1 and 2
+│                             THE PERMANENT ABI (chapter 27)
+├── cli/
+│   ├── main.c                LAYER 1 - the application
+│   └── Makefile
+├── kmod/
+│   ├── secsign_drv.c         LAYER 2 - the Linux driver
+│   └── Makefile
+├── ta/
+│   ├── include/
+│   │   └── secsign_ta.h      SEAM B - shared by layers 2 and 3
+│   ├── secsign_ta.c          LAYER 3 - the trusted application
+│   ├── user_ta_header_defines.h
+│   ├── Makefile
+│   └── sub.mk
+└── optee_os_patch/
+    └── core/drivers/crypto/hwsha/
+        ├── hwsha.c           LAYER 4 - the secure-world driver
+        └── sub.mk            (chapter 29 - built INTO OP-TEE,
+                               not alongside it)
+
+/* NOTE THE TWO SHARED HEADERS. Each defines one seam, and
+   each is included by exactly the two layers on either side
+   of it. A single header shared by all four layers would
+   couple the application to the TA's internals, which is
+   precisely what the seams exist to prevent.              */</code></pre>
+
+<h2 id="order">The order to build it in</h2>
+
+<p>Building all four layers before testing anything is the reliable way to spend a day not knowing which one is
+broken. This order gives you a working system at every step.</p>
+
+<pre class="diagram">   1. THE TA ALONE, called by the standard OP-TEE test
+      client. Proves the secure world works and your TA
+      loads and is signed correctly.        (chapter 28)
+
+   2. THE KERNEL DRIVER, invoking the TA, exercised with a
+      throwaway ioctl from a shell. Proves seam B.
+                                            (chapter 27)
+
+   3. THE CLI, replacing the throwaway test. Proves seam A.
+                                            (chapter 27)
+
+   4. THE CORE DRIVER, replacing the software hash with the
+      accelerator. Proves seam C — and note the layers above
+      it should not change AT ALL, which is the test that
+      your abstraction is right.            (chapter 29)
+
+   5. THE ATTACK TESTS. Only now is there anything to
+      attack.                               (chapter 29)
+
+   AT EVERY STEP the thing you just built is exercised before
+   the next is started. That is slower to read and very much
+   faster to debug.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Which seam</th></tr></thead>
+<tbody>
+<tr><td><code>ioctl</code> returns <code>-EFAULT</code></td><td>A — a user pointer dereferenced directly
+instead of copied</td></tr>
+<tr><td><code>ioctl</code> returns <code>-ENODEV</code></td><td>B — the driver never got a TEE session at
+probe</td></tr>
+<tr><td>Signature is produced but never verifies</td><td>C, usually — the digest the TA signed is not the
+digest you computed</td></tr>
+<tr><td>Works as root, fails otherwise</td><td>A — device node permissions, which is a deliberate policy
+decision</td></tr>
+<tr><td>Second concurrent caller hangs</td><td>B — secure-world contexts, or a session not serialised in the
+driver</td></tr>
+<tr><td>Everything works until the accelerator is enabled</td><td>C — length or alignment the driver should
+have rejected</td></tr>
+<tr><td>The key changes after a reflash</td><td>Expected if it is stored in normal-world-backed storage; see
+<a href="tee-15-secure-storage.html">chapter 15</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the four layers and name the exception level and world each runs in.</li>
+  <li>Name the three seams and the mechanism at each.</li>
+  <li>Give three reasons a kernel driver earns its place here — and say when it would not.</li>
+  <li>State the security property precisely, including what an attacker with root <em>can</em> still do.</li>
+  <li>Explain why the TA must not trust the kernel, given the kernel is more privileged than the app.</li>
+  <li>Name two attackers this design does not defend against, and what would be needed for each.</li>
+  <li>Explain why there are two shared headers rather than one.</li>
+  <li>Say what you would build and test first, and why.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

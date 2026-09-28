@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mutual exclusion from first principles | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Mutual exclusion from first principles</h1>
+<p class="lead">Before you can use a mutex well you have to know what one is made of. This chapter builds
+mutual exclusion up from nothing — the software-only algorithms that almost work, the hardware instruction
+that makes it possible, and the futex trick that makes it fast.</p>
+
+<h2 id="requirements">What we are trying to buy</h2>
+
+<p>Before any implementation, it is worth stating what a correct mutual-exclusion mechanism must actually guarantee. Several plausible-looking schemes fail one of these, and knowing the list is how you spot that.</p>
+
+<pre class="diagram">   A correct mutual-exclusion protocol needs four properties.
+   Dropping any one of them is a real bug with a real name.
+
+   1. MUTUAL EXCLUSION
+        at most one thread in the critical section at a time.
+        Without it: the thing you were trying to prevent.
+
+   2. PROGRESS  (deadlock freedom)
+        if nobody is in the critical section and somebody
+        wants in, somebody gets in.
+        Without it: deadlock (chapter 14).
+
+   3. BOUNDED WAITING  (starvation freedom)
+        a thread that wants in gets in after a bounded number
+        of other entries.
+        Without it: starvation - a thread waits for ever
+        while others take turns ahead of it.
+
+   4. NO ASSUMPTIONS ABOUT SPEED
+        correctness must not depend on relative thread speeds,
+        core counts, or the scheduler.
+        Without it: works on your laptop.
+
+   Note what is NOT on the list: fairness in the FIFO sense,
+   and performance. Most real mutexes deliberately give up
+   strict fairness to go faster (see barging, below).</pre>
+
+<h2 id="software">Software-only: interesting, and not what you use</h2>
+
+<p>Mutual exclusion can be built from ordinary loads and stores alone, which is a genuinely surprising result. These algorithms are impractical today and worth seeing once, because they show exactly what the hardware instructions later replace.</p>
+
+<pre><code>/* PETERSON'S ALGORITHM - two threads, no special instruction.
+   Correct on a sequentially consistent machine.            */
+
+atomic_bool want[2] = { false, false };
+atomic_int  turn    = 0;
+
+void lock(int me)
+{
+        int other = 1 - me;
+        want[me] = true;        /* I want in                  */
+        turn = other;           /* but you go first           */
+        while (want[other] &amp;&amp; turn == other)
+                ;               /* spin                       */
+}
+
+void unlock(int me) { want[me] = false; }
+
+/* WHY IT WORKS: the `turn` write is a deliberate deference.
+   If both threads arrive together, both set turn, and the
+   LAST write wins - so exactly one of them sees turn pointing
+   away from itself and proceeds.
+
+   WHY YOU WILL NEVER USE IT:
+
+   1. It is for exactly two threads. Extending it (Lamport's
+      bakery algorithm) needs O(n) storage and O(n) scanning
+      per acquisition.
+
+   2. It spins. Every waiter burns a core.
+
+   3. THE REAL KILLER: it is only correct under sequential
+      consistency, and no real CPU provides that. On ARM or
+      x86 the store to `want[me]` and the load of
+      `want[other]` can be reordered, and both threads enter.
+      Making it correct needs full barriers in both places -
+      at which point you are paying more than a real mutex
+      costs.
+
+   It is on the exam because it proves mutual exclusion is
+   possible without hardware help. It is not in your code
+   because hardware help is cheaper.                        */</code></pre>
+
+<h2 id="hardware">The instruction that changes everything</h2>
+
+<p>Every practical lock rests on an instruction the hardware guarantees is indivisible. There are a few such primitives, and they differ in what they promise under contention.</p>
+
+<pre><code>/* What we need is one indivisible read-modify-write. Every
+   architecture provides one; they differ in shape.        */
+
+/* x86: exchange, with an implicit lock prefix. */
+        xchg    eax, [lock]        ; atomically swap
+
+/* x86: compare-and-swap, the general form. */
+        lock cmpxchg [ptr], ebx    ; if [ptr]==eax, [ptr]=ebx
+
+/* ARM: LOAD-LINKED / STORE-CONDITIONAL. No single atomic RMW -
+   instead a pair, where the store FAILS if anyone touched the
+   line in between.                                          */
+retry:  ldaxr   w1, [x0]           ; load-acquire exclusive
+        cmp     w1, #0
+        b.ne    retry              ; already locked, spin
+        mov     w2, #1
+        stlxr   w3, w2, [x0]       ; store-release exclusive
+        cbnz    w3, retry          ; w3 != 0 means we lost the
+                                   ; reservation - try again
+
+/* ARMv8.1-A LSE adds true single-instruction atomics, which
+   scale far better under contention because they can be done
+   at the point of coherency instead of bouncing the line:   */
+        swpal   w1, w2, [x0]       ; swap
+        casal   w1, w2, [x0]       ; compare-and-swap
+        ldaddal w1, w2, [x0]       ; atomic add
+
+/* In C, you write none of this: */
+        while (atomic_exchange_explicit(&amp;lock, 1,
+                                        memory_order_acquire))
+                ;                          /* spin lock       */
+        /* critical section */
+        atomic_store_explicit(&amp;lock, 0, memory_order_release);</code></pre>
+
+<div class="key">
+<b>Why acquire and release, specifically</b>
+<p>The lock is not just about exclusion — it is about <em>visibility</em>. Acquiring with
+<code>memory_order_acquire</code> guarantees that everything the previous holder did before releasing is
+visible to you afterwards. Releasing with <code>memory_order_release</code> guarantees your writes are visible
+to the next acquirer. A "mutex" that excluded correctly but gave no ordering guarantee would still let you
+read stale data. <a href="mt-12-memory-ordering.html">Chapter 12</a> is this idea in full.</p>
+</div>
+
+<h2 id="spinlock">A spinlock, properly written</h2>
+
+<p>The simplest usable lock busy-waits rather than sleeping. That is the right trade only under specific conditions, and the naive implementation performs badly on a multiprocessor for reasons worth understanding.</p>
+
+<pre><code>/* The naive version, and why each fix matters. */
+
+/* v1: correct, and terrible under contention. */
+void lock_v1(atomic_flag *l) {
+        while (atomic_flag_test_and_set_explicit(l, memory_order_acquire))
+                ;
+}
+/* Every waiter hammers the cache line with an atomic RMW.
+   With 16 waiters the line ping-pongs 16 ways and the HOLDER
+   cannot even write its own data. Contention makes it slower
+   the more threads you add.                                */
+
+/* v2: test-and-test-and-set. Spin on a plain LOAD, which can
+   sit in the local cache in Shared state and generate no bus
+   traffic at all. Only attempt the expensive RMW when it
+   looks free.                                              */
+void lock_v2(atomic_bool *l) {
+        for (;;) {
+                if (!atomic_exchange_explicit(l, true,
+                                              memory_order_acquire))
+                        return;
+                while (atomic_load_explicit(l, memory_order_relaxed))
+                        cpu_relax();          /* pause / yield  */
+        }
+}
+
+/* v3: add back-off, so the thundering herd on release does not
+   all collide at once. */
+void lock_v3(atomic_bool *l) {
+        unsigned backoff = 1;
+        for (;;) {
+                if (!atomic_exchange_explicit(l, true,
+                                              memory_order_acquire))
+                        return;
+                while (atomic_load_explicit(l, memory_order_relaxed)) {
+                        for (unsigned i = 0; i &lt; backoff; i++)
+                                cpu_relax();
+                        if (backoff &lt; 1024) backoff *= 2;
+                }
+        }
+}
+
+/* v4: give up and sleep, because spinning past a few hundred
+   cycles is worse than a context switch. That is a MUTEX. */
+
+/* And note none of v1-v3 is FAIR: a thread that just released
+   can immediately re-acquire while an older waiter is still
+   backing off. A TICKET LOCK fixes that:                   */
+
+struct ticket { atomic_uint next, now_serving; };
+
+void ticket_lock(struct ticket *t) {
+        unsigned me = atomic_fetch_add_explicit(&amp;t-&gt;next, 1,
+                                        memory_order_relaxed);
+        while (atomic_load_explicit(&amp;t-&gt;now_serving,
+                                    memory_order_acquire) != me)
+                cpu_relax();
+}
+void ticket_unlock(struct ticket *t) {
+        atomic_fetch_add_explicit(&amp;t-&gt;now_serving, 1,
+                                  memory_order_release);
+}
+/* Strict FIFO, and every waiter still spins on one shared
+   line. MCS and CLH locks fix that too by giving each waiter
+   its own line to spin on - which is what the kernel uses for
+   contended spinlocks.                                     */</code></pre>
+
+<div class="warn">
+<b>Never spin where you can be preempted</b>
+<p>A spinlock assumes the holder is <em>running</em> and will release shortly. If the holder is descheduled —
+because you are in user space, or in a VM whose vCPU was taken away
+(<a href="virt-08-vcpu-switch.html">virtualisation chapter 08</a>) — every waiter burns a full timeslice
+waiting for a thread that cannot run. This is lock-holder preemption, and it is why spinlocks belong in the
+kernel with preemption disabled, not in application code.</p>
+</div>
+
+<h2 id="futex">The futex: spin a little, then sleep</h2>
+
+<p>A mutex that always entered the kernel would be far too slow, and one that never did could not block. The solution is a hybrid that stays in user space when uncontended and calls the kernel only when a thread must actually wait.</p>
+
+<pre class="diagram">   A real mutex wants both: no syscall in the fast path, and
+   no spinning in the slow one. Linux's futex gives exactly
+   that by making the KERNEL involved only on contention.
+
+   state: 0 = free, 1 = locked, 2 = locked and someone waits
+
+   LOCK
+     CAS 0 -> 1 succeeds?          done. NO SYSCALL AT ALL.
+                                   This is the common case and
+                                   it costs ~20 ns.
+     otherwise:
+       spin briefly (adaptive)
+       still locked?
+         set state to 2  ("I am going to sleep")
+         futex(FUTEX_WAIT, addr, 2)
+           kernel: "is *addr still 2? then queue me and sleep"
+           - the recheck inside the kernel is what closes the
+             race between deciding to sleep and sleeping
+
+   UNLOCK
+     if state was 1:  store 0.     NO SYSCALL.
+     if state was 2:  store 0, then
+                      futex(FUTEX_WAKE, addr, 1)
+
+   THE WHOLE TRICK is that "2" records the existence of
+   waiters, so the unlock path knows whether a syscall is
+   needed. An uncontended mutex never enters the kernel in
+   either direction.
+
+   Windows: WaitOnAddress / WakeByAddressSingle.
+   macOS:   __ulock_wait / os_unfair_lock.
+   Same idea everywhere.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hand-rolled lock works on x86, fails on ARM</td><td>Missing barriers; the algorithm assumed sequential
+consistency</td></tr>
+<tr><td>Spinlock gets slower as threads are added</td><td>Test-and-set hammering one cache line — needs
+test-and-test-and-set</td></tr>
+<tr><td>One thread never acquires while others cycle</td><td>Barging; the lock is unfair. Use a ticket
+lock</td></tr>
+<tr><td>A core is pinned at 100% doing nothing</td><td>Spinning on a lock whose holder is
+descheduled</td></tr>
+<tr><td>Latency spikes to whole milliseconds</td><td>Lock-holder preemption, or spinning past the point where
+sleeping was cheaper</td></tr>
+<tr><td>Reading stale data despite holding the lock</td><td>Lock implemented with relaxed atomics — exclusion
+without ordering</td></tr>
+<tr><td>Wake-up is missed and a thread sleeps for ever</td><td>The check-then-sleep race; futex's in-kernel
+recheck exists to prevent exactly this</td></tr>
+<tr><td>Performance collapses at exactly N threads</td><td>N is the point where the contended path starts
+entering the kernel</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the four properties a mutual-exclusion protocol must have, and name the bug you get without
+  each.</li>
+  <li>Explain how Peterson's algorithm achieves exclusion, and the three reasons it is unusable.</li>
+  <li>Name the atomic primitive on x86 and the ARM equivalent, and say why LL/SC can fail
+  spuriously.</li>
+  <li>Explain what LSE atomics improve over LL/SC under contention.</li>
+  <li>Explain why a lock needs acquire and release semantics, not just exclusion.</li>
+  <li>Improve a naive test-and-set spinlock twice and justify each change.</li>
+  <li>Write a ticket lock and say what it fixes and what it does not.</li>
+  <li>Explain lock-holder preemption and why spinlocks are a kernel construct.</li>
+  <li>Describe the three futex states and say why the "2" state exists.</li>
+  <li>Explain what the kernel-side recheck in <code>FUTEX_WAIT</code> prevents.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

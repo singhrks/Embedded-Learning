@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Physical memory management and allocators | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Physical memory management and allocators</h1>
+<p class="lead">Before virtual memory can hand out address spaces, something must track which physical pages
+are free. This chapter covers that layer — the page allocator, the object allocators built on it, and
+fragmentation, which is the problem all of them exist to fight.</p>
+
+<h2 id="layers">The allocator stack</h2>
+
+<p>Memory management is several allocators stacked on one another, each solving a problem the layer beneath cannot. Seeing them as a stack is what makes the individual pieces make sense.</p>
+
+<pre class="diagram">   kmalloc(64)                    application malloc(64)
+        │                                  │
+        ▼                                  ▼
+   ┌─────────────────┐             ┌──────────────────┐
+   │  SLAB / SLUB    │             │  libc allocator   │
+   │  object caches  │             │  (ptmalloc, etc.) │
+   │  bytes → objects│             │  bins, arenas     │
+   └────────┬────────┘             └─────────┬────────┘
+            │                                 │ brk / mmap
+            ▼                                 ▼
+   ┌──────────────────────────────────────────────────┐
+   │  BUDDY ALLOCATOR — the page allocator             │
+   │  hands out 2^order contiguous pages               │
+   └────────────────────┬─────────────────────────────┘
+                        ▼
+   ┌──────────────────────────────────────────────────┐
+   │  memblock / early allocator (boot only)           │
+   │  physical memory map from firmware / device tree  │
+   └──────────────────────────────────────────────────┘
+
+Each layer solves the layer above's granularity problem: the buddy
+allocator deals in pages, but most allocations are tens of bytes.</pre>
+
+<h2 id="buddy">The buddy allocator</h2>
+
+<p>The foundation allocator hands out power-of-two runs of pages, splitting and merging as needed. Its behaviour — especially how it fragments — leaks upward into everything built on it.</p>
+
+<pre class="diagram">Free lists, one per ORDER, where order n means 2^n contiguous pages.
+
+  order 0:  4 KB      order 3:  32 KB     order 6:  256 KB
+  order 1:  8 KB      order 4:  64 KB     order 7:  512 KB
+  order 2: 16 KB      order 5: 128 KB     ... up to order 10 (4 MB)
+
+ALLOCATION of order 2, when only an order-4 block is free:
+
+   order 4:  [================ 64 KB ================]
+                       split
+   order 3:  [====== 32 KB ======][====== 32 KB ======]
+                  split                  ↑ freed to order-3 list
+   order 2:  [= 16 =][= 16 =]
+              return   ↑ freed to order-2 list
+
+FREEING: when a block is released, check whether its BUDDY — the
+adjacent block of the same size, found by flipping one address bit —
+is also free. If so, merge them and repeat upward.
+
+   buddy_address = block_address XOR (block_size)
+
+That single XOR is why the scheme is fast: finding the buddy is one
+arithmetic operation, not a search.
+
+  + coalescing is automatic and cheap
+  + finding a block is O(1) amortised
+  - INTERNAL fragmentation: a 5-page request takes an order-3
+    block (8 pages), wasting 3
+  - EXTERNAL fragmentation: many scattered order-0 blocks cannot
+    satisfy an order-5 request even with plenty free</pre>
+
+<pre><code># see it live
+cat /proc/buddyinfo
+# Node 0, zone   Normal   1024   512   256   64   16   4   1   0   0   0   0
+#                         ^order0 ^1    ^2   ...                    ^order10
+# Lots of low-order blocks and zeros at high orders means the memory
+# is FRAGMENTED: plenty free, but no large contiguous runs.
+
+cat /proc/pagetypeinfo     # per migrate-type breakdown
+cat /proc/zoneinfo         # free pages, watermarks, per zone</code></pre>
+
+<h2 id="zones">Zones and NUMA nodes</h2>
+
+<p>Not all physical memory is equivalent. Some can be reached by every device, some cannot, and on larger machines some is closer to one processor than another — so the allocator must know which is which.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Zone</th><th>Range</th><th>Exists because</th></tr></thead>
+<tbody>
+<tr><td><code>ZONE_DMA</code></td><td>First 16 MB (x86)</td><td>Ancient ISA devices could only address 24 bits</td></tr>
+<tr><td><code>ZONE_DMA32</code></td><td>First 4 GB</td><td>Devices with 32-bit DMA addressing</td></tr>
+<tr><td><code>ZONE_NORMAL</code></td><td>The rest</td><td>General use</td></tr>
+<tr><td><code>ZONE_HIGHMEM</code></td><td>Above the kernel's direct map</td><td>32-bit only; gone on 64-bit</td></tr>
+<tr><td><code>ZONE_MOVABLE</code></td><td>Pseudo-zone</td><td>Pages that can be migrated — enables hotplug and defragmentation</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Zones are why allocation can fail with memory apparently free:
+   a device needing DMA32 memory cannot use pages above 4 GB.
+   This is exactly what dma_set_mask() communicates.          */
+
+/* NUMA: on multi-socket systems, memory attached to another
+   socket costs 1.5-2x the latency. The allocator prefers the
+   local node.                                                */
+numactl --hardware               # node distances and free memory
+numastat -p PID                  # where THIS process's pages live
+cat /proc/PID/numa_maps</code></pre>
+
+<h2 id="slab">Slab allocators</h2>
+
+<p>Most kernel allocations are small and short-lived, which the page allocator handles badly. A layer above it keeps caches of same-sized objects, which is both faster and far less wasteful.</p>
+
+<pre class="diagram">The problem: kmalloc(64) from a 4 KB page allocator wastes 98%.
+Plus, initialising a complex object is expensive if repeated.
+
+The slab idea (Bonwick, 1994):
+  · allocate a PAGE (or several), carve it into equal-size objects
+  · keep a free list threaded through the unused objects
+  · allocation = pop the list; free = push it. O(1), no search.
+  · objects of one TYPE share a cache, so they stay hot in CPU cache
+
+   ┌──────────── one slab (4 KB page) ────────────┐
+   │ obj0 │ obj1 │ obj2 │ obj3 │ ... │ objN │ meta │
+   └──┬────────────┬───────────────────────────────┘
+      └── free ────┘  a singly-linked list through free objects
+
+Linux has had three implementations:
+  SLAB   original; per-CPU and per-node queues, complex
+  SLUB   the current default; simpler, better multicore scaling,
+         less metadata, better debugging
+  SLOB   tiny, for very small systems (removed in 6.4)</pre>
+
+<pre><code>/* generic sizes — kmalloc uses power-of-two caches */
+void *p = kmalloc(100, GFP_KERNEL);      /* comes from kmalloc-128,
+                                            so 28 bytes are wasted */
+
+/* a dedicated cache, when you allocate one type constantly */
+static struct kmem_cache *my_cache;
+
+my_cache = kmem_cache_create("my_objects",
+                             sizeof(struct my_object),
+                             0,                     /* alignment  */
+                             SLAB_HWCACHE_ALIGN,    /* flags      */
+                             NULL);                 /* constructor */
+
+struct my_object *o = kmem_cache_alloc(my_cache, GFP_KERNEL);
+kmem_cache_free(my_cache, o);
+kmem_cache_destroy(my_cache);
+
+/* Benefits over kmalloc: exact sizing (no power-of-two waste),
+   a named entry in /proc/slabinfo for leak hunting, per-type
+   locality, and optional constructors.                       */</code></pre>
+
+<pre><code># which caches are consuming memory?
+sudo slabtop -s c              # sorted by cache size
+cat /proc/slabinfo
+
+# a steadily growing cache with no corresponding workload growth
+# is a kernel memory leak, and slabtop names the object type —
+# which usually identifies the subsystem immediately.</code></pre>
+
+<h2 id="fragmentation">Fragmentation</h2>
+
+<p>Memory can be plentiful and still unusable, if what is free is scattered. There are two distinct kinds of this problem with two distinct remedies, and conflating them leads to the wrong fix.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Kind</th><th>Meaning</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td><strong>Internal</strong></td><td>Allocated more than requested; the remainder is unusable</td><td>Size-class tuning, dedicated slab caches</td></tr>
+<tr><td><strong>External</strong></td><td>Enough total free memory, but not contiguous</td><td>Compaction, migration, avoiding large allocations</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">External fragmentation, made concrete
+
+   memory:  [used][free][used][free][used][free][used][free]
+              4KB   4KB   4KB   4KB   4KB   4KB   4KB   4KB
+
+   16 KB free in total. An order-2 (16 KB contiguous) request FAILS.
+
+Linux's defences:
+
+  MIGRATE TYPES     group pages by movability, so unmovable kernel
+                    allocations do not scatter through regions that
+                    would otherwise be compactable
+                      MIGRATE_UNMOVABLE   kernel data, page tables
+                      MIGRATE_MOVABLE     user pages, page cache
+                      MIGRATE_RECLAIMABLE caches that can be dropped
+
+  COMPACTION        physically MOVE movable pages to create
+                    contiguous free runs, updating page tables and
+                    reverse mappings as it goes
+                      echo 1 &gt; /proc/sys/vm/compact_memory
+
+  CMA               reserve a region at boot that is normally used
+                    for movable pages but can be reclaimed on demand
+                    for large contiguous DMA buffers — cameras,
+                    video codecs, GPUs
+
+  This is why kmalloc of large sizes can fail on a long-running
+  system, and why kvmalloc() exists: try kmalloc (contiguous),
+  fall back to vmalloc (virtually contiguous only).           */</pre>
+
+<h2 id="vmalloc">vmalloc versus kmalloc</h2>
+
+<p>When a large allocation does not need to be physically contiguous, the kernel can stitch scattered pages into one contiguous virtual range — with consequences for anything that then wants a physical address.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>kmalloc</code></th><th><code>vmalloc</code></th></tr></thead>
+<tbody>
+<tr><td>Physically contiguous</td><td><strong>Yes</strong></td><td>No</td></tr>
+<tr><td>Virtually contiguous</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Usable for DMA</td><td><strong>Yes</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Max practical size</td><td>A few MB, and fails under fragmentation</td><td>Large — limited by the vmalloc area</td></tr>
+<tr><td>Cost</td><td>Fast</td><td>Slower: page table setup, TLB pressure</td></tr>
+<tr><td>Can sleep</td><td>Depends on GFP flag</td><td>Always — never in atomic context</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>void *p = kvmalloc(size, GFP_KERNEL);   /* try kmalloc, fall back
+                                           to vmalloc              */
+kvfree(p);
+/* Use this whenever the buffer is large and does NOT need to be
+   physically contiguous. It is the right default for most
+   variable-size kernel allocations.                          */</code></pre>
+
+<h2 id="reclaim">Reclaim and the OOM killer</h2>
+
+<p>When memory runs short the kernel does not simply fail. It works progressively harder to free some, and knowing that sequence explains both the latency spikes and the eventual killing of a process.</p>
+
+<pre class="diagram">Watermarks per zone drive reclaim:
+
+   free pages
+      │
+   HIGH  ──────  above this: no reclaim needed
+      │
+   LOW   ──────  kswapd wakes and reclaims in the BACKGROUND
+      │
+   MIN   ──────  allocators reclaim SYNCHRONOUSLY (direct reclaim)
+      │          — the allocating task now pays the cost, and
+      │            latency spikes
+      0          allocation fails → OOM killer
+
+What gets reclaimed, cheapest first:
+  1. clean page cache          just drop it, it is on disk
+  2. clean anonymous pages     only if swap exists
+  3. dirty page cache          must write back first
+  4. dirty anonymous pages     swap out
+  5. slab caches               shrinkers: dentry, inode, fs caches
+
+  echo 3 &gt; /proc/sys/vm/drop_caches     # drop clean caches (testing)
+  vm.swappiness                          # anon vs file cache bias
+  vm.min_free_kbytes                     # raise for network/RT work
+                                         # to avoid direct reclaim</pre>
+
+<pre><code># when reclaim fails: the OOM killer picks a victim by oom_score
+cat /proc/PID/oom_score
+echo -1000 &gt; /proc/PID/oom_score_adj    # never kill this process
+dmesg | grep -A20 'Out of memory'
+
+# In containers, the cgroup limit triggers a per-cgroup OOM long
+# before the machine is out of memory:
+cat /sys/fs/cgroup/.../memory.max
+cat /sys/fs/cgroup/.../memory.events    # oom_kill counter</code></pre>
+
+<div class="tip">
+<b>Reading "free" correctly</b>
+<pre><code>free -h
+#               total   used   free   shared  buff/cache  available
+# Mem:            16G    4G     1G      200M        11G         11G
+#                              ^^^      low, and PERFECTLY NORMAL
+#                                                              ^^^
+#                                              THIS is what matters
+
+/* "free" memory is wasted memory — Linux uses everything spare for
+   page cache, which it can drop instantly. Look at AVAILABLE, which
+   accounts for reclaimable cache. Alarm on `free` being low is the
+   single most common Linux memory misdiagnosis.                */</code></pre>
+</div>
+
+<h2 id="userspace">The user-space side</h2>
+
+<p>An application's allocator sits above all of this, and the gap between what it requests and what the kernel provides explains why freeing memory often does not return it to the system.</p>
+
+<pre><code>/* malloc does not call the kernel for every allocation. */
+
+brk / sbrk        grow the heap contiguously. Simple, but memory is
+                  only returned to the OS from the TOP — one live
+                  allocation at the end pins everything below it.
+
+mmap              anonymous mappings. glibc uses this for requests
+                  above MMAP_THRESHOLD (128 KB by default), and
+                  returns them to the OS immediately on free.
+
+/* Which explains a common observation: freeing a lot of memory
+   sometimes reduces RSS and sometimes does not. Small allocations
+   from the brk heap are recycled internally; large mmap'd ones
+   go straight back.                                            */
+
+mallopt(M_MMAP_THRESHOLD, 64*1024);
+malloc_trim(0);                  /* ask glibc to return free pages */
+MALLOC_ARENA_MAX=2 ./program     /* limit per-thread arenas —
+                                    often cuts RSS substantially in
+                                    highly threaded programs      */</code></pre>
+
+<h2 id="embedded">Embedded systems</h2>
+
+<p>On a small system without swap, most of the mechanisms above either do not exist or behave very differently — which changes what running out of memory actually looks like.</p>
+
+<pre><code>/* No MMU means no virtual memory, so physical fragmentation is
+   permanent and unrecoverable. This is why (C chapter 14):     */
+
+/* Static allocation — the linker proves it fits at BUILD time */
+static struct session sessions[MAX_SESSIONS];
+
+/* Fixed-size pools — O(1), no fragmentation, bounded */
+static struct msg pool[64];
+static uint64_t  used;
+
+/* TLSF (Two-Level Segregated Fit) — a real-time heap with
+   BOUNDED worst-case allocation time, unlike a general malloc */
+
+/* FreeRTOS ships five heap implementations, and choosing between
+   them is a real design decision:
+     heap_1  allocate only, never free — safest
+     heap_2  free supported, no coalescing — fragments
+     heap_4  coalescing — the usual choice
+     heap_5  heap_4 across multiple memory regions            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Allocation fails with plenty of free memory</td><td>Fragmentation, or a zone constraint (DMA32)</td></tr>
+<tr><td><code>kmalloc</code> of 1 MB fails after weeks of uptime</td><td>External fragmentation; use <code>kvmalloc</code></td></tr>
+<tr><td>Latency spikes under memory pressure</td><td>Direct reclaim; raise <code>vm.min_free_kbytes</code></td></tr>
+<tr><td>Process killed with plenty of RAM shown as cached</td><td>cgroup limit, not machine memory</td></tr>
+<tr><td>"free" shows almost no free memory</td><td>Page cache — read the <em>available</em> column</td></tr>
+<tr><td>A slab cache grows without bound</td><td>Kernel leak; <code>slabtop</code> names the object type</td></tr>
+<tr><td>RSS does not fall after freeing memory</td><td>brk heap cannot return non-top blocks; try <code>malloc_trim</code></td></tr>
+<tr><td>Threaded server uses far more RSS than expected</td><td>Per-thread malloc arenas; set <code>MALLOC_ARENA_MAX</code></td></tr>
+<tr><td>DMA buffer allocation fails on an embedded board</td><td>No CMA reservation, or the region is exhausted</td></tr>
+<tr><td>Device fails after weeks, works after reboot</td><td>Fragmentation in a no-MMU system; use pools</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the allocator stack and say what problem each layer solves.</li>
+  <li>Explain buddy allocation, including how the buddy address is computed.</li>
+  <li>Explain what <code>/proc/buddyinfo</code> tells you about fragmentation.</li>
+  <li>Say why zones exist and give a case where allocation fails despite free memory.</li>
+  <li>Explain the slab idea and two advantages of a dedicated cache over <code>kmalloc</code>.</li>
+  <li>Distinguish internal from external fragmentation and name Linux's three defences against the latter.</li>
+  <li>Give three differences between <code>kmalloc</code> and <code>vmalloc</code>.</li>
+  <li>Explain the watermarks and why direct reclaim causes latency spikes.</li>
+  <li>Explain why low "free" memory on Linux is normal.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KVM/arm64 internals | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>KVM/arm64 internals</h1>
+<p class="lead">Everything in this track so far exists in one directory of the Linux source tree. This
+chapter is the map: where each mechanism lives, what the ioctl interface looks like from the outside, and how
+to build a working hypervisor in about two hundred lines so that the abstractions stop being abstract.</p>
+
+<h2 id="map">The source map</h2>
+
+<p>Knowing where things live in the source tree is most of the battle when reading KVM, and the layout follows the architecture closely.</p>
+
+<pre class="diagram">   arch/arm64/kvm/
+   |
+   +-- arm.c              VM and vCPU lifecycle, the run loop.
+   |                      kvm_arch_vcpu_ioctl_run() is the
+   |                      function everything passes through.
+   +-- handle_exit.c      the exit dispatch table, keyed on
+   |                      ESR_EL2.EC. Start reading here.
+   +-- sys_regs.c         the emulated system register table -
+   |                      one entry per trapped register, with
+   |                      its access function and reset value.
+   |                      Enormous, and mechanical.
+   +-- mmu.c              stage-2: memslots, user_mem_abort(),
+   |                      page table management, dirty logging.
+   +-- pkvm.c             protected-KVM setup.
+   +-- psci.c             PSCI: CPU_ON/OFF/SUSPEND, SYSTEM_RESET.
+   +-- pmu.c pmu-emul.c   virtual PMU.
+   +-- arch_timer.c       CNTVOFF, the timer save/restore and
+   |                      the hrtimer used while descheduled.
+   +-- vgic/
+   |    +-- vgic-init.c   creation, from the KVM device API
+   |    +-- vgic-mmio*.c  the emulated distributor/redistributor
+   |    +-- vgic-v3.c     list registers, the hardware side
+   |    +-- vgic-its.c    the emulated ITS
+   |    +-- vgic-v4.c     direct injection
+   +-- hyp/
+        +-- nvhe/         code that runs at EL2 in nVHE mode.
+        |                 Compiled separately, its own linker
+        |                 script, cannot call ordinary kernel
+        |                 functions.
+        +-- vhe/          the VHE variants
+        +-- include/      shared switch code
+
+   virt/kvm/              architecture-independent core:
+                          kvm_main.c, eventfd.c (irqfd,
+                          ioeventfd), the memslot machinery.
+
+   READING ORDER that works:
+     1. handle_exit.c  - see every exit reason in one table
+     2. arm.c          - the loop around it
+     3. mmu.c          - user_mem_abort(), the single most
+                         important function in the file
+     4. sys_regs.c     - pick one register and follow it
+     5. vgic/          - only when you need it</pre>
+
+<h2 id="api">The ioctl interface, in order</h2>
+
+<p>The interface between a VMM and KVM is a small number of ioctls used in a fixed order, and seeing that order makes the next section readable.</p>
+
+<pre><code>/* This is the entire contract between a VMM and KVM. Every
+   VMM - QEMU, crosvm, firecracker, cloud-hypervisor - makes
+   these calls in this order.                               */
+
+  int kvm = open("/dev/kvm", O_RDWR);
+
+  ioctl(kvm, KVM_GET_API_VERSION);              /* must be 12  */
+  ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
+
+  int vm = ioctl(kvm, KVM_CREATE_VM, 40);       /* 40-bit IPA  */
+
+  /* Memory: tell KVM which host memory backs which guest
+     physical range. Anything not covered is MMIO.            */
+  ioctl(vm, KVM_SET_USER_MEMORY_REGION,
+        &amp;(struct kvm_userspace_memory_region){
+            .slot            = 0,
+            .guest_phys_addr = 0x40000000,
+            .memory_size     = 1UL &lt;&lt; 30,
+            .userspace_addr  = (uint64_t)mmap(...),
+        });
+
+  /* The interrupt controller is a "KVM device".              */
+  int gic = ioctl(vm, KVM_CREATE_DEVICE,
+        &amp;(struct kvm_create_device){
+            .type = KVM_DEV_TYPE_ARM_VGIC_V3 });
+  ioctl(gic, KVM_SET_DEVICE_ATTR, ...);   /* base addresses    */
+
+  /* vCPUs.                                                    */
+  int vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
+
+  struct kvm_vcpu_init init = {};
+  ioctl(vm, KVM_ARM_PREFERRED_TARGET, &amp;init);
+  init.features[0] |= 1 &lt;&lt; KVM_ARM_VCPU_PSCI_0_2;
+  ioctl(vcpu, KVM_ARM_VCPU_INIT, &amp;init);
+
+  /* The shared communication page.                            */
+  size_t mmap_sz = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
+  struct kvm_run *run = mmap(NULL, mmap_sz, PROT_READ|PROT_WRITE,
+                             MAP_SHARED, vcpu, 0);
+
+  /* Registers are set through a generic ID-based interface.   */
+  ioctl(vcpu, KVM_SET_ONE_REG, &amp;(struct kvm_one_reg){
+            .id   = ARM64_CORE_REG(regs.pc),
+            .addr = (uint64_t)&amp;entry_point });
+
+  /* And then, forever:                                        */
+  for (;;) {
+          ioctl(vcpu, KVM_RUN, 0);
+          switch (run-&gt;exit_reason) { ... }
+  }</code></pre>
+
+<h2 id="minimal">A hypervisor in two hundred lines</h2>
+
+<p>A working hypervisor is far shorter than expected, and writing one is the fastest way to understand what the kernel is and is not doing for you.</p>
+
+<pre><code>/* Runs a tiny AArch64 payload that writes to a UART address we
+   model, then halts. Build:
+       aarch64-linux-gnu-gcc -static -o tinyvmm tinyvmm.c
+   Run on an arm64 host with /dev/kvm.                       */
+
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;linux/kvm.h&gt;
+
+#define GUEST_RAM   0x40000000UL
+#define RAM_SIZE    (2UL * 1024 * 1024)
+#define UART_BASE   0x09000000UL
+
+/* The guest program, assembled by hand:
+
+     mov  x1, #0x09000000        // UART base
+     mov  w2, #'K'
+     str  w2, [x1]
+     mov  w2, #'V'
+     str  w2, [x1]
+     mov  w2, #'M'
+     str  w2, [x1]
+     mov  w2, #'\n'
+     str  w2, [x1]
+   1: wfi
+     b    1b
+*/
+static const uint32_t guest_code[] = {
+        0xd2a12001,  /* mov x1, #0x09000000                   */
+        0x52800962,  /* mov w2, #0x4b  'K'                    */
+        0xb9000022,  /* str w2, [x1]                          */
+        0x52800ac2,  /* mov w2, #0x56  'V'                    */
+        0xb9000022,
+        0x528009a2,  /* mov w2, #0x4d  'M'                    */
+        0xb9000022,
+        0x52800142,  /* mov w2, #0x0a  '\n'                   */
+        0xb9000022,
+        0xd503207f,  /* wfi                                   */
+        0x17ffffff,  /* b .-4                                 */
+};
+
+#define ARM64_CORE_REG(x) \
+        (KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | \
+         (offsetof(struct kvm_regs, x) / sizeof(__u32)))
+
+int main(void)
+{
+        int kvmfd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+        if (kvmfd &lt; 0) { perror("/dev/kvm"); return 1; }
+
+        int vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
+
+        /* Guest RAM. */
+        void *ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                         -1, 0);
+        memcpy(ram, guest_code, sizeof guest_code);
+
+        struct kvm_userspace_memory_region region = {
+                .slot            = 0,
+                .guest_phys_addr = GUEST_RAM,
+                .memory_size     = RAM_SIZE,
+                .userspace_addr  = (uint64_t)ram,
+        };
+        ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &amp;region);
+
+        /* One vCPU. */
+        int vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
+
+        struct kvm_vcpu_init init = {};
+        ioctl(vmfd, KVM_ARM_PREFERRED_TARGET, &amp;init);
+        ioctl(vcpufd, KVM_ARM_VCPU_INIT, &amp;init);
+
+        size_t run_size = ioctl(kvmfd, KVM_GET_VCPU_MMAP_SIZE, 0);
+        struct kvm_run *run = mmap(NULL, run_size,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED, vcpufd, 0);
+
+        /* PC = start of our code, PSTATE = EL1h, interrupts
+           masked.                                            */
+        uint64_t pc = GUEST_RAM;
+        uint64_t pstate = 0x3c5;   /* D,A,I,F masked, EL1h     */
+        struct kvm_one_reg r;
+
+        r = (struct kvm_one_reg){ .id = ARM64_CORE_REG(regs.pc),
+                                  .addr = (uint64_t)&amp;pc };
+        ioctl(vcpufd, KVM_SET_ONE_REG, &amp;r);
+        r = (struct kvm_one_reg){ .id = ARM64_CORE_REG(regs.pstate),
+                                  .addr = (uint64_t)&amp;pstate };
+        ioctl(vcpufd, KVM_SET_ONE_REG, &amp;r);
+
+        /* The loop. */
+        for (;;) {
+                if (ioctl(vcpufd, KVM_RUN, 0) &lt; 0) {
+                        perror("KVM_RUN");
+                        return 1;
+                }
+
+                switch (run-&gt;exit_reason) {
+                case KVM_EXIT_MMIO:
+                        if (run-&gt;mmio.phys_addr == UART_BASE &amp;&amp;
+                            run-&gt;mmio.is_write) {
+                                putchar(run-&gt;mmio.data[0]);
+                                fflush(stdout);
+                        }
+                        break;
+
+                case KVM_EXIT_SYSTEM_EVENT:
+                        printf("\n[system event %u]\n",
+                               run-&gt;system_event.type);
+                        return 0;
+
+                case KVM_EXIT_FAIL_ENTRY:
+                        fprintf(stderr, "entry failed: 0x%llx\n",
+                                run-&gt;fail_entry.hardware_entry_failure_reason);
+                        return 1;
+
+                default:
+                        fprintf(stderr, "exit reason %u\n",
+                                run-&gt;exit_reason);
+                        return 1;
+                }
+        }
+}</code></pre>
+
+<pre><code>$ aarch64-linux-gnu-gcc -static -o tinyvmm tinyvmm.c
+$ ./tinyvmm
+KVM
+
+# Then it sits in WFI forever - because we never created a vGIC,
+# so nothing can ever wake it. Ctrl-C.
+
+# That single word of output required: a VM, a memslot, a vCPU,
+# an architected reset state, a run loop and an MMIO handler.
+# Everything else in QEMU is more of the same, plus device
+# models, plus a device tree, plus forty years of compatibility.</code></pre>
+
+<div class="key">
+<b>What this proves</b>
+<p>KVM does not "run virtual machines". It provides a CPU in a box and tells you when the box needs
+something. Every device, every address-space decision, every piece of firmware and every policy is user
+space's problem. That is why there are half a dozen VMMs with wildly different characters — firecracker
+boots in 100 ms because it declines to implement almost everything QEMU does.</p>
+</div>
+
+<h2 id="vmms">The VMMs, and what they optimise for</h2>
+
+<p>The user-space half varies widely in size and philosophy, and the choice determines your attack surface and your boot time more than your throughput.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>VMM</th><th>Language</th><th>Optimises for</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>QEMU</strong></td><td>C</td><td>Completeness</td><td>Every device, every architecture, TCG as
+well as KVM. The reference</td></tr>
+<tr><td><strong>Firecracker</strong></td><td>Rust</td><td>Boot time and attack surface</td><td>~5 devices, no
+PCI, no BIOS. Used for AWS Lambda</td></tr>
+<tr><td><strong>crosvm</strong></td><td>Rust</td><td>Sandboxing</td><td>Each device in its own process with
+seccomp; the basis of ChromeOS and Android VMs</td></tr>
+<tr><td><strong>cloud-hypervisor</strong></td><td>Rust</td><td>Modern cloud workloads</td><td>Hotplug, live
+migration, no legacy emulation</td></tr>
+<tr><td><strong>rust-vmm</strong></td><td>Rust</td><td>Being a library</td><td>The shared crates the above are
+built from; the fastest way to write your own</td></tr>
+<tr><td><strong>kvmtool</strong></td><td>C</td><td>Being readable</td><td>~10k lines. The best code to learn
+from after this chapter</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="debug">Instrumenting KVM</h2>
+
+<p>KVM is unusually well instrumented, and knowing which counters and tracepoints exist turns performance questions into measurements.</p>
+
+<pre><code># Per-VM statistics (modern kernels expose them per-fd):
+$ sudo ls /sys/kernel/debug/kvm/
+$ sudo grep . /sys/kernel/debug/kvm/*/vcpu0/stat/* 2>/dev/null
+
+# Tracepoints - the useful ones:
+$ sudo ls /sys/kernel/debug/tracing/events/kvm/
+kvm_entry  kvm_exit  kvm_guest_fault  kvm_mmio  kvm_set_irq
+kvm_wfx_arm64  kvm_hvc_arm64  kvm_arm_setup_debug  ...
+
+$ sudo perf record -e 'kvm:*' -a -- sleep 5
+$ sudo perf script | awk '{print $5}' | sort | uniq -c | sort -rn
+
+# Live summary:
+$ sudo perf kvm --host stat live
+
+# Function-level, when you are changing KVM itself:
+$ sudo trace-cmd record -p function_graph \
+      -g kvm_arch_vcpu_ioctl_run -O nofuncgraph-irqs
+$ trace-cmd report | head -50
+
+# Building a KVM with your own printk:
+#   CONFIG_KVM=y (not =m, if you are changing hyp code)
+#   CONFIG_DEBUG_INFO=y
+# Note: in nVHE mode, code under arch/arm64/kvm/hyp/nvhe/
+# CANNOT printk. Use the trace buffer or a magic register value
+# you read after the exit. In VHE mode, ordinary printk works -
+# one more reason VHE made KVM development pleasant.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>KVM_CREATE_VM: Permission denied</code></td><td>Not in the <code>kvm</code> group; check
+<code>ls -l /dev/kvm</code></td></tr>
+<tr><td><code>KVM_ARM_VCPU_INIT: Invalid argument</code></td><td>Requested a feature the host does not have —
+call <code>KVM_ARM_PREFERRED_TARGET</code> first and start from that</td></tr>
+<tr><td><code>KVM_RUN</code> returns <code>KVM_EXIT_FAIL_ENTRY</code> immediately</td><td>Illegal
+<code>PSTATE</code> in the initial register set, or PC outside any memslot</td></tr>
+<tr><td>Guest runs but produces no output</td><td>MMIO handler matching the wrong address, or the payload
+writing to an address in a memslot (so it never traps)</td></tr>
+<tr><td>vCPU never wakes from <code>WFI</code></td><td>No vGIC created, so no interrupt can ever be
+delivered</td></tr>
+<tr><td>Works as root, fails as a user</td><td><code>RLIMIT_MEMLOCK</code>, or <code>/dev/kvm</code>
+permissions</td></tr>
+<tr><td>Exit reason 0 or an unknown number</td><td>Kernel newer than your headers — rebuild against the
+running kernel's <code>linux/kvm.h</code></td></tr>
+<tr><td>Guest memory writes not visible to the VMM</td><td>Memslot registered with <code>MAP_PRIVATE</code>
+where the device or another process needs <code>MAP_SHARED</code></td></tr>
+<tr><td>No <code>printk</code> output from hyp code</td><td>nVHE mode — that code cannot printk at all</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the file in <code>arch/arm64/kvm/</code> that handles each of: exit dispatch, stage-2 faults,
+  system-register emulation, the timer.</li>
+  <li>List the ioctls needed to get from <code>/dev/kvm</code> to a running vCPU, in order.</li>
+  <li>Explain what a memslot is and what "outside a memslot" implies.</li>
+  <li>Explain what <code>kvm_run</code> is and how the VMM gets access to it.</li>
+  <li>Explain why the tiny VMM's guest never wakes from <code>WFI</code>.</li>
+  <li>State the division of responsibility between KVM and the VMM in one sentence.</li>
+  <li>Give two VMMs other than QEMU and say what each optimises for.</li>
+  <li>Name three KVM tracepoints and what each tells you.</li>
+  <li>Explain why hyp code cannot <code>printk</code> in nVHE mode.</li>
+  <li>Extend the tiny VMM: add a second MMIO address that returns a counter on read.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

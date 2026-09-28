@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timer virtualisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Timer virtualisation</h1>
+<p class="lead">Time is the illusion hardest to maintain, because a guest can measure it against the outside
+world. ARM's answer is a single 64-bit offset register that shifts a guest's view of the counter, plus a
+dedicated virtual timer per exception level — and a set of compromises about what happens while a vCPU is
+not running.</p>
+
+<h2 id="counter">One counter, several views</h2>
+
+<p>There is one physical counter and several views of it, and the offset between views is the whole mechanism of timer virtualisation.</p>
+
+<pre class="diagram">   There is exactly ONE physical counter in the system: a
+   free-running, always-on, fixed-frequency counter, shared by
+   every core. Software reads it through several windows.
+
+   CNTPCT_EL0   physical count   = the counter, raw
+   CNTVCT_EL0   virtual count    = CNTPCT_EL0 - CNTVOFF_EL2
+
+                                              ^^^^^^^^^^^
+                             ONE register, per vCPU, 64-bit,
+                             writable only at EL2. That is the
+                             entire mechanism.
+
+   Timers (comparators) come in matching flavours:
+
+     EL1 physical timer   CNTP_CTL_EL0  CNTP_CVAL_EL0  CNTP_TVAL_EL0
+     EL1 virtual timer    CNTV_CTL_EL0  CNTV_CVAL_EL0  CNTV_TVAL_EL0
+     EL2 hypervisor timer CNTHP_CTL_EL2 CNTHP_CVAL_EL2
+     EL2 virtual timer    CNTHV_*_EL2   (VHE)
+     EL3 secure timer     CNTPS_*_EL1
+
+   Each has its own interrupt (a PPI):
+     30  EL1 physical timer
+     27  EL1 virtual timer     &lt;-- the one a KVM guest uses
+     26  EL2 hypervisor timer
+     29  EL3 secure timer
+
+   A guest kernel under KVM is told, via its device tree, to use
+   the VIRTUAL timer. It then reads CNTVCT_EL0 with no trap at
+   all, and gets a value shifted by CNTVOFF_EL2.</pre>
+
+<div class="key">
+<b>Why the offset must exist</b>
+<p>A guest that boots two hours after the host expects its counter to start near zero, not at the host's
+uptime. More importantly, a guest that is suspended and resumed, or migrated to another machine, must not
+see time jump backwards or leap forwards — its scheduler, its watchdogs and its TCP stack all assume
+monotonic, roughly-real time. <code>CNTVOFF_EL2</code> lets the hypervisor rebase the guest's clock without
+touching a single guest instruction.</p>
+</div>
+
+<h2 id="offset">What the hypervisor does with CNTVOFF</h2>
+
+<p>One register lets the hypervisor lie to a guest about what time it is, which is exactly what is needed to hide the time a guest spent not running.</p>
+
+<pre><code>/* At VM creation: */
+    vcpu-&gt;cntvoff = read_cntpct();      /* guest time starts at 0 */
+
+/* On every guest entry: */
+    write_sysreg(vcpu-&gt;cntvoff, cntvoff_el2);
+
+/* All vCPUs of one VM MUST share the same offset, or the guest
+   sees different cores disagreeing about the time - which
+   breaks its scheduler, its clocksource watchdog and any
+   lock-free algorithm using timestamps.
+
+   KVM enforces this: CNTVOFF is per-VM, not per-vCPU.       */
+
+/* On resume from a host suspend: */
+    /* The physical counter kept running (or did not - it is
+       "always on" but the SoC may have powered it). Either way
+       the guest must not observe a jump. Adjust:            */
+    vcpu-&gt;cntvoff += (now - suspend_started);
+
+/* On live migration: */
+    /* The destination machine's counter has a completely
+       different value AND possibly a different frequency.
+       CNTFRQ_EL0 is not writable per-guest, which is a real
+       architectural gap - migration between machines with
+       different counter frequencies is not supported. Check
+       CNTFRQ on both ends before you promise migration.     */</code></pre>
+
+<h2 id="who">Which timer belongs to whom</h2>
+
+<p>Several timers exist at once and they belong to different owners. Confusing them is a common source of guests that either never wake or wake constantly.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Timer</th><th>Used by</th><th>Trapped?</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>EL1 virtual (<code>CNTV_*</code>)</td><td>The guest</td><td>No</td><td>The fast path. Guest programs
+its own comparator; hardware raises PPI 27; the vGIC delivers it</td></tr>
+<tr><td>EL1 physical (<code>CNTP_*</code>)</td><td>Bare-metal EL1 software; a guest that was misconfigured</td><td><strong>Yes</strong>,
+via <code>CNTHCTL_EL2.EL1PCEN</code></td><td>Must be trapped and emulated, because the physical timer's
+interrupt is not the guest's to own</td></tr>
+<tr><td>EL2 hypervisor (<code>CNTHP_*</code>)</td><td>The hypervisor</td><td>n/a</td><td>Preemption timer: how
+KVM takes a vCPU away when its slice expires</td></tr>
+<tr><td>Counter reads (<code>CNTVCT_EL0</code>)</td><td>Guest user space and kernel</td><td>No</td><td>Offset in
+hardware. This is why <code>clock_gettime()</code> in a guest is as fast as on bare metal</td></tr>
+<tr><td><code>CNTPCT_EL0</code></td><td>Anyone</td><td>Optionally, via <code>CNTHCTL_EL2.EL0PCTEN</code>/
+<code>EL1PCTEN</code></td><td>Trapping it hides the host's real uptime; leaving it open lets a guest detect
+virtualisation</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* CNTHCTL_EL2 - who may touch what, from EL1 and EL0.       */
+
+  Without VHE (or with TGE=0):
+    EL1PCTEN  [0]  EL0/EL1 may read CNTPCT_EL0
+    EL1PCEN   [1]  EL0/EL1 may use the EL1 PHYSICAL timer
+    EVNTEN    [2]  event stream enable
+    EVNTDIR   [3]  event stream edge
+    EVNTI     [7:4] which counter bit drives the event stream
+
+/* KVM's normal setting for a guest:
+
+     EL1PCTEN = 1   let the guest read CNTPCT - it is only the
+                    raw counter, and hiding it costs a trap on
+                    a hot path for very little benefit
+     EL1PCEN  = 0   TRAP the physical timer. The guest should be
+                    using the virtual one; if it insists on the
+                    physical one, KVM emulates it on top of the
+                    virtual timer.
+
+   A guest device tree that lists the physical timer interrupt
+   instead of the virtual one produces a guest that works but
+   traps on every timer programming operation. Symptom: high
+   exit count with EC=0x18 on CNTP registers.               */</code></pre>
+
+<h2 id="lost">The hard part: time while you are not running</h2>
+
+<p>The genuinely hard problem: a guest's timer can expire while it is not scheduled, and what the hypervisor does about that is a design decision with visible consequences.</p>
+
+<pre class="diagram">   A guest sets a timer for 1 ms from now, then its vCPU is
+   descheduled for 20 ms because the host is busy.
+
+   The virtual timer fires - in hardware - while the vCPU is
+   not resident. Who notices?
+
+   ANSWER: the hypervisor must arrange to notice. KVM does this
+   by putting the guest's timer deadline into a HOST timer
+   (an hrtimer) whenever the vCPU is descheduled:
+
+     vCPU blocks / is preempted
+        |
+        v
+     read guest CNTV_CVAL, convert to host time
+     arm a host hrtimer for that instant
+     save and DISABLE the guest's timer in hardware
+        |
+        ... host runs other things ...
+        |
+     hrtimer fires -> mark virtual PPI 27 pending for that vCPU
+                   -> wake the vCPU thread
+        |
+        v
+     vCPU is scheduled again
+        |
+        v
+     restore guest timer state, inject the pending interrupt
+
+   The guest observes: "my 1 ms timer fired after 20 ms".
+   That is LATE, not WRONG - and lateness is unavoidable when
+   you overcommit. But it must never be EARLY, and it must
+   never be LOST.</pre>
+
+<div class="warn">
+<b>The RTOS problem</b>
+<p>An RTOS guest with a 100 µs deadline cannot tolerate 20 ms of scheduling delay, and no amount of
+hypervisor cleverness fixes it — the physical CPU was genuinely doing something else. The answer is not a
+better timer path; it is to stop sharing that CPU: pin the vCPU, isolate the core (<code>isolcpus</code>,
+<code>nohz_full</code>), give it a real-time scheduling class, or use a
+<a href="virt-18-partitioning.html">partitioning hypervisor</a> that never time-shares in the first
+place.</p>
+</div>
+
+<h2 id="ptimer">Steal time: telling the guest the truth</h2>
+
+<p>Rather than hiding lost time, a hypervisor can report it — which lets a cooperative guest schedule sensibly instead of being confused.</p>
+
+<pre><code>/* A guest's own accounting is a lie under overcommit: it
+   thinks it used 100 ms of CPU when 60 ms of that was spent
+   descheduled. Its load average, its CPU-frequency governor
+   and its scheduler all draw wrong conclusions.
+
+   The paravirtual fix: the hypervisor publishes, in a shared
+   page, how much time this vCPU spent NOT running.        */
+
+  struct pvclock_vcpu_stolen_time {
+          __le32 revision;
+          __le32 attributes;
+          __le64 stolen_time;      /* nanoseconds, monotonic  */
+          /* padded to 64 bytes                              */
+  };
+
+/* Discovered via SMCCC:
+     HV_PV_TIME_FEATURES  -> is it there?
+     HV_PV_TIME_ST        -> give me the IPA of my structure   */
+
+/* In the guest: */
+$ cat /proc/stat | head -2
+cpu  1204 0 388 90112 22 0 8 1877 0 0
+                                 ^^^^
+                                 steal time, in USER_HZ
+
+$ vmstat 1
+procs -----------memory---------- ---system-- ------cpu-----
+ r  b   swpd   free  buff  cache   in   cs us sy id wa st
+ 2  0      0 743210  1122  88240  912 1840 41  6 22  0 31
+                                                        ^^
+                                            31% stolen - this
+                                            guest is starved
+
+/* st consistently above a few percent means the host is
+   oversubscribed. It is the single most useful number for
+   diagnosing "the VM is slow" complaints, and it points at the
+   host, not the guest.                                      */</code></pre>
+
+<h2 id="verify">Checking the timer setup</h2>
+
+<p>Timer configuration is checkable from inside the guest, and doing so resolves most "the clock is wrong" reports quickly.</p>
+
+<pre><code># Guest: which timer is it actually using?
+$ cat /proc/interrupts | grep timer
+  3:      12045      11982   GICv3  27 Level  arch_timer
+                                    ^^ 27 = VIRTUAL timer. Good.
+                                    30 would be the physical one.
+
+$ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+arch_sys_counter
+
+$ dmesg | grep -i arch_timer
+[    0.000000] arch_timer: cp15 timer(s) running at 54.00MHz (virt).
+[    0.000000] clocksource: arch_sys_counter: mask: 0xff...
+                                                         ^^^^^^
+# "(virt)" is what you want. "(phys)" means the guest is on the
+# physical timer and every access traps.
+
+# Host: what frequency does the hardware run at?
+$ dmesg | grep -i 'arch_timer.*MHz'
+# Must match on both ends of a live migration.
+
+# Prove the offset works - guest uptime should not be host uptime:
+$ uptime            # in the guest
+$ ssh host uptime   # on the host
+
+# Measure timer accuracy inside the guest:
+$ cyclictest -t1 -p 80 -n -i 1000 -l 10000
+T: 0 ( 1234) P:80 I:1000 C:  10000 Min:     12 Act:   28 Avg:   35 Max:    9812
+                                                                       ^^^^^^^
+# 9.8 ms worst case = the vCPU was descheduled. Pin it and
+# re-run; on an isolated core this should drop to tens of us.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest time is the host's uptime, not zero-based</td><td><code>CNTVOFF_EL2</code> never
+initialised</td></tr>
+<tr><td>Guest cores disagree about the time; scheduler misbehaves</td><td>Per-vCPU rather than per-VM
+<code>CNTVOFF</code></td></tr>
+<tr><td>Guest time jumps after host suspend/resume</td><td>Offset not adjusted across the suspend
+window</td></tr>
+<tr><td>Huge exit rate with <code>EC=0x18</code> on <code>CNTP_*</code></td><td>Guest using the physical timer
+— wrong interrupt in its device tree</td></tr>
+<tr><td>Guest timers fire late by whole milliseconds</td><td>vCPU descheduled; the host hrtimer path is
+working as designed. Pin and isolate</td></tr>
+<tr><td>Guest timer never fires at all</td><td>Descheduled-vCPU hrtimer not armed, or the virtual PPI not
+injected on wake</td></tr>
+<tr><td>Guest clocksource watchdog marks the counter unstable</td><td>Time observed going backwards — usually
+an offset updated on one vCPU only</td></tr>
+<tr><td>Live migration leaves the guest's clock wrong</td><td>Different <code>CNTFRQ_EL0</code> on source and
+destination</td></tr>
+<tr><td>Guest reports high load with idle applications</td><td>Steal time not exposed, so the guest attributes
+stolen cycles to itself</td></tr>
+<tr><td><code>cyclictest</code> max latency in milliseconds</td><td>Overcommitted host; this is a capacity
+decision, not a bug</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write the relationship between <code>CNTPCT_EL0</code>, <code>CNTVCT_EL0</code> and
+  <code>CNTVOFF_EL2</code>.</li>
+  <li>Name the four timer variants and the PPI number each uses.</li>
+  <li>Explain why <code>CNTVOFF</code> must be per-VM rather than per-vCPU.</li>
+  <li>Say which timer a KVM guest should use and how it is told.</li>
+  <li>Explain what <code>CNTHCTL_EL2.EL1PCEN</code> controls and why KVM clears it.</li>
+  <li>Describe how a guest timer fires while its vCPU is descheduled.</li>
+  <li>Explain why "late" is acceptable but "early" and "lost" are not.</li>
+  <li>Define steal time, say how a guest learns it, and explain what a high value tells you.</li>
+  <li>Explain why counter frequency blocks some live migrations.</li>
+  <li>Verify from inside a guest that it is using the virtual timer.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a DX12 triangle, every line explained | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a DX12 triangle, every line explained</h1>
+<p class="lead">The smallest complete DX12 program. Roughly 400 lines, and by the end of this chapter every
+one of them should be a decision you understand rather than a line you copied — which is the entire
+difference between using DX12 and fighting it.</p>
+
+<h2 id="order">The order of operations</h2>
+
+<pre class="diagram">   STARTUP
+     1.  enable the debug layer      BEFORE the device
+     2.  create the DXGI factory
+     3.  pick an adapter             not adapter 0
+     4.  create the device
+     5.  configure the info queue and DRED
+     6.  create the command queue
+     7.  create the swap chain       needs the QUEUE, not the
+                                     device
+     8.  create descriptor heaps     RTV heap for backbuffers
+     9.  create RTVs for each backbuffer
+     10. create command allocators   one per frame in flight
+     11. create the command list
+     12. create the fence and event
+     13. compile shaders
+     14. create the root signature
+     15. create the PSO
+     16. create the vertex buffer + upload it
+     17. WAIT for the upload to finish
+
+   PER FRAME
+     18. wait for this frame slot's fence
+     19. reset allocator, then list
+     20. transition backbuffer PRESENT -> RENDER_TARGET
+     21. set state, clear, draw
+     22. transition RENDER_TARGET -> PRESENT
+     23. close, execute, present, signal
+
+   SHUTDOWN
+     24. flush - wait for the GPU to be completely idle
+     25. release, in any order (ComPtr does it)
+
+   Step 24 is not optional: destroying resources the GPU is
+   still using is a page fault or a hang, and it happens on
+   exit where nobody looks.</pre>
+
+<h2 id="shader">The shader</h2>
+
+<pre><code>// triangle.hlsl - compile both entry points:
+//   dxc -T vs_6_0 -E VSMain -Fo vs.cso triangle.hlsl
+//   dxc -T ps_6_0 -E PSMain -Fo ps.cso triangle.hlsl
+//
+// dxc, not fxc: fxc only emits DXBC (shader model 5.1 and
+// below). Anything using wave intrinsics or SM 6 features
+// needs dxc.
+
+struct VSIn  { float3 pos : POSITION; float4 col : COLOR; };
+struct VSOut { float4 pos : SV_Position; float4 col : COLOR; };
+
+VSOut VSMain(VSIn i)
+{
+    VSOut o;
+    o.pos = float4(i.pos, 1.0);   // already in clip space -
+                                  // no matrices in a first
+                                  // triangle
+    o.col = i.col;
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    return i.col;                 // interpolated across the
+                                  // triangle by the
+                                  // rasteriser, for free
+}</code></pre>
+
+<h2 id="init">Initialisation</h2>
+
+<pre><code>#include &lt;d3d12.h&gt;
+#include &lt;dxgi1_6.h&gt;
+#include &lt;d3dcompiler.h&gt;
+#include &lt;wrl/client.h&gt;
+#include &lt;stdexcept&gt;
+#include &lt;vector&gt;
+using Microsoft::WRL::ComPtr;
+
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+
+static const UINT kFrames = 2;
+
+struct Vertex { float pos[3]; float col[4]; };
+
+class TriangleApp {
+    ComPtr&lt;ID3D12Device&gt;              device_;
+    ComPtr&lt;ID3D12CommandQueue&gt;        queue_;
+    ComPtr&lt;IDXGISwapChain3&gt;           swap_;
+    ComPtr&lt;ID3D12DescriptorHeap&gt;      rtvHeap_;
+    ComPtr&lt;ID3D12Resource&gt;            backBuf_[kFrames];
+    ComPtr&lt;ID3D12CommandAllocator&gt;    alloc_[kFrames];
+    ComPtr&lt;ID3D12GraphicsCommandList&gt; cmd_;
+    ComPtr&lt;ID3D12RootSignature&gt;       rootSig_;
+    ComPtr&lt;ID3D12PipelineState&gt;       pso_;
+    ComPtr&lt;ID3D12Resource&gt;            vb_;
+    D3D12_VERTEX_BUFFER_VIEW          vbv_{};
+    ComPtr&lt;ID3D12Fence&gt;               fence_;
+    HANDLE   fenceEvent_ = nullptr;
+    UINT64   fenceVal_[kFrames] = {};
+    UINT64   nextFence_ = 1;
+    UINT     frame_ = 0, rtvSize_ = 0;
+    UINT     width_ = 1280, height_ = 720;
+
+public:
+void Init(HWND hwnd)
+{
+    /* 1. DEBUG LAYER FIRST. After device creation it silently
+          does nothing. */
+#if defined(_DEBUG)
+    ComPtr&lt;ID3D12Debug&gt; dbg;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&amp;dbg))))
+        dbg-&gt;EnableDebugLayer();
+    UINT factoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+#else
+    UINT factoryFlags = 0;
+#endif
+
+    /* 2-4. factory, adapter, device (chapter 12). */
+    ComPtr&lt;IDXGIFactory6&gt; factory;
+    CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&amp;factory));
+
+    ComPtr&lt;IDXGIAdapter1&gt; adapter;
+    factory-&gt;EnumAdapterByGpuPreference(
+        0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        IID_PPV_ARGS(&amp;adapter));
+
+    if (FAILED(D3D12CreateDevice(adapter.Get(),
+                                 D3D_FEATURE_LEVEL_11_0,
+                                 IID_PPV_ARGS(&amp;device_))))
+        throw std::runtime_error("D3D12CreateDevice");
+
+    /* 6. The queue. The swap chain needs it, not the device -
+          because presentation is itself queued work. */
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    device_-&gt;CreateCommandQueue(&amp;qd, IID_PPV_ARGS(&amp;queue_));
+
+    /* 7. Swap chain. FLIP_DISCARD is mandatory for DX12 and
+          is also the only mode that allows tearing control
+          and true independent flip. */
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.BufferCount = kFrames;
+    sd.Width       = width_;
+    sd.Height      = height_;
+    sd.Format      = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SampleDesc.Count = 1;          /* MSAA is NOT allowed on
+                                         a flip-model swap
+                                         chain - render to your
+                                         own MSAA target and
+                                         resolve into this   */
+    ComPtr&lt;IDXGISwapChain1&gt; sc1;
+    factory-&gt;CreateSwapChainForHwnd(queue_.Get(), hwnd, &amp;sd,
+                                    nullptr, nullptr, &amp;sc1);
+    factory-&gt;MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    sc1.As(&amp;swap_);
+    frame_ = swap_-&gt;GetCurrentBackBufferIndex();
+
+    /* 8-9. RTV heap and one view per backbuffer. */
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.NumDescriptors = kFrames;
+    hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;   /* CPU-only */
+    device_-&gt;CreateDescriptorHeap(&amp;hd, IID_PPV_ARGS(&amp;rtvHeap_));
+
+    /* QUERY the increment - do not assume (chapter 14). */
+    rtvSize_ = device_-&gt;GetDescriptorHandleIncrementSize(
+                   D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    auto rtv = rtvHeap_-&gt;GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i &lt; kFrames; i++) {
+        swap_-&gt;GetBuffer(i, IID_PPV_ARGS(&amp;backBuf_[i]));
+        device_-&gt;CreateRenderTargetView(backBuf_[i].Get(),
+                                        nullptr, rtv);
+        rtv.ptr += rtvSize_;
+        device_-&gt;CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&amp;alloc_[i]));       /* 10 */
+    }
+
+    /* 12. Fence. */
+    device_-&gt;CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                         IID_PPV_ARGS(&amp;fence_));
+    fenceEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+    CreatePipeline();
+    CreateVertexBuffer();
+}</code></pre>
+
+<pre><code>void CreatePipeline()
+{
+    /* 14. An EMPTY root signature - this shader takes no
+           parameters at all. Still required: a PSO must have
+           one. */
+    D3D12_ROOT_SIGNATURE_DESC rs = {};
+    rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr&lt;ID3DBlob&gt; sig, err;
+    if (FAILED(D3D12SerializeRootSignature(
+            &amp;rs, D3D_ROOT_SIGNATURE_VERSION_1, &amp;sig, &amp;err)))
+        throw std::runtime_error((char *)err-&gt;GetBufferPointer());
+
+    device_-&gt;CreateRootSignature(0, sig-&gt;GetBufferPointer(),
+                                 sig-&gt;GetBufferSize(),
+                                 IID_PPV_ARGS(&amp;rootSig_));
+
+    ComPtr&lt;ID3DBlob&gt; vs = LoadBlob(L"vs.cso");
+    ComPtr&lt;ID3DBlob&gt; ps = LoadBlob(L"ps.cso");
+
+    /* The semantic NAMES must match the HLSL exactly, and the
+       OFFSETS must match the C++ struct exactly. Both are
+       silent when wrong (chapter 7). */
+    D3D12_INPUT_ELEMENT_DESC layout[] = {
+      { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0,
+        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+      { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
+        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC p = {};
+    p.pRootSignature = rootSig_.Get();
+    p.VS = { vs-&gt;GetBufferPointer(), vs-&gt;GetBufferSize() };
+    p.PS = { ps-&gt;GetBufferPointer(), ps-&gt;GetBufferSize() };
+    p.InputLayout = { layout, _countof(layout) };
+
+    p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        /* NONE for a first triangle: with BACK, a winding
+           order you did not think about gives you an empty
+           screen and no error. Turn culling on once you can
+           see something. */
+    p.RasterizerState.DepthClipEnable = TRUE;
+
+    p.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+        /* zero-initialised means BlendEnable = FALSE, which is
+           what we want - but the WRITE MASK also defaults to
+           0, which writes nothing. Set it. */
+
+    p.DepthStencilState.DepthEnable   = FALSE;
+    p.DepthStencilState.StencilEnable = FALSE;
+
+    p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    p.NumRenderTargets = 1;
+    p.RTVFormats[0]    = DXGI_FORMAT_R8G8B8A8_UNORM;
+        /* MUST match the swap chain format exactly, or PSO
+           creation fails. */
+    p.SampleDesc.Count = 1;
+    p.SampleMask       = UINT_MAX;
+        /* THE CLASSIC BLACK SCREEN. Defaults to 0, which
+           masks out every sample. */
+
+    if (FAILED(device_-&gt;CreateGraphicsPipelineState(
+            &amp;p, IID_PPV_ARGS(&amp;pso_))))
+        throw std::runtime_error("CreateGraphicsPipelineState");
+
+    /* 11. The list is created OPEN, on allocator 0. Close it
+           so the frame loop can Reset symmetrically. */
+    device_-&gt;CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                               alloc_[0].Get(), pso_.Get(),
+                               IID_PPV_ARGS(&amp;cmd_));
+    cmd_-&gt;Close();
+}</code></pre>
+
+<pre><code>void CreateVertexBuffer()
+{
+    Vertex verts[] = {
+        { {  0.0f,  0.75f, 0.0f }, { 1, 0, 0, 1 } },
+        { {  0.75f,-0.75f, 0.0f }, { 0, 1, 0, 1 } },
+        { { -0.75f,-0.75f, 0.0f }, { 0, 0, 1, 1 } },
+    };
+    const UINT size = sizeof verts;
+
+    /* SHORTCUT, and it is worth naming as one: this puts the
+       vertex buffer in an UPLOAD heap so we can memcpy
+       directly, with no staging buffer and no copy command.
+       For three vertices that is fine. For real geometry it
+       is wrong - upload memory is slower for the GPU to read,
+       and you want DEFAULT plus a copy (chapter 14). */
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = size;
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    device_-&gt;CreateCommittedResource(
+        &amp;hp, D3D12_HEAP_FLAG_NONE, &amp;rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+            /* UPLOAD heap resources must be created in
+               GENERIC_READ and can never leave it. */
+        nullptr, IID_PPV_ARGS(&amp;vb_));
+
+    void *p = nullptr;
+    D3D12_RANGE readNothing = { 0, 0 };
+    vb_-&gt;Map(0, &amp;readNothing, &amp;p);
+    memcpy(p, verts, size);          /* WRITE ONLY. Never read
+                                        from upload memory. */
+    vb_-&gt;Unmap(0, nullptr);
+
+    vbv_.BufferLocation = vb_-&gt;GetGPUVirtualAddress();
+    vbv_.StrideInBytes  = sizeof(Vertex);
+    vbv_.SizeInBytes    = size;
+        /* Stride must equal the C++ struct size and match the
+           input layout offsets. A mismatch renders garbage
+           silently. */
+}</code></pre>
+
+<h2 id="frame">The frame</h2>
+
+<pre><code>void Render()
+{
+    /* 18. Do not touch this allocator until the GPU has
+           finished the last frame that used it. */
+    WaitForFence(fenceVal_[frame_]);
+
+    /* 19. Allocator first (frees its memory), then the list
+           (begins recording into it). */
+    alloc_[frame_]-&gt;Reset();
+    cmd_-&gt;Reset(alloc_[frame_].Get(), pso_.Get());
+
+    cmd_-&gt;SetGraphicsRootSignature(rootSig_.Get());
+
+    D3D12_VIEWPORT vp = { 0, 0, (float)width_, (float)height_,
+                          0.0f, 1.0f };
+    D3D12_RECT     sc = { 0, 0, (LONG)width_, (LONG)height_ };
+    cmd_-&gt;RSSetViewports(1, &amp;vp);
+    cmd_-&gt;RSSetScissorRects(1, &amp;sc);
+        /* A scissor of {0,0,0,0} clips everything away. It is
+           the second most common blank-screen cause after
+           SampleMask, and neither produces an error. */
+
+    /* 20. The backbuffer arrives in PRESENT state. */
+    Transition(backBuf_[frame_].Get(),
+               D3D12_RESOURCE_STATE_PRESENT,
+               D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        rtvHeap_-&gt;GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += SIZE_T(frame_) * rtvSize_;
+
+    cmd_-&gt;OMSetRenderTargets(1, &amp;rtv, FALSE, nullptr);
+
+    const float clear[4] = { 0.05f, 0.06f, 0.09f, 1.0f };
+    cmd_-&gt;ClearRenderTargetView(rtv, clear, 0, nullptr);
+
+    /* 21. Three lines to draw a triangle. */
+    cmd_-&gt;IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        /* The PSO holds the TYPE (triangle); the list holds
+           LIST vs STRIP. Both are required. */
+    cmd_-&gt;IASetVertexBuffers(0, 1, &amp;vbv_);
+    cmd_-&gt;DrawInstanced(3, 1, 0, 0);
+
+    /* 22. Back to PRESENT, or Present() fails validation. */
+    Transition(backBuf_[frame_].Get(),
+               D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_PRESENT);
+
+    /* 23. Close, submit, present, signal. */
+    cmd_-&gt;Close();
+    ID3D12CommandList *lists[] = { cmd_.Get() };
+    queue_-&gt;ExecuteCommandLists(1, lists);
+
+    swap_-&gt;Present(1, 0);        /* 1 = vsync                  */
+
+    fenceVal_[frame_] = nextFence_;
+    queue_-&gt;Signal(fence_.Get(), nextFence_++);
+
+    frame_ = swap_-&gt;GetCurrentBackBufferIndex();
+        /* ASK the swap chain, do not assume (frame+1)%N.
+           With FLIP_DISCARD the order is not guaranteed. */
+}
+
+void WaitForFence(UINT64 v)
+{
+    if (v == 0 || fence_-&gt;GetCompletedValue() &gt;= v) return;
+    fence_-&gt;SetEventOnCompletion(v, fenceEvent_);
+    WaitForSingleObject(fenceEvent_, INFINITE);
+}
+
+void Transition(ID3D12Resource *r, D3D12_RESOURCE_STATES from,
+                D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = r;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter  = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd_-&gt;ResourceBarrier(1, &amp;b);
+}
+
+/* 24. SHUTDOWN. Wait for everything, then let ComPtr free. */
+void Shutdown()
+{
+    queue_-&gt;Signal(fence_.Get(), nextFence_);
+    WaitForFence(nextFence_);
+    CloseHandle(fenceEvent_);
+}
+};   /* class TriangleApp */</code></pre>
+
+<div class="danger">
+<b>The four blank-screen causes, in order of frequency</b>
+<p><strong>1.</strong> <code>SampleMask</code> left at 0. <strong>2.</strong> Scissor rect not set, so it is
+{0,0,0,0}. <strong>3.</strong> <code>RenderTargetWriteMask</code> left at 0. <strong>4.</strong> Backface
+culling with the winding order you did not think about. None of the four produces an error message. If you
+get a clear colour but no triangle, work down that list before anything else.</p>
+</div>
+
+<h2 id="extend">Where to go from here</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Next step</th><th>What it teaches</th></tr></thead>
+<tbody>
+<tr><td>Add a constant buffer with a rotation matrix</td><td>Root descriptors, per-frame upload, and the
+lifetime rule (<a href="gpu-15-dx12-pso.html">chapter 15</a>)</td></tr>
+<tr><td>Move the vertex buffer to a DEFAULT heap</td><td>Staging buffers, copies and the barrier that follows
+(<a href="gpu-14-dx12-resources.html">chapter 14</a>)</td></tr>
+<tr><td>Add a depth buffer</td><td>DSV heaps, and reversed-Z (<a href="gpu-08-rasterisation.html">chapter
+8</a>)</td></tr>
+<tr><td>Add a texture</td><td>Descriptor heaps, SRVs, <code>UpdateSubresources</code> and static
+samplers</td></tr>
+<tr><td>Draw 10,000 instances</td><td><code>DrawInstanced</code>, and where the real CPU cost is</td></tr>
+<tr><td>Handle window resize</td><td>Flush, release the backbuffers, <code>ResizeBuffers</code>, recreate
+RTVs — a surprising amount of care</td></tr>
+<tr><td>Record from four threads</td><td>Allocator-per-thread and barrier consistency
+(<a href="gpu-13-dx12-commands.html">chapter 13</a>)</td></tr>
+<tr><td>Capture it in PIX</td><td>What a frame actually looks like to a tool</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Clear colour appears, no triangle</td><td>One of the four causes above</td></tr>
+<tr><td>Nothing at all, not even the clear</td><td>Missing barrier to <code>RENDER_TARGET</code>, or the RTV
+handle offset is wrong</td></tr>
+<tr><td>Garbage geometry</td><td>Vertex stride or input layout offsets do not match the struct</td></tr>
+<tr><td>PSO creation fails</td><td>RTV format does not match the swap chain, or semantics do not match the
+shader</td></tr>
+<tr><td><code>Present</code> fails validation</td><td>Backbuffer not returned to <code>PRESENT</code>
+state</td></tr>
+<tr><td>Crash or corruption after a few seconds</td><td>Allocator reset without waiting on the fence</td></tr>
+<tr><td>Crash on exit</td><td>No flush before releasing resources</td></tr>
+<tr><td>Swap chain creation fails</td><td>MSAA requested on a flip-model swap chain, or the wrong swap
+effect</td></tr>
+<tr><td>Alt-Enter does something strange</td><td><code>MakeWindowAssociation</code> not
+called</td></tr>
+<tr><td>Second frame renders into the first buffer</td><td>Assumed <code>(frame+1)%N</code> instead of asking
+<code>GetCurrentBackBufferIndex</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the startup steps in order and say why the debug layer must be first.</li>
+  <li>Explain why the swap chain is created from the queue rather than the device.</li>
+  <li>Say why <code>SampleMask</code> and the write mask must be set explicitly.</li>
+  <li>Give the four blank-screen causes and how to distinguish them.</li>
+  <li>Explain why the vertex buffer here is in an UPLOAD heap and why that is a shortcut.</li>
+  <li>Say why the allocator is reset before the list, and what the fence protects.</li>
+  <li>Explain the two places primitive topology is specified and why both are needed.</li>
+  <li>Explain why the backbuffer index is queried rather than computed.</li>
+  <li>Say what must happen at shutdown and what goes wrong without it.</li>
+  <li>Get the triangle on screen, then break it four ways deliberately and recognise each symptom.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

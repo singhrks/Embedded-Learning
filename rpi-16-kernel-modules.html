@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Writing and loading a module on the Pi | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Writing and loading a module on the Pi</h1>
+<p class="lead">The <a href="lx-15-modules.html">Linux track</a> covers modules in general. This chapter
+is the Pi-specific loop: how to build against the running kernel without building the kernel, how to iterate
+in seconds, and how to recover when your module wedges the board.</p>
+
+<h2 id="headers">Headers, not a kernel build</h2>
+
+<pre><code># You do NOT need to build a kernel to build a module. You
+# need the headers and build metadata for the RUNNING one.
+
+$ sudo apt install raspberrypi-kernel-headers
+$ ls -l /lib/modules/$(uname -r)/build
+lrwxrwxrwx ... build -> /usr/src/linux-headers-6.6.51+rpt-rpi-2712
+
+# If that symlink is missing or dangling, nothing below
+# works, and the error is a confusing one about a missing
+# Makefile. Check it first.
+
+# PIN THE KERNEL (chapter 04), or an apt upgrade will
+# replace it and your module will stop loading against the
+# new one while the headers still describe the old:
+$ sudo apt-mark hold raspberrypi-kernel raspberrypi-kernel-headers
+
+# CROSS-COMPILING A MODULE needs the kernel SOURCE tree,
+# prepared to match the target. This is the one case where
+# chapter 15's tree is required even though you are not
+# installing a kernel:
+$ cd linux
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+       bcm2712_defconfig
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+       modules_prepare
+$ make -C /path/to/linux M=$PWD ARCH=arm64 \
+       CROSS_COMPILE=aarch64-linux-gnu- modules
+
+# The source must be the SAME VERSION as the running
+# kernel, or the module is rejected at load time with a
+# vermagic mismatch. Native building sidesteps this
+# entirely, which is why it is the recommended route here.
+</code></pre>
+
+<h2 id="hello">The smallest useful module</h2>
+
+<pre><code>/* pidev.c - a character device that reports board info.
+   Enough structure to be a real driver, small enough to
+   read in one sitting.                                    */
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/of.h&gt;
+
+#define DEVNAME "pidev"
+
+static dev_t         devno;
+static struct cdev   pidev_cdev;
+static struct class *pidev_class;
+
+static int count;
+module_param(count, int, 0644);
+MODULE_PARM_DESC(count, "an example parameter");
+/* Appears at /sys/module/pidev/parameters/count and can be
+   written at runtime because of the 0644. Excellent for
+   development knobs.                                       */
+
+static ssize_t pidev_read(struct file *f, char __user *buf,
+                          size_t len, loff_t *off)
+{
+    char tmp[128];
+    const char *model = "unknown";
+    struct device_node *root;
+    int n;
+
+    /* Read the board model straight out of the device tree
+       the firmware handed us (chapter 03).                 */
+    root = of_find_node_by_path("/");
+    if (root) {
+        of_property_read_string(root, "model", &amp;model);
+        of_node_put(root);        /* refcounted - releasing
+                                     it matters             */
+    }
+
+    n = scnprintf(tmp, sizeof(tmp), "%s\ncount=%d\n", model, count);
+
+    /* simple_read_from_buffer handles the offset and the
+       copy_to_user, including the partial-read case that
+       hand-rolled versions get wrong.                      */
+    return simple_read_from_buffer(buf, len, off, tmp, n);
+}
+
+static const struct file_operations pidev_fops = {
+    .owner = THIS_MODULE,
+    .read  = pidev_read,
+};
+
+static int __init pidev_init(void)
+{
+    int rc;
+
+    rc = alloc_chrdev_region(&amp;devno, 0, 1, DEVNAME);
+    if (rc) return rc;
+
+    cdev_init(&amp;pidev_cdev, &amp;pidev_fops);
+    rc = cdev_add(&amp;pidev_cdev, devno, 1);
+    if (rc) goto err_cdev;
+
+    /* Creating a class and device makes udev produce
+       /dev/pidev automatically. Without it you would have
+       to mknod by hand.                                    */
+    pidev_class = class_create(DEVNAME);
+    if (IS_ERR(pidev_class)) { rc = PTR_ERR(pidev_class); goto err_class; }
+    device_create(pidev_class, NULL, devno, NULL, DEVNAME);
+
+    pr_info("pidev: loaded, major=%d\n", MAJOR(devno));
+    return 0;
+
+/* Unwind in EXACTLY reverse order. Getting this wrong is
+   the most common module bug, and it only shows up when
+   something fails - i.e. rarely, and at the worst time.
+   The Linux track's error-handling chapter covers the
+   pattern.                                                 */
+err_class:
+    cdev_del(&amp;pidev_cdev);
+err_cdev:
+    unregister_chrdev_region(devno, 1);
+    return rc;
+}
+
+static void __exit pidev_exit(void)
+{
+    device_destroy(pidev_class, devno);
+    class_destroy(pidev_class);
+    cdev_del(&amp;pidev_cdev);
+    unregister_chrdev_region(devno, 1);
+    pr_info("pidev: unloaded\n");
+}
+
+module_init(pidev_init);
+module_exit(pidev_exit);
+MODULE_LICENSE("GPL");           /* NOT optional - a non-GPL
+                                    module cannot use most
+                                    exported symbols and
+                                    taints the kernel      */
+MODULE_AUTHOR("you");
+MODULE_DESCRIPTION("Pi board info character device");
+</code></pre>
+
+<pre><code># Makefile - kbuild, not ordinary make. The "obj-m" line is
+# the whole interface.
+
+obj-m += pidev.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# Note the TAB before $(MAKE). Make requires tabs; a space
+# gives "missing separator".
+
+$ make
+$ sudo insmod pidev.ko count=7
+$ cat /dev/pidev
+Raspberry Pi 5 Model B Rev 1.0
+count=7
+$ dmesg | tail -2
+$ echo 42 | sudo tee /sys/module/pidev/parameters/count
+$ sudo rmmod pidev
+</code></pre>
+
+<h2 id="loop">The iteration loop</h2>
+
+<pre><code># Combine chapter 07's sync-and-build with insmod/rmmod and
+# you get a kernel development cycle of a few seconds.
+
+# --- reload.sh, on the Pi ---
+#!/usr/bin/env bash
+set -euo pipefail
+sudo rmmod pidev 2&gt;/dev/null || true    # ignore "not loaded"
+make
+sudo insmod pidev.ko "$@"
+sudo dmesg -w &amp;                         # follow the log
+sleep 0.3; cat /dev/pidev
+
+# --- from the host, on every save ---
+$ find . -name '*.c' -o -name Makefile | \
+      entr -c ./push.sh
+
+# TAIL THE LOG IN A SECOND WINDOW, always:
+$ ssh pi 'sudo dmesg -w'
+
+# pr_info and friends go to the kernel ring buffer, NOT to
+# your terminal. Levels, and where they surface:
+pr_emerg / pr_alert / pr_crit / pr_err / pr_warn
+pr_notice / pr_info / pr_debug
+#   pr_debug is compiled out unless DEBUG is defined or
+#   CONFIG_DYNAMIC_DEBUG lets you enable it at runtime:
+$ echo 'module pidev +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+#   That turns on every pr_debug in the module with no
+#   rebuild - the single most useful trick in this chapter
+#   (chapter 17 covers it fully).
+
+# Make the log readable while iterating:
+$ sudo dmesg -n 8            # everything to the console
+$ sudo dmesg -C              # clear before a test run
+$ sudo dmesg -T              # human timestamps
+</code></pre>
+
+<div class="danger">
+<b>Your module runs with no safety net</b>
+<p>A null dereference in userspace is a segfault; in the kernel it is an oops that may take the machine with
+it. A module that leaks memory leaks it until reboot. A module that deadlocks holding a lock the filesystem
+needs will hang every process that touches the disk — including your SSH session, so the board looks dead
+while the kernel is still running. This is exactly why <a href="rpi-05-serial-console.html">chapter 05</a>'s
+serial console and its SysRq keys matter, and why <a href="rpi-07-remote-workflow.html">chapter 07</a>
+recommends a second board. Expect to power-cycle. Do not develop modules on a board holding anything you
+care about.</p>
+</div>
+
+<h2 id="oops">Reading an oops</h2>
+
+<pre><code>[  842.113] Unable to handle kernel NULL pointer dereference at
+           virtual address 0000000000000000
+[  842.113] Mem abort info:
+[  842.113]   ESR = 0x0000000096000004
+[  842.113] CPU: 2 PID: 1893 Comm: cat Tainted: G           O
+[  842.113] Hardware name: Raspberry Pi 5 Model B Rev 1.0 (DT)
+[  842.113] pc : pidev_read+0x38/0xd0 [pidev]
+[  842.113] lr : vfs_read+0xb8/0x2a0
+[  842.113] Call trace:
+[  842.113]  pidev_read+0x38/0xd0 [pidev]
+[  842.113]  vfs_read+0xb8/0x2a0
+[  842.113]  ksys_read+0x70/0x108
+
+# READ IT LIKE THIS:
+#   ESR                the ARM fault syndrome register.
+#                      Decode it with the ARM track's
+#                      chapter 29 - it names the exact
+#                      fault type.
+#   pc                 where it died: function + offset
+#   Tainted: G ... O   'O' = an out-of-tree module is
+#                      loaded. Yours.
+#   Call trace         who called whom
+
+# TURN THE OFFSET INTO A LINE:
+$ aarch64-linux-gnu-addr2line -e pidev.ko -f -i 0x38
+pidev_read
+/home/me/pidev/pidev.c:41
+
+# Or, if the module was built with debug info:
+$ ./scripts/decode_stacktrace.sh pidev.ko . &lt; oops.txt
+
+# KEEP THE .ko WITH SYMBOLS. Once you rebuild, the offsets
+# no longer correspond and the oops you saved is
+# undecodable. Copy the .ko aside before iterating.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"missing separator" from make</td><td>Spaces instead of a tab in the Makefile</td></tr>
+<tr><td>No rule to make target <code>modules</code></td><td><code>/lib/modules/$(uname -r)/build</code>
+missing — install headers</td></tr>
+<tr><td>insmod: "invalid module format"</td><td>Built against different kernel headers than the running
+kernel</td></tr>
+<tr><td>insmod: "unknown symbol"</td><td>Missing <code>MODULE_LICENSE("GPL")</code>, or a genuinely absent
+export</td></tr>
+<tr><td>rmmod: "device or resource busy"</td><td>Something still has the device open, or your refcounting is
+wrong</td></tr>
+<tr><td>Module stops loading after an update</td><td>Kernel replaced — hold the packages</td></tr>
+<tr><td><code>printk</code> output nowhere to be seen</td><td>It is in <code>dmesg</code>, not your
+terminal</td></tr>
+<tr><td><code>pr_debug</code> silent</td><td>Compiled out — enable via dynamic debug</td></tr>
+<tr><td>Board hangs, SSH dead, kernel alive</td><td>Deadlock in your module — use serial console and
+SysRq</td></tr>
+<tr><td>Oops offsets decode to nonsense</td><td>The <code>.ko</code> was rebuilt after the oops</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what you need to build a module, and what you do not.</li>
+  <li>Explain why the kernel packages should be held during module work.</li>
+  <li>Explain what breaks when module and kernel versions differ.</li>
+  <li>Say what <code>MODULE_LICENSE("GPL")</code> affects beyond legality.</li>
+  <li>Explain why init error paths unwind in reverse order and when that code runs.</li>
+  <li>Say what <code>class_create</code> plus <code>device_create</code> buys you.</li>
+  <li>Give the runtime trick that enables every <code>pr_debug</code> without rebuilding.</li>
+  <li>Explain why a module deadlock can make a live board look dead.</li>
+  <li>Decode the fields of an oops: <code>pc</code>, <code>Tainted</code>, call trace.</li>
+  <li>Explain why you must keep the <code>.ko</code> to decode an oops later.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

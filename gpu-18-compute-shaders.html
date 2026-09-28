@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compute shaders and GPGPU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Compute shaders and GPGPU</h1>
+<p class="lead">The graphics pipeline with the graphics removed: no vertices, no rasteriser, no render
+target. Just a grid of threads, groupshared memory and read-write buffers. It is the same hardware as a pixel
+shader with the fixed-function stages switched off, and it is how most GPU work is written today.</p>
+
+<h2 id="model">The dispatch model</h2>
+
+<pre class="diagram">   Dispatch(gx, gy, gz)   launches gx*gy*gz THREAD GROUPS.
+   [numthreads(tx,ty,tz)] says each group has tx*ty*tz threads.
+
+     total threads = gx*gy*gz * tx*ty*tz
+
+   THE IDS available in the shader:
+
+     SV_GroupID           which group am I in       (gx,gy,gz)
+     SV_GroupThreadID     where in my group         (tx,ty,tz)
+     SV_DispatchThreadID  global = GroupID*size + GroupThreadID
+     SV_GroupIndex        flattened index within the group
+
+   THE HIERARCHY, and it is the same as CUDA's with different
+   names (chapter 1):
+
+     thread          one lane
+     wave/warp       32 (or 64) threads in lockstep
+     THREAD GROUP    up to 1024 threads. Shares GROUPSHARED
+                     memory and can use GroupMemoryBarrier.
+                     Runs entirely on one compute unit.
+     dispatch        all groups. NO synchronisation between
+                     groups, and no guaranteed order.
+
+   THE RULE: cooperation within a group, none between groups.
+   Need a global barrier? That is a second Dispatch.
+
+   GROUP SIZE: use a multiple of the wave size. 64 is the
+   safe default - one wave on AMD, two on NVIDIA - and 256 is
+   the usual choice for 1D work. A group of 1 wastes 31 lanes
+   of every wave.</pre>
+
+<pre><code>// A compute shader, complete.
+// dxc -T cs_6_0 -E CSMain -Fo cs.cso blur.hlsl
+
+Texture2D&lt;float4&gt;   Input  : register(t0);
+RWTexture2D&lt;float4&gt; Output : register(u0);   // UAV: writable
+
+cbuffer Params : register(b0) { uint2 Size; float Radius; };
+
+[numthreads(8, 8, 1)]           // 64 threads - one wave on AMD
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy &gt;= Size)) return;      // bounds check: the
+                                         // grid is rounded up
+    float4 sum = 0;
+    int    n   = 0;
+    for (int dy = -2; dy &lt;= 2; dy++)
+        for (int dx = -2; dx &lt;= 2; dx++) {
+            int2 p = clamp(int2(id.xy) + int2(dx, dy),
+                           int2(0,0), int2(Size) - 1);
+            sum += Input[p];             // [] is a LOAD, not a
+            n++;                         // Sample - no filter,
+        }                                // no mip, no sampler
+    Output[id.xy] = sum / n;
+}</code></pre>
+
+<pre><code>/* Dispatching it from DX12. */
+
+cmd-&gt;SetPipelineState(computePSO.Get());
+cmd-&gt;SetComputeRootSignature(computeRootSig.Get());
+    /* NOTE: SetCompute*, not SetGraphics*. Graphics and
+       compute root arguments are SEPARATE sets of state on the
+       same command list. Using the wrong setter binds nothing
+       and produces no error. */
+
+ID3D12DescriptorHeap *heaps[] = { srvUavHeap.Get() };
+cmd-&gt;SetDescriptorHeaps(1, heaps);
+cmd-&gt;SetComputeRootDescriptorTable(0, srvUavHeap.Gpu(0));
+
+/* ROUND UP - the last group is partly out of bounds, which is
+   why the shader needs its bounds check. */
+UINT gx = (width  + 7) / 8;
+UINT gy = (height + 7) / 8;
+cmd-&gt;Dispatch(gx, gy, 1);
+
+/* THEN A UAV BARRIER before anything reads the output. */
+D3D12_RESOURCE_BARRIER uav = {};
+uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+uav.UAV.pResource = outputTex.Get();
+cmd-&gt;ResourceBarrier(1, &amp;uav);
+
+/* And a transition if a pixel shader will sample it: */
+Transition(outputTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);</code></pre>
+
+<div class="key">
+<b>Compute PSOs are separate objects</b>
+<p><code>CreateComputePipelineState</code> takes a much smaller desc — a root signature and a compute shader,
+nothing else. There is no blend state, no rasteriser, no render-target format, because none of those stages
+exist. That also means a compute PSO is far cheaper to create than a graphics one, which is why compute-heavy
+engines have far fewer PSO problems.</p>
+</div>
+
+<h2 id="groupshared">Groupshared memory</h2>
+
+<pre><code>/* The whole reason thread groups exist: a fast scratchpad
+   the group shares. Same hardware as CUDA's __shared__, same
+   banking rules (chapter 4).                              */
+
+groupshared float tile[10][10];      // 8x8 plus a 1-pixel
+                                     // border
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 gid : SV_GroupID,
+            uint3 tid : SV_GroupThreadID,
+            uint3 did : SV_DispatchThreadID)
+{
+    /* COOPERATIVE LOAD: each thread fetches one texel, and a
+       few also fetch the border. The 3x3 blur below then
+       reads 9 texels per thread from GROUPSHARED memory
+       instead of 9 from the texture cache. */
+    tile[tid.y + 1][tid.x + 1] = Input[did.xy].r;
+    if (tid.x == 0) tile[tid.y+1][0] = Input[did.xy - int2(1,0)].r;
+    if (tid.x == 7) tile[tid.y+1][9] = Input[did.xy + int2(1,0)].r;
+    /* ... and the same for y, and the corners ... */
+
+    GroupMemoryBarrierWithGroupSync();
+    /* The barrier. THREE VARIANTS, and choosing wrong is
+       either a bug or wasted time:
+         GroupMemoryBarrier()               groupshared only,
+                                            no thread sync
+         GroupMemoryBarrierWithGroupSync()  groupshared + all
+                                            threads arrive
+         DeviceMemoryBarrierWithGroupSync() also UAV/texture
+                                            writes - slower  */
+
+    float sum = 0;
+    for (int dy = 0; dy &lt; 3; dy++)
+        for (int dx = 0; dx &lt; 3; dx++)
+            sum += tile[tid.y + dy][tid.x + dx];
+    Output[did.xy] = sum / 9;
+}
+
+/* THE SAVING: without the tile, a 3x3 blur reads each texel
+   NINE times. With it, once. On a bandwidth-bound filter
+   that is close to a 9x reduction in traffic.
+
+   THE LIMITS:
+     * 32 KB per group typically (16 KB on older hardware)
+     * more groupshared -> fewer groups resident -> lower
+       occupancy (chapter 5). It is the same budget trade as
+       registers.
+     * ALL THREADS IN THE GROUP MUST REACH THE BARRIER. Putting
+       GroupMemoryBarrierWithGroupSync inside a divergent
+       branch hangs the group - and on a GPU that means a TDR
+       and a device removal.                               */</code></pre>
+
+<div class="warn">
+<b>The early-return bug</b>
+<p><code>if (any(id.xy &gt;= Size)) return;</code> is correct in the first example and <em>fatal</em> in the
+second: threads that returned never reach the barrier, so the rest of the group waits for ever. When a group
+uses barriers, every thread must run to the end — clamp the coordinates instead of returning, or guard only
+the final write. This produces a GPU hang, a two-second TDR and a device removal, which is a confusing way to
+discover a one-line mistake.</p>
+</div>
+
+<h2 id="patterns">The patterns worth knowing</h2>
+
+<pre><code>/* PARALLEL REDUCTION - sum a buffer. The canonical example,
+   and the structure of half of all compute work. */
+
+groupshared float partial[256];
+
+[numthreads(256, 1, 1)]
+void Reduce(uint3 did : SV_DispatchThreadID,
+            uint  idx : SV_GroupIndex,
+            uint3 gid : SV_GroupID)
+{
+    partial[idx] = (did.x &lt; Count) ? Input[did.x] : 0.0;
+    GroupMemoryBarrierWithGroupSync();
+
+    /* Tree reduction: halve the active threads each step. */
+    for (uint s = 128; s &gt; 0; s &gt;&gt;= 1) {
+        if (idx &lt; s) partial[idx] += partial[idx + s];
+        GroupMemoryBarrierWithGroupSync();
+        /* the barrier is OUTSIDE the if - every thread reaches
+           it, including the ones with nothing to do */
+    }
+
+    if (idx == 0) Output[gid.x] = partial[0];
+    /* one partial per group. Dispatch again over those, until
+       one value remains. */
+}
+
+/* BETTER: use wave intrinsics for the last steps and skip
+   most of the barriers entirely (chapter 2): */
+    float v = WaveActiveSum(myValue);        // whole wave, no
+                                             // memory, no
+                                             // barrier
+    if (WaveIsFirstLane()) partial[waveId] = v;
+    GroupMemoryBarrierWithGroupSync();       // ONE barrier
+    if (idx &lt; numWaves) {
+        v = WaveActiveSum(partial[idx]);
+        if (idx == 0) Output[gid.x] = v;
+    }
+/* Two barriers instead of eight, and far less groupshared
+   traffic. This is the modern shape of a reduction. */
+
+/* ATOMICS - when you need one global result and can tolerate
+   contention: */
+    InterlockedAdd(Counter[0], 1);
+    InterlockedMax(MaxVal[0], asuint(myValue));   // float via
+                                                  // bit trick
+/* Every thread hitting one address serialises at L2. AGGREGATE
+   FIRST - reduce within the wave, then have one lane do the
+   atomic. That turns 32 atomics into 1: */
+    uint total = WaveActiveCountBits(predicate);
+    if (WaveIsFirstLane()) InterlockedAdd(Counter[0], total);
+
+/* APPEND BUFFERS - a GPU-side vector, for culling and
+   compaction: */
+    AppendStructuredBuffer&lt;Item&gt; Visible : register(u1);
+    if (IsVisible(item)) Visible.Append(item);
+/* The counter is an atomic underneath, so the same
+   aggregation advice applies for hot cases. */
+
+/* INDIRECT DISPATCH - the GPU decides its own work size,
+   with no CPU round trip: */
+    cmd-&gt;ExecuteIndirect(cmdSig, 1, argBuffer, 0, nullptr, 0);
+/* argBuffer was written by an earlier compute pass. This is
+   how GPU-driven rendering works: cull on the GPU, write the
+   draw arguments, and execute them without the CPU ever
+   learning how many objects survived.                      */</code></pre>
+
+<h2 id="uses">What compute is used for</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Use</th><th>Why compute rather than a pixel shader</th></tr></thead>
+<tbody>
+<tr><td>Post-processing: blur, bloom, tonemap</td><td>Groupshared memory removes redundant texture reads; no
+rasteriser overhead</td></tr>
+<tr><td>Particle simulation</td><td>Read-write buffers; no vertex/fragment structure to fight</td></tr>
+<tr><td>Culling and LOD selection</td><td>Feeds <code>ExecuteIndirect</code>; keeps the CPU out of the
+loop</td></tr>
+<tr><td>Light binning (clustered/forward+)</td><td>Arbitrary data structures, atomics, append buffers</td></tr>
+<tr><td>Skinning, cloth, physics</td><td>Large uniform data-parallel work</td></tr>
+<tr><td>Mipmap and BVH generation</td><td>Hierarchical, needs multiple dispatches with barriers</td></tr>
+<tr><td>ML inference</td><td>What tensor cores are for; usually via DirectML or ONNX rather than by
+hand</td></tr>
+<tr><td>Sorting, scan, histogram</td><td>Classic parallel primitives; use a library</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Async compute is where the free performance is</b>
+<p>A shadow pass is geometry- and depth-bound; a compute post-process is ALU-bound. Run them on separate
+queues (<a href="gpu-13-dx12-commands.html">chapter 13</a>) and they fill each other's idle units — typically
+5–15% of frame time for no algorithmic change. It is one of the few optimisations that costs only plumbing,
+and it is why compute-shader post-processing displaced pixel-shader post-processing.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>GPU hang, TDR, device removed</td><td>A barrier not reached by every thread — usually an early
+<code>return</code></td></tr>
+<tr><td>Wrong results at tile edges</td><td>Cooperative load missing the border, or a missing
+barrier</td></tr>
+<tr><td>Reader sees stale data</td><td>No UAV barrier between the writing and reading dispatches</td></tr>
+<tr><td>Bindings appear to do nothing</td><td><code>SetGraphicsRoot*</code> used instead of
+<code>SetComputeRoot*</code></td></tr>
+<tr><td>Last row or column of the image is wrong</td><td>Grid not rounded up, or the bounds check is
+missing</td></tr>
+<tr><td>Occupancy collapses after adding groupshared</td><td>Groupshared is a budget like registers</td></tr>
+<tr><td>Atomics dominate the profile</td><td>Every thread hitting one address — aggregate per wave
+first</td></tr>
+<tr><td>Group size 32 is slower than 64 on AMD</td><td>Half a wavefront idle on wave64 hardware</td></tr>
+<tr><td>Async compute gives no gain</td><td>Over-synchronised, or both passes bound by the same unit</td></tr>
+<tr><td>Reduction result is non-deterministic</td><td>Floating-point addition is not associative — expected,
+not a bug</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute the total thread count from a dispatch and a <code>numthreads</code> declaration.</li>
+  <li>Name the four system-value IDs and what each gives you.</li>
+  <li>Say what can synchronise within a group and what cannot between groups.</li>
+  <li>Explain why group size should be a multiple of the wave size.</li>
+  <li>Write a cooperative tile load and say what traffic it saves.</li>
+  <li>Name the three barrier intrinsics and when each applies.</li>
+  <li>Explain the early-return bug and its symptom.</li>
+  <li>Write a tree reduction, then rewrite it with wave intrinsics and count the barriers saved.</li>
+  <li>Explain wave aggregation for atomics and the factor it saves.</li>
+  <li>Describe what <code>ExecuteIndirect</code> enables that the CPU path cannot.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

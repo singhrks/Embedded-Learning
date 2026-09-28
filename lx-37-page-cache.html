@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The page cache and writeback | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The page cache and writeback</h1>
+<p class="lead"><a href="lx-36-vfs.html">Chapter 41</a> showed how <code>read()</code> reaches a filesystem's
+own code through the VFS. This chapter is what actually sits between that call and the disk: the page cache,
+which is why a second read of the same file is nearly free, why "free" memory on a healthy Linux box is
+usually a lie, and why a write can succeed and still be lost on a power cut.</p>
+
+<h2 id="what">Reads and writes go through memory, not straight to disk</h2>
+
+<p>Reading a file does not usually touch the disk, and writing one almost never does — not immediately. Between your program and the storage sits a cache of file contents in RAM, and nearly every surprising thing about file I/O performance follows from it.</p>
+
+<pre class="diagram">   read(fd, buf, count) DOES NOT, IN THE COMMON CASE, TOUCH
+   THE DISK AT ALL:
+
+     read() call
+        |
+        v
+     PAGE CACHE - is this file's data already resident in a
+                  page of RAM, indexed by (inode, offset)?
+        |
+        +-- YES: copy straight out of RAM into buf. Done.
+        |        No disk I/O whatsoever. This is why reading
+        |        the same file twice in a row is dramatically
+        |        faster the second time.
+        |
+        +-- NO:  read the page from the underlying block
+                 device INTO the page cache first, THEN copy
+                 out of it - so every subsequent read of that
+                 same page is now a cache hit.
+
+   write() WORKS THE SAME WAY IN REVERSE: by default, a
+   write() just modifies the page IN THE CACHE and marks it
+   DIRTY. It does NOT wait for the disk. The syscall returns
+   successfully long before the data is actually durable on
+   storage - see the writeback section below for why that
+   matters.</pre>
+
+<div class="key">
+<b>"Free" memory on a healthy Linux system is a misleading number</b>
+<p>The page cache uses whatever RAM is not otherwise needed — <code>free -h</code>'s "available" column, not
+its "free" column, is the number that actually matters, because the kernel will happily reclaim clean
+(non-dirty) cache pages instantly under memory pressure with zero cost, since their content can always be
+re-read from disk. A Linux system reporting a few hundred megabytes "free" and many gigabytes cached is not low
+on memory — the opposite reading, jumping to add more RAM because "free" looks small, is one of the most common
+and unnecessary reactions to a completely healthy system.</p>
+</div>
+
+<h2 id="dirty">Dirty pages: memory the disk does not yet agree with</h2>
+
+<p>When you write to a file the data goes into that cache and is marked as changed but not yet saved. The kernel then decides when to actually write it out, and the gap between those two moments is where both the performance win and the risk of data loss live.</p>
+
+<pre class="diagram">   A DIRTY PAGE is one that has been WRITTEN in the page
+   cache but not yet flushed to the underlying storage. The
+   kernel deliberately BATCHES and DELAYS this flush - called
+   WRITEBACK - rather than writing synchronously on every
+   write() call, because:
+
+     · combining many small writes into fewer, larger disk
+       operations is dramatically more efficient
+     · a page written multiple times in quick succession only
+       needs to reach disk ONCE, with its final content
+     · deferring the actual I/O off the calling thread's
+       critical path is most of why write() feels instant
+
+   WRITEBACK IS TRIGGERED BY THREE THINGS:
+     1. TIME - a dirty page older than dirty_expire_centisecs
+        (default 30s) gets flushed on the next writeback pass
+     2. VOLUME - total dirty memory crossing
+        vm.dirty_background_ratio triggers background
+        writeback quietly, in a kernel thread
+     3. PRESSURE - crossing vm.dirty_ratio forces the WRITING
+        PROCESS ITSELF to block and do writeback synchronously
+        - this is the mechanism behind a write() call that
+        suddenly, visibly stalls under heavy I/O load</pre>
+
+<pre><code># See dirty memory right now:
+grep -i dirty /proc/meminfo
+    Dirty:            18432 kB
+    Writeback:          512 kB    /* currently being flushed */
+
+# The two thresholds, as a percentage of available memory:
+cat /proc/sys/vm/dirty_background_ratio    # quiet flushing starts
+cat /proc/sys/vm/dirty_ratio                # writers start blocking
+
+# Force ALL dirty pages to disk right now, synchronously:
+sync
+# Force just one file's dirty pages and metadata to disk,
+# and BLOCK until the device confirms it is durable:
+fsync(fd);       /* the ONLY way to know data actually
+                     survived a crash - write() alone never
+                     guarantees this                          */
+fdatasync(fd);   /* like fsync, but skips flushing metadata
+                     that does not affect reading the data back
+                     (e.g. access time) - slightly cheaper     */
+</code></pre>
+
+<div class="danger">
+<b>A successful write() is not a durability guarantee</b>
+<p><code>write()</code> returning success means the data reached the page cache — nothing more. If the machine
+loses power before writeback runs, every dirty page not yet flushed is gone, even though the application
+already received a success return value and may have told a user, or another system, that the data was saved.
+Any program with a real durability requirement — a database committing a transaction, a logger recording an
+event before acknowledging it — must call <code>fsync()</code> (or open the file with <code>O_DSYNC</code>)
+and treat that call's success, not <code>write()</code>'s, as the actual durability guarantee.</p>
+</div>
+
+<h2 id="mmap">mmap: the page cache visible directly, with no copy at all</h2>
+
+<p>Instead of copying data out of the cache into your buffer, a program can ask for the cache pages themselves to appear in its address space. There is then exactly one copy of the data in memory, shared by everyone touching that file.</p>
+
+<pre><code>void *p = mmap(NULL, length, PROT_READ | PROT_WRITE,
+               MAP_SHARED, fd, 0);
+/* This does NOT read the file into a separate buffer. It
+   maps the file's PAGE CACHE PAGES directly into the
+   process's address space - touching p[100] for the first
+   time takes a page fault (the same mechanism chapter 39's
+   copy-on-write section used, here reading from disk instead
+   of copying a page), which pulls that one page of the file
+   into the cache and maps it in, on demand.
+
+   WITH MAP_SHARED, a write to p[100] dirties the SAME PAGE
+   CACHE PAGE that read()/write() on this file would use -
+   there is exactly one copy of the file's data in memory,
+   regardless of whether it is accessed through mmap or
+   through ordinary read()/write() calls, and the two views
+   stay consistent because they are, literally, the same
+   physical pages.
+
+   THIS IS WHY mmap CAN BE FASTER FOR LARGE, RANDOMLY-ACCESSED
+   FILES: no copy from kernel buffer to user buffer at all,
+   just a page-table entry pointing straight at the cache
+   page - avoiding exactly the copy chapter 09's user-copy
+   chapter otherwise describes as unavoidable for read().    */
+</code></pre>
+
+<h2 id="readahead">Readahead: prefetching before you ask</h2>
+
+<p>If you are reading a file from start to finish, the kernel can see that pattern and fetch the next part before you ask for it — so the data is already in memory by the time you need it. This is why sequential reads often outrun the drive's own latency.</p>
+
+<pre class="diagram">   THE KERNEL WATCHES A FILE'S ACCESS PATTERN. If reads are
+   SEQUENTIAL, it starts speculatively reading FURTHER AHEAD
+   than what was actually requested, so that by the time the
+   application asks for the next chunk, it is often already
+   sitting in the page cache.
+
+     Application reads offset 0-4KB
+     Kernel notices a sequential pattern, and prefetches
+     offset 4KB-132KB in the background while the app is
+     still processing the first chunk
+
+     Application reads offset 4KB-8KB
+        -&gt; ALREADY IN CACHE. No disk wait at all.
+
+   THIS IS WHY SEQUENTIAL FILE READS ARE OFTEN FASTER THAN THE
+   RAW DEVICE THROUGHPUT WOULD SUGGEST, AND WHY RANDOM ACCESS
+   PATTERNS DO NOT BENEFIT: readahead's entire value depends on
+   correctly guessing what comes next, which a sequential scan
+   makes easy and a random-access workload makes actively
+   counterproductive - which is exactly why `posix_fadvise()`
+   lets an application override the guess in either direction:
+
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);  /* disables
+                                                          readahead */</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"Free" memory looks nearly exhausted, system runs fine</td><td>Expected — most of it is reclaimable
+page cache; check "available," not "free"</td></tr>
+<tr><td>Data is lost after a power cut despite a successful <code>write()</code></td><td>The page was dirty and
+had not yet been flushed — the application needed <code>fsync()</code> for a durability guarantee</td></tr>
+<tr><td>A write() call occasionally stalls noticeably under heavy I/O</td><td>Dirty memory crossed
+<code>vm.dirty_ratio</code> and the calling process is now doing synchronous writeback itself</td></tr>
+<tr><td>Reading a file a second time is dramatically faster than the first</td><td>Expected — the page cache
+served it from RAM with no disk I/O</td></tr>
+<tr><td>Two processes see each other's writes to a shared <code>mmap</code> region instantly</td><td>Expected —
+both map the same underlying page cache pages, not separate copies</td></tr>
+<tr><td>Sequential file reads run faster than the raw device's rated throughput</td><td>Readahead is prefetching
+ahead of the application, hiding the latency</td></tr>
+<tr><td>A random-access workload benefits from disabling readahead</td><td>Expected — readahead's speculative
+reads are wasted work when the access pattern is not sequential</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what happens on a <code>read()</code> cache hit versus a cache miss.</li>
+  <li>Explain why "available" memory, not "free" memory, is the number that reflects real memory pressure.</li>
+  <li>Explain what a dirty page is and the three conditions that trigger writeback.</li>
+  <li>Explain why a successful <code>write()</code> is not a durability guarantee, and what call actually
+  provides one.</li>
+  <li>Explain why <code>MAP_SHARED mmap</code> writes are visible to ordinary <code>read()</code> calls on the
+  same file with no explicit synchronisation.</li>
+  <li>Explain readahead, and why it helps sequential access but not random access.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

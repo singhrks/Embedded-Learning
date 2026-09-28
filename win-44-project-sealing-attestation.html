@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: layer 4 — sealing, the secure kernel and attestation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: layer 4 — sealing, the secure kernel and attestation</h1>
+<p class="lead">The key so far dies with the process. This chapter makes it survive a reboot without ever
+becoming readable: the enclave asks <code>securekernel.exe</code> to seal it, VTL1 ring 0 does the work against
+a platform-rooted secret, and the resulting blob is stored on ordinary disk where anybody may read it and
+nobody may use it. Then the whole stack is run end to end and attacked.</p>
+
+<h2 id="layer4">What the fourth layer actually is</h2>
+
+<p>In the OP-TEE project layer 4 was a driver you wrote. Here it is code you cannot write, and the interesting
+question becomes what you are allowed to ask it for — which turns out to be a more useful question anyway.</p>
+
+<pre class="diagram">   THE CALL:  EnclaveSealData(...)          VTL1, ring 3
+                     │                       your enclave
+                     ▼
+              securekernel.exe               VTL1, ring 0
+                     │  derives a key from:
+                     │    · a platform secret, rooted in the
+                     │      TPM and established at boot
+                     │    · the IDENTITY of the caller, per
+                     │      the policy you pass in
+                     ▼
+              an opaque blob, handed back to you
+
+   YOU NEVER SEE THE SEALING KEY. You cannot ask for it, and
+   there is no API that returns it. The only thing you can do
+   with it is seal and unseal - which is the same arrangement
+   as an OP-TEE TA and its HUK-derived storage key.
+
+   WHY THIS IS A REAL LAYER AND NOT A LIBRARY CALL:
+
+     the work happens at a HIGHER PRIVILEGE than the caller,
+     using a secret the caller cannot reach, against hardware
+     the caller cannot address.
+
+   That sentence is also the definition of layer 4 in the
+   OP-TEE project. The mechanism is completely different; the
+   structure is identical.</pre>
+
+<h2 id="identity">The sealing policy is the interesting parameter</h2>
+
+<p>Sealing binds a blob to an identity, and you choose how tightly. This single argument decides whether your
+next build can still read yesterday's key — which is a product decision disguised as an enum.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Policy</th><th>Can unseal</th><th>Costs you</th></tr></thead>
+<tbody>
+<tr><td>Exact code</td><td>Only a byte-identical enclave image</td><td>Every rebuild, including a one-character
+fix, loses the key</td></tr>
+<tr><td>Same image</td><td>Any version of the same enclave image identity</td><td>A compromised later version
+can read earlier secrets</td></tr>
+<tr><td>Same family</td><td>Any enclave in the declared family</td><td>You must actually control the whole
+family</td></tr>
+<tr><td>Same author</td><td>Anything signed by the same author</td><td>The broadest, and the easiest to regret
+after an acquisition or a key rotation</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>For a signing key the right answer is usually "same image": a rebuild must not silently destroy the user's
+identity, but nothing signed by an unrelated team of yours should be able to sign on its behalf. The wrong
+answer is to pick the loosest policy because the tight one made testing annoying, which is the decision this
+table exists to interrupt.</p>
+
+<h2 id="seal">The enclave, with persistence</h2>
+
+<p>Three functions replace the throwaway <code>EnsureKey</code> from chapter 42. Note what is <em>not</em>
+here: no decision about where the file lives, and no attempt to protect it. The blob is designed to be public.</p>
+
+<pre><code>/* enclave/winsign_enclave.c - LAYER 3 calling LAYER 4 */
+
+/* The enclave has no file access of its own. It hands the
+   sealed blob out to the host, which stores it - and that
+   is fine, because a sealed blob is not a secret.        */
+
+static NTSTATUS SealKey(unsigned char *blobOut, ULONG cap,
+                        ULONG *blobLen)
+{
+    unsigned char raw[256];
+    ULONG rawLen = 0;
+    NTSTATUS status;
+
+    /* Export the private key INSIDE the enclave. This is the
+       only moment it exists in a buffer, and it is in
+       enclave memory the whole time.                      */
+    status = BCryptExportKey(g_key, NULL,
+                 BCRYPT_ECCPRIVATE_BLOB, raw, sizeof(raw),
+                 &amp;rawLen, 0);
+    if (!NT_OK(status))
+        return status;
+
+    /* THE CALL INTO LAYER 4. The identity policy is the
+       argument that matters; see the table above.         */
+    status = EnclaveSealData(raw, rawLen,
+                 ENCLAVE_IDENTITY_POLICY_SEAL_SAME_IMAGE,
+                 0,                 /* runtime policy      */
+                 blobOut, cap, blobLen);
+
+    SecureZeroMemory(raw, sizeof(raw));
+    return status;
+}
+
+static NTSTATUS UnsealKey(const unsigned char *blob,
+                          ULONG blobLen)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    unsigned char raw[256];
+    ULONG rawLen = 0;
+    ENCLAVE_IDENTITY id = {};
+    ULONG idFlags = 0;
+    NTSTATUS status;
+
+    /* blob came from VTL0. Its LENGTH is attacker-chosen and
+       its CONTENT is attacker-chosen; neither matters,
+       because unsealing authenticates it. A wrong blob
+       fails, it does not produce a wrong key.            */
+    if (blobLen == 0 || blobLen &gt; 4096)
+        return STATUS_INVALID_PARAMETER;
+
+    status = EnclaveUnsealData(blob, blobLen,
+                 raw, sizeof(raw), &amp;rawLen,
+                 &amp;id, &amp;idFlags);
+    if (!NT_OK(status))
+        return status;
+
+    status = BCryptOpenAlgorithmProvider(&amp;alg,
+                 BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0);
+    if (NT_OK(status)) {
+        status = BCryptImportKeyPair(alg, NULL,
+                     BCRYPT_ECCPRIVATE_BLOB, &amp;g_key,
+                     raw, rawLen, 0);
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+
+    SecureZeroMemory(raw, sizeof(raw));
+    return status;
+}
+
+/* Replaces EnsureKey. The host passes in whatever blob it
+   found on disk, or nothing on the very first run.       */
+static NTSTATUS LoadOrCreateKey(const unsigned char *blob,
+                                ULONG blobLen,
+                                unsigned char *newBlob,
+                                ULONG cap, ULONG *newLen)
+{
+    NTSTATUS status;
+
+    *newLen = 0;
+    if (g_key != NULL)
+        return 0;
+
+    if (blob != NULL &amp;&amp; blobLen &gt; 0) {
+        status = UnsealKey(blob, blobLen);
+        if (NT_OK(status))
+            return 0;
+        /* Deliberately NOT falling through to "generate a
+           new one" on failure. A blob that will not unseal
+           means something changed - a rebuild under an
+           exact-code policy, a different machine, or
+           tampering. Silently minting a new identity would
+           turn all three into a confusing non-event.     */
+        return status;
+    }
+
+    status = GenerateKey();     /* the generate half of
+                                   chapter 42's EnsureKey */
+    if (!NT_OK(status))
+        return status;
+
+    return SealKey(newBlob, cap, newLen);
+}</code></pre>
+
+<div class="key">
+<b>Why refusing to regenerate is the right behaviour</b>
+<p>Falling back to generating a fresh key when unsealing fails makes the first run and the
+<em>compromised</em> run look identical, and it makes a failed upgrade look like a successful one. Every
+signature made afterwards verifies against a public key nobody expected, and the failure surfaces days later as
+"verification stopped working" with no trace of when. Failing loudly at the point of unsealing costs one
+confusing error message the first time you rebuild, and saves the investigation.</p>
+</div>
+
+<h2 id="attest">Attestation: proving it to someone else</h2>
+
+<p>Sealing convinces <em>you</em>. A report signed by the platform is what convinces a server on the other side
+of a network that the public key it is about to trust really came from an enclave, on a machine with VBS
+actually running, rather than from a convincing program on a laptop.</p>
+
+<pre><code>/* Ask layer 4 for a report over data of our choosing. The
+   report binds that data to the enclave's identity and the
+   platform's state.                                       */
+static NTSTATUS MakeAttestation(const unsigned char *pubkey,
+                                ULONG pubLen,
+                                unsigned char *report,
+                                ULONG cap, ULONG *reportLen)
+{
+    /* BIND THE PUBLIC KEY INTO THE REPORT. A report over
+       nothing proves only that some enclave exists; a report
+       over this key proves THIS enclave holds it. That
+       binding is the entire value.                       */
+    return EnclaveGetAttestationReport(pubkey,
+               report, cap, reportLen);
+}
+
+/* On the RELYING PARTY - a server, or a provisioning tool -
+   the report is checked before the key is trusted:
+
+     EnclaveVerifyAttestationReport(ENCLAVE_TYPE_VBS,
+                                    report, reportLen);
+
+   and then the caller must STILL check the identity in the
+   report is the enclave it expected. Verifying the signature
+   only proves SOME enclave produced it - including an
+   attacker's own, on their own machine. Checking the image
+   identity is the step people forget, and it is the step
+   that does the work.                                    */</code></pre>
+
+<h2 id="run">Running the whole thing</h2>
+
+<p>Every piece from chapters 40 to 43, started in dependency order. The first run generates and seals; every
+run afterwards unseals, and the difference between those two paths is visible in one command.</p>
+
+<pre><code># 1. The driver (installed in chapter 41):
+sc query winsign
+
+# 2. The host. It creates the enclave, loads any blob it
+#    finds, and registers with the driver:
+winsignhost.exe
+# first run:
+#   no sealed key found - generating
+#   sealed 121 bytes to C:\ProgramData\winsign\key.blob
+# later runs:
+#   unsealed key from C:\ProgramData\winsign\key.blob
+
+# 3. The application, unchanged since chapter 41:
+winsign pubkey
+04a3f1...        &lt;- 64 hex bytes
+
+winsign sign C:\test.txt
+wrote C:\test.txt.sig (64 bytes)
+
+# 4. THE TEST THAT PROVES LAYER 4 DID ANYTHING:
+#    reboot, then ask again.
+shutdown /r /t 0
+winsign pubkey
+04a3f1...        &lt;- THE SAME KEY
+
+#    Before this chapter it was different every run. That
+#    one line of identical output is the whole of layer 4.</code></pre>
+
+<h2 id="verify">Verifying from outside</h2>
+
+<p>A signature only this stack can check proves nothing at all. This verifies it with tooling that knows
+nothing about enclaves, drivers or VBS.</p>
+
+<pre><code># tools/verify.ps1
+param([string]$File, [string]$Sig, [string]$PubHex)
+
+# The app prints x||y; rebuild a standard public key object.
+$pub  = [byte[]] -split ($PubHex -replace '..', '$&amp; ')
+$ec   = [System.Security.Cryptography.ECDsa]::Create()
+$parm = [System.Security.Cryptography.ECParameters]::new()
+$parm.Curve = [System.Security.Cryptography.ECCurve]::
+              CreateFromFriendlyName('nistP256')
+$parm.Q.X = $pub[0..31]
+$parm.Q.Y = $pub[32..63]
+$ec.ImportParameters($parm)
+
+$data = [IO.File]::ReadAllBytes($File)
+$sg   = [IO.File]::ReadAllBytes($Sig)
+
+# BCryptSignHash emits r||s, which is exactly the format
+# .NET calls IeeeP1363 - no DER conversion needed here,
+# unlike the OpenSSL path in the OP-TEE project.
+$ok = $ec.VerifyData($data, $sg,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.DSASignatureFormat]::
+          IeeeP1363FixedFieldConcatenation)
+
+if ($ok) { "Verified OK" } else { "VERIFICATION FAILED" }</code></pre>
+
+<h2 id="attack">Attacking it</h2>
+
+<p>These are the tests that decide whether the four layers are a security design or an elaborate way to call
+BCrypt. Write them before you believe the result — and expect test 4 to be the uncomfortable one.</p>
+
+<pre><code># 1. Can an unprivileged user sign?
+C:\&gt; winsign sign test.txt
+winsign: CreateFile 5                    (ACCESS_DENIED)
+#    Blocked by the interface SDDL. POLICY only - an
+#    administrator defeats it, by design.
+
+# 2. Can an administrator read the key out of the host?
+C:\&gt; procdump -ma winsignhost.exe dump.dmp
+C:\&gt; strings dump.dmp | findstr /i &lt;key bytes&gt;
+#    Nothing. The enclave range is not in the dump at all -
+#    the kernel cannot read it either, so it cannot write
+#    it out. THIS IS THE TEST THE WHOLE PROJECT EXISTS FOR.
+
+# 3. Is the sealed blob useful on another machine?
+C:\&gt; copy key.blob \\other\C$\ProgramData\winsign\
+#    On the other machine:
+#    EnclaveUnsealData failed 0xc000000d
+#    Rooted in THIS platform. Copying it achieves nothing.
+
+# 4. Can a debugger read the key?
+C:\&gt; windbg -p &lt;winsignhost pid&gt;
+0:000&gt; dq &lt;enclave base&gt;
+#    ??????????  - unreadable, on a NON-DEBUG enclave.
+#    NOW REBUILD WITH ENCLAVE_VBS_FLAG_DEBUG AND REPEAT.
+#    The key is right there. Do this once, deliberately,
+#    so you never ship a debug enclave by accident.
+
+# 5. Can a second host steal requests?
+C:\&gt; winsignhost.exe        (while one is already running)
+register: 1010 - another host already running?
+#    One host. A second could answer requests it never
+#    received, with signatures over data of its choosing.
+
+# 6. Can a hostile host forge a result for another client?
+C:\&gt; evilhost --answer-id 999 --sig 00000...
+#    Dropped: STATUS_NOT_FOUND. The driver matches on the
+#    id IT assigned. Remove that check and this succeeds -
+#    which is why the id is in the contract.
+
+# 7. Does an over-long input get refused at every layer?
+C:\&gt; fsutil file createnew big.bin 2000000
+C:\&gt; winsign sign big.bin
+input must be 1..1048576 bytes
+#    Layer 1 refuses. Remove that and confirm layer 2
+#    refuses. Remove THAT and confirm the enclave refuses.
+#    Defence in depth is only real if each layer
+#    independently says no.
+
+# IF TEST 2 OR TEST 3 SUCCEEDS, STOP. The design does not
+# do what this chapter claims.</code></pre>
+
+<div class="danger">
+<b>Test 2 is the one to run first, and the one to re-run after every change</b>
+<p>It is the only test that directly demonstrates the property the entire four-layer structure exists to
+provide: an administrator, with a full memory dump of the very process hosting the key, cannot find it. Every
+other test checks a policy, a contract or a convenience. If a refactor ever makes test 2 fail — a key
+accidentally copied into a VTL0 buffer to be logged, an export added for debugging, a debug-flagged build
+shipped — the stack still works perfectly and has stopped being worth anything.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>EnclaveSealData</code> fails with invalid parameter</td><td>An identity policy the enclave's own
+identity cannot satisfy, or an output buffer too small</td></tr>
+<tr><td>Unsealing fails after every rebuild</td><td>Exact-code policy, working as documented — choose same-image
+if that is wrong for you</td></tr>
+<tr><td>Unsealing fails after a Windows feature update</td><td>The platform identity changed; plan a rewrap
+path before shipping</td></tr>
+<tr><td>The public key changes silently one day</td><td>A regenerate-on-failure fallback somebody added back
+in</td></tr>
+<tr><td>Verification fails with a correct-looking signature</td><td>Signature format — <code>r||s</code> being
+handed to a DER-expecting verifier</td></tr>
+<tr><td>Attestation verifies but the identity is wrong</td><td>The relying party checked the signature and not
+the identity — the common and serious mistake</td></tr>
+<tr><td>The blob is readable by everyone</td><td>Expected. It is designed to be public; if that feels wrong,
+re-read what sealing does</td></tr>
+<tr><td>Test 2 finds the key in a dump</td><td>The key reached a VTL0 buffer somewhere, or the enclave is a
+debug build</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why <code>EnclaveSealData</code> counts as a fourth layer rather than a library call.</li>
+  <li>Name the four sealing identity policies and what each one costs you.</li>
+  <li>Say which policy you would choose for a signing key, and why.</li>
+  <li>Explain why the enclave does not store the blob itself, and why that is safe.</li>
+  <li>Explain why unsealing failure must not fall back to generating a new key.</li>
+  <li>Say what an attestation report proves, and the check a relying party usually forgets.</li>
+  <li>Describe the one command that proves layer 4 is doing anything at all.</li>
+  <li>Verify a signature with tooling that knows nothing about the stack.</li>
+  <li>Run attack test 2, then repeat it against a debug-flagged enclave.</li>
+  <li>Compare this layer 4 with the OP-TEE one: what is different, and what is structurally the same.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

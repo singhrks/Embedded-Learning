@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread pools, work queues and work stealing | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Thread pools, work queues and work stealing</h1>
+<p class="lead">Creating a thread costs about as much as ten thousand mutex operations, so you create them
+once and feed them work. That single decision brings its own set of problems: how many threads, what happens
+when the queue fills, and the deadlock that every pool eventually hits.</p>
+
+<h2 id="why">The shape</h2>
+
+<p>Creating a thread per unit of work does not scale, for reasons the cost discussion in chapter 1 already established. A pool separates the expensive thing — having threads — from the cheap thing — having work.</p>
+
+<pre class="diagram">   submit(task) ---> +---------------------------+
+                     |      TASK QUEUE           |
+                     +---------------------------+
+                        |        |        |
+                     +--v--+  +--v--+  +--v--+
+                     | W 0 |  | W 1 |  | W 2 |    N workers,
+                     +-----+  +-----+  +-----+    created once
+
+   Each worker:
+        for (;;) {
+                task = queue.pop();     /* blocks when empty  */
+                if (!task) break;       /* shutdown sentinel  */
+                task();
+        }
+
+   WHAT THE POOL BUYS
+     * thread creation cost paid once, not per task
+     * a bound on concurrency - N threads, not N-thousand
+     * a natural place to apply backpressure
+     * warm caches: a worker keeps running the same code
+
+   WHAT IT COSTS
+     * the queue is a contention point
+     * a blocking task occupies a worker doing nothing
+     * thread-local state now belongs to the WORKER, not the
+       task (chapter 2)
+     * and the deadlock in the "recursion" section below</pre>
+
+<h2 id="sizing">How many threads</h2>
+
+<p>How many threads a pool should hold has a real answer, and it differs sharply depending on whether the work is CPU-bound or blocks on I/O. Using the wrong formula wastes either cores or memory.</p>
+
+<pre><code>/* THE ONLY TWO RULES YOU NEED */
+
+/* CPU-BOUND work: N = number of cores.
+   More threads do not create more CPU; they add context
+   switches and cache pressure. */
+        unsigned n = std::thread::hardware_concurrency();
+        /* subtract one if the main thread also works */
+
+/* I/O-BOUND work: N = cores / (1 - blocked_fraction)
+   A thread blocked 90% of the time uses 10% of a core, so
+   you need ~10x more threads to keep the cores busy. */
+
+        /* measured: each task spends 45 ms waiting, 5 ms
+           computing -> blocked_fraction = 0.9
+           8 cores / (1 - 0.9) = 80 threads               */
+
+/* AND THE REAL ADVICE: if the answer is "80 threads", you
+   probably want async I/O and a small pool instead
+   (chapter 18). Eighty stacks is 640 MB of reserved address
+   space and eighty things for the scheduler to consider. */
+
+/* MIXED WORKLOADS: use SEPARATE POOLS, sized differently.
+   One CPU pool of `cores` threads, one I/O pool of many.
+   A single pool sized for I/O will thrash on CPU work; sized
+   for CPU it will stall on I/O.                          */
+
+/* MEASURE, do not calculate:
+     * are all workers busy?         -> add threads
+     * are cores idle with work queued?  -> workers are
+                                            blocking
+     * is throughput flat but latency rising? -> the queue is
+                                            growing; you are
+                                            past capacity     */</code></pre>
+
+<h2 id="pool">A pool, complete</h2>
+
+<p>A pool is a queue plus some workers, and nearly all of the difficulty is in the queue — specifically in how workers wait when it is empty and how the pool shuts down without losing work.</p>
+
+<pre><code>#include &lt;thread&gt;
+#include &lt;mutex&gt;
+#include &lt;condition_variable&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;future&gt;
+#include &lt;vector&gt;
+
+class ThreadPool {
+public:
+    explicit ThreadPool(unsigned n, size_t max_queue = 4096)
+        : max_(max_queue)
+    {
+        for (unsigned i = 0; i &lt; n; i++)
+            workers_.emplace_back([this] { run(); });
+    }
+
+    ~ThreadPool() { shutdown(); }
+
+    /* Returns a future, so the caller can wait for a result -
+       and, crucially, so an exception in the task surfaces at
+       get() instead of calling std::terminate. */
+    template &lt;class F&gt;
+    auto submit(F f) -&gt; std::future&lt;decltype(f())&gt;
+    {
+        using R = decltype(f());
+        auto task = std::make_shared&lt;std::packaged_task&lt;R()&gt;&gt;(
+                        std::move(f));
+        auto fut = task-&gt;get_future();
+        {
+            std::unique_lock&lt;std::mutex&gt; lk(m_);
+
+            /* BACKPRESSURE. An unbounded queue is not a
+               feature - it converts "too slow" into "out of
+               memory", much later, somewhere else. */
+            not_full_.wait(lk, [this] {
+                    return q_.size() &lt; max_ || stop_; });
+            if (stop_) throw std::runtime_error("pool stopped");
+
+            q_.emplace_back([task] { (*task)(); });
+        }
+        not_empty_.notify_one();
+        return fut;
+    }
+
+    void shutdown()
+    {
+        { std::lock_guard&lt;std::mutex&gt; g(m_);
+          if (stop_) return;
+          stop_ = true; }
+        not_empty_.notify_all();      /* release every waiter  */
+        not_full_.notify_all();
+        for (auto &amp;t : workers_)      /* THEN join. Signal all,
+            if (t.joinable()) t.join();  then join all
+                                         (chapter 3).          */
+        workers_.clear();
+    }
+
+private:
+    void run()
+    {
+        for (;;) {
+            std::function&lt;void()&gt; task;
+            {
+                std::unique_lock&lt;std::mutex&gt; lk(m_);
+                not_empty_.wait(lk, [this] {
+                        return !q_.empty() || stop_; });
+                if (q_.empty()) return;     /* stopping, drained */
+                task = std::move(q_.front());
+                q_.pop_front();
+            }
+            not_full_.notify_one();
+
+            /* A task that throws must not kill the worker, or
+               the pool silently shrinks to zero and everything
+               hangs. packaged_task captures the exception into
+               the future; this catch is the belt to that
+               braces. */
+            try { task(); }
+            catch (...) { /* log it */ }
+        }
+    }
+
+    std::mutex                        m_;
+    std::condition_variable           not_empty_, not_full_;
+    std::deque&lt;std::function&lt;void()&gt;&gt; q_;
+    std::vector&lt;std::thread&gt;          workers_;
+    size_t                            max_;
+    bool                              stop_ = false;
+};</code></pre>
+
+<div class="danger">
+<b>The deadlock every pool eventually hits</b>
+<p>A task submits another task to the <em>same</em> pool and waits for it. With N workers, N such tasks
+occupy every worker, and the sub-tasks they are waiting for can never be scheduled. The pool is full of
+threads waiting for work that cannot start. It works fine in testing with one request and deadlocks under
+load.</p>
+</div>
+
+<pre><code>/* THE DEADLOCK */
+pool.submit([&amp;] {
+        auto f = pool.submit([] { return part_two(); });
+        return part_one() + f.get();     /* &lt;-- waits, holding
+                                            a worker            */
+});
+
+/* FIXES, in order of preference:
+
+   1. DO NOT BLOCK IN A TASK. Restructure so the continuation
+      is itself a task, triggered by completion. This is what
+      async/await and future.then() are for (chapter 18).
+
+   2. SEPARATE POOLS. Parent tasks in pool A, children in
+      pool B. The cycle is broken because they are different
+      resources - the same reasoning as lock ordering.
+
+   3. HELP WHILE WAITING. The waiting thread runs queued tasks
+      instead of blocking. This is what work-stealing runtimes
+      (TBB, Rayon, Go, .NET) do, and it is why they tolerate
+      nested parallelism. Note it changes the semantics: your
+      task can now be re-entered on the same thread.
+
+   4. AN UNBOUNDED POOL that grows when all workers block.
+      .NET's injection heuristic. Effective, and it makes
+      thread counts unpredictable.                          */</code></pre>
+
+<h2 id="stealing">Work stealing</h2>
+
+<p>A single shared queue becomes a bottleneck as workers multiply. Giving each worker its own queue and letting idle workers take from busy ones removes that, and is how most modern task systems are built.</p>
+
+<pre class="diagram">   ONE SHARED QUEUE
+     every pop contends on one lock and one cache line. With
+     many short tasks the queue IS the bottleneck.
+
+   PER-WORKER DEQUES + STEALING
+     Each worker owns a double-ended queue.
+
+       own work:  push and pop at the BOTTOM  (LIFO)
+       stealing:  other workers take from the TOP (FIFO)
+
+     +--------+   +--------+   +--------+
+     | W0 [==]|   | W1 [  ]|   | W2 [==]|
+     +---^----+   +---^----+   +--------+
+         |            |
+      pop bottom   empty -> steal from the top of a random
+      (hot, LIFO)  victim's deque
+
+   WHY LIFO FOR YOUR OWN WORK
+     the most recently pushed task is the most recently
+     touched data - it is still in L1. Depth-first execution
+     also bounds memory: you finish subtrees before starting
+     new ones.
+
+   WHY FIFO FOR STEALING
+     the oldest task is the largest remaining subtree, so one
+     steal transfers a lot of work. And the top is far from
+     the bottom, so the owner and the thief rarely touch the
+     same cache line.
+
+   WHY IT SCALES
+     in the common case a worker never synchronises with
+     anyone. Stealing happens only when a worker runs dry,
+     which under good load balance is rare.
+
+   Used by: Cilk, Intel TBB, Java ForkJoinPool, Rust's Rayon,
+   Go's scheduler, .NET's ThreadPool.</pre>
+
+<div class="warn">
+<b>Thread-local state belongs to the worker, not the task</b>
+<p>A <code>thread_local</code> holding "the current request id" is set by task 1 and still there when
+unrelated task 2 runs on the same worker. With work stealing it is worse: a task can migrate mid-tree, so
+even "the same task" may see different thread-local state. Either clear it at every task boundary, or pass
+context explicitly. This is a common source of logs attributing work to the wrong request.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Pool hangs under load, fine in tests</td><td>Nested submit-and-wait exhausting the workers</td></tr>
+<tr><td>Pool silently stops processing</td><td>A task threw and killed its worker; repeat until zero
+remain</td></tr>
+<tr><td>Memory grows until the process dies</td><td>Unbounded queue absorbing a permanent overload</td></tr>
+<tr><td>Cores idle with a long queue</td><td>Workers blocked on I/O — wrong pool size, or wrong
+model</td></tr>
+<tr><td>Throughput flat, latency climbing</td><td>Past capacity; the queue is the delay</td></tr>
+<tr><td>Queue lock is the hottest thing in the profile</td><td>Tasks too small — batch them, or use work
+stealing</td></tr>
+<tr><td>Log lines attributed to the wrong request</td><td><code>thread_local</code> context not cleared
+between tasks</td></tr>
+<tr><td>Shutdown hangs</td><td>Workers blocked in <code>wait</code> with no stop flag in the
+predicate</td></tr>
+<tr><td>Adding threads made it slower</td><td>Context switching and cache pressure past the core
+count</td></tr>
+<tr><td>Deadlock only with work stealing enabled</td><td>A task was re-entered on a thread already inside
+it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three things a pool buys and three it costs.</li>
+  <li>Size a pool for CPU-bound and for I/O-bound work, and say when the I/O answer means you want async
+  instead.</li>
+  <li>Explain why an unbounded task queue is a bug, not a feature.</li>
+  <li>Explain what happens when a task throws, and two places to catch it.</li>
+  <li>Describe the nested-submit deadlock and give four fixes in order of preference.</li>
+  <li>Explain why work stealing uses LIFO locally and FIFO for thieves.</li>
+  <li>Explain why work stealing scales when a single shared queue does not.</li>
+  <li>Say why <code>thread_local</code> is dangerous in a pool, and worse with stealing.</li>
+  <li>Write the shutdown sequence and explain the order of its steps.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

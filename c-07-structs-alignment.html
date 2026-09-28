@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structs, unions, padding and alignment | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Structs, unions, padding and alignment</h1>
+<p class="lead">Structs are how C describes memory layout — for data structures, for hardware register blocks,
+and for wire protocols. The compiler inserts invisible padding to satisfy alignment, and if you do not know
+where it goes, you will write structs that are twice the size they need to be and protocol parsers that
+silently corrupt data.</p>
+
+<h2 id="alignment">Alignment</h2>
+
+<div class="key">
+<b>The requirement</b>
+<p>Every type has an <strong>alignment</strong>: a power of two that its address must be a multiple of.
+Typically alignment equals size for scalar types — a 4-byte <code>int</code> must sit at an address divisible
+by 4.</p>
+<p>The hardware imposes this. On ARM, an unaligned access to <em>Device</em> memory always faults; on Normal
+memory it usually works but may be slower or split into two bus transactions. On some architectures it faults
+everywhere. In C, forming or dereferencing a misaligned pointer is undefined behaviour regardless of what the
+hardware would do.</p>
+</div>
+
+<pre><code>#include &lt;stdalign.h&gt;
+
+alignof(char)      /* 1  */
+alignof(short)     /* 2  */
+alignof(int)       /* 4  */
+alignof(double)    /* 8  */
+alignof(void *)    /* 8 on 64-bit */
+alignof(max_align_t)  /* the strictest fundamental alignment: 16 typically */
+
+/* A struct's alignment is the LARGEST alignment among its members.
+   Its size is always a multiple of its alignment.                */</code></pre>
+
+<h2 id="padding">Padding, member by member</h2>
+
+<p>A struct is not simply its members laid end to end. The compiler inserts gaps so that each member lands on an address its type requires, which means a struct is usually larger than the sum of its parts — and reordering members can shrink it substantially.</p>
+
+<pre class="diagram">struct bad {
+        char  a;      /* offset 0                  */
+                      /* offsets 1-3: PADDING      */
+        int   b;      /* offset 4  (must be /4)    */
+        char  c;      /* offset 8                  */
+                      /* offsets 9-11: TAIL PADDING */
+};                    /* sizeof == 12, alignof == 4 */
+
+  byte:   0    1    2    3    4    5    6    7    8    9   10   11
+        +----+----+----+----+----+----+----+----+----+----+----+----+
+        | a  | ..pad.. |         b         | c  |    ..pad..       |
+        +----+----+----+----+----+----+----+----+----+----+----+----+
+
+Two kinds of padding, for two different reasons:
+
+  INTERNAL padding aligns the NEXT member.
+  TAIL padding makes sizeof a multiple of alignof, so that in an
+  ARRAY of this struct, every element is correctly aligned.
+
+Reorder largest-to-smallest and both shrink:
+
+struct good {
+        int   b;      /* offset 0 */
+        char  a;      /* offset 4 */
+        char  c;      /* offset 5 */
+                      /* offsets 6-7: tail padding */
+};                    /* sizeof == 8 — 33% smaller */</pre>
+
+<pre><code>/* Inspect any struct's real layout — do not guess */
+#include &lt;stddef.h&gt;
+printf("size=%zu align=%zu b@%zu c@%zu\n",
+       sizeof(struct bad), alignof(struct bad),
+       offsetof(struct bad, b), offsetof(struct bad, c));
+
+/* Or have the compiler print it for you */
+//   gcc -Wpadded              warns wherever padding is inserted
+//   pahole ./binary           shows every struct's holes (from dwarves)
+//   clang -Xclang -fdump-record-layouts</code></pre>
+
+<div class="note">
+<b>Why layout matters beyond size</b>
+<p>A struct that fits in one 64-byte cache line costs one miss; one that straddles two costs two
+(<a href="ca-14-caches.html">CA ch. 14</a>). In the Linux kernel, shrinking a frequently allocated struct
+below a slab size class is a measurable performance win. <code>pahole</code> exists precisely because this is
+worth doing systematically — and it is a routine kind of upstream patch.</p>
+</div>
+
+<h2 id="packed">packed: powerful and dangerous</h2>
+
+<p>You can tell the compiler to remove the padding, which is sometimes necessary and always costly. On ARM in particular the consequences go beyond performance and can reach correctness.</p>
+
+<pre><code>struct __attribute__((packed)) wire {
+        uint8_t  type;
+        uint32_t length;      /* now at offset 1 — MISALIGNED */
+        uint16_t flags;
+};                            /* sizeof == 7, alignof == 1     */
+
+/* This removes all padding. It also creates a real hazard: */
+
+struct wire *w = (struct wire *)buffer;
+uint32_t len = w-&gt;length;    /* compiler knows this is packed, so it
+                                emits byte loads + shifts. Correct,
+                                but slower.                          */
+
+uint32_t *p = &amp;w-&gt;length;    /* -Waddress-of-packed-member:
+                                a plain uint32_t* implies 4-byte
+                                alignment, which this is NOT.
+                                Dereferencing p is UB and FAULTS on
+                                strict-alignment targets.            */</code></pre>
+
+<div class="danger">
+<b>The packed-struct rules</b>
+<ol>
+<li><strong>Never take the address of a packed member</strong> and store it in a normal pointer. Enable
+<code>-Waddress-of-packed-member</code> and treat it as an error.</li>
+<li><strong>Never pass a packed member by reference</strong> to a function expecting an aligned pointer.</li>
+<li><strong>Packed does not fix endianness.</strong> It controls padding only. A wire protocol still needs
+explicit byte-order conversion.</li>
+<li><strong>Prefer explicit serialisation</strong> for protocols. Packed structs work, but they trade a
+portability problem you can see for one you cannot.</li>
+</ol>
+</div>
+
+<pre><code>/* The robust alternative: explicit serialisation. Slightly more
+   code, and immune to padding, alignment AND endianness.        */
+
+static size_t wire_parse(const uint8_t *b, size_t n, struct msg *out)
+{
+        if (n &lt; 7) return 0;
+        out-&gt;type   = b[0];
+        out-&gt;length = ((uint32_t)b[1] &lt;&lt; 24) | ((uint32_t)b[2] &lt;&lt; 16) |
+                      ((uint32_t)b[3] &lt;&lt;  8) |  (uint32_t)b[4];   /* big endian */
+        out-&gt;flags  = ((uint16_t)b[5] &lt;&lt;  8) |  (uint16_t)b[6];
+        return 7;
+}
+
+/* Or use the standard conversions when you do use a struct: */
+#include &lt;arpa/inet.h&gt;          /* htonl, ntohl, htons, ntohs      */
+#include &lt;endian.h&gt;             /* htobe32, le32toh, ... (glibc)   */
+val = be32toh(w-&gt;length);       /* kernel: be32_to_cpu()           */</code></pre>
+
+<h2 id="hardware">Structs for hardware registers</h2>
+
+<p>When a struct describes a hardware register block or a wire protocol, its layout is not yours to choose — it is dictated by something external, and the compiler must be made to match exactly.</p>
+
+<pre><code>/* The idiomatic MMIO register block: every member volatile, gaps
+   declared explicitly, and a static assertion on the layout.    */
+
+struct uart_regs {
+        volatile uint32_t DR;         /* 0x00 data                */
+        volatile uint32_t RSR;        /* 0x04 receive status      */
+        uint32_t          _pad0[4];   /* 0x08-0x14 reserved       */
+        volatile uint32_t FR;         /* 0x18 flags               */
+        uint32_t          _pad1;      /* 0x1C                     */
+        volatile uint32_t IBRD;       /* 0x20 integer baud rate   */
+};
+
+_Static_assert(sizeof(struct uart_regs) == 0x24, "uart_regs layout");
+_Static_assert(offsetof(struct uart_regs, FR) == 0x18, "FR offset");
+
+#define UART0 ((struct uart_regs *)0x40000000u)
+
+/* Why the static asserts: a silent padding change — from a member
+   type edit, a compiler upgrade, or a different ABI — would shift
+   every subsequent register. The assert turns a runtime mystery
+   into a build failure.                                          */
+
+/* Note: do NOT pack a register-block struct. The registers are
+   naturally aligned by design; packing only invites the compiler
+   to emit byte accesses, which most peripherals reject.        */</code></pre>
+
+<h2 id="unions">Unions</h2>
+
+<p>A union stores one of several members in the same space, which makes it both a legitimate space-saving tool and the standard way people attempt type punning — with rules that are stricter than most code assumes.</p>
+
+<pre><code>/* All members share the same storage, starting at offset 0.
+   sizeof is the largest member; alignof is the strictest.     */
+
+union value {
+        uint32_t u;
+        float    f;
+        uint8_t  bytes[4];
+};                            /* sizeof == 4 */
+
+/* Legal use 1: saving space when only one member is live at a time,
+   with a tag to say which. This is a "tagged union".            */
+struct variant {
+        enum { V_INT, V_FLOAT, V_PTR } kind;
+        union {
+                int64_t i;
+                double  d;
+                void   *p;
+        } u;
+};
+
+/* Legal use 2: type punning. In C — unlike C++ — reading a member
+   other than the one last written is DEFINED, since C99 TC3.    */
+union { float f; uint32_t bits; } cvt = { .f = 1.0f };
+printf("%08x\n", cvt.bits);        /* 3f800000 — well defined in C */
+
+/* The alternative that is always correct in both languages: */
+uint32_t bits;
+memcpy(&amp;bits, &amp;f, sizeof bits);    /* compiles to zero instructions
+                                      at -O2; the compiler recognises
+                                      the idiom                     */
+
+/* What is NOT legal: punning through incompatible POINTERS.
+   That violates strict aliasing — see chapter 15.               */
+uint32_t bits = *(uint32_t *)&amp;f;   /* UB. Do not do this.          */
+
+/* Anonymous unions and structs (C11) — very common in kernel code */
+struct packet {
+        uint8_t type;
+        union {                        /* no member name needed */
+                struct { uint16_t a, b; } pair;
+                uint32_t raw;
+        };
+};
+p.raw = 0;  p.pair.a = 1;             /* accessed directly */</code></pre>
+
+<h2 id="bitfields">Bitfields</h2>
+
+<p>Bitfields let you name individual bits as struct members, which reads beautifully and is implementation-defined in almost every way that matters. That combination makes them a poor fit for the hardware registers people reach for them to describe.</p>
+
+<pre><code>struct flags {
+        unsigned int enable   : 1;
+        unsigned int mode     : 3;
+        unsigned int priority : 4;
+        unsigned int          : 0;    /* force to next storage unit */
+        unsigned int count    : 16;
+};</code></pre>
+
+<div class="warn">
+<b>Bitfields are unsuitable for hardware and wire formats</b>
+<p>Almost everything about them is implementation-defined:</p>
+<ul>
+<li><strong>Allocation order</strong> within a storage unit — MSB-first or LSB-first — is up to the ABI, so
+the same struct describes different bits on big- and little-endian targets.</li>
+<li><strong>Straddling</strong> a storage-unit boundary is implementation-defined.</li>
+<li><strong>The underlying type</strong>: only <code>int</code>, <code>signed int</code>,
+<code>unsigned int</code> and <code>_Bool</code> are portable. Plain <code>int</code> bitfields may be signed
+or unsigned — always write <code>unsigned</code>.</li>
+<li><strong>Access is not atomic.</strong> Reading or writing one bitfield may read-modify-write the whole
+storage unit, so two threads updating adjacent bitfields can lose an update — even though they touch
+"different variables". The C11 memory model bounds this, but it still surprises people.</li>
+<li><strong>You cannot take the address</strong> of a bitfield.</li>
+</ul>
+<p>For registers and protocols, use explicit masks and shifts. They are portable, greppable, and generate the
+same code.</p>
+</div>
+
+<pre><code>/* Do this instead */
+#define CTRL_ENABLE      (1u &lt;&lt; 0)
+#define CTRL_MODE_SHIFT  1
+#define CTRL_MODE_MASK   (0x7u &lt;&lt; CTRL_MODE_SHIFT)
+
+reg = (reg &amp; ~CTRL_MODE_MASK) | ((mode &lt;&lt; CTRL_MODE_SHIFT) &amp; CTRL_MODE_MASK);
+reg |= CTRL_ENABLE;
+
+/* Linux provides checked helpers */
+#include &lt;linux/bitfield.h&gt;
+#define CTRL_MODE  GENMASK(3, 1)
+reg = (reg &amp; ~CTRL_MODE) | FIELD_PREP(CTRL_MODE, mode);
+mode = FIELD_GET(CTRL_MODE, reg);</code></pre>
+
+<h2 id="init">Initialisation</h2>
+
+<p>C offers several ways to initialise a struct, and they differ in what happens to the members you did not mention — which matters enormously when a member is later added to the struct.</p>
+
+<pre><code>struct point { int x, y, z; };
+
+struct point a = {1, 2, 3};          /* positional               */
+struct point b = {1};                /* y and z are ZERO, not garbage */
+struct point c = {0};                /* whole struct zeroed      */
+struct point d = { };                /* C23; GNU extension before */
+
+/* Designated initialisers (C99) — use these. They survive member
+   reordering, document intent, and zero everything unmentioned. */
+struct point e = { .x = 1, .z = 3 };          /* y == 0 */
+
+/* Essential for sparse structs, which is why kernel code is full
+   of them: */
+static const struct file_operations fops = {
+        .owner   = THIS_MODULE,
+        .open    = my_open,
+        .read    = my_read,
+        .release = my_release,
+        /* every other member is NULL — safely and explicitly */
+};
+
+/* Compound literals (C99): an unnamed object you can take the
+   address of. Lifetime is the enclosing block.                */
+send(&amp;(struct point){ .x = 1, .y = 2 });
+configure((struct cfg){ .baud = 115200, .bits = 8 });</code></pre>
+
+<h2 id="comparison">Structs cannot be compared</h2>
+
+<p>Two structs with identical member values are not necessarily equal byte for byte, because the padding between members holds whatever was there before. That is why comparing structs with <code>memcmp</code> is a bug.</p>
+
+<pre><code>struct point a, b;
+if (a == b)                    /* COMPILE ERROR — no == for structs */
+
+if (memcmp(&amp;a, &amp;b, sizeof a) == 0)   /* compiles, and is WRONG */
+
+/* memcmp compares the PADDING BYTES too, and padding contents are
+   indeterminate. Two structs with identical members can compare
+   unequal. Assignment copies padding unpredictably; a struct built
+   field-by-field has different padding from one from an initialiser.
+
+   Correct: compare member by member.                              */
+static bool point_eq(const struct point *a, const struct point *b)
+{
+        return a-&gt;x == b-&gt;x &amp;&amp; a-&gt;y == b-&gt;y &amp;&amp; a-&gt;z == b-&gt;z;
+}
+
+/* The same reasoning applies to HASHING a struct and to sending one
+   over a wire: padding bytes may leak stale stack contents — a real
+   information-disclosure class in kernel ioctl handlers. Always
+   memset the whole struct before filling it, when it crosses a
+   trust boundary.                                                  */
+struct info out;
+memset(&amp;out, 0, sizeof out);      /* not just = {0} on all paths */
+out.a = ...;
+copy_to_user(u, &amp;out, sizeof out);</code></pre>
+
+<h2 id="containerof">container_of</h2>
+
+<p>Given a pointer to a member, you can compute a pointer to the struct containing it. This idiom underpins intrusive data structures throughout the Linux kernel, and it is worth understanding as arithmetic rather than magic.</p>
+
+<pre><code>/* Given a pointer to a member, recover the enclosing struct.
+   This is how intrusive data structures work throughout the kernel. */
+
+#define container_of(ptr, type, member) \
+        ((type *)((char *)(ptr) - offsetof(type, member)))
+
+struct task {
+        int              pid;
+        struct list_head list;     /* embedded, not a pointer */
+        char             name[16];
+};
+
+/* Given a struct list_head *node from a generic list walk: */
+struct task *t = container_of(node, struct task, list);
+
+/* Why this is better than a `void *data` pointer in the node:
+     - no extra allocation per element
+     - no extra indirection on access
+     - one object can be on SEVERAL lists at once, each with its
+       own embedded node
+   The cost is that it is pointer arithmetic the compiler cannot
+   type-check, which is why the kernel's version adds a
+   __same_type() assertion.                                       */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>sizeof</code> a struct is larger than the sum of its members</td><td>Padding — reorder members largest first</td></tr>
+<tr><td>A wire protocol parses correctly on x86, wrongly on ARM</td><td>Endianness, or a bitfield's implementation-defined order</td></tr>
+<tr><td>Fault when dereferencing a pointer to a packed member</td><td>Misaligned pointer; strict-alignment target</td></tr>
+<tr><td>Register writes go to the wrong offsets after a compiler upgrade</td><td>Padding changed; add <code>_Static_assert</code> on offsets</td></tr>
+<tr><td>Two identical-looking structs compare unequal</td><td><code>memcmp</code> including indeterminate padding</td></tr>
+<tr><td>Kernel leaks stack bytes to userspace</td><td>Padding in a struct copied out without being zeroed</td></tr>
+<tr><td>Concurrent updates to adjacent bitfields lose one</td><td>Read-modify-write of the shared storage unit</td></tr>
+<tr><td>Struct grew and throughput dropped</td><td>It now spans two cache lines</td></tr>
+<tr><td>Uninitialised member despite an initialiser</td><td>Positional initialiser missing a member — use designated form</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute the size and layout of <code>struct { char a; int b; char c; }</code> and reorder it optimally.</li>
+  <li>Explain the difference between internal and tail padding, and why tail padding must exist.</li>
+  <li>Give three rules for using packed structs safely, and say what packed does <em>not</em> fix.</li>
+  <li>Write a register-block struct with static assertions and explain what they protect against.</li>
+  <li>Explain why type punning through a union is legal in C but a pointer cast is not.</li>
+  <li>List four implementation-defined properties of bitfields.</li>
+  <li>Explain why <code>memcmp</code> on structs is wrong, and what to do instead.</li>
+  <li>Write <code>container_of</code> and explain why intrusive lists use it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Machine-independent optimisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Machine-independent optimisation</h1>
+<p class="lead">What the middle end actually does to your code, why each transformation is legal, and the
+one assumption underneath all of it: that your program has no undefined behaviour.</p>
+
+<h2 id="rule">The rule every optimisation obeys</h2>
+
+<div class="key">
+<b>The as-if rule</b>
+<p>A compiler may perform any transformation, however drastic, provided the <em>observable behaviour</em> of
+the program is unchanged. In C, observable behaviour is: I/O, accesses to <code>volatile</code> objects,
+and the final state at program termination.</p>
+<p>Everything else — the order of computations, whether a variable exists at all, how many times a loop
+body runs, whether a function call happens — is fair game. And because <strong>undefined behaviour has no
+defined observable behaviour</strong>, a program containing UB places no constraint on the compiler at all
+along that path (<a href="cmp-15-ub-and-optimiser.html">chapter 15</a>).</p>
+</div>
+
+<h2 id="local">The local transformations</h2>
+
+<pre><code>/* --- CONSTANT FOLDING: evaluate at compile time --------- */
+        int x = 2 * 3 + 4;              -&gt;  int x = 10;
+        if (sizeof(int) == 4)           -&gt;  if (1)
+
+/* --- CONSTANT PROPAGATION ------------------------------- */
+        x = 5;
+        y = x + 1;      -&gt;  y = 6;
+        z = y * 2;      -&gt;  z = 12;
+
+/* --- ALGEBRAIC SIMPLIFICATION --------------------------- */
+        x * 1     -&gt; x            x + 0     -&gt; x
+        x * 0     -&gt; 0            x - x     -&gt; 0
+        x / 1     -&gt; x            x &amp; x     -&gt; x
+        x | 0     -&gt; x            x ^ x     -&gt; 0
+        !!x       -&gt; x != 0       -(-x)     -&gt; x
+        (x+1)-1   -&gt; x            &lt;-- ONLY if overflow is UB!
+
+/* --- STRENGTH REDUCTION: cheaper operations ------------- */
+        x * 8       -&gt;  x &lt;&lt; 3
+        x / 8       -&gt;  x &gt;&gt; 3      (unsigned; signed needs a
+                                     correction for negatives)
+        x % 8       -&gt;  x &amp; 7       (unsigned)
+        x * 10      -&gt;  (x &lt;&lt; 3) + (x &lt;&lt; 1)
+        pow(x, 2)   -&gt;  x * x
+
+/* THE SIGNED DIVISION ONE is worth seeing, because it
+   explains a common "why is this so many instructions?": */
+        int f(int x) { return x / 8; }
+   -&gt;   add   w8, w0, #7        ; if negative, bias by 7
+        cmp   w0, #0
+        csel  w8, w8, w0, lt    ; select the biased value
+        asr   w0, w8, #3        ; arithmetic shift
+   Four instructions, because C rounds toward zero and a
+   plain shift rounds toward negative infinity. Unsigned
+   division by 8 is ONE instruction. That is a real reason to
+   use unsigned types for indices and sizes.
+
+/* --- COMMON SUBEXPRESSION ELIMINATION ------------------- */
+        a = b * c + g;
+        d = b * c * e;
+   -&gt;   t = b * c;
+        a = t + g;
+        d = t * e;
+
+/* --- COPY PROPAGATION ----------------------------------- */
+        y = x;
+        z = y + 1;      -&gt;  z = x + 1;
+
+/* --- DEAD CODE ELIMINATION ------------------------------ */
+        x = compute();          /* if x is never used AND
+                                   compute() has no side
+                                   effects -&gt; delete both  */
+
+/* --- DEAD STORE ELIMINATION ----------------------------- */
+        x = 1;
+        x = 2;          -&gt;  x = 2;
+/* AND THE SECURITY PROBLEM this causes: */
+        memset(key, 0, sizeof(key));    /* DELETED - the
+                                           buffer is never
+                                           read afterwards */
+        free(key);
+/* Use explicit_bzero(), memset_s(), SecureZeroMemory(), or a
+   volatile pointer. This is a real, exploited bug class
+   (isolation chapter 16).                                */</code></pre>
+
+<h2 id="inlining">Inlining</h2>
+
+<pre><code>/* THE MOST IMPORTANT OPTIMISATION, because it enables all the
+   others. */
+
+        static int square(int x) { return x * x; }
+        int f(int a) { return square(a) + square(3); }
+
+/* after inlining: */
+        int f(int a) { return a * a + 3 * 3; }
+/* after constant folding: */
+        int f(int a) { return a * a + 9; }
+
+/* THE COMPOUNDING EFFECT is the point: inlining exposes the
+   arguments as constants, which enables folding, which
+   enables branch elimination, which enables dead code
+   removal, which may enable more inlining.
+
+/* WHAT THE HEURISTIC WEIGHS:
+     · the callee's size (LLVM's cost model, GCC's
+       -finline-limit)
+     · how many call sites there are
+     · whether the callee is `static` and called once - then
+       inlining is FREE, because the out-of-line copy can be
+       deleted
+     · whether arguments are constants at the call site
+     · whether it is in a loop
+     · profile data, if available (PGO)
+
+/* THE ATTRIBUTES: */
+        static inline int f(void) { ... }
+        /* `inline` is a HINT, and in C it primarily affects
+           linkage rules, not the decision. */
+
+        __attribute__((always_inline))     /* force it */
+        __attribute__((noinline))          /* forbid it */
+        __attribute__((flatten))           /* inline
+                                              everything this
+                                              function calls */
+
+/* WHEN NOT TO INLINE - and these are real:
+     · large functions called from many places: I-cache
+       pressure costs more than the call (CA chapter 14)
+     · cold error paths: inlining them pushes the hot path out
+       of the cache. Mark them noinline.
+     · anything you need to see in a profile or a backtrace
+
+/* THE EMBEDDED CONSIDERATION: -O2 inlines aggressively and
+   can grow code substantially. On a flash-constrained part
+   measure with `size` and consider -Os, which uses a much
+   more conservative inlining threshold.                  */</code></pre>
+
+<h2 id="global">Global transformations</h2>
+
+<pre><code>/* --- GLOBAL VALUE NUMBERING ----------------------------- */
+/* CSE across basic blocks, using SSA to identify expressions
+   that provably compute the same value.                   */
+
+/* --- PARTIAL REDUNDANCY ELIMINATION --------------------- */
+        if (cond)
+                x = a + b;      /* computed here */
+        y = a + b;              /* redundant on that path,
+                                   not on the other        */
+   -&gt;   if (cond)  { t = a + b; x = t; }
+        else       { t = a + b; }
+        y = t;
+/* Hoist the computation onto the path that lacked it, so it
+   is computed exactly once on every path.                */
+
+/* --- TAIL CALL ELIMINATION ------------------------------ */
+        int f(int n, int acc) {
+                if (n == 0) return acc;
+                return f(n - 1, acc * n);    /* TAIL call */
+        }
+   -&gt;   a LOOP. No stack growth.
+/* Which is why the recursive version is as fast as the
+   iterative one at -O2, and why it stack-overflows at -O0.
+   C does not GUARANTEE this - it is an optimisation, not a
+   language rule, unlike in Scheme.                       */
+
+/* --- JUMP THREADING ------------------------------------- */
+        if (a) x = 1; else x = 2;
+        if (a) y = 3; else y = 4;
+   -&gt;   if (a) { x = 1; y = 3; } else { x = 2; y = 4; }
+/* The second test is known on each path.                 */
+
+/* --- IF-CONVERSION: branches to conditional moves ------- */
+        if (a &gt; b) m = a; else m = b;
+   -&gt;   cmp  w0, w1
+        csel w0, w0, w1, gt          ; ONE instruction, no
+                                     ; branch, no misprediction
+/* On ARM this is very effective because of the rich
+   conditional-select instructions (ARM chapter 07). It is
+   also why a "branchless" hand-optimisation is usually
+   unnecessary: the compiler already did it.
+   BUT: it evaluates BOTH sides, so it is only legal when
+   both are side-effect free and safe to execute. This is
+   also why if-conversion is NOT constant-time-safe in the
+   way people assume for crypto (cryptography ch. 19).   */
+
+/* --- FUNCTION SPECIALISATION (IPA-CP) ------------------- */
+        static void f(int mode) { if (mode) ... else ... }
+        f(1); f(1); f(0);
+   -&gt;   two specialised copies, each with the branch folded
+        away.
+
+/* --- DEVIRTUALISATION (C++) ----------------------------- */
+/* If the dynamic type is provable, replace an indirect call
+   through a vtable with a direct call - which then allows
+   inlining. Enormously important for C++ performance
+   (C++ track chapter 07).                               */</code></pre>
+
+<h2 id="ordering">Pass ordering</h2>
+
+<pre class="diagram">Optimisations ENABLE one another, so order matters and no
+single order is optimal for all programs. A representative
+LLVM -O2 pipeline:
+
+   SROA                     split aggregates, promote to SSA
+   EarlyCSE
+   InstCombine              peephole on the IR
+   SimplifyCFG              merge and delete blocks
+      |
+   INLINING  &lt;--------------+  (the "CGSCC" pass manager runs
+      |                     |   this bottom-up over the call
+   more InstCombine,        |   graph, so a callee is
+   SimplifyCFG, SROA -------+   optimised before its caller
+      |                         is considered for inlining)
+   GVN                      global value numbering
+   MemCpyOpt
+   DSE                      dead store elimination
+      |
+   LOOP PASSES:
+     LoopRotate             turn while into do-while
+     LICM                   hoist invariants (chapter 07)
+     LoopUnswitch
+     IndVarSimplify         canonicalise induction variables
+     LoopIdiom              recognise memset/memcpy patterns
+     LoopDeletion
+     LoopUnroll
+     LoopVectorize          (chapter 07)
+     SLPVectorize
+      |
+   InstCombine, SimplifyFG  again - the loop passes exposed
+      |                     new opportunities
+   ADCE                     aggressive dead code elimination
+      |
+   -&gt; the back end (chapters 08-09)
+
+  NOTE HOW OFTEN InstCombine AND SimplifyCFG REPEAT. Cleanup
+  passes run after every major transformation because each one
+  leaves debris the next pass would otherwise trip over.
+
+  SEE THE REAL ONE:
+     llvm: opt -O2 -debug-pass-manager < in.ll > /dev/null
+     gcc:  -fdump-tree-all -fdump-ipa-all</pre>
+
+<h2 id="lto">Link-time optimisation</h2>
+
+<pre><code># The problem: separate compilation (chapter 01) means the
+# compiler cannot inline across translation units, or prove
+# anything about a function defined elsewhere.
+
+# LTO defers optimisation until link time, when everything is
+# visible.
+
+    gcc -flto -O2 -c a.c b.c
+    gcc -flto -O2 a.o b.o -o prog
+    ; the .o files contain IR, not machine code
+
+    clang -flto=thin -O2 ...     ; ThinLTO: parallel, scalable,
+                                 ; nearly as effective, much
+                                 ; faster to link
+
+# WHAT IT ENABLES:
+#   cross-module inlining
+#   whole-program dead code elimination - unused functions
+#     across the whole program disappear
+#   better devirtualisation
+#   global constant propagation
+#   identical code folding
+
+# TYPICAL RESULTS: 5-15% faster, and often SMALLER because of
+# the dead code elimination - which on an embedded target may
+# matter more than the speed.
+
+# THE COSTS:
+#   link time grows substantially (ThinLTO mitigates this)
+#   memory use at link time
+#   debugging is harder - inlining across files confuses
+#     backtraces
+#   it EXPOSES UB that separate compilation hid. Code that
+#     "worked" may now break, because the optimiser can finally
+#     see the contradiction (chapter 15).
+
+# THE LAST POINT IS THE ONE TO EXPECT: enabling LTO on an old
+# codebase frequently surfaces latent bugs. They were always
+# bugs.</code></pre>
+
+<h2 id="pgo">Profile-guided optimisation</h2>
+
+<pre><code># The compiler's heuristics guess which branches are taken and
+# which functions are hot. PGO replaces the guess with
+# measurement.
+
+# 1. build instrumented
+    gcc -fprofile-generate -O2 prog.c -o prog
+    clang -fprofile-instr-generate -O2 prog.c -o prog
+
+# 2. RUN IT on a REPRESENTATIVE workload
+    ./prog typical-input
+
+# 3. rebuild using the data
+    gcc -fprofile-use -O2 prog.c -o prog
+    clang -fprofile-instr-use=prog.profdata -O2 prog.c -o prog
+
+# WHAT IT IMPROVES:
+#   branch layout - the hot path becomes the fall-through, so
+#     the I-cache holds contiguous hot code (CA chapter 12)
+#   inlining decisions - inline what is actually hot
+#   hot/cold splitting - cold code moved to a separate section
+#   loop unrolling based on real trip counts
+#   register allocation priorities
+
+# TYPICAL: 10-20% on branch-heavy code. Sometimes much more on
+# interpreters and parsers.
+
+# SAMPLE-BASED PGO, which avoids the instrumented build:
+    perf record -b ./prog
+    create_llvm_prof --binary=./prog --out=prog.prof
+    clang -fprofile-sample-use=prog.prof ...
+# Lower overhead, usable on production workloads, slightly
+# less accurate.
+
+# THE CAVEAT: a profile from an unrepresentative workload can
+# make things WORSE, because the compiler will optimise
+# confidently for the wrong case. Profile what you actually
+# run.</code></pre>
+
+<h2 id="see">Watching it happen</h2>
+
+<pre><code># Which optimisations fired, and which did not and why:
+    gcc -fopt-info-all
+    gcc -fopt-info-inline-optimized
+    gcc -fopt-info-vec-missed
+
+    clang -Rpass=inline
+    clang -Rpass-missed=loop-vectorize
+    clang -Rpass-analysis=loop-vectorize
+    ; the -missed and -analysis forms print the REASON, which
+    ; is the useful part
+
+# Step through the IR one pass at a time:
+    opt -O2 -print-after-all input.ll 2&gt; passes.txt
+    opt -passes='sroa,instcombine' -S input.ll
+    ; run exactly the passes you want, and see the effect of
+    ; each. This is the best way to understand what a pass
+    ; actually does.
+
+# GCC's equivalent:
+    gcc -fdump-tree-all-details
+    ls *.c.*t.*        ; one file per pass, in order
+
+# AND ALWAYS: godbolt.org, with the "Optimization Pipeline"
+# view enabled - it shows the IR after every pass, diffed.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A <code>memset</code> that clears a key is gone</td><td>Dead store elimination — use <code>explicit_bzero</code></td></tr>
+<tr><td>A loop that should run is deleted</td><td>Its result is unused, or it contains UB</td></tr>
+<tr><td>Signed division is four instructions</td><td>C's round-toward-zero rule — use unsigned where correct</td></tr>
+<tr><td>A "branchless" hand-optimisation is slower</td><td>The compiler already did if-conversion, better</td></tr>
+<tr><td>Recursive code overflows only at <code>-O0</code></td><td>Tail call elimination at higher levels</td></tr>
+<tr><td>Code grows a lot at <code>-O2</code></td><td>Inlining — try <code>-Os</code> on constrained targets</td></tr>
+<tr><td>Hot path slower after inlining</td><td>I-cache pressure — mark cold paths <code>noinline</code></td></tr>
+<tr><td>LTO breaks a working program</td><td>Latent UB the optimiser can now see</td></tr>
+<tr><td>PGO makes it slower</td><td>Unrepresentative profile</td></tr>
+<tr><td>A function does not appear in a profile</td><td>Inlined — <code>-fno-inline</code> to check</td></tr>
+<tr><td>Assembly bears no resemblance to the source</td><td>Working as intended; read the IR to follow it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the as-if rule and what counts as observable behaviour in C.</li>
+  <li>Name eight local optimisations and give an example of each.</li>
+  <li>Explain why signed division by a power of two costs more than unsigned.</li>
+  <li>Explain why dead store elimination is a security problem, and the fix.</li>
+  <li>Explain why inlining is the most important optimisation.</li>
+  <li>Give three cases where inlining should be prevented.</li>
+  <li>Explain tail call elimination and why it is not guaranteed in C.</li>
+  <li>Explain if-conversion and one situation where it is not what you want.</li>
+  <li>Say why cleanup passes repeat throughout the pipeline.</li>
+  <li>Explain what LTO enables and why it exposes latent bugs.</li>
+  <li>Run a PGO build and say what it improves.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

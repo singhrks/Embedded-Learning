@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quantisation and efficient inference | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Quantisation and efficient inference</h1>
+<p class="lead">Representing weights in 8 or 4 bits instead of 16. This is fixed-point arithmetic, scale
+factors and dynamic range — territory an embedded engineer already knows, applied to a new problem.</p>
+
+<h2 id="why">Why it works</h2>
+
+<p>Dropping from sixteen bits to four sounds like it should destroy a model and largely does not. Why it works is worth understanding, because it tells you when it will not.</p>
+
+<pre class="diagram">   THE MOTIVATION IS BANDWIDTH, NOT ARITHMETIC
+   (chapters 04, 25).
+
+     70B model in fp16   140 GB   -> ~14 tokens/s at
+                                     2 TB/s
+     the same in int8     70 GB   -> ~28 tokens/s
+     the same in int4     35 GB   -> ~56 tokens/s
+
+   THE SPEEDUP IS PROPORTIONAL TO THE BYTE REDUCTION,
+   because generation reads every weight once per token and
+   the multipliers are idle anyway. It also determines
+   whether the model FITS AT ALL - which for a device is
+   usually the real question.
+
+   AND WHY IT DOES NOT DESTROY THE MODEL:
+
+     · WEIGHTS ARE ROUGHLY GAUSSIAN and tightly clustered
+       around zero. A well-chosen scale covers the range
+       with little error.
+     · NEURAL NETWORKS ARE ROBUST TO NOISE. They were
+       trained with dropout, augmentation and stochastic
+       gradients; small perturbations to weights behave
+       like more of the same.
+     · THE ERROR AVERAGES OUT. A dot product over 4096
+       terms sums many independent rounding errors, which
+       partially cancel (chapter 08).
+     · AND THE INFORMATION IS REDUNDANT. Superposition
+       (chapter 17) means features are spread across many
+       weights, so no single weight is critical.
+
+   THE FORMATS, and note what varies:
+
+     FORMAT   BITS   RANGE           WHERE USED
+     fp32       32   +-3.4e38        training master
+                                     weights
+     fp16       16   +-65504         older training, some
+                                     inference
+     bf16       16   +-3.4e38        MODERN TRAINING -
+                                     fp32's range, fewer
+                                     mantissa bits, so NO
+                                     LOSS SCALING NEEDED
+     fp8         8   two variants    newest accelerators
+                     (E4M3, E5M2)
+     int8        8   -128..127       THE EMBEDDED WORKHORSE
+     int4        4   -8..7           LLM weights
+     int2/
+     ternary   2-1.6 {-1,0,1}        research, and
+                                     BitNet-style models
+
+   THE PATTERN: FEWER BITS MEANS LESS RANGE OR LESS
+   PRECISION, AND THE SCALE FACTOR IS WHAT BUYS THE RANGE
+   BACK.</pre>
+
+<h2 id="how">The arithmetic</h2>
+
+<p>The arithmetic is simple, and the details of where the scale factors live are what separate a method that holds accuracy from one that does not.</p>
+
+<pre><code>/* --- THE BASIC MAPPING --- */
+
+    QUANTISE:    q = round(x / scale) + zero_point
+    DEQUANTISE:  x = (q - zero_point) * scale
+
+/* SYMMETRIC (zero_point = 0): */
+    scale = max(|x|) / 127                # int8
+    q     = clamp(round(x / scale), -128, 127)
+
+    Simpler and faster - no zero-point term in the inner
+    loop. USE FOR WEIGHTS, which are roughly symmetric
+    about zero.
+
+/* ASYMMETRIC: */
+    scale = (max - min) / 255
+    zero_point = round(-min / scale)
+
+    Uses the full range for skewed distributions. USE FOR
+    ACTIVATIONS after ReLU, which are all non-negative -
+    symmetric quantisation would waste half the codes.
+
+/* --- WHY THE ACCUMULATOR IS WIDER (chapter 02) --- */
+    int8 * int8 -> up to 16 bits, and summing 4096 of them
+    needs ~28 bits. So hardware accumulates int8 x int8 into
+    INT32, then rescales once at the end:
+
+        acc = 0                          # int32
+        for i: acc += a_q[i] * b_q[i]    # int8 x int8
+        out = acc * (scale_a * scale_b)  # ONE rescale
+
+    THE SCALES FACTOR OUT OF THE SUM. That is the whole
+    trick that makes quantised matmul exact-ish and fast:
+    the inner loop is pure integer MAC, and the floating
+    point appears once.
+
+/* --- GRANULARITY: the single most important choice --- */
+    PER-TENSOR    one scale for the entire weight matrix.
+                  Simplest, worst accuracy.
+    PER-CHANNEL   one scale per output channel/row. MUCH
+                  better, negligible extra cost.
+    PER-GROUP     one scale per group of 32-128 weights
+                  ALONG a row. What int4 LLM quantisation
+                  uses.
+                  Costs ~0.5 bits/weight in scale overhead
+                  and is worth every bit of it.
+
+    A SINGLE OUTLIER WEIGHT FORCES A LARGE SCALE, which
+    coarsens every other weight sharing it. Finer groups
+    contain the damage. THIS IS THE ENTIRE REASON GROUPED
+    QUANTISATION EXISTS.
+
+/* --- THE OUTLIER PROBLEM IN ACTIVATIONS --- */
+    Transformer activations contain a small number of
+    dimensions with values 10-100x larger than the rest,
+    consistently in the same channels. Quantising naively
+    destroys everything else.
+
+    THE SOLUTIONS:
+      LLM.int8()   keep the outlier dimensions in fp16, the
+                   rest in int8. A mixed-precision matmul.
+      SMOOTHQUANT  MIGRATE the difficulty from activations
+                   into weights by scaling:
+                       Y = (X / s) @ (s * W)
+                   mathematically identical, and the
+                   scaling is folded into the previous
+                   layer's weights so it is free at
+                   runtime. Weights are much easier to
+                   quantise than activations, so this is a
+                   genuinely elegant fix.
+      AWQ          identify the ~1% of weight channels that
+                   matter most (by activation magnitude) and
+                   protect them with per-channel scaling.  */</code></pre>
+
+<h2 id="methods">The methods</h2>
+
+<p>The named methods differ mainly in how much work they do up front and what they need access to. Choosing between them is usually a question of what you can afford to run.</p>
+
+<pre><code>/* --- PTQ: POST-TRAINING QUANTISATION --- */
+    Quantise an already-trained model. No retraining.
+
+    DYNAMIC   weights quantised offline, activations
+              quantised at runtime from their observed
+              range. Easy, no calibration data, some
+              runtime cost.
+    STATIC    activation ranges determined in advance from
+              a CALIBRATION SET of a few hundred
+              representative samples. Faster at runtime.
+              THE CALIBRATION DATA MUST RESEMBLE PRODUCTION
+              DATA, or the ranges are wrong.
+
+    THE MODERN LLM METHODS:
+      GPTQ    layer-by-layer, using second-order information
+              to choose roundings that minimise the output
+              error. int4 with small degradation.
+      AWQ     activation-aware; protects salient channels.
+              Fast, and generally excellent at int4.
+      GGUF /  llama.cpp's family (Q4_K_M, Q5_K_M, Q8_0...).
+      K-QUANTS Mixed precision per tensor type - attention
+              and the output layer get more bits. THE
+              PRACTICAL DEFAULT FOR RUNNING MODELS LOCALLY.
+      HQQ,
+      SqueezeLLM, and a steady stream of others
+
+/* --- QAT: QUANTISATION-AWARE TRAINING --- */
+    Simulate quantisation DURING training so the model
+    learns weights that survive it.
+
+      forward:  x_q = dequant(quant(x))   # "fake quant"
+      backward: STRAIGHT-THROUGH ESTIMATOR - pass the
+                gradient through as if quantisation were
+                the identity, because round() has zero
+                gradient everywhere (chapter 07)
+
+    · better accuracy than PTQ, especially below 8 bits
+    · needs training infrastructure and data
+    · ESSENTIAL FOR VERY SMALL MODELS on MCUs, where PTQ
+      at int8 can lose several percent of accuracy that QAT
+      recovers
+
+/* --- WHAT ACCURACY ACTUALLY COSTS (large models) --- */
+    fp16      baseline
+    int8      essentially lossless with per-channel scales
+    int4 GPTQ/AWQ    perplexity +1-3%; usually
+                     imperceptible in use
+    int3      noticeable degradation
+    int2      substantial, though active research
+              continues
+
+    AND THE RULE THAT MATTERS FOR CHOOSING:
+      A 4-BIT 70B MODEL BEATS AN 8-BIT 34B MODEL AT THE SAME
+      MEMORY BUDGET. Given a fixed number of gigabytes,
+      prefer a larger model more aggressively quantised -
+      up to about 4 bits, below which the relationship
+      inverts.
+
+/* --- THE CODE --- */
+    # llama.cpp - the practical local path
+    #   python convert_hf_to_gguf.py ./model
+    #   ./llama-quantize model.gguf out.gguf Q4_K_M
+
+    # PyTorch dynamic PTQ, for a small model
+    import torch.ao.quantization as q
+    qmodel = q.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8)
+
+    # bitsandbytes, at load time
+    from transformers import BitsAndBytesConfig
+    cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",     # normal-float 4,
+                                       # matched to a
+                                       # Gaussian weight
+                                       # distribution
+        bnb_4bit_use_double_quant=True)  # quantise the
+                                         # scales too
+    model = AutoModelForCausalLM.from_pretrained(
+                name, quantization_config=cfg)
+
+    # AND THIS IS WHAT QLoRA USES (chapter 24): a 4-bit
+    # frozen base plus bf16 adapters.</code></pre>
+
+<div class="key">
+<b>Quantise the KV cache too</b>
+<p>At long context the KV cache exceeds the model itself (<a href="ai-25-inference.html">chapter 25</a>).
+Quantising it to int8 halves that, and to int4 quarters it. Keys tolerate quantisation less well than
+values — keys feed a dot product whose result goes through a softmax, so errors are amplified — so a
+common configuration is int8 keys with int4 values. For long-context serving this is often a larger win
+than quantising the weights.</p>
+</div>
+
+<h2 id="other">The other compression techniques</h2>
+
+<p>Quantisation is the compression technique that works most reliably, but it is not the only one, and the others have their own trade-offs worth knowing.</p>
+
+<pre><code>/* --- PRUNING --- */
+    UNSTRUCTURED   zero individual weights. High sparsity
+                   achievable (50-90%), and NO SPEEDUP on
+                   normal hardware, because the memory
+                   access pattern is destroyed (chapter 03).
+    STRUCTURED     remove whole channels, heads
+                   (chapter 21), or layers. Lower achievable
+                   sparsity, REAL SPEEDUP - the matrices are
+                   genuinely smaller.
+    2:4 SEMI-      exactly 2 of every 4 weights zero.
+    STRUCTURED     Supported in hardware by recent NVIDIA
+                   parts for a ~2x gain. The compromise that
+                   actually ships.
+
+    THE LESSON, which generalises far beyond this: SPARSITY
+    ONLY HELPS IF THE HARDWARE CAN EXPLOIT ITS PATTERN.
+
+/* --- DISTILLATION --- */
+    Train a small STUDENT to match a large TEACHER.
+
+      L = alpha * CE(student, hard_labels)
+        + (1-alpha) * T^2 * KL(student_soft || teacher_soft)
+
+    THE SOFT TARGETS CARRY MORE INFORMATION than the labels:
+    a teacher saying "80% cat, 15% dog, 5% fox" tells the
+    student about the similarity structure, which a one-hot
+    label cannot. This is called DARK KNOWLEDGE, and it is
+    why distillation beats training the small model
+    directly.
+
+    (The T^2 factor compensates for the gradients shrinking
+    as 1/T^2 when the logits are softened.)
+
+    DistilBERT: 40% smaller, 60% faster, 97% of the
+    performance. And most good small models today are
+    distilled from larger ones - which is why the small-model
+    frontier moves whenever the large-model frontier does.
+
+/* --- ARCHITECTURE-LEVEL CHOICES --- */
+    · GQA / MQA           smaller KV cache (chapter 19)
+    · sliding-window attention
+    · fewer, wider layers - better for parallel hardware
+    · WEIGHT SHARING across layers (ALBERT-style) - large
+      memory saving, some quality cost
+    · and simply TRAINING A SMALL MODEL LONGER
+      (chapter 23), which is now the mainstream answer
+
+/* --- COMPILATION AND KERNELS --- */
+    torch.compile, TensorRT, ONNX Runtime, OpenVINO,
+    TVM, ExecuTorch.
+
+    WHAT THEY ACTUALLY DO - and it will be familiar from any
+    embedded optimisation work:
+      · OPERATOR FUSION: LayerNorm + Linear + GELU as one
+        kernel, so intermediates never leave registers or
+        SRAM. This is the single biggest win, and it is a
+        MEMORY TRAFFIC optimisation.
+      · constant folding
+      · memory planning and buffer reuse
+      · selecting the best kernel per shape
+      · removing framework overhead entirely
+
+    2-5x SPEEDUP FOR NO ACCURACY LOSS is typical, and it
+    should be the FIRST thing you try - before quantising,
+    before pruning, before anything that costs accuracy. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>int8 model loses several percent accuracy</td><td>Per-tensor scales — switch to per-channel</td></tr>
+<tr><td>Accuracy collapses despite per-channel scales</td><td>Activation outliers — use SmoothQuant or LLM.int8()</td></tr>
+<tr><td>Quantised model fine in tests, poor in production</td><td>Calibration data unrepresentative</td></tr>
+<tr><td>int4 output is incoherent</td><td>Group size too large, or a naive round-to-nearest method</td></tr>
+<tr><td>Quantisation gives no speedup</td><td>Compute bound, not memory bound — check the phase</td></tr>
+<tr><td>Overflow in a quantised matmul</td><td>Accumulator too narrow — int8 needs int32</td></tr>
+<tr><td>Pruning to 70% sparsity gives no speedup</td><td>Unstructured — hardware cannot exploit it</td></tr>
+<tr><td>Long-context serving still runs out of memory</td><td>KV cache not quantised</td></tr>
+<tr><td>Distilled student worse than expected</td><td>Temperature too low — soft targets carry the signal</td></tr>
+<tr><td>QAT gradients are always zero</td><td>Straight-through estimator missing — <code>round()</code> has no gradient</td></tr>
+<tr><td>Small model on MCU loses accuracy at int8</td><td>PTQ is not enough at that size — use QAT</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why quantisation speeds up generation, in terms of bytes not FLOPs.</li>
+  <li>Give four reasons neural networks tolerate quantisation.</li>
+  <li>Write the quantise and dequantise formulas, and say when to use symmetric versus asymmetric.</li>
+  <li>Explain why the accumulator is int32 and how the scales factor out.</li>
+  <li>Compare per-tensor, per-channel and per-group granularity, and say why outliers force finer groups.</li>
+  <li>Explain the activation outlier problem and how SmoothQuant fixes it.</li>
+  <li>Contrast PTQ and QAT, and explain the straight-through estimator.</li>
+  <li>State the rule for choosing model size against bit width at a fixed memory budget.</li>
+  <li>Say why keys tolerate KV-cache quantisation worse than values.</li>
+  <li>Explain why unstructured pruning gives no speedup and what 2:4 sparsity is.</li>
+  <li>Explain dark knowledge and the <code>T²</code> factor in distillation.</li>
+  <li>Say what operator fusion does and why it should be tried first.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

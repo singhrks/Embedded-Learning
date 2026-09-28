@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stage-2 faults and how to decode them | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Stage-2 faults and how to decode them</h1>
+<p class="lead">A stage-2 fault is not an error. It is the hypervisor's primary input channel: it is how
+demand paging, MMIO emulation, dirty tracking, ballooning and copy-on-write all get their work. Learning to
+read one exactly is the difference between guessing and knowing.</p>
+
+<h2 id="why">A fault is a request</h2>
+
+<p>Reframing a fault as the hardware asking the hypervisor a question — rather than as an error — is what makes demand paging, MMIO emulation and dirty tracking look like one mechanism instead of three.</p>
+
+<pre class="diagram">   The guest does something perfectly ordinary:
+
+       LDR x0, [x1]        where x1 -&gt; 0x0900_0000 (its UART)
+                        or x1 -&gt; 0x4100_0000 (its RAM)
+
+   Stage 1 translates: VA -&gt; IPA. Fine, the guest's own tables.
+   Stage 2 translates: IPA -&gt; PA. And here it may say NO.
+
+       +-------------------------------------------------+
+       |  stage-2 descriptor invalid, or permission       |
+       |  insufficient  ->  DATA ABORT to EL2             |
+       +-------------------------------------------------+
+                        |
+                        v
+       hypervisor asks: WHY did I leave that unmapped?
+
+         "because there is no RAM there, but there IS a
+          device model"        -> emulate the access (ch. 14)
+
+         "because I have not allocated backing memory yet"
+                               -> allocate, map, retry
+
+         "because I am tracking which pages the guest writes"
+                               -> record it, make writable, retry
+
+         "because I swapped it out"
+                               -> page it back in, map, retry
+
+         "because the guest is genuinely misbehaving"
+                               -> inject an abort into the guest
+
+   FIVE different meanings, one hardware event. Everything
+   depends on decoding it correctly.</pre>
+
+<h2 id="regs">The three registers that describe a fault</h2>
+
+<p>Three registers carry everything you need, and knowing what each one holds is the difference between decoding a fault in a minute and guessing at it for an hour.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>Holds</th><th>Caveat</th></tr></thead>
+<tbody>
+<tr><td><code>ESR_EL2</code></td><td>Exception class and syndrome: what kind of access, what size, which
+register, why it faulted</td><td>The syndrome is only <em>partly</em> valid — check
+<code>ISV</code></td></tr>
+<tr><td><code>FAR_EL2</code></td><td>The faulting <strong>virtual</strong> address</td><td>Meaningless to the
+hypervisor on its own — it is a guest VA, in the guest's address space</td></tr>
+<tr><td><code>HPFAR_EL2</code></td><td>The faulting <strong>IPA</strong>, bits [47:12], shifted right by
+8</td><td>This is the one you actually want. It exists <em>because</em> <code>FAR_EL2</code> is
+useless</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Reconstructing the faulting IPA */
+
+    u64 hpfar = read_sysreg(hpfar_el2);
+    u64 far   = read_sysreg(far_el2);
+
+    u64 ipa = (hpfar & GENMASK(47, 4)) &lt;&lt; 8;   /* page-aligned  */
+    ipa |= far & 0xfff;                        /* offset in page */
+
+/* HPFAR gives you the PAGE. The low 12 bits of the byte offset
+   come from FAR - and that is legitimate, because stage 1 does
+   not change the low 12 bits of an address.                   */</code></pre>
+
+<h2 id="esr">Decoding ESR_EL2</h2>
+
+<p>The syndrome register is where the useful detail is, and it is worth being able to take it apart field by field without a reference to hand.</p>
+
+<pre class="diagram">   EC = 0x24  Data Abort from a lower EL   (stage-2 data fault)
+   EC = 0x20  Instruction Abort, lower EL   (stage-2 fetch fault)
+
+   ISS layout for a data abort:
+
+    24  23 22 21 20 19  16 15 14 13 12 11 10  9  8  7 6 5     0
+   +---+---+---+--+---+-----+--+--+--+--+--+---+--+--+---------+
+   |ISV| SAS |SSE| SRT  |SF|AR| VNCR|SET|FnV|EA|CM|S1PTW|WnR|DFSC|
+   +---+---+---+--+---+-----+--+--+--+--+--+---+--+--+---------+
+
+   ISV   [24]     Instruction Syndrome Valid. If 0, the fields
+                  below are NOT populated and you must decode the
+                  guest instruction yourself.
+   SAS   [23:22]  access size: 00=byte 01=half 10=word 11=double
+   SSE   [21]     sign extend
+   SRT   [20:16]  the guest register number involved
+   SF    [15]     64-bit register
+   AR    [14]     acquire/release semantics
+   S1PTW [7]      the fault happened while walking a STAGE-1
+                  table - i.e. the guest's own page table lives
+                  in a page you have not mapped
+   WnR   [6]      1 = write, 0 = read
+   DFSC  [5:0]    the actual fault status code</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>DFSC</th><th>Meaning</th><th>What the hypervisor usually does</th></tr></thead>
+<tbody>
+<tr><td><code>0b000100</code>–<code>0b000111</code></td><td>Translation fault, level 0–3</td><td>Nothing was
+mapped. Allocate and map, or route to a device model</td></tr>
+<tr><td><code>0b001000</code>–<code>0b001011</code></td><td>Access flag fault, level 0–3</td><td>Set AF; used
+to build a page-age estimate for reclaim</td></tr>
+<tr><td><code>0b001100</code>–<code>0b001111</code></td><td>Permission fault, level 0–3</td><td>Mapped but not
+with these rights. Dirty tracking, CoW, or a real guest violation</td></tr>
+<tr><td><code>0b010000</code></td><td>External abort, not on a table walk</td><td>The bus said no. Real
+hardware error — usually fatal</td></tr>
+<tr><td><code>0b010100</code>–<code>0b010111</code></td><td>External abort on a table walk</td><td>Your
+stage-2 tables are in unbacked or faulty memory</td></tr>
+<tr><td><code>0b100001</code></td><td>Alignment fault</td><td>Guest did an unaligned access to Device memory —
+see the attribute-downgrade trap in <a href="virt-05-stage2.html">chapter 05</a></td></tr>
+<tr><td><code>0b110000</code></td><td>TLB conflict abort</td><td>Overlapping TLB entries. Invalidate
+everything and retry</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="isv">The ISV=0 problem</h2>
+
+<p>When <code>ISV</code> is 1 the hardware hands you the access size, direction and register number, and MMIO
+emulation is trivial. When it is 0 you get none of that, and you must fetch and decode the guest's
+instruction yourself — from guest memory, at a guest VA, which may itself be unmapped.</p>
+
+<pre><code>/* ISV is 0 for, among others:
+
+     - any instruction abort (there is no data operand)
+     - load/store multiple  (LDP/STP is fine; LDM on AArch32 is not)
+     - loads/stores with writeback in some cases
+     - DC ZVA and other cache operations
+     - accesses to a page where S1PTW is set
+     - anything the implementation simply chose not to report
+
+   Consequence: a hypervisor CANNOT rely on ISV. KVM's answer is
+   blunt and correct: if ISV is 0 on an MMIO access, refuse.   */
+
+  if (!(esr & ESR_ELx_ISV)) {
+          kvm_pr_unimpl("Data abort outside memslots with no valid syndrome\n");
+          return -ENOSYS;      /* the VM dies                   */
+  }
+
+/* Which is why a guest driver that does this:
+
+       ldp x0, x1, [x2]        // load pair from an MMIO region
+
+   can kill the VM outright while the equivalent
+
+       ldr x0, [x2]
+       ldr x1, [x2, #8]
+
+   works perfectly. It is not a bug in your driver on hardware.
+   It is a rule you only discover under virtualisation:
+
+     NEVER use load/store-multiple, DC ZVA, or unaligned access
+     on memory-mapped device registers.
+
+   Linux enforces this by making you go through readl/writel,
+   which compile to single loads and stores for exactly this
+   reason.                                                     */</code></pre>
+
+<div class="danger">
+<b>The <code>memcpy</code>-to-MMIO bug</b>
+<p><code>memcpy()</code> into a device region compiles to <code>LDP</code>/<code>STP</code> and possibly
+<code>DC ZVA</code>. On hardware it usually works. Under a hypervisor it produces <code>ISV=0</code> and the
+VM is killed with "no valid syndrome". Use <code>memcpy_toio()</code>/<code>__iowrite32_copy()</code>, or
+explicit <code>writel()</code> loops.</p>
+</div>
+
+<h2 id="s1ptw">S1PTW: the nested fault</h2>
+
+<p>A fault that occurs while the hardware is walking the guest's own page tables behaves differently from an ordinary one, and it confuses people the first time it appears.</p>
+
+<pre class="diagram">   The guest's stage-1 page table is itself in guest memory.
+   That memory has an IPA. That IPA needs stage-2 translation.
+
+     guest executes    LDR x0, [x1]
+        |
+        v
+     stage-1 walk needs to read the L2 descriptor
+        |  descriptor lives at guest-physical 0x4020_3000
+        v
+     stage 2 asked to translate IPA 0x4020_3000
+        |
+        v
+     NOT MAPPED  ->  data abort to EL2, with S1PTW = 1
+
+   Meaning: "I faulted while fetching the guest's own page
+   table, not while performing the guest's actual access."
+
+   Why you must care:
+     * WnR is meaningless-ish: the walk may be a READ even
+       though the guest's access was a WRITE. Do not use WnR to
+       decide writability here. (With hardware dirty-bit
+       management the walk may genuinely write, which is why
+       modern code checks both.)
+     * ISV is 0.
+     * You must map the page and RETRY. Do not try to emulate.
+     * If the IPA has no memory behind it at all, the guest has
+       put its page tables in a device region or in a hole. That
+       is a guest bug and deserves an injected abort.</pre>
+
+<h2 id="handler">A fault handler, end to end</h2>
+
+<p>Putting the pieces together into a complete handler shows how few distinct outcomes there really are.</p>
+
+<pre><code>int handle_stage2_abort(struct vcpu *v)
+{
+        u64  esr   = read_sysreg(esr_el2);
+        u32  dfsc  = esr & 0x3f;
+        bool write = esr & ESR_ELx_WNR;
+        bool s1ptw = esr & ESR_ELx_S1PTW;
+        u64  ipa   = (read_sysreg(hpfar_el2) & GENMASK(47,4)) &lt;&lt; 8;
+
+        ipa |= read_sysreg(far_el2) & 0xfff;
+
+        /* 1. Is this address backed by guest RAM at all? */
+        struct memslot *slot = find_memslot(v-&gt;vm, ipa);
+
+        if (!slot) {
+                /* No RAM. Either a device we model, or nowhere. */
+                if (s1ptw)
+                        return inject_abort(v);   /* page tables
+                                                     in a hole  */
+                if (!(esr & ESR_ELx_ISV))
+                        return -ENOSYS;           /* cannot emulate */
+                return emulate_mmio(v, ipa, esr); /* chapter 14  */
+        }
+
+        /* 2. Backed by RAM. Why did it fault? */
+        switch (dfsc &amp; ~3) {                 /* mask off the level */
+        case FSC_TRANSLATION:                /* nothing mapped     */
+                return map_page(v, ipa, slot, write);
+
+        case FSC_ACCESS_FLAG:                /* aging              */
+                return set_access_flag(v, ipa);
+
+        case FSC_PERMISSION:
+                if (write &amp;&amp; dirty_logging_enabled(v-&gt;vm)) {
+                        mark_page_dirty(v-&gt;vm, ipa);
+                        return make_writable(v, ipa);
+                }
+                if (write &amp;&amp; is_cow(slot, ipa))
+                        return do_copy_on_write(v, ipa);
+                return inject_abort(v);      /* genuine violation  */
+
+        case FSC_EXTERNAL:
+                return inject_serror(v);     /* the bus said no    */
+
+        default:
+                return inject_abort(v);
+        }
+        /* NOTE: no vcpu_skip_instr anywhere. After mapping a page
+           we RETRY the guest instruction; it must run again. This
+           is the opposite of a system-register trap.            */
+}</code></pre>
+
+<div class="key">
+<b>Retry versus skip</b>
+<p>A system-register trap is <em>emulated</em>, so you advance the guest PC past it. A stage-2 translation
+fault is <em>fixed</em>, so you leave the PC alone and let the instruction re-execute. Skipping after a
+translation fault silently drops the guest's load or store; retrying after an emulated MMIO write performs
+it twice. Both are ugly, intermittent bugs.</p>
+</div>
+
+<h2 id="dirty">Dirty tracking, which is just permission faults on purpose</h2>
+
+<p>Live migration's dirty tracking is not a separate feature — it is permission faults being provoked deliberately, which is a good example of the mechanism being reused.</p>
+
+<pre><code>/* Live migration needs to know which guest pages changed while
+   it was copying. There is no hardware "dirty log" for stage 2
+   on most parts, so KVM builds one out of faults:            */
+
+  1. write-protect every stage-2 mapping        (S2AP = read only)
+  2. copy all guest memory to the destination
+  3. guest writes a page -> PERMISSION FAULT at stage 2
+     handler: record the page number in a bitmap,
+              set S2AP = RW, TLBI, retry
+  4. re-copy the pages in the bitmap
+  5. repeat 3-4 until the dirty set is small
+  6. pause the guest, copy the remainder, switch over
+
+/* Cost: one exit per page, per round. A guest writing memory
+   faster than you can copy it never converges - that is the
+   classic "migration never completes" failure, and the fix is
+   either to throttle the guest or to give up and pause it.
+
+   ARMv8.1 hardware dirty-bit management (VTCR_EL2.HD) lets the
+   PTW set the dirty bit itself, removing the exit. Where it
+   exists, KVM uses it and migration gets dramatically cheaper. */</code></pre>
+
+<h2 id="debug">Seeing faults on a live system</h2>
+
+<p>Faults are countable on a running system, and the counts are usually the fastest way to find out what a guest is really doing.</p>
+
+<pre><code>$ sudo perf stat -e 'kvm:kvm_*' -a sleep 5
+       142,551  kvm:kvm_exit
+        98,204  kvm:kvm_mmio                # device emulation
+        31,880  kvm:kvm_guest_fault         # stage-2 faults
+           440  kvm:kvm_set_spte_hva
+
+# Per-fault detail, including the IPA and the ESR:
+$ sudo perf record -e kvm:kvm_guest_fault -a -- sleep 2
+$ sudo perf script | head -3
+ CPU 2 ... kvm_guest_fault: ipa 0x40a13000 hsr 0x93000047 hxfar 0xffff800010a13000
+
+#   hsr  = ESR_EL2  -> 0x93000047
+#     EC   = 0x24  data abort, lower EL
+#     ISV  = 1
+#     WnR  = 1     it was a write
+#     DFSC = 0x07  translation fault, level 3
+#   So: guest wrote to an unmapped page; KVM will allocate one.
+
+# Inside a guest, the other side of the same story:
+$ sudo dmesg | grep -i 'unhandled fault\|synchronous external abort'</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>Data abort outside memslots with no valid syndrome</code>, VM killed</td><td><code>ISV=0</code>
+on an MMIO access — the guest used <code>LDP</code>/<code>STP</code>, <code>memcpy</code> or
+<code>DC ZVA</code> on a device region</td></tr>
+<tr><td>Guest load returns a stale or wrong value once in a while</td><td>Handler advanced the PC after fixing
+a translation fault, dropping the access</td></tr>
+<tr><td>Emulated device sees each write twice</td><td>Handler retried instead of skipping after emulating an
+MMIO access</td></tr>
+<tr><td>Infinite fault loop on one address</td><td>Descriptor written but no <code>DSB</code>/<code>TLBI</code>,
+so the walker keeps seeing the old entry</td></tr>
+<tr><td>Guest dies during early boot with an abort on its own page tables</td><td><code>S1PTW</code> fault the
+handler treated as MMIO</td></tr>
+<tr><td>Live migration never converges</td><td>Guest dirties pages faster than they can be copied; no hardware
+dirty-bit support and no throttling</td></tr>
+<tr><td>Alignment faults inside a guest that works on hardware</td><td>Stage-2 attributes downgraded the region
+to Device</td></tr>
+<tr><td>Fault reported at a guest VA that makes no sense</td><td>Reading <code>FAR_EL2</code> instead of
+<code>HPFAR_EL2</code></td></tr>
+<tr><td>Guest sees SError shortly after an abort</td><td>External abort turned into an SError injection —
+usually genuinely broken hardware or a bad DMA target</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List five different reasons a hypervisor might deliberately leave a stage-2 mapping absent.</li>
+  <li>Explain why <code>FAR_EL2</code> is insufficient and what <code>HPFAR_EL2</code> provides.</li>
+  <li>Reconstruct a full faulting IPA from <code>HPFAR_EL2</code> and <code>FAR_EL2</code>.</li>
+  <li>Decode <code>ESR_EL2 = 0x93000047</code> completely.</li>
+  <li>Explain <code>ISV</code>, name three cases where it is 0, and say what a hypervisor does then.</li>
+  <li>Explain why <code>memcpy()</code> to MMIO can kill a VM but works on bare metal.</li>
+  <li>Define <code>S1PTW</code> and explain why <code>WnR</code> is unreliable when it is set.</li>
+  <li>State the rule for when to retry the guest instruction and when to skip it.</li>
+  <li>Describe how dirty-page tracking is built from permission faults, and what
+  <code>VTCR_EL2.HD</code> changes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

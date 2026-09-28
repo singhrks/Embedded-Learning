@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nested virtualisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Nested virtualisation</h1>
+<p class="lead">There is one EL2 and two hypervisors that want it. Resolving that — letting a guest believe
+it owns the virtualisation extensions while the real owner watches — is the most intricate trick in the
+architecture, and it is why your cloud VM can itself run Docker Desktop, Android emulators and CI runners
+that expect KVM.</p>
+
+<h2 id="names">The names, first</h2>
+
+<p>Nested virtualisation has three levels and every discussion of it becomes incomprehensible unless the naming is fixed first.</p>
+
+<pre class="diagram">   L0   the real hypervisor, running at real EL2.
+        The only software with genuine EL2 privilege.
+
+   L1   a GUEST that is itself a hypervisor. It believes it
+        runs at EL2. It actually runs at EL1.
+
+   L2   L1's guest. It believes it runs at EL1. It actually
+        also runs at EL1 - but with L0 having composed L1's
+        intentions into the real hardware.
+
+   +---------------------------------------------+
+   |  L2 guest  (thinks: EL1)     really: EL1    |
+   +---------------------------------------------+
+   |  L1 hypervisor (thinks: EL2)  really: EL1   |
+   |     - has "its own" HCR_EL2, VTTBR_EL2 ...  |
+   |       every one of them a value in memory   |
+   +---------------------------------------------+
+   |  L0 hypervisor            really: EL2       |
+   |     - owns the actual system registers      |
+   |     - owns the actual stage-2 tables        |
+   +---------------------------------------------+
+   |  hardware                                   |
+   +---------------------------------------------+
+
+   Real-world instances:
+     L0 = your cloud provider's KVM
+     L1 = the KVM inside your VM
+     L2 = the container-in-a-VM, the Android emulator, the
+          CI runner's test VM
+
+   Or, on a phone:
+     L0 = pKVM
+     L1 = the Android guest kernel running its own VMs
+     L2 = a protected app VM</pre>
+
+<h2 id="how">How L0 fakes EL2 for L1</h2>
+
+<p>The trick is that there is only one EL2, so the outer hypervisor must present a convincing imitation of it to a guest that believes it is a hypervisor.</p>
+
+<pre><code>/* L1 executes code that only EL2 may execute. Since L1 is
+   really at EL1, that traps to L0. L0 then EMULATES an EL2
+   for it.                                                   */
+
+  L1 does:  MSR VTTBR_EL2, x0
+     -> trap to L0 (EC = 0x18, or a dedicated nested trap)
+     -> L0 records: "L1's virtual VTTBR_EL2 = x0"
+        It does NOT program the hardware VTTBR_EL2 with it.
+
+  L1 does:  MSR HCR_EL2, x0
+     -> trap. L0 records L1's intended trap configuration and
+        RECOMPUTES the real HCR_EL2 as roughly
+             real = L0's own requirements
+                  UNION L1's requirements
+        so that anything either hypervisor wanted to trap
+        still traps - to L0, which then decides whether the
+        trap belongs to L1.
+
+  L1 does:  ERET into L2
+     -> trap. L0 switches to "running L2" mode: it loads the
+        shadow stage-2 (below), sets the real HCR_EL2 for an
+        L2 guest, and ERETs.
+
+  L2 traps (say, an MMIO access)
+     -> arrives at L0, because all traps arrive at real EL2.
+     -> L0 asks: did L1 ask for this to trap?
+          YES -> synthesise an exception INTO L1: set L1's
+                 virtual ESR_EL2, ELR_EL2, SPSR_EL2 and enter
+                 L1 at its virtual VBAR_EL2.
+          NO  -> handle it myself and resume L2 directly.
+
+/* Every EL2 register L1 touches becomes a field in a struct.
+   ARMv8.4-NV and 8.4-NV2 help enormously: NV redirects
+   _EL2 register accesses at EL1 to trap, and NV2 redirects
+   many of them to a MEMORY PAGE instead of trapping at all -
+   so L1 writes "VTTBR_EL2" and the value lands in a VNCR page
+   that L0 reads later, with no exception taken.            */</code></pre>
+
+<div class="key">
+<b>NV2 is the difference between "possible" and "usable"</b>
+<p>Without <code>ARMv8.4-NV2</code>, every single EL2 register access by L1 is a trap, and a hypervisor
+touches those constantly. NV2 gives L1 a page of memory that the hardware treats as the EL2 register file for
+most registers. L1's ordinary <code>MSR</code>/<code>MRS</code> become memory accesses; L0 reads the page
+when it needs to. Nested virtualisation on hardware without NV2 works and is slow enough that few people
+use it.</p>
+</div>
+
+<h2 id="shadow">Shadow stage-2: two translations, one MMU</h2>
+
+<p>Two levels of guest mean three address spaces to collapse into the two the hardware provides, and the merged table is where the cost lives.</p>
+
+<pre class="diagram">   The hardware has ONE stage-2. Nesting needs two:
+
+     L2 virtual address
+        |  L2's stage 1 (L2's own page tables)
+        v
+     L2 intermediate physical address
+        |  L1's stage 2  - L1 built these tables and believes
+        |                  they are in force
+        v
+     L1 intermediate physical address
+        |  L0's stage 2  - the real one
+        v
+     real physical address
+
+   The hardware can do one of those. So L0 COMPOSES them:
+
+     shadow_s2[L2_ipa] = L0_s2[ L1_s2[L2_ipa] ]
+
+   and programs the shadow into the real VTTBR_EL2 whenever L2
+   runs. This is exactly the shadow-page-table technique that
+   stage 2 was invented to eliminate (chapter 02) - it has
+   returned, one level up.
+
+   Maintaining it:
+     * L1 edits its stage-2 tables. Those tables live in L1's
+       memory, so L0 can write-protect them and catch edits...
+       expensive.
+     * Better: L1 must issue a TLBI after any change (the
+       architecture requires it). L0 traps the TLBI and
+       invalidates the corresponding shadow entries. This is
+       why nested virt REQUIRES trapping L1's TLB maintenance
+       while ordinary virt deliberately does not.
+     * The shadow is built lazily: on an L2 fault, walk L1's
+       stage 2 in software, then L0's, install one entry.
+
+   COST: an L2 stage-2 fault costs a software walk of L1's
+   tables plus a shadow install - hundreds of times a plain
+   stage-2 fault. L2's steady-state execution, once the shadow
+   is warm, is close to native.</pre>
+
+<h2 id="ints">Interrupts and timers, nested</h2>
+
+<p>Interrupts and timers are harder than memory under nesting, because both have hardware acceleration that assumes only one level.</p>
+
+<pre><code>/* The vGIC problem: L1 wants to write list registers. There is
+   one set, and L0 is using it.                             */
+
+  L1 writes ICH_LR0_EL2 to inject into L2
+     -> trap (or NV2 memory write)
+     -> L0 records L1's intended list-register content
+     -> when L0 runs L2, it merges:
+           interrupts L0 wants to inject into L1
+           interrupts L1 wants to inject into L2
+        into the real list registers, with the right virtual
+        INTIDs for whichever level is executing.
+
+/* GICv4.1 helps: a VPE can be a NESTED vCPU, so an LPI can be
+   delivered directly to L2 without either hypervisor running.
+   Support for this is recent and not universal.            */
+
+/* Timers: CNTVOFF_EL2 is singular, and now two hypervisors
+   want to offset time.
+
+     L1 sets its virtual CNTVOFF_EL2 = A  (to rebase L2)
+     L0 has its own CNTVOFF_EL2      = B  (to rebase L1)
+
+   The value the hardware needs while L2 runs is A + B, and L0
+   computes it. ARMv8.6-ECV adds CNTPOFF_EL2 and finer control
+   precisely because composing offsets by hand was error-prone.
+
+   Symptom of getting it wrong: L2's clock drifts relative to
+   L1's, and the guest's clocksource watchdog eventually
+   declares the counter unstable.                           */</code></pre>
+
+<h2 id="use">Turning it on</h2>
+
+<p>Nested support is available in specific configurations, and knowing the requirements saves a lot of time before you try.</p>
+
+<pre><code># Hardware requirement: FEAT_NV2 in practice. Check:
+$ dmesg | grep -i nested
+[    0.512] kvm [1]: Nested virtualization is experimental
+
+# Enable in the host kernel (L0):
+#   kvm-arm.mode=nested
+# and the VM must be created asking for it:
+
+$ qemu-system-aarch64 -M virt -accel kvm -cpu host,el2=on ...
+
+# Inside L1, confirm it believes it has EL2:
+$ dmesg | grep -i 'EL2\|kvm'
+[    0.000000] CPU: All CPU(s) started at EL2
+[    0.498112] kvm [1]: Hyp mode initialized successfully
+$ ls -l /dev/kvm
+
+# Then run L2 from inside L1 exactly as normal.
+
+# x86 equivalent, for comparison - the concept is identical:
+$ cat /sys/module/kvm_intel/parameters/nested
+Y
+$ qemu-system-x86_64 -cpu host,+vmx ...
+
+# EXPECTATIONS. Measure, do not assume:
+#   L1 CPU-bound work      ~ native
+#   L2 CPU-bound work      ~ native
+#   L2 I/O and interrupts  noticeably slower - every exit that
+#                          L1 must see is two exits
+#   L1 booting L2          slow: the shadow stage-2 is cold and
+#                          every page is a software walk</code></pre>
+
+<div class="warn">
+<b>Nested is for capability, not performance</b>
+<p>People enable nesting so that something <em>works</em> — a CI job that spawns VMs, a developer's Android
+emulator, a container runtime that wants a VM per container. If L2's performance is on your critical path,
+the answer is almost always to flatten the stack rather than to tune the nesting.</p>
+</div>
+
+<h2 id="pkvm">Where it actually ships</h2>
+
+<p>The mechanism sees far more production use than the datacentre framing suggests, and the place it actually ships is probably in your pocket.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Stack</th><th>L0</th><th>L1</th><th>L2</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Cloud CI</td><td>Provider KVM</td><td>Your VM's KVM</td><td>Test VMs</td><td>Build and test images that
+need a real kernel</td></tr>
+<tr><td>Android</td><td>pKVM</td><td>Android kernel</td><td>Protected app VMs</td><td>Isolate a payment or
+biometric workload from Android itself</td></tr>
+<tr><td>Windows on Arm</td><td>Hyper-V</td><td>The "root" Windows</td><td>WSL2, containers,
+VBS</td><td>Virtualisation-based security means Windows itself is already a guest</td></tr>
+<tr><td>Automotive dev</td><td>Type-1 hypervisor</td><td>Linux domain</td><td>Emulated ECUs</td><td>Develop and
+test partitions without the target hardware</td></tr>
+<tr><td>Hypervisor development</td><td>KVM</td><td>The hypervisor you are writing</td><td>Its
+guests</td><td>Debug an EL2 payload with gdb instead of a JTAG probe — see
+<a href="qemu-11-gdb.html">QEMU chapter 11</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>L1 says <code>HYP mode not available</code></td><td>The VM was not created with EL2
+(<code>-cpu host,el2=on</code>), or L0 does not have nesting enabled</td></tr>
+<tr><td>L2 boots then hangs at random points</td><td>Shadow stage-2 stale — L1's TLBI not trapped or not
+translated into shadow invalidation</td></tr>
+<tr><td>L2 memory corruption under load</td><td>Shadow composition bug: permissions not intersected across
+both stage-2 levels</td></tr>
+<tr><td>L2's clock drifts from L1's</td><td>Timer offsets not composed (<code>A + B</code>)</td></tr>
+<tr><td>L2 never receives interrupts</td><td>L1's list-register writes recorded but not merged into the real
+list registers when L2 runs</td></tr>
+<tr><td>Extremely slow, hardware supports nesting</td><td>No NV2 — every L1 EL2 register access is a
+trap</td></tr>
+<tr><td>L1 crashes with an unexpected exception</td><td>L0 synthesised an exception into L1 with an
+<code>ESR</code> encoding L1 does not handle</td></tr>
+<tr><td>Works with one vCPU, breaks with several</td><td>Shadow tables shared across vCPUs without the
+locking the real hardware provided implicitly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define L0, L1 and L2 and state the real exception level each runs at.</li>
+  <li>Explain what happens when L1 executes <code>MSR VTTBR_EL2</code>.</li>
+  <li>Explain how L0 computes the real <code>HCR_EL2</code> from its own needs and L1's.</li>
+  <li>Describe what happens to an L2 trap and how L0 decides whether L1 should see it.</li>
+  <li>Explain shadow stage-2 and write the composition rule.</li>
+  <li>Say why nested virtualisation must trap L1's <code>TLBI</code> when ordinary virtualisation must
+  not.</li>
+  <li>Explain what FEAT_NV2 changes and why it matters so much.</li>
+  <li>Explain how two levels of timer offset are combined.</li>
+  <li>Give three real deployments of nested virtualisation and what each needs it for.</li>
+  <li>Predict which of L2's workloads will be near-native and which will not.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

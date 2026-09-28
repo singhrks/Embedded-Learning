@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exceptions and error-handling strategies | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Exceptions and error-handling strategies</h1>
+<p class="lead">How C++ exceptions actually work, what they cost, and why most embedded projects disable
+them. Then the alternatives — and one of them, <code>std::expected</code>, is genuinely better than either
+exceptions or error codes.</p>
+
+<h2 id="mechanism">How they work</h2>
+
+<p>Exceptions are usually discussed in terms of style. What matters for systems work is the mechanism: what the compiler emits, what it costs when nothing is thrown, and what has to exist at run time for a throw to work at all.</p>
+
+<pre class="diagram">   throw MyError{42};
+        |
+   1. ALLOCATE the exception object. __cxa_allocate_exception
+      uses malloc, falling back to an emergency static buffer.
+        |
+   2. __cxa_throw begins UNWINDING.
+        |
+   3. PHASE 1 - SEARCH. Walk up the stack using the .eh_frame
+      unwind tables (compilers chapter 14), asking each frame's
+      "personality routine" whether it has a matching handler.
+      NOTHING IS DESTROYED YET.
+        |
+   4. If no handler is found -> std::terminate. This is why an
+      uncaught exception can abort with the stack intact.
+        |
+   5. PHASE 2 - CLEANUP. Walk up again, this time running each
+      frame's destructors and landing pads, and transfer
+      control to the handler.
+        |
+   catch (const MyError& e) { ... }
+
+   THE TWO-PHASE DESIGN exists so that if no handler exists,
+   the program terminates with the throwing frame still on the
+   stack - which makes the core dump useful.
+
+   THE IMPLEMENTATION IS TABLE-DRIVEN ("zero-cost"):
+     · NO code on the non-throwing path. No flag to set, no
+       branch, no register saved. A function that never throws
+       runs exactly as fast as the C equivalent.
+     · The cost is entirely in DATA: .eh_frame and
+       .gcc_except_table describe, for every address, what to
+       destroy and where the handlers are.
+
+   SO THE HONEST COST is:
+     RUNTIME (happy path)   zero
+     RUNTIME (throwing)     microseconds - table lookup,
+                            unwinding, allocation. NOT bounded.
+     CODE SIZE              typically 10-20% larger binary
+     RAM                    a heap allocation per throw
+     DETERMINISM            none - the unwind time depends on
+                            stack depth and table contents</pre>
+
+<h2 id="why-not">Why embedded disables them</h2>
+
+<p>Most kernel and embedded code forbids exceptions, and the reasons are concrete — binary size, unbounded timing, and a dependency on run-time support that may not exist.</p>
+
+<pre><code>/* -fno-exceptions is the default choice in embedded C++, and
+   the reasons are concrete rather than dogmatic:         */
+
+   1. CODE SIZE. The tables are 10-20% of the binary, and the
+      unwinder itself (libgcc_eh or libunwind) is tens of
+      kilobytes. On a 256 KB part that is decisive.
+
+   2. NON-DETERMINISM. Throw time depends on stack depth, the
+      number of frames with destructors, and table lookups.
+      A hard real-time deadline cannot accommodate an
+      unbounded operation on any path.
+
+   3. THE ALLOCATION. __cxa_allocate_exception calls malloc.
+      On a system with no heap that is a link error; on one
+      with a heap it is an allocation on the error path, which
+      is exactly where you least want one.
+
+   4. WRITING EXCEPTION-SAFE CODE IS HARD, and the
+      consequences of getting it wrong are subtle - a
+      half-updated data structure after an unwind is worse
+      than an error code that was ignored.
+
+   5. THE ECOSYSTEM. Vendor SDKs, RTOS APIs and HALs are C.
+      An exception cannot propagate through a C stack frame
+      (there are no unwind tables), so it terminates.
+
+   BUILD WITH:
+        -fno-exceptions -fno-unwind-tables
+        -fno-asynchronous-unwind-tables
+
+   WHAT CHANGES:
+     · `throw` and `try`/`catch` are compile errors
+     · std::terminate is called where the library would throw
+     · new returns nullptr if you use std::nothrow, otherwise
+       it terminates - so use the nothrow form
+     · vector::at, optional::value, variant::get become
+       unusable - use operator[], *opt, get_if
+     · noexcept is implied everywhere
+
+   MEASURE IT ON YOUR OWN CODE before deciding. On embedded
+   Linux with megabytes of flash, exceptions may be entirely
+   affordable, and the argument is then only about
+   determinism.                                            */</code></pre>
+
+<div class="key">
+<b>The one thing exceptions genuinely do better</b>
+<p>They cannot be ignored. An error code returned and not checked is silent; an exception not caught
+terminates loudly. And they propagate through call chains that have no way to return a value — most
+importantly constructors, which is why a constructor that can fail either throws or requires a two-phase
+init. Every alternative below has to answer that second point.</p>
+</div>
+
+<h2 id="expected">std::expected</h2>
+
+<p>If exceptions are unavailable, errors must be returned. Modern C++ has a type for "a value or an error" that makes that ergonomic rather than a chore of out-parameters and sentinels.</p>
+
+<pre><code>#include &lt;expected&gt;     /* C++23; std::optional plus an error */
+
+/* THE BEST OF BOTH: a value or an error, in the return type,
+   with no allocation, no unwinding, and no way to ignore it
+   accidentally.                                            */
+
+enum class Error { Timeout, Nack, BusBusy, BadArgument };
+
+std::expected&lt;uint16_t, Error&gt; read_register(uint8_t addr)
+{
+        if (addr &gt; MAX_REG)
+                return std::unexpected(Error::BadArgument);
+
+        if (!bus_acquire())
+                return std::unexpected(Error::BusBusy);
+
+        auto v = bus_read(addr);
+        if (!v)
+                return std::unexpected(Error::Timeout);
+
+        return *v;              /* the success value */
+}
+
+        auto r = read_register(0x10);
+        if (r) {
+                use(*r);
+        } else {
+                log(r.error());
+        }
+
+        uint16_t v = read_register(0x10).value_or(0);
+
+/* AND IT COMPOSES - monadic operations (C++23): */
+        auto result = read_register(0x10)
+                .and_then([](uint16_t v)
+                        { return validate(v); })
+                .transform([](uint16_t v)
+                        { return v * 2; })
+                .or_else([](Error e)
+                        { return fallback(e); });
+
+/* LAYOUT: a union of the value and the error, plus a
+   discriminant. INLINE, no allocation - typically
+   max(sizeof(T), sizeof(E)) + alignment.
+
+   static_assert(sizeof(std::expected&lt;uint16_t, Error&gt;) == 4);
+
+/* MARK IT [[nodiscard]] and ignoring it becomes a warning: */
+        [[nodiscard]] std::expected&lt;uint16_t, Error&gt;
+                read_register(uint8_t addr);
+
+/* IF YOUR TOOLCHAIN LACKS C++23, tl::expected is a
+   header-only implementation with the same interface, and
+   it is widely used in embedded projects for exactly this
+   reason.                                                 */</code></pre>
+
+<h2 id="alternatives">The other strategies</h2>
+
+<p>Beyond returning errors, several established patterns handle failure without exceptions while keeping the code readable.</p>
+
+<pre><code>/* --- 1. ERROR CODES, the C way ------------------------- */
+        Status read(uint8_t addr, uint16_t *out);
+        if (read(0x10, &amp;v) != Status::Ok) { ... }
+/* PROS: universal, no machinery, works with C.
+   CONS: out-parameters, ignorable, no composition, and the
+   value cannot be const.
+   FIX THE IGNORABILITY: */
+        [[nodiscard]] Status read(...);
+
+/* --- 2. optional, when there is only one failure mode --- */
+        std::optional&lt;uint16_t&gt; read(uint8_t addr);
+/* Simpler than expected when the caller does not need to
+   know WHY.
+
+/* --- 3. AN ERROR STATE ON THE OBJECT, sticky ------------ */
+class Bus {
+        Error last_ = Error::None;
+public:
+        uint16_t read(uint8_t a)
+        {
+                if (last_ != Error::None) return 0;   /* already
+                                                         failed */
+                ...
+        }
+        Error error() const { return last_; }
+        void clear_error() { last_ = Error::None; }
+        explicit operator bool() const
+                { return last_ == Error::None; }
+};
+        bus.write(0x10, 1);
+        bus.write(0x11, 2);
+        bus.write(0x12, 3);
+        if (!bus) handle(bus.error());   /* CHECK ONCE, after
+                                            a sequence       */
+/* THE STICKY-ERROR PATTERN is genuinely good for a sequence
+   of hardware operations: no per-call checking, and the
+   first failure suppresses the rest so nothing operates on
+   garbage. It is how iostreams work, and how many HAL
+   layers should.
+
+/* --- 4. ASSERT AND ABORT, for programmer errors ---------- */
+        void set_channel(uint8_t ch)
+        {
+                assert(ch &lt; NUM_CHANNELS);   /* a BUG, not a
+                                                runtime error */
+                ...
+        }
+/* DISTINGUISH THE TWO CASES, and this is the important
+   distinction in the whole chapter:
+
+     A PROGRAMMER ERROR - a precondition violated, an invalid
+     index, a null where one is impossible - is a BUG. Assert,
+     and fail fast. Returning an error code invites the caller
+     to continue with a broken invariant.
+
+     A RUNTIME ERROR - the hardware timed out, the input was
+     malformed, the resource is busy - is an EXPECTED
+     CONDITION. Return it.
+
+   Conflating them produces either code full of unreachable
+   error handling, or bugs papered over as failures.      */
+
+/* --- 5. CONSTRUCTORS THAT CANNOT FAIL ------------------- */
+/* The problem exceptions solve. Without them: */
+
+        /* (a) two-phase init */
+        class Device {
+                bool ok_ = false;
+        public:
+                Device() = default;
+                bool init(uintptr_t base);   /* returns success */
+                explicit operator bool() const { return ok_; }
+        };
+
+        /* (b) a static factory returning expected */
+        class Device {
+                explicit Device(uintptr_t base);   /* private,
+                                                      cannot
+                                                      fail    */
+        public:
+                static std::expected&lt;Device, Error&gt;
+                create(uintptr_t base)
+                {
+                        if (!probe(base))
+                                return std::unexpected(
+                                        Error::NotPresent);
+                        return Device{base};
+                }
+        };
+        auto d = Device::create(0x40000000);
+
+/* (b) IS THE BETTER PATTERN: there is no "constructed but
+   invalid" state to check for, and the type system enforces
+   that you handled the failure before you have a Device.  */</code></pre>
+
+<h2 id="safety">Exception safety, if you do use them</h2>
+
+<p>Even without exceptions, the levels of guarantee a function offers on failure are a useful vocabulary — they describe what state the program is in after something goes wrong.</p>
+
+<pre><code>/* FOUR GUARANTEES a function can offer: */
+
+   NOTHROW      it never throws. Mark it `noexcept`.
+   STRONG       if it throws, the program state is UNCHANGED -
+                the operation is transactional.
+   BASIC        if it throws, everything is still VALID and
+                destructible, but possibly modified. No leaks,
+                no broken invariants.
+   NONE         all bets are off. Unacceptable.
+
+/* THE BASIC GUARANTEE IS THE MINIMUM. Achieve it with RAII
+   (chapter 02): if every resource is owned by an object,
+   unwinding releases everything automatically.
+
+/* THE STRONG GUARANTEE, via copy-and-swap: */
+        void Container::insert(const T&amp; v)
+        {
+                Container tmp = *this;  /* may throw - harmless */
+                tmp.do_insert(v);       /* may throw - harmless */
+                swap(*this, tmp);       /* noexcept - COMMITS */
+        }
+/* Do all the throwing work on a copy, then commit with an
+   operation that cannot fail. Expensive, and the only
+   general way to be transactional.
+
+/* noexcept, and why it matters: */
+        void f() noexcept;
+/* If f throws anyway, std::terminate is called IMMEDIATELY -
+   no unwinding. So `noexcept` is a promise, not a filter.
+
+   MARK noexcept:
+     · move constructors and move assignment (chapter 03 -
+       vector depends on it)
+     · destructors (implicitly noexcept already)
+     · swap
+     · anything genuinely trivial
+   DO NOT mark it speculatively: removing it later is an ABI
+   break.
+
+/* DESTRUCTORS MUST NOT THROW. They are implicitly noexcept,
+   and a throwing destructor during unwinding terminates the
+   program. If a destructor performs an operation that can
+   fail - closing a file, flushing a buffer - either swallow
+   the error or provide an explicit close() the user calls
+   first.                                                  */</code></pre>
+
+<h2 id="mixing">Interoperating with C</h2>
+
+<p>C++ code with exceptions calling C code, or the reverse, has rules that must be followed exactly. An exception propagating through a C frame is undefined behaviour, not merely poor form.</p>
+
+<pre><code>/* An exception must NEVER propagate through a C stack frame.
+   There are no unwind tables for it, and the behaviour is
+   undefined - in practice, terminate.                     */
+
+/* SO EVERY C CALLBACK NEEDS A BARRIER: */
+extern "C" int my_callback(void *ctx, int arg) noexcept
+{
+        try {
+                auto *self = static_cast&lt;Handler *&gt;(ctx);
+                return self-&gt;handle(arg);
+        } catch (const std::exception&amp; e) {
+                log_error(e.what());
+                return -1;
+        } catch (...) {
+                return -1;
+        }
+}
+
+/* THE `noexcept` ON AN extern "C" FUNCTION is the belt and
+   braces: even if a catch is missed, terminate happens HERE,
+   at a diagnosable point, rather than corrupting the C
+   caller's stack.
+
+/* AND THE SAME AT EVERY BOUNDARY:
+     · a signal handler
+     · a thread entry function
+     · an interrupt handler (in the rare case C++ is used
+       there)
+     · anything registered with a C library
+     · a DLL/shared-library export
+
+   RULE: `extern "C"` and `noexcept` go together, with a
+   catch-all inside.                                       */</code></pre>
+
+<h2 id="decide">Choosing</h2>
+
+<p>The decision is not purely technical — it depends on the platform, the toolchain and the project's constraints. This is the reasoning laid out so the choice can be made deliberately.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Context</th><th>Strategy</th></tr></thead>
+<tbody>
+<tr><td>Bare metal, hard real-time</td><td><code>-fno-exceptions</code>; <code>expected</code> or error codes; assert for bugs</td></tr>
+<tr><td>Bare metal, soft real-time</td><td>Same — the code size argument usually decides it</td></tr>
+<tr><td>Embedded Linux application</td><td>Either. <code>expected</code> for recoverable errors, exceptions for genuinely exceptional ones</td></tr>
+<tr><td>A library with a C API</td><td>No exceptions across the boundary; translate at the edge</td></tr>
+<tr><td>Kernel or driver code</td><td>Never — no runtime support exists</td></tr>
+<tr><td>Constructor that can fail</td><td>A static factory returning <code>expected</code></td></tr>
+<tr><td>Programmer error</td><td><code>assert</code>, always — never an error return</td></tr>
+<tr><td>Existing codebase</td><td>Match it. Mixing two strategies is worse than either</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Link error: <code>__gxx_personality_v0</code></td><td>Exceptions enabled but no unwinder linked — use <code>-fno-exceptions</code></td></tr>
+<tr><td>Link error: <code>__cxa_throw</code>, <code>_Unwind_Resume</code></td><td>Same</td></tr>
+<tr><td>Binary 20% larger than expected</td><td>Unwind tables — check with <code>size -A</code></td></tr>
+<tr><td>Terminate with no message</td><td>An exception escaped a <code>noexcept</code> function or a C boundary</td></tr>
+<tr><td>Terminate during stack unwinding</td><td>A destructor threw</td></tr>
+<tr><td>Crash on the error path only</td><td>Allocation failure inside <code>__cxa_allocate_exception</code></td></tr>
+<tr><td><code>vector::at</code> causes a link error</td><td>It throws — use <code>operator[]</code></td></tr>
+<tr><td><code>new</code> terminates instead of returning null</td><td>Use <code>new (std::nothrow)</code></td></tr>
+<tr><td>Data structure half-updated after an error</td><td>Only the basic guarantee was provided where strong was needed</td></tr>
+<tr><td><code>vector</code> copies instead of moving</td><td>Move constructor not <code>noexcept</code> (<a href="cpp-03-special-members.html">ch. 03</a>)</td></tr>
+<tr><td>An error was silently ignored</td><td>No <code>[[nodiscard]]</code> on the return type</td></tr>
+<tr><td>Latency spike on an error path</td><td>Unwinding — the reason real-time systems disable it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the two-phase unwinding process and why it is two phases.</li>
+  <li>State the four costs of exceptions precisely, including the zero one.</li>
+  <li>Give five reasons embedded projects disable them, and what changes when you do.</li>
+  <li>Say the one thing exceptions do that alternatives must answer for.</li>
+  <li>Use <code>std::expected</code> including its monadic operations, and state its layout.</li>
+  <li>Distinguish a programmer error from a runtime error, and handle each correctly.</li>
+  <li>Give two ways to handle a constructor that can fail, and say which is better.</li>
+  <li>Name the four exception-safety guarantees and achieve the strong one.</li>
+  <li>Say when to mark <code>noexcept</code> and why it is an ABI commitment.</li>
+  <li>Write a correct C callback barrier.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

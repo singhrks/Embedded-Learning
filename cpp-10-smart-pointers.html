@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart pointers and ownership | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Smart pointers and ownership</h1>
+<p class="lead">Making ownership visible in the type system. <code>unique_ptr</code> costs nothing and
+prevents leaks; <code>shared_ptr</code> costs atomics and is usually the wrong answer. On embedded, the most
+valuable use is not the heap at all — it is wrapping hardware handles.</p>
+
+<h2 id="ownership">Expressing ownership</h2>
+
+<p>Before any syntax, the question every pointer should answer: who is responsible for destroying this? Smart pointers exist to encode that answer in the type, so it cannot be forgotten or misremembered.</p>
+
+<pre class="diagram">   A raw pointer says nothing about ownership. These do:
+
+     T*                  a NON-OWNING observer. Someone else
+                         frees it. May be null.
+     T&amp;                  a non-owning observer that cannot be
+                         null and cannot be reseated.
+     std::unique_ptr&lt;T&gt;  EXCLUSIVE ownership. Freed when it
+                         goes out of scope. Move-only.
+     std::shared_ptr&lt;T&gt;  SHARED ownership. Freed when the last
+                         owner goes. Atomic refcount.
+     std::weak_ptr&lt;T&gt;    a non-owning reference to a shared
+                         object, which knows whether it is
+                         still alive.
+     std::optional&lt;T&gt;    a value that may be absent, stored
+                         INLINE - not a pointer at all.
+     std::span&lt;T&gt;        a non-owning view of a contiguous
+                         range.
+
+   THE CONVENTION THIS ENABLES, and it is worth adopting
+   wholesale:
+
+     · a function taking `unique_ptr&lt;T&gt;` by value TAKES
+       OWNERSHIP
+     · a function taking `T*` or `T&amp;` BORROWS - the caller
+       keeps ownership and must outlive the call
+     · a function returning `unique_ptr&lt;T&gt;` TRANSFERS
+       ownership
+     · a raw pointer stored as a member means "someone else
+       owns this, and I depend on their lifetime"
+
+   Once a codebase follows this, ownership is READABLE FROM
+   THE SIGNATURE, which is most of what documentation used to
+   have to carry.</pre>
+
+<h2 id="unique">unique_ptr</h2>
+
+<p>Exclusive ownership, with the destruction happening automatically at the end of scope. It costs nothing compared with a raw pointer and should be your default whenever ownership is involved.</p>
+
+<pre><code>#include &lt;memory&gt;
+
+        auto p = std::make_unique&lt;Widget&gt;(arg1, arg2);
+        p-&gt;method();
+        Widget&amp; w = *p;
+        Widget *raw = p.get();          /* observe, do not own */
+
+        auto q = std::move(p);          /* transfer - p is now
+                                           null              */
+        p.reset();                      /* delete and null */
+        Widget *released = p.release(); /* give up ownership;
+                                           YOU must delete    */
+
+        std::unique_ptr&lt;Widget[]&gt; arr =
+                std::make_unique&lt;Widget[]&gt;(10);   /* uses
+                                                     delete[] */
+
+/* SIZE: exactly sizeof(T*). No overhead at all, provided the
+   deleter is stateless. Verify: */
+        static_assert(sizeof(std::unique_ptr&lt;int&gt;)
+                      == sizeof(int *));
+
+/* THE GENERATED CODE is identical to a raw pointer plus a
+   manual delete on every exit path - including the ones you
+   would have forgotten (chapter 01).
+
+/* MOVE-ONLY BY DESIGN: */
+        auto a = std::make_unique&lt;int&gt;(1);
+        auto b = a;                     /* COMPILE ERROR */
+        auto c = std::move(a);          /* fine */
+
+/* IN A FACTORY, which is its most natural use: */
+        std::unique_ptr&lt;Driver&gt; create_driver(DeviceType t)
+        {
+                switch (t) {
+                case SPI: return std::make_unique&lt;SpiDriver&gt;();
+                case I2C: return std::make_unique&lt;I2cDriver&gt;();
+                }
+                return nullptr;
+        }
+/* The caller owns the result and cannot forget to delete it.
+   Note the return type is the BASE class - which requires a
+   virtual destructor (chapter 11).                       */</code></pre>
+
+<h2 id="deleters">Custom deleters — the embedded use</h2>
+
+<p>The cleanup action does not have to be <code>delete</code>. Supplying your own turns the same mechanism into a wrapper for file handles, hardware resources or anything from a C API with a paired release function.</p>
+
+<pre><code>/* THE MOST VALUABLE PATTERN IN THIS CHAPTER FOR EMBEDDED
+   WORK: unique_ptr does not have to own heap memory. It can
+   own ANY resource with a release function.              */
+
+/* --- a file descriptor --- */
+        struct FdDeleter {
+                using pointer = int;    /* the "pointer" type
+                                           is an int!        */
+                void operator()(int fd) const
+                        { if (fd &gt;= 0) ::close(fd); }
+        };
+        using UniqueFd = std::unique_ptr&lt;int, FdDeleter&gt;;
+
+        UniqueFd fd{::open("/dev/thing", O_RDWR)};
+        if (fd.get() &lt; 0) return -1;
+        ioctl(fd.get(), ...);
+        /* closed automatically, on every path */
+
+/* THE `using pointer = int;` IS THE TRICK: unique_ptr uses
+   Deleter::pointer if it exists, so the "pointer" can be any
+   handle type - an int, a HANDLE, a DMA channel number.
+
+/* --- a C library handle --- */
+        struct FileCloser {
+                void operator()(FILE *f) const { fclose(f); }
+        };
+        std::unique_ptr&lt;FILE, FileCloser&gt; f{fopen(path, "r")};
+
+        /* or, more briefly, with a function pointer type: */
+        std::unique_ptr&lt;FILE, decltype(&amp;fclose)&gt;
+                f{fopen(path, "r"), &amp;fclose};
+/* NOTE: this second form makes the unique_ptr TWO pointers
+   wide, because the deleter has state. Prefer the stateless
+   functor.                                                */
+
+/* --- a hardware resource --- */
+        struct DmaReleaser {
+                using pointer = DmaChannel;
+                void operator()(DmaChannel c) const
+                        { dma_release(c); }
+        };
+        using UniqueDma = std::unique_ptr&lt;DmaChannel,
+                                          DmaReleaser&gt;;
+
+        UniqueDma claim_dma()
+        {
+                return UniqueDma{dma_claim()};
+        }
+        /* move-only, released automatically, no heap involved
+           anywhere */
+
+/* --- and a placement-new object in a static pool --- */
+        struct PoolDeleter {
+                Pool *pool;
+                void operator()(Widget *w) const
+                {
+                        w-&gt;~Widget();
+                        pool-&gt;free(w);
+                }
+        };
+        std::unique_ptr&lt;Widget, PoolDeleter&gt;
+                make_pooled(Pool&amp; p)
+        {
+                void *mem = p.alloc(sizeof(Widget));
+                return {new (mem) Widget{}, PoolDeleter{&amp;p}};
+        }
+/* RAII, ownership transfer, exception safety - with a fixed
+   pool and no global heap. This is unique_ptr earning its
+   place on a microcontroller.                           */</code></pre>
+
+<div class="key">
+<b>The point for embedded</b>
+<p><code>unique_ptr</code> is not a heap tool. It is an <em>ownership</em> tool that happens to default to
+the heap. With a custom deleter it wraps file descriptors, DMA channels, hardware locks, pool allocations
+and vendor SDK handles — giving move-only semantics, automatic release and a signature that documents who
+owns what, at exactly zero runtime cost.</p>
+</div>
+
+<h2 id="shared">shared_ptr, and why to hesitate</h2>
+
+<p>When ownership genuinely is shared, the reference count has to live somewhere and be updated atomically. Both of those are real costs, which is why this should be the exception rather than the default.</p>
+
+<pre><code>        auto p = std::make_shared&lt;Widget&gt;(args);
+        auto q = p;                     /* refcount 2 */
+        p.use_count();
+
+/* WHAT IT COSTS:
+     · TWO pointers: the object, and the CONTROL BLOCK
+     · the control block holds a strong count, a weak count,
+       and a deleter
+     · every copy and destruction is an ATOMIC increment or
+       decrement - a full memory barrier on ARM
+       (ARM chapter 22)
+     · make_shared does ONE allocation for both; constructing
+       from a raw pointer does TWO
+
+/* WHY IT IS USUALLY THE WRONG ANSWER:
+
+   1. THE ATOMICS ARE NOT FREE. Copying a shared_ptr in a hot
+      path is a measurable cost, and on a multi-core system
+      the cache line containing the refcount ping-pongs
+      between cores (CA chapter 15).
+
+   2. IT HIDES THE OWNERSHIP GRAPH. "Who frees this?" becomes
+      unanswerable, and destruction happens at an
+      unpredictable point, possibly on an unexpected thread.
+
+   3. CYCLES LEAK. Two objects holding shared_ptr to each
+      other never reach zero.
+
+   4. IT IS OFTEN CHOSEN TO AVOID THINKING about lifetimes,
+      which is exactly when it goes wrong.
+
+/* WHEN IT IS GENUINELY RIGHT: several independent owners,
+   with no clear "last one", and a lifetime that really is
+   dynamic - a cache of shared resources, a plugin registry.
+   That is rarer than its usage suggests.
+
+/* BREAKING A CYCLE with weak_ptr: */
+        struct Node {
+                std::shared_ptr&lt;Node&gt; child;
+                std::weak_ptr&lt;Node&gt;   parent;   /* NOT shared */
+        };
+
+        if (auto p = node-&gt;parent.lock()) {  /* promote to
+                                                shared, or get
+                                                null           */
+                use(*p);
+        }
+
+/* ON EMBEDDED: shared_ptr is rarely appropriate. If you find
+   yourself reaching for it, ask whether the real answer is a
+   fixed pool of objects with indices, or a single owner and
+   borrowed references.                                    */</code></pre>
+
+<h2 id="rules">Using them correctly</h2>
+
+<p>Smart pointers remove most lifetime bugs and introduce a few of their own — reference cycles, dangling observers, and passing them in ways that copy when they should not.</p>
+
+<pre><code>/* --- 1. ALWAYS make_unique / make_shared --- */
+        auto p = std::make_unique&lt;Widget&gt;(args);   /* yes */
+        std::unique_ptr&lt;Widget&gt; q{new Widget(args)}; /* avoid */
+/* make_shared is also ONE allocation instead of two. And in
+   C++14 and earlier, the make_ forms avoided a real exception
+   -safety hole in expressions like f(unique_ptr(new A),
+   unique_ptr(new B)).
+
+/* --- 2. NEVER two owners from one raw pointer --- */
+        Widget *raw = new Widget;
+        std::unique_ptr&lt;Widget&gt; a{raw};
+        std::unique_ptr&lt;Widget&gt; b{raw};   /* DOUBLE DELETE */
+
+/* --- 3. PASS BY REFERENCE unless transferring ownership --- */
+        void use(const Widget&amp; w);              /* borrows */
+        void use(Widget *w);                    /* borrows,
+                                                   nullable  */
+        void take(std::unique_ptr&lt;Widget&gt; w);   /* TAKES */
+        void reseat(std::unique_ptr&lt;Widget&gt;&amp; w);/* may replace */
+
+        void bad(const std::unique_ptr&lt;Widget&gt;&amp; w);
+/* That last one is a common mistake: it borrows, but forces
+   the caller to have a unique_ptr specifically. Take
+   `const Widget&amp;` instead - then any owner works.
+
+/* --- 4. DO NOT store a raw pointer to something you do not
+       control --- */
+        class Bad {
+                Widget *w_;             /* who owns this?
+                                           will it outlive
+                                           me?               */
+        };
+/* If the answer is "the caller guarantees it", say so in a
+   comment and take it as a reference in the constructor. If
+   it is not guaranteed, the design is wrong.
+
+/* --- 5. FOR A POLYMORPHIC BASE, virtual destructor --- */
+        class Base { public: virtual ~Base() = default; };
+        std::unique_ptr&lt;Base&gt; p = std::make_unique&lt;Derived&gt;();
+/* Without the virtual destructor, ~Derived never runs.
+   (shared_ptr is the exception - it captures the deleter at
+   construction, so it destroys correctly even without one.
+   Do not rely on that.)                                   */</code></pre>
+
+<h2 id="nonheap">Ownership without a heap</h2>
+
+<p>Smart pointers are usually discussed with heap allocation, and neither requires the other. On a target with no heap the same ownership semantics are still available.</p>
+
+<pre><code>/* On a target with no dynamic allocation, ownership still
+   matters. The patterns: */
+
+/* --- 1. A STATIC POOL WITH INDICES --- */
+template&lt;typename T, size_t N&gt;
+class Pool {
+        std::array&lt;std::optional&lt;T&gt;, N&gt; slots_{};
+public:
+        struct Handle {
+                uint8_t index = 0xFF;
+                bool valid() const { return index &lt; N; }
+        };
+
+        Handle acquire()
+        {
+                for (size_t i = 0; i &lt; N; i++)
+                        if (!slots_[i]) {
+                                slots_[i].emplace();
+                                return {static_cast&lt;uint8_t&gt;(i)};
+                        }
+                return {};      /* exhausted - a BOUNDED
+                                   failure                  */
+        }
+
+        void release(Handle h)
+                { if (h.valid()) slots_[h.index].reset(); }
+
+        T *get(Handle h)
+                { return h.valid() &amp;&amp; slots_[h.index]
+                         ? &amp;*slots_[h.index] : nullptr; }
+};
+/* A HANDLE IS SMALLER THAN A POINTER, survives the pool
+   moving, and can be validated. A generation counter added to
+   the handle catches use-after-release:                  */
+        struct Handle { uint8_t index; uint8_t generation; };
+/* which is the standard "generational index" pattern, and it
+   turns a dangling reference into a detectable error.
+
+/* --- 2. SINGLE OWNER, BORROWED REFERENCES --- */
+        class System {
+                Uart   uart_{UART0_BASE};   /* System OWNS
+                Sensor sensor_{&amp;uart_};        these  */
+                Logger logger_{&amp;uart_};
+        };
+/* Members are constructed in declaration order and destroyed
+   in reverse (chapter 03), so `uart_` outlives its users by
+   construction. No allocation, no smart pointers, and the
+   lifetimes are provable by reading the class.
+
+/* --- 3. STATIC STORAGE WITH PLACEMENT NEW --- */
+        alignas(Driver) static std::byte storage[sizeof(Driver)];
+        Driver *drv = nullptr;
+
+        void init() { drv = new (storage) Driver{cfg}; }
+        void deinit() { drv-&gt;~Driver(); drv = nullptr; }
+/* You control exactly when construction happens - useful when
+   it must be after clock setup (chapter 01).            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Double free</td><td>Two smart pointers constructed from one raw pointer</td></tr>
+<tr><td>Derived destructor never runs</td><td>Base destructor not <code>virtual</code></td></tr>
+<tr><td>Memory grows steadily</td><td><code>shared_ptr</code> cycle — break it with <code>weak_ptr</code></td></tr>
+<tr><td>Hot path slower than expected</td><td>Copying <code>shared_ptr</code> — atomic refcounts</td></tr>
+<tr><td>Cache line contention across cores</td><td>Shared refcount being modified by several threads</td></tr>
+<tr><td>Destructor runs on an unexpected thread</td><td><code>shared_ptr</code> — the last owner destroys it, wherever that is</td></tr>
+<tr><td><code>unique_ptr</code> is 16 bytes</td><td>A stateful deleter — use a stateless functor</td></tr>
+<tr><td>"use of deleted function" copying a <code>unique_ptr</code></td><td>Correct — it is move-only</td></tr>
+<tr><td>Caller must have a <code>unique_ptr</code> to call your function</td><td>Take <code>const T&amp;</code> instead</td></tr>
+<tr><td>Use-after-free with a pool</td><td>No generation counter in the handle</td></tr>
+<tr><td>Object outlives what it points to</td><td>Raw member pointer with no lifetime guarantee</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what each pointer type communicates about ownership.</li>
+  <li>State the parameter conventions for taking versus borrowing.</li>
+  <li>Prove <code>unique_ptr</code> has no size or code overhead.</li>
+  <li>Write a custom deleter for a file descriptor and for a hardware channel.</li>
+  <li>Explain the <code>using pointer =</code> trick.</li>
+  <li>List four costs of <code>shared_ptr</code> and say when it is genuinely right.</li>
+  <li>Break a reference cycle with <code>weak_ptr</code>.</li>
+  <li>Give five rules for using smart pointers correctly.</li>
+  <li>Design a static pool with generational handles and say what it detects.</li>
+  <li>Express ownership in a heap-free system three different ways.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

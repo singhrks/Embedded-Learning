@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPI in practice: DMA, multi-slave and quad SPI | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SPI in practice: DMA, multi-slave and quad SPI</h1>
+<p class="lead">SPI's simplicity means all the engineering lives outside the protocol: how to move a megabyte
+without occupying the CPU, how to share one bus between drivers that do not know about each other, and what
+changes when the bus grows to four data lines.</p>
+
+<h2 id="dma">Full-duplex DMA</h2>
+
+<pre><code>/* SPI always exchanges, so a DMA transfer needs BOTH
+   directions configured even if you only care about one.
+   Miss the RX stream and the receive FIFO overruns, which
+   on most parts wedges the peripheral.                    */
+
+static uint8_t tx_buf[256], rx_buf[256];
+
+void spi_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t n)
+{
+    /* RX FIRST. It must be armed before any clock edge, or
+       the first bytes arrive with nowhere to go.          */
+    DMA2_Stream0-&gt;PAR  = (uint32_t) &amp;SPI1-&gt;DR;
+    DMA2_Stream0-&gt;M0AR = (uint32_t) rx;
+    DMA2_Stream0-&gt;NDTR = n;
+    DMA2_Stream0-&gt;CR   = (3u &lt;&lt; 25) | DMA_SxCR_MINC
+                       | DMA_SxCR_TCIE;      /* periph-&gt;mem */
+    DMA2_Stream0-&gt;CR  |= DMA_SxCR_EN;
+
+    DMA2_Stream3-&gt;PAR  = (uint32_t) &amp;SPI1-&gt;DR;
+    DMA2_Stream3-&gt;M0AR = (uint32_t) tx;
+    DMA2_Stream3-&gt;NDTR = n;
+    DMA2_Stream3-&gt;CR   = (3u &lt;&lt; 25) | DMA_SxCR_MINC
+                       | DMA_SxCR_DIR_0;     /* mem-&gt;periph */
+    DMA2_Stream3-&gt;CR  |= DMA_SxCR_EN;
+
+    CS_LOW();
+    SPI1-&gt;CR2 |= SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN;
+}
+
+/* COMPLETION IS THE RX INTERRUPT, NOT TX. TX completes when
+   the last byte enters the shift register; RX completes
+   when the last byte has fully arrived. Raising CS on TX
+   completion truncates the transfer (chapter 04).        */
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    DMA2-&gt;LIFCR = DMA_LIFCR_CTCIF0;
+    while (SPI1-&gt;SR &amp; SPI_SR_BSY) { }     /* belt and braces */
+    CS_HIGH();
+    SPI1-&gt;CR2 &amp;= ~(SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
+    xfer_done = 1;
+}
+
+/* WRITE-ONLY TRANSFERS still need somewhere for the
+   incoming bytes to go. Two options:
+     - a real rx buffer you ignore, or
+     - a ONE-BYTE dummy with MINC cleared, so every incoming
+       byte overwrites the same location. This is the
+       idiomatic trick and it costs one byte of RAM:      */
+DMA2_Stream0-&gt;M0AR = (uint32_t) &amp;dummy;
+DMA2_Stream0-&gt;CR   = (3u &lt;&lt; 25) | DMA_SxCR_TCIE;  /* no MINC */
+
+/* READ-ONLY transfers use the mirror image: a single
+   constant 0xFF source with MINC cleared on the TX stream. */
+</code></pre>
+
+<div class="warn">
+<b>Cortex-M7 cache maintenance applies here in full</b>
+<p>Before a transmit DMA, clean the cache so the controller sees your data. After a receive DMA, invalidate so
+the CPU does not read stale lines. Both operations work on cache-line granularity (32 bytes), so a buffer that
+shares a cache line with another variable can have that variable clobbered by the invalidate. Align DMA buffers
+to 32 bytes and pad their length to a multiple of 32 — the alternative is a corruption bug that depends on the
+linker's variable placement.</p>
+</div>
+
+<h2 id="multislave">Sharing the bus</h2>
+
+<pre class="diagram">   MULTI-SLAVE: one bus, N chip selects.
+
+              +-------- SCLK/MOSI/MISO --------+
+              |            |            |      |
+   MASTER  CS1|         CS2|         CS3|      |
+     |--------+            |            |      |
+     |---------------------+            |      |
+     |----------------------------------+      |
+                                             sensor A
+                                             sensor B
+                                             flash
+
+   THE RULE: exactly one CS low at any instant. Two devices
+   driving MISO simultaneously is a short between two
+   push-pull outputs.
+
+   THE PROBLEM: devices may need DIFFERENT modes and speeds.
+   Sensor A wants mode 0 at 10 MHz; the flash wants mode 3
+   at 50 MHz. The controller has one configuration.
+
+   THE SOLUTION: reconfigure per transaction, under a lock.
+   This is exactly what Linux's SPI subsystem does with
+   spi_transfer and per-device spi_device structs (see the
+   Linux track, chapter 19) - and the reason that
+   abstraction exists is this problem.</pre>
+
+<pre><code>/* A bus manager. In an RTOS this is a mutex; bare metal, a
+   flag plus a critical section.                           */
+
+typedef struct {
+    uint32_t cr1;                /* mode + speed for this   */
+    GPIO_TypeDef *cs_port;
+    uint16_t      cs_pin;
+} spi_device_t;
+
+static SemaphoreHandle_t spi_lock;
+
+int spi_transact(const spi_device_t *dev,
+                 const uint8_t *tx, uint8_t *rx, size_t n)
+{
+    if (xSemaphoreTake(spi_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return -EBUSY;           /* TIMEOUT, not forever    */
+    }
+
+    /* Reconfigure for THIS device. SPE must be off to
+       change mode - the peripheral latches CR1 on enable
+       (chapter 01).                                        */
+    SPI1-&gt;CR1 &amp;= ~SPI_CR1_SPE;
+    SPI1-&gt;CR1  = dev-&gt;cr1;
+    SPI1-&gt;CR1 |= SPI_CR1_SPE;
+
+    dev-&gt;cs_port-&gt;BSRR = dev-&gt;cs_pin &lt;&lt; 16;   /* CS low     */
+    int r = spi_xfer_blocking(tx, rx, n);
+    while (SPI1-&gt;SR &amp; SPI_SR_BSY) { }
+    dev-&gt;cs_port-&gt;BSRR = dev-&gt;cs_pin;         /* CS high    */
+
+    xSemaphoreGive(spi_lock);
+    return r;
+}
+
+/* WITHOUT THE LOCK: two tasks interleave, the mode changes
+   mid-transaction, and two chip selects end up low at once.
+   The symptom is corruption that appears only when both
+   devices are used concurrently - which is to say, only in
+   the integrated system and never in the unit test.       */
+</code></pre>
+
+<h2 id="daisy">Daisy chaining</h2>
+
+<pre class="diagram">   Some devices - shift registers, LED drivers, some ADCs -
+   support chaining, so N devices need only ONE chip select.
+
+   MASTER MOSI --&gt;[ dev 1 ]--&gt;[ dev 2 ]--&gt;[ dev 3 ]--&gt; MISO
+                      ^           ^           ^
+                      +-----------+-----------+
+                              CS (shared)
+
+   Data shifts THROUGH each device into the next. To load
+   three 8-bit devices you clock 24 bits with CS low, then
+   raise CS - which latches each device's own byte.
+
+   THE ORDER IS REVERSED: the FIRST byte you send ends up in
+   the LAST device, because it has been pushed furthest
+   along the chain.
+
+     uint8_t frame[3] = { dev3_data, dev2_data, dev1_data };
+     CS_LOW();
+     spi_write(frame, 3);
+     while (SPI1-&gt;SR &amp; SPI_SR_BSY) { }
+     CS_HIGH();          /* latches all three at once      */
+
+   Getting the order backwards is the universal first bug,
+   and it looks like the devices are wired in the wrong
+   sequence.
+
+   TRADE-OFF: one CS pin and simultaneous update, against
+   having to rewrite the whole chain to change one device
+   and a maximum length set by accumulated propagation
+   delay.</pre>
+
+<h2 id="qspi">Quad SPI</h2>
+
+<pre><code>/* When SPI is used for program storage, one data line is
+   the bottleneck. Quad SPI uses four bidirectional lines. */
+
+/*   SPI      1 bit  per clock
+     DUAL     2 bits per clock
+     QUAD     4 bits per clock
+     OCTAL    8 bits per clock  (xSPI / HyperBus)
+
+   At 100 MHz: single = 12.5 MB/s, quad = 50 MB/s.
+
+   THE KILLER FEATURE IS MEMORY-MAPPED MODE. The controller
+   translates bus reads into flash commands automatically,
+   so external flash appears at an address:               */
+
+QUADSPI-&gt;CCR = QUADSPI_CCR_FMODE       /* memory-mapped    */
+             | (3u &lt;&lt; 24)              /* 4-line data      */
+             | (2u &lt;&lt; 8)               /* 1-line address   */
+             | 0xEB;                   /* fast read quad   */
+
+/* Now this just works, executing directly from external
+   flash (execute-in-place, mcu chapter 01):               */
+const uint8_t *font = (const uint8_t *) 0x90000000;
+uint8_t glyph = font[offset];
+
+/* WHAT IT COSTS:
+   - reads are slower than internal flash, so cache matters
+     enormously; on M7 enable the D-cache for that region
+   - the first access after idle pays the command overhead
+   - you CANNOT write while executing from it, so a
+     firmware update to QSPI must run from internal flash
+     or RAM (the .ramfunc trick, mcu chapter 05)
+   - erase takes hundreds of milliseconds during which
+     nothing can read it
+
+   That last point is the design constraint people miss:
+   put code and rarely-changing assets in QSPI, and never
+   put anything you must write during normal operation
+   alongside code you must execute.                        */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>SPI wedges after the first DMA transfer</td><td>RX DMA not configured; the receive FIFO
+overran</td></tr>
+<tr><td>Last bytes of a DMA transfer lost</td><td>CS raised on TX completion rather than RX</td></tr>
+<tr><td>DMA corrupts a nearby variable on M7</td><td>Cache invalidate hit a shared cache line — align and pad
+buffers to 32 bytes</td></tr>
+<tr><td>Corruption only when two devices are used together</td><td>No bus lock; mode changed
+mid-transaction</td></tr>
+<tr><td>Mode change has no effect</td><td>Written while <code>SPE</code> was set</td></tr>
+<tr><td>Two devices respond at once</td><td>Two chip selects low — check every CS is deasserted on
+init</td></tr>
+<tr><td>Daisy chain devices show each other's data</td><td>Byte order reversed — the first byte sent travels
+furthest</td></tr>
+<tr><td>QSPI memory-mapped reads return garbage</td><td>Wrong read command opcode or dummy-cycle count for
+that flash</td></tr>
+<tr><td>System hangs during a QSPI erase</td><td>Code executing from the flash being erased</td></tr>
+<tr><td>Throughput far below the clock rate</td><td>Per-byte CPU overhead; the bus is idle between
+bytes</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why a write-only SPI DMA transfer still needs an RX stream.</li>
+  <li>Give the one-byte trick for discarding received data.</li>
+  <li>Say which DMA completion signals the end of a transfer, and why.</li>
+  <li>Explain the cache-line hazard for DMA buffers on Cortex-M7.</li>
+  <li>State the invariant for chip selects on a shared bus.</li>
+  <li>Explain why per-device reconfiguration needs a lock.</li>
+  <li>Explain why <code>SPE</code> must be cleared to change mode.</li>
+  <li>Describe daisy chaining and the byte-order rule.</li>
+  <li>Say what memory-mapped QSPI enables and give its throughput advantage.</li>
+  <li>Explain why a firmware update to QSPI cannot execute from QSPI.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

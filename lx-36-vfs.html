@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The virtual filesystem: superblock, inode, dentry and file | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The virtual filesystem: superblock, inode, dentry and file</h1>
+<p class="lead"><a href="lx-20-char-devices.html">Chapter 22</a> showed a driver implementing
+<code>file_operations</code> so that <code>read()</code> and <code>write()</code> reach its code. This chapter
+is the layer that makes that possible at all: the Virtual Filesystem Switch, which lets ext4, NFS, a USB
+thumb drive and your character device all answer to the exact same four system calls.</p>
+
+<h2 id="why">One set of syscalls, dozens of filesystem implementations</h2>
+
+<p>The same four system calls work on a file on a local disk, a file served over the network, and a device node backed by your driver. Something has to sit in the middle translating those calls into whatever each of those things actually needs, and that something is the VFS.</p>
+
+<pre class="diagram">   open(), read(), write(), close() ARE THE SAME FOUR CALLS
+   REGARDLESS OF WHETHER THE FILE LIVES ON ext4, IS SERVED
+   OVER NFS, IS A FUSE FILESYSTEM IN USERSPACE, OR IS YOUR
+   OWN CHARACTER DEVICE. The kernel achieves this the same way
+   any object-oriented design would: through a set of function
+   pointer tables that each filesystem or driver fills in, and
+   generic code that calls through those tables without caring
+   what is on the other side.
+
+     USER SPACE:  open("/mnt/nfs/report.pdf", O_RDONLY)
+          |
+          v
+     VFS: "which filesystem owns /mnt/nfs?"  -&gt;  NFS
+          |
+          v
+     NFS's OWN inode_operations and file_operations run,
+     making network requests underneath - and the caller
+     never knows, or needs to know, that a network round trip
+     just happened where a local filesystem would have done a
+     disk read instead.
+
+   THIS IS EXACTLY THE SAME PATTERN chapter 22's character
+   device used - file_operations is a VFS-level table your
+   driver fills in, and open()/read()/write() reach it through
+   the identical dispatch mechanism a real filesystem uses.
+   A driver author is, without necessarily realising it,
+   already writing to this interface.</pre>
+
+<h2 id="objects">Four objects, four different jobs</h2>
+
+<p>The VFS models everything with four structures. They are easy to confuse because in casual speech we call all of them "the file", but they answer four genuinely different questions — and most filesystem confusion comes from conflating two of them.</p>
+
+<pre class="diagram">   SUPERBLOCK    one per MOUNTED filesystem instance. Holds
+                 filesystem-wide state: block size, total and
+                 free space, the root inode, and a pointer to
+                 the filesystem's own operations table
+                 (super_operations) for tasks like syncing or
+                 allocating a new inode.
+
+   INODE         one per FILE, independent of its name. Holds
+                 everything about the file's IDENTITY and
+                 CONTENT: size, permissions, owner, timestamps,
+                 and - crucially - WHERE THE DATA ACTUALLY IS
+                 on the underlying storage. A file can have
+                 many names (hard links) pointing at the SAME
+                 inode; deleting one name does not touch the
+                 inode until the LAST name referencing it, and
+                 every open file descriptor referencing it, is
+                 gone.
+
+   DENTRY        one per PATH COMPONENT - the directory-entry
+                 cache mapping a NAME to an inode. "/home/x/a.txt"
+                 walks through dentries for "/", "home", "x",
+                 "a.txt" in turn. Dentries are aggressively
+                 CACHED (the "dcache") because resolving a path
+                 component by component, on every single access,
+                 would be far too slow otherwise.
+
+   FILE          one per OPEN FILE DESCRIPTOR - not per file.
+                 Two processes (or the same process twice)
+                 opening the SAME inode get TWO SEPARATE file
+                 objects, each with its OWN current read/write
+                 offset. This is exactly why two file
+                 descriptors on the same underlying file do not
+                 interfere with each other's seek position.</pre>
+
+<div class="key">
+<b>Why a hard-linked file with two names is still "one file"</b>
+<p>The inode, not the dentry, is where a file's actual identity and content live — two dentries
+(<code>/home/a/report.pdf</code> and <code>/home/b/copy.pdf</code>) can point at the exact same inode, meaning
+they share the same size, the same permissions, the same content, and editing through one name is
+instantly visible through the other. A symbolic link is structurally different: it is its own inode whose
+content is simply a path string, resolved by following it to a fresh dentry lookup — which is why deleting the
+target of a symlink leaves a broken link behind, while deleting one hard-linked name leaves the file completely
+intact under its other name.</p>
+</div>
+
+<h2 id="path">Walking a path: how open() finds the right inode</h2>
+
+<p>Turning a path like <code>/home/user/notes.txt</code> into the data on disk means resolving one component at a time, each of which is a lookup in a directory. Doing that from scratch on every access would be far too slow, so the results are aggressively cached.</p>
+
+<pre><code>/* Conceptually, resolving "/home/user/report.pdf": */
+
+struct dentry *d = root_dentry;             /* start at "/" */
+for each component in path {
+        /* 1. Check the dcache - is this component already
+              cached under the current dentry?               */
+        struct dentry *next = d_lookup(d, component);
+        if (!next) {
+                /* 2. CACHE MISS: ask the filesystem's own
+                      inode_operations-&gt;lookup() to read the
+                      directory from disk (or network) and
+                      find the entry, then populate a new
+                      dentry so next time this is a cache hit */
+                next = d->d_inode->i_op->lookup(d->d_inode,
+                                                 component, ...);
+        }
+        d = next;
+}
+/* d now names the final component; d->d_inode is the INODE
+   the whole lookup was for.                                  */
+
+/* SEE THE CACHE'S EFFECT DIRECTLY: */
+echo 3 &gt; /proc/sys/vm/drop_caches   /* drops dentry+inode
+                                        caches (and page cache) -
+                                        watch the NEXT `ls -R`
+                                        on a large tree get
+                                        noticeably slower       */
+cat /proc/sys/fs/dentry-state
+slabtop | grep -i dentry             /* dentries live in their
+                                        own slab cache, chapter
+                                        06's kmem_cache in action */
+</code></pre>
+
+<h2 id="registering">How a filesystem — or a driver — joins the VFS</h2>
+
+<p>Both a real filesystem and a character-device driver plug into the VFS, but they do so at very different depths — which explains why your driver from chapter 22 needed nothing resembling the machinery described above.</p>
+
+<pre><code>/* A FILESYSTEM registers a way to build a superblock: */
+static struct file_system_type my_fs_type = {
+        .name    = "myfs",
+        .mount   = my_fs_mount,      /* builds a superblock and
+                                        root dentry/inode from a
+                                        block device or a
+                                        network source           */
+        .kill_sb = kill_block_super,
+};
+register_filesystem(&amp;my_fs_type);
+
+/* A DRIVER, by contrast, never implements a superblock at all
+   - chapter 22's character device registers directly at the
+   FILE level, skipping the superblock/inode machinery real
+   filesystems need, because /dev/mychardev already has an
+   inode (created by devtmpfs) before the driver is ever
+   involved:                                                   */
+static const struct file_operations my_fops = {
+        .open  = my_open,
+        .read  = my_read,
+        .write = my_write,
+        .release = my_release,
+};
+/* cdev_add() (chapter 22) connects THIS table to the inode
+   devtmpfs already created - the driver plugs into the VFS
+   at the file_operations layer, several levels shallower than
+   a real filesystem does.                                     */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Deleting a hard-linked file's name does not free its disk space</td><td>Expected — the inode survives
+until every name (and every open descriptor) referencing it is gone</td></tr>
+<tr><td>Two file descriptors on the same file have independent seek positions</td><td>Expected — each
+<code>open()</code> creates its own <code>struct file</code>, even though both share one inode</td></tr>
+<tr><td>Deleting a symlink's target leaves the link visibly broken</td><td>Expected — a symlink is its own
+inode holding a path string, resolved fresh on each lookup, not a shared reference to the target inode</td></tr>
+<tr><td><code>ls -R</code> on a large, cold tree is slow, then fast on the second run</td><td>Dentry and inode
+caches were empty, then populated — a normal cache-warming effect</td></tr>
+<tr><td>A custom filesystem's <code>lookup()</code> is never called for a cached name</td><td>Expected — the
+dcache satisfied the lookup without reaching the filesystem at all</td></tr>
+<tr><td>A character device driver has no superblock or inode-allocation code</td><td>Expected — a driver
+plugs in at the <code>file_operations</code> layer; the inode already exists via devtmpfs</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four core VFS objects and what each one is responsible for.</li>
+  <li>Explain why a hard-linked file is "one file" with two names, using the inode/dentry distinction.</li>
+  <li>Explain why two file descriptors on the same file have independent read/write offsets.</li>
+  <li>Walk through how <code>open()</code> resolves a multi-component path, including the role of the
+  dentry cache.</li>
+  <li>Explain why a character device driver never implements a superblock, unlike a real filesystem.</li>
+  <li>Explain the difference between a hard link and a symbolic link in terms of inodes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

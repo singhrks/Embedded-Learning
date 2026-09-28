@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confidential computing: CCA, SEV-SNP and TDX | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Confidential computing: CCA, SEV-SNP and TDX</h1>
+<p class="lead">Every chapter so far assumed the hypervisor is trusted — it maps your memory, so it can read
+it. Confidential computing removes that assumption while leaving the hypervisor in charge of scheduling and
+allocation. The result is a strange and interesting split: the most privileged software on the machine manages
+a guest it cannot look inside.</p>
+
+<h2 id="threat">The threat model, stated precisely</h2>
+
+<p>This only makes sense once you are exact about who is being defended against, because the answer is
+unusual: the attacker is the infrastructure the guest is running on.</p>
+
+<pre class="diagram">   THE CLASSICAL MODEL, everywhere else in this track:
+
+     TRUSTED    hardware, firmware, hypervisor
+     UNTRUSTED  the guest
+     GOAL       stop a guest escaping or interfering with
+                another guest
+
+   THE CONFIDENTIAL MODEL:
+
+     TRUSTED    hardware, and a small spec'd firmware
+                component
+     UNTRUSTED  the hypervisor, the host kernel, the cloud
+                operator, anyone with physical access to the
+                DRAM
+     GOAL       stop the HOST reading or silently modifying
+                the guest
+
+   ---------------------------------------------------------
+
+   WHY ANYONE WANTS THIS: you want to run a workload on
+   someone else's computer without trusting them with the
+   data. Regulated data, private keys, model weights,
+   another company's source code.
+
+   ---------------------------------------------------------
+
+   WHAT DOES NOT CHANGE, and this is the part people miss:
+
+     · the hypervisor still SCHEDULES the guest
+     · it still ALLOCATES the guest's memory
+     · it still provides the guest's DEVICES
+     · it can still DENY SERVICE - stop scheduling, refuse
+       memory, kill the VM
+
+   CONFIDENTIALITY AND INTEGRITY, NOT AVAILABILITY. A
+   malicious host can always refuse to run you. What it
+   cannot do is read what you computed. If your threat model
+   needs availability, this is the wrong technology.</pre>
+
+<h2 id="shape">The common shape</h2>
+
+<p>Three vendors, three names, one architecture. Seeing the shape first makes each implementation a set of
+details rather than a separate subject to learn.</p>
+
+<pre class="diagram">   EVERY DESIGN HAS THE SAME THREE PIECES:
+
+   1. A HARDWARE-ENFORCED OWNERSHIP TABLE
+        Every page of physical memory has an owner recorded
+        somewhere the hypervisor cannot forge, and the
+        hardware CHECKS that owner on every access - in
+        addition to stage 1 and stage 2.
+
+        ARM CCA   Granule Protection Table, checked by the
+                  Granule Protection Check
+        AMD SNP   Reverse Map Table (RMP)
+        Intel TDX Secure EPT, managed by the TDX module
+
+   2. A SMALL TRUSTED INTERMEDIARY
+        The hypervisor can no longer edit a guest's memory
+        map directly. It must ASK a small, audited component
+        which validates the request.
+
+        ARM CCA   RMM (Realm Management Monitor) at R-EL2
+        AMD SNP   the AMD Secure Processor plus RMP checks
+        Intel TDX the TDX module, running in SEAM mode
+
+   3. MEMORY ENCRYPTION, usually with a per-guest key
+        Defends against physical attacks on DRAM. On its own
+        it is NOT enough - which is the lesson of the next
+        section.
+
+   ---------------------------------------------------------
+
+   AND THE INTERFACE SPLITS IN TWO:
+
+     HYPERVISOR -&gt; INTERMEDIARY   "create a realm", "add
+                                   this page", "run this
+                                   vCPU"    (CCA: RMI)
+     GUEST      -&gt; INTERMEDIARY   "attest me", "make this
+                                   page shared"
+                                              (CCA: RSI)
+
+   THE HYPERVISOR DRIVES THE LIFECYCLE. It just cannot see
+   the contents, and every structural change it requests is
+   validated first.</pre>
+
+<div class="warn">
+<b>Encryption alone was not enough, and the history is instructive</b>
+<p>The first generation of these designs encrypted guest memory and stopped there. That defeats an attacker
+reading DRAM, and it does <em>not</em> defeat the hypervisor, which can still do things that do not require
+reading: remap a page so the guest's own access lands somewhere else, replay a previously captured ciphertext
+back into the same address, or swap two encrypted pages. The guest decrypts them successfully, because the key
+is right — it is the <em>mapping</em> that was attacked, not the confidentiality. This is why the current
+designs all added an ownership table with integrity, and it is a good general lesson: encryption protects
+contents, not structure. Defending a mapping requires something that checks the mapping.</p>
+</div>
+
+<h2 id="cca">ARM CCA in more detail</h2>
+
+<p><a href="virt-19-secure-virt.html">Chapter 20</a> introduced Realms in one page. This is the part that
+matters for a hypervisor engineer: what your stage-2 code has to become.</p>
+
+<pre class="diagram">   FOUR SECURITY STATES, up from two:
+
+     Non-secure   the hypervisor and its ordinary VMs
+     Secure       TrustZone: TEE and secure partitions
+     Realm        confidential VMs
+     Root         EL3: the Monitor and the GPT
+
+   THE GRANULE PROTECTION CHECK runs on EVERY memory access
+   from any state, after stage 1 and stage 2, and asks: does
+   the accessing state own this granule? A non-secure access
+   to a realm granule takes a GRANULE PROTECTION FAULT.
+
+   ---------------------------------------------------------
+
+   WHAT CHANGES FOR THE HYPERVISOR, concretely:
+
+     BEFORE (chapter 05)
+       fault -&gt; allocate a page -&gt; write the stage-2
+       descriptor -&gt; return to guest
+
+     WITH CCA
+       fault -&gt; allocate a page -&gt; ASK THE RMM to delegate
+       it to the realm and install the mapping -&gt; the RMM
+       validates and does it -&gt; return
+
+   YOU STILL DECIDE WHICH PHYSICAL PAGE. You no longer write
+   the descriptor yourself, and you cannot map that page
+   into your own address space afterwards - the GPT will not
+   let you.
+
+   ---------------------------------------------------------
+
+   THE MENTAL MODEL WORTH CARRYING: this is pKVM (chapter
+   09), with the trusted component moved out of your control
+   and into hardware-enforced firmware. pKVM asks you to
+   trust a small EL2 component that you compiled. CCA asks
+   you to trust a spec'd RMM and the GPT hardware. The
+   architecture is the same idea; the root of trust is not.</pre>
+
+<h2 id="io">The hard part is I/O</h2>
+
+<p>Memory confidentiality is largely solved by the hardware. Getting data in and out of a guest whose devices
+are provided by an untrusted hypervisor is not, and it is where most of the engineering actually goes.</p>
+
+<pre class="diagram">   THE PROBLEM: virtio (chapter 15) works by SHARING MEMORY
+   with the host. In a confidential guest, the host cannot
+   read the guest's memory. So virtio cannot work - unless
+   the guest deliberately opens a window.
+
+   THE ANSWER: TWO CLASSES OF GUEST PAGE.
+
+     PRIVATE   the default. Encrypted, owned by the guest,
+               invisible to the host.
+     SHARED    deliberately given up by the guest, so the
+               host can read and write them.
+
+   The guest asks the trusted intermediary to convert a page
+   between the two. That call is the security decision, and
+   it is made BY THE GUEST.
+
+   ---------------------------------------------------------
+
+   WHICH MEANS EVERY I/O IS A BOUNCE:
+
+     guest driver writes into PRIVATE memory
+        │  copy
+        ▼
+     a SHARED bounce buffer          <- the host can see this
+        │  host DMA
+        ▼
+     the device
+
+   Linux already had the machinery for this - swiotlb, built
+   for devices with limited addressing - and confidential
+   guests reuse it. The performance cost is a copy on every
+   transfer, which is exactly what virtio was designed to
+   avoid. Getting that cost back is an active area.
+
+   ---------------------------------------------------------
+
+   AND THE CONSEQUENCE PEOPLE UNDERESTIMATE: everything in
+   that shared buffer is visible to, and modifiable by, the
+   host. So the guest must treat ITS OWN DEVICES as hostile:
+
+     · encrypt and authenticate disk contents - the block
+       device is untrusted
+     · use TLS to the far end - the network device is
+       untrusted, and terminating TLS inside the guest is
+       the entire point
+     · VALIDATE EVERYTHING a virtio device returns. A
+       malicious host controls the descriptor rings, the
+       lengths and the data. Guest drivers written assuming
+       a cooperative device are an attack surface, and
+       hardening them has been a real body of work.</pre>
+
+<h2 id="attest">Attestation: the part that makes it useful</h2>
+
+<p>Without attestation, none of this helps you — you would be trusting the host's claim that your workload is
+running confidentially. Attestation is how the guest proves its own state to someone who trusts the hardware
+vendor rather than the operator.</p>
+
+<pre class="diagram">   THE FLOW:
+
+     1. The guest asks the intermediary for a REPORT.
+     2. The report contains MEASUREMENTS - hashes of the
+        initial memory, the configuration, and the firmware
+        version - and a fresh nonce you supplied.
+     3. It is SIGNED by a key rooted in the hardware vendor.
+     4. The guest sends it to a RELYING PARTY.
+     5. The relying party checks the signature chain and
+        compares the measurements to what it expected.
+     6. ONLY THEN does it release the secret - the disk
+        encryption key, the model weights, the credentials.
+
+   ---------------------------------------------------------
+
+   THE ORDER IS THE WHOLE DESIGN. The guest starts with NO
+   secrets. It proves what it is, and the secrets arrive
+   afterwards. A host that tampered with the image gets a
+   different measurement and the secret is never sent.
+
+   THIS IS THE SAME PATTERN AS SECURE BOOT plus remote
+   verification (isolation chapter 14), applied to a VM
+   instead of a device, and it fails in the same way if
+   nobody actually CHECKS the measurements. An attestation
+   report that is fetched and not verified is theatre.
+
+   ---------------------------------------------------------
+
+   WHAT THE MEASUREMENT DOES NOT COVER: anything loaded
+   after boot. Measure the initial image, then rely on the
+   guest's own integrity from there - dm-verity, signed
+   packages, a read-only root.</pre>
+
+<h2 id="limits">What it does not defend against</h2>
+
+<p>Being precise here separates a security design from a marketing claim, and several of these have produced
+real published attacks.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Attack</th><th>Defended?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Host reads guest memory</td><td><strong>Yes</strong></td><td>The ownership check, on every
+access</td></tr>
+<tr><td>Host remaps or replays guest pages</td><td><strong>Yes</strong>, in current
+generations</td><td>Integrity in the ownership table — the thing encryption alone missed</td></tr>
+<tr><td>Physical DRAM attack (cold boot, interposer)</td><td><strong>Largely</strong></td><td>Memory
+encryption with a per-guest key</td></tr>
+<tr><td>Host denies service</td><td><strong>No</strong></td><td>It still schedules you; out of scope by
+design</td></tr>
+<tr><td>Side channels — cache, timing, contention</td><td><strong>Mostly not</strong></td><td>The
+microarchitecture is still shared (<a href="virt-18-partitioning.html">chapter 19</a>)</td></tr>
+<tr><td>Malicious device responses</td><td><strong>Only if the guest validates</strong></td><td>The host
+controls the virtio rings; hardened drivers are required</td></tr>
+<tr><td>A bug in the trusted intermediary</td><td><strong>No</strong></td><td>Which is why it is kept small
+and specified — the same argument as a TEE's TCB</td></tr>
+<tr><td>A bug in the guest itself</td><td><strong>No</strong></td><td>Nothing here protects a guest from its
+own vulnerabilities</td></tr>
+<tr><td>Operator who never gets the secret</td><td><strong>Yes, by construction</strong></td><td>Attestation
+gates the secret on the measurement</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>Details here move faster than any other part of this track</b>
+<p>Register names, firmware interfaces, which generation fixed which weakness, and what Linux calls these
+features are all moving. The <em>architecture</em> — an ownership table, a small trusted intermediary, private
+and shared pages, attestation before secrets — has been stable across all three vendors and is what this
+chapter teaches. Before building anything, read the current specification for your platform and the current
+kernel documentation, and check the published attack literature: several of these designs have had generations
+specifically because researchers broke the previous one.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hypervisor cannot map a guest page it allocated</td><td>Working as designed — it was delegated to the
+guest and the ownership check refuses</td></tr>
+<tr><td>Granule protection fault in host code</td><td>The host touched realm memory; find who kept the
+pointer</td></tr>
+<tr><td>virtio device does not work in a confidential guest</td><td>Buffers are private; the guest must use
+shared bounce buffers</td></tr>
+<tr><td>Throughput collapses compared with a normal guest</td><td>The bounce copy on every transfer</td></tr>
+<tr><td>Guest boots but attestation fails</td><td>A measurement mismatch — the image, the config, or the
+firmware version differs from what the verifier expects</td></tr>
+<tr><td>Attestation "succeeds" but the report is never checked</td><td>The most common real-world failure, and
+it makes the whole design decorative</td></tr>
+<tr><td>Guest crashes on data from a device</td><td>A driver trusting a hostile host's device</td></tr>
+<tr><td>Secrets present in the image</td><td>A design error — secrets must arrive after attestation, never
+before</td></tr>
+<tr><td>Live migration does not work</td><td>Guest memory cannot be read by the host; it needs explicit
+support from the intermediary</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State who is trusted and who is not, and contrast with the rest of this track.</li>
+  <li>Name the one security property this deliberately does not provide, and why.</li>
+  <li>Give the three pieces every design has, with each vendor's name for them.</li>
+  <li>Explain why memory encryption alone was insufficient, with a concrete attack.</li>
+  <li>Say what changes in a stage-2 fault handler under CCA.</li>
+  <li>Compare CCA with pKVM, and say what differs about the root of trust.</li>
+  <li>Explain why virtio needs bounce buffers here, and who decides a page is shared.</li>
+  <li>Give three things a confidential guest must do because its devices are untrusted.</li>
+  <li>Describe the attestation flow and say why the order matters.</li>
+  <li>Name three attacks this does not stop.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

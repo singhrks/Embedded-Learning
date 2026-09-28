@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The WDF object model | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The WDF object model</h1>
+<p class="lead">Handles, contexts, parenting and cleanup callbacks. Once you understand these four ideas,
+every WDF API follows the same shape — and most of your cleanup code disappears.</p>
+
+<h2 id="handles">Objects and handles</h2>
+
+<p>You never hold a pointer to a WDF object. You hold an opaque handle, and the framework validates it — which means a stale or wrong handle produces a clear diagnostic rather than corrupting memory.</p>
+
+<pre><code>/* A WDF object is an opaque HANDLE, not a pointer: */
+
+        WDFDEVICE     device;
+        WDFQUEUE      queue;
+        WDFREQUEST    request;
+        WDFMEMORY     memory;
+        WDFSPINLOCK   lock;
+        WDFTIMER      timer;
+        WDFINTERRUPT  interrupt;
+        WDFDMAENABLER dmaEnabler;
+        WDFCHILDLIST  childList;
+        WDFFILEOBJECT fileObject;
+        WDFCOLLECTION collection;
+        WDFKEY        registryKey;
+        WDFSTRING     string;
+        WDFIOTARGET   ioTarget;
+
+/* EVERY CREATION FUNCTION HAS THE SAME SHAPE: */
+
+        NTSTATUS Wdf&lt;Type&gt;Create(
+                &lt;parent or config&gt;,
+                &lt;type-specific config&gt;,
+                PWDF_OBJECT_ATTRIBUTES Attributes,
+                &lt;Type&gt; *Handle);
+
+/* AND EVERY OBJECT HAS: */
+        a TYPE
+        a PARENT              &lt;-- the important one
+        an optional CONTEXT   your data, attached to it
+        a reference count
+        optional EvtCleanupCallback and EvtDestroyCallback
+
+/* YOU NEVER FREE AN OBJECT DIRECTLY in normal code. It is
+   destroyed when its parent is. WdfObjectDelete exists but
+   is needed only for objects you deliberately parented to
+   something long-lived.                                    */</code></pre>
+
+<h2 id="parenting">Parenting</h2>
+
+<p>This is the idea that makes WDF cleanup work, and the one worth understanding before any other: every object has a parent, and when the parent is destroyed its children are destroyed first, automatically, in order. Most driver cleanup code simply disappears.</p>
+
+<pre class="diagram">   WDFDRIVER
+      |
+      +-- WDFDEVICE                (parent: the driver)
+             |
+             +-- WDFQUEUE          (parent: the device)
+             |      |
+             |      +-- WDFREQUEST (parent: the queue)
+             |             |
+             |             +-- WDFMEMORY
+             |
+             +-- WDFINTERRUPT
+             +-- WDFDMAENABLER
+             |      +-- WDFDMATRANSACTION
+             +-- WDFTIMER
+             +-- WDFWORKITEM
+             +-- WDFSPINLOCK
+             +-- WDFFILEOBJECT     (one per open handle)
+
+   DESTROYING A PARENT DESTROYS ITS CHILDREN, depth-first,
+   in reverse creation order.
+
+   SO: parent everything to your WDFDEVICE and device removal
+   cleans up the entire tree, in the correct order, on every
+   path - including a failed EvtDeviceAdd.
+
+   THE DEFAULT PARENT is usually sensible: WdfSpinLockCreate
+   with WDF_NO_OBJECT_ATTRIBUTES parents to the DRIVER, which
+   is almost never what you want. SET IT EXPLICITLY:
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = device;
+        WdfSpinLockCreate(&amp;attr, &amp;lock);
+
+   THIS IS EXACTLY Linux's devm_ (ch. 33) with a tree instead
+   of a flat list - and the same payoff: correct unwinding
+   that you did not have to write, on the error path you did
+   not test.</pre>
+
+<h2 id="context">Contexts</h2>
+
+<p>Your driver needs somewhere to keep its own state for each device, queue or request. Rather than maintaining a lookup table, WDF lets you attach a typed structure directly to any object and retrieve it with a generated accessor.</p>
+
+<pre><code>/* A context is YOUR structure attached to a WDF object. It
+   replaces WDM's DeviceExtension, and unlike it, you can
+   attach one to ANY object.                                */
+
+/* 1. DECLARE the type and its accessor: */
+
+typedef struct _MY_DEVICE_CONTEXT {
+        WDFDEVICE     Device;
+        WDFQUEUE      ReadQueue;
+        WDFINTERRUPT  Interrupt;
+        PUCHAR        RegBase;
+        ULONG         RegLength;
+        WDFSPINLOCK   StateLock;
+        ULONG         SampleRate;
+        LONG64        InterruptCount;
+} MY_DEVICE_CONTEXT, *PMY_DEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MY_DEVICE_CONTEXT,
+                                   MyGetDeviceContext)
+/* generates:
+     PMY_DEVICE_CONTEXT MyGetDeviceContext(WDFOBJECT);
+   plus the type information WDF needs to size the
+   allocation.                                              */
+
+/* 2. REQUEST it at creation: */
+        WDF_OBJECT_ATTRIBUTES attributes;
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attributes,
+                                        MY_DEVICE_CONTEXT);
+        status = WdfDeviceCreate(&amp;DeviceInit, &amp;attributes,
+                                 &amp;device);
+
+/* 3. USE it: */
+        PMY_DEVICE_CONTEXT ctx = MyGetDeviceContext(device);
+        ctx-&gt;SampleRate = 48000;
+
+/* SEVERAL CONTEXT TYPES ON ONE OBJECT is allowed, with
+   different accessors - useful when a shared library and your
+   driver both need private data on the same device.       */
+
+/* PER-REQUEST CONTEXT, the common second use: */
+typedef struct _MY_REQUEST_CONTEXT {
+        WDFMEMORY  Memory;
+        ULONG      Channel;
+        LARGE_INTEGER StartTime;
+} MY_REQUEST_CONTEXT, *PMY_REQUEST_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MY_REQUEST_CONTEXT,
+                                   MyGetRequestContext)
+
+        /* attach it to requests arriving on a queue: */
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attr,
+                                        MY_REQUEST_CONTEXT);
+        queueConfig.  /* ... */;
+        WdfIoQueueCreate(device, &amp;queueConfig, &amp;attr, &amp;queue);
+        /* now every request on this queue has your context */
+
+/* THE CONTEXT MEMORY IS NON-PAGED and ZEROED at creation, so
+   you do not allocate or free it - it lives inside the
+   object's own allocation.                                */</code></pre>
+
+<div class="key">
+<b>The most common WDF mistake</b>
+<p>Calling <code>MyGetDeviceContext()</code> on an object created <em>without</em>
+<code>WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE</code>. The accessor returns garbage or NULL, and you get a
+crash with no obvious cause. If a context pointer looks wrong, check the creation call first — the attributes
+must name the same context type the accessor expects.</p>
+</div>
+
+<h2 id="cleanup">Cleanup and destroy callbacks</h2>
+
+<p>Two callbacks fire as an object goes away, at different moments and with different rules about what you may do. Choosing the wrong one is a common source of teardown bugs, and the distinction is genuinely subtle.</p>
+
+<pre><code>/* Two callbacks, at different points in an object's death. */
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attr,
+                                        MY_DEVICE_CONTEXT);
+        attr.EvtCleanupCallback = MyEvtDeviceCleanup;
+        attr.EvtDestroyCallback = MyEvtDeviceDestroy;
+        attr.ParentObject       = parent;
+
+VOID
+MyEvtDeviceCleanup(_In_ WDFOBJECT Object)
+{
+        PMY_DEVICE_CONTEXT ctx = MyGetDeviceContext(Object);
+
+        /* CLEANUP: the object is being deleted, but its
+           children still exist and its context is still
+           valid. This is where you release things you
+           acquired yourself.
+
+           IRQL: &lt;= DISPATCH_LEVEL by default, or PASSIVE if
+           you asked for WdfExecutionLevelPassive.        */
+
+        if (ctx-&gt;MyOwnAllocation) {
+                ExFreePoolWithTag(ctx-&gt;MyOwnAllocation, TAG);
+                ctx-&gt;MyOwnAllocation = NULL;
+        }
+}
+
+VOID
+MyEvtDeviceDestroy(_In_ WDFOBJECT Object)
+{
+        /* DESTROY: the last reference is gone, all children
+           are destroyed, and the memory is about to be
+           freed. Very little belongs here.
+
+           IRQL: &lt;= DISPATCH_LEVEL. Do not touch children -
+           they no longer exist.                          */
+}
+
+/* THE ORDER on deletion:
+     1. EvtCleanupCallback on the object
+     2. children are deleted (each with its own cleanup)
+     3. EvtDestroyCallback on the object
+     4. memory freed
+
+/* WHICH TO USE: almost always Cleanup. Destroy is for the
+   rare case where you must know the object is truly gone -
+   for example, signalling that a device's memory can now be
+   reused.
+
+/* AND THE POINT: if everything you allocate is either a WDF
+   object parented correctly, or a WDFMEMORY, you need
+   NEITHER callback. Reach for them only for raw resources
+   the framework does not know about.                     */</code></pre>
+
+<h2 id="memory">WDFMEMORY</h2>
+
+<p>A WDF memory object is an allocation with a lifetime attached to the object tree, so it is freed when its parent is. It also carries its own length, which removes the commonest cause of buffer overruns.</p>
+
+<pre><code>/* A WDF object wrapping a buffer, so allocation participates
+   in parenting and lifetime management.                    */
+
+        WDFMEMORY memory;
+        PVOID buffer;
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = request;    /* dies with the
+                                           request           */
+
+        status = WdfMemoryCreate(&amp;attr,
+                                 NonPagedPoolNx,
+                                 MY_POOL_TAG,
+                                 size,
+                                 &amp;memory,
+                                 &amp;buffer);   /* optional out */
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* no free needed - the request's completion destroys
+           it                                                */
+
+/* GETTING AT IT LATER: */
+        size_t length;
+        PVOID p = WdfMemoryGetBuffer(memory, &amp;length);
+
+/* WRAPPING A BUFFER YOU ALREADY HAVE, without copying: */
+        status = WdfMemoryCreatePreallocated(&amp;attr,
+                        existingBuffer, size, &amp;memory);
+        /* WDF does NOT free the buffer in this case - you
+           still own it. Use this to hand an existing buffer
+           to an API that wants a WDFMEMORY.               */
+
+/* COPYING, with bounds checking done for you: */
+        WdfMemoryCopyFromBuffer(memory, offset, src, length);
+        WdfMemoryCopyToBuffer(memory, offset, dst, length);
+/* These return STATUS_BUFFER_TOO_SMALL rather than
+   overrunning - which is the argument for using them instead
+   of RtlCopyMemory on a raw pointer.                      */</code></pre>
+
+<h2 id="sync">Synchronisation scope</h2>
+
+<p>By default WDF may call your callbacks concurrently on several processors. Synchronisation scope lets you ask the framework to serialise them for you — a decision worth making deliberately, because the convenient answer costs concurrency.</p>
+
+<pre><code>/* WDF can AUTOMATICALLY serialise your callbacks, so you may
+   not need locks at all.                                   */
+
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.SynchronizationScope = WdfSynchronizationScopeDevice;
+        attr.ExecutionLevel       = WdfExecutionLevelPassive;
+
+/* SYNCHRONIZATION SCOPE:
+
+   WdfSynchronizationScopeDevice
+        ALL callbacks for this device, and its queues, timers
+        and DPCs, are serialised against one another with a
+        single device lock. Simplest to reason about; limits
+        parallelism.
+
+   WdfSynchronizationScopeQueue
+        callbacks for one queue are serialised with each
+        other, but different queues run in parallel.
+
+   WdfSynchronizationScopeNone
+        no automatic serialisation. YOU do the locking.
+        The default for a parallel queue, and the right choice
+        for a high-throughput device.
+
+   WdfSynchronizationScopeInheritFromParent
+        the default for most objects.
+
+/* EXECUTION LEVEL:
+
+   WdfExecutionLevelPassive
+        every callback runs at PASSIVE_LEVEL, so it may touch
+        paged memory and sleep. The framework uses work items
+        to arrange it.
+        NOTE: cannot be combined with a queue that must run at
+        DISPATCH_LEVEL, and it adds latency.
+
+   WdfExecutionLevelDispatch
+        callbacks may run at DISPATCH_LEVEL.
+
+   WdfExecutionLevelInheritFromParent   the default.
+
+/* THE TRADE, stated plainly:
+     ScopeDevice + LevelPassive is the EASIEST model to write
+     correctly - one lock, everything sleepable, no IRQL
+     puzzles. It is also the slowest, because every callback
+     serialises against every other.
+
+     ScopeNone + parallel dispatch is the FASTEST and requires
+     you to get the locking right yourself (chapter 10).
+
+   START with the simple model. Move to the parallel one when
+   you have measured a reason to.                          */</code></pre>
+
+<h2 id="collections">Collections and child lists</h2>
+
+<p>When a driver needs to track a set of objects — open handles, pending operations, child devices — WDF provides a container that participates in the same lifetime rules as everything else.</p>
+
+<pre><code>/* WDFCOLLECTION - an ordered set of WDF objects: */
+        WDFCOLLECTION collection;
+
+        WdfCollectionCreate(&amp;attr, &amp;collection);
+        WdfCollectionAdd(collection, someObject);
+
+        ULONG count = WdfCollectionGetCount(collection);
+        for (ULONG i = 0; i &lt; count; i++) {
+                WDFOBJECT obj = WdfCollectionGetItem(collection, i);
+                ...
+        }
+        WdfCollectionRemove(collection, someObject);
+
+/* Holds a REFERENCE on each item, so an object in a
+   collection outlives its parent's deletion attempt until
+   removed. Convenient, and a source of "the device will not
+   go away" bugs if you forget to empty it.               */
+
+/* WDFCHILDLIST - for a BUS DRIVER that enumerates children: */
+        WDF_CHILD_LIST_CONFIG config;
+
+        WDF_CHILD_LIST_CONFIG_INIT(&amp;config,
+                        sizeof(MY_CHILD_ID),
+                        MyEvtChildListCreateDevice);
+        WdfFdoInitSetDefaultChildListConfig(DeviceInit,
+                        &amp;config, WDF_NO_OBJECT_ATTRIBUTES);
+
+        /* when you discover a child: */
+        WdfChildListBeginScan(list);
+        WdfChildListAddOrUpdateChildDescriptionAsPresent(
+                        list, &amp;id.Header, NULL);
+        WdfChildListEndScan(list);
+        /* anything not re-reported during the scan is
+           automatically reported as REMOVED - which handles
+           hot-unplug without you tracking it            */
+
+/* This is how a driver for a bus, a multi-function device, or
+   a device with dynamically appearing endpoints reports its
+   children to PnP (chapter 06).                          */</code></pre>
+
+<h2 id="debug">Debugging WDF objects</h2>
+
+<p>The framework's debugger extension can show you the whole object tree, the queues and every request in flight, which turns most WDF questions into a single command.</p>
+
+<pre><code># The WDF debugger extension - load it first:
+    .load wdfkd.dll
+    !wdfkd.wdfhelp
+
+# THE ESSENTIAL COMMANDS:
+    !wdfdriverinfo mydriver         everything about the driver
+    !wdfdevicequeues &lt;WDFDEVICE&gt;    every queue and its
+                                    contents
+    !wdfobjectdump                  every WDF object
+    !wdfhandle &lt;handle&gt;             one object: type, parent,
+                                    context, refcount
+    !wdfobject &lt;handle&gt;
+    !wdfqueue &lt;WDFQUEUE&gt;            requests in a queue
+    !wdfrequest &lt;WDFREQUEST&gt;        one request's state
+    !wdflogdump mydriver            THE FRAMEWORK'S OWN LOG
+
+# !wdflogdump IS THE ONE TO REMEMBER. WDF keeps an internal
+# trace of every state transition, every request, and every
+# error it detected. On a crash, it usually tells you what the
+# framework thought was happening - which is often the whole
+# answer.
+
+# ENABLE VERBOSE FRAMEWORK LOGGING during development:
+#   in the registry, under the driver's Parameters\Wdf key:
+    VerboseOn      = 1
+    VerifierOn     = 1     ; WDF VERIFIER - see below
+    DbgBreakOnError = 1
+
+# Or via the WDF verifier settings in the WDK's
+# "WDF Verifier Control Application" (wdfverifier.exe).
+
+# WDF VERIFIER checks framework-specific rules: object
+# lifetime, handle validity, IRQL for each API, correct
+# request completion. It is separate from Driver Verifier
+# (chapter 22) and catches a different, WDF-specific class of
+# bug. Turn BOTH on.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Context accessor returns NULL or garbage</td><td>Object created without the matching context type</td></tr>
+<tr><td>Objects leak across device removal</td><td><code>ParentObject</code> not set — they parented to the driver</td></tr>
+<tr><td>Crash in a cleanup callback</td><td>Touched a child that was already destroyed — use Cleanup, not Destroy</td></tr>
+<tr><td>Device will not go away</td><td>A reference held by a collection, or an object parented too high</td></tr>
+<tr><td>Callbacks race with each other</td><td><code>SynchronizationScopeNone</code> without your own locking</td></tr>
+<tr><td>Callback bugchecks touching paged memory</td><td>Execution level is Dispatch, not Passive</td></tr>
+<tr><td>Buffer freed while still in use</td><td>WDFMEMORY parented to something shorter-lived than its use</td></tr>
+<tr><td>Preallocated memory double-freed</td><td><code>WdfMemoryCreatePreallocated</code> does not take ownership</td></tr>
+<tr><td>Child devices never removed</td><td>Not re-scanned — WDFCHILDLIST reports absence by omission</td></tr>
+<tr><td>WDF verifier bugcheck</td><td>A framework rule violation it made deterministic</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name ten WDF object types and the common shape of their creation functions.</li>
+  <li>Draw the parenting tree and explain what destroying a device does.</li>
+  <li>Explain why the default parent is often wrong and what to set instead.</li>
+  <li>Declare a context type, request it at creation, and use the accessor.</li>
+  <li>Explain the most common context mistake and how to spot it.</li>
+  <li>Distinguish Cleanup from Destroy and say which to use.</li>
+  <li>Use WDFMEMORY, including the preallocated form and its ownership rule.</li>
+  <li>Explain synchronisation scope and execution level, and the trade between them.</li>
+  <li>Explain how a WDFCHILDLIST reports removal.</li>
+  <li>Use <code>!wdflogdump</code> and say why it is the first command to try.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

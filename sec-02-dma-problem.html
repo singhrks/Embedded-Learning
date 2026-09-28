@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why DMA breaks memory protection | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Why DMA breaks memory protection</h1>
+<p class="lead">The MMU sits between a CPU core and the interconnect. A DMA engine does not go through a CPU
+core. Every isolation guarantee built out of page tables therefore has a hole in it, and closing that hole is
+what the SMMU exists to do.</p>
+
+<h2 id="gap">The gap</h2>
+
+<p>Every protection mechanism discussed so far applies to the processor. A device performing DMA is not the processor, and by default it addresses memory with nothing checking it at all — which quietly invalidates the memory protection you thought you had.</p>
+
+<pre class="diagram">   WITHOUT AN SMMU
+
+   CPU                              DMA-capable device
+    |                                     |
+    v                                     |
+   +-------+                              |
+   |  MMU  |  translate + check           |  raw PHYSICAL
+   +-------+                              |  addresses,
+    |                                     |  NO checks
+    v                                     v
+   +----------------------------------------------------+
+   |            interconnect  ->  DRAM                   |
+   +----------------------------------------------------+
+
+  Every CPU access is translated and permission-checked
+  (ARM chapters 12-14). Every DEVICE access is not checked at
+  all — it goes straight onto the bus.
+
+  So a device programmed with address X reads or writes physical
+  address X. Any X. Including kernel memory, including the secure
+  world's memory, including the page tables themselves.</pre>
+
+<div class="danger">
+<b>What this means concretely</b>
+<p>An attacker who can program a DMA engine — which on most systems means an attacker who has compromised the
+kernel, or who can plug in a Thunderbolt device — can:</p>
+<ul>
+<li>Read kernel memory, including disk encryption keys held in RAM.</li>
+<li>Overwrite kernel code or the page tables, escalating from device access to full control.</li>
+<li>Overwrite another VM's memory, escaping the hypervisor.</li>
+<li>Do all of this <em>with the CPU's MMU perfectly configured</em>, because the MMU was never involved.</li>
+</ul>
+</div>
+
+<h2 id="attacks">Real attack classes</h2>
+
+<p>These are not hypothetical. Each class below has been demonstrated against shipping hardware, and several are the reason the mitigations later in this track exist at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Attack</th><th>Vector</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><strong>Thunderbolt / PCIe hotplug</strong></td><td>Plug a malicious device into a running machine and DMA to arbitrary memory</td><td>The "evil maid" attack. Thunderclap (2019) demonstrated it against every major OS.</td></tr>
+<tr><td><strong>FireWire</strong></td><td>The original — FireWire allowed unmediated DMA by design</td><td>Used for years to unlock laptops by patching the password check in RAM</td></tr>
+<tr><td><strong>Compromised device firmware</strong></td><td>A NIC, GPU or storage controller running attacker code, DMA-ing anywhere</td><td>Firmware is rarely audited and often updatable</td></tr>
+<tr><td><strong>Buggy device</strong></td><td>Not malicious — a hardware or firmware bug writing outside its buffer</td><td>Far more common than deliberate attacks, and just as destructive</td></tr>
+<tr><td><strong>Driver bug</strong></td><td>A driver programs a device with an attacker-influenced address</td><td>Turns a driver bug into arbitrary physical write</td></tr>
+<tr><td><strong>VM escape</strong></td><td>A guest with a passed-through device programs it with guest-physical addresses</td><td>Without stage-2 IOMMU translation, those are treated as host-physical</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="four">Four problems, one solution</h2>
+
+<p>The problem has four distinct forms depending on whether the device is malicious, buggy, compromised or merely misconfigured. They need different defences, and conflating them leads to protecting against the least likely one.</p>
+
+<pre class="diagram">The SMMU is usually described as a security feature. It solves
+FOUR distinct problems, and only one is security:
+
+  1. ISOLATION (security)
+       constrain a device to the memory it was given
+       -> the whole of this chapter
+
+  2. VIRTUALISATION
+       a guest programs a device with GUEST-physical addresses.
+       Without translation, the device uses them as HOST-physical
+       and scribbles over the host or another guest.
+       -> stage 2 makes device passthrough possible at all
+
+  3. SCATTER-GATHER
+       a device wanting one large contiguous buffer forces the OS
+       to find contiguous PHYSICAL memory, which fragments and
+       eventually fails (OS chapter 11).
+       -> with translation, physically scattered pages appear
+          contiguous to the device
+
+  4. ADDRESS WIDTH
+       a legacy 32-bit device cannot reach memory above 4 GB.
+       Without translation you need slow BOUNCE BUFFERS: copy the
+       data down below 4 GB, DMA, copy back.
+       -> with translation, any physical page can be mapped into
+          the device's reachable range
+
+  Problems 3 and 4 are why IOMMUs existed long before anyone
+  worried about DMA attacks. The security benefit came later,
+  and is now the main reason they are mandatory.</pre>
+
+<h2 id="solution">Putting an MMU in front of the device</h2>
+
+<p>The answer is to put a translation and permission check in front of the device, exactly as the MMU sits in front of the processor. That is what an SMMU is, and the next four chapters are how it works.</p>
+
+<pre class="diagram">   WITH AN SMMU
+
+   CPU                              DMA-capable device
+    |                                     |
+    v                                     v
+   +-------+                        +-----------+
+   |  MMU  |                        |   SMMU    |
+   +-------+                        +-----------+
+    |   translate + check            |   translate + check,
+    |                                |   BY STREAMID
+    v                                v
+   +----------------------------------------------------+
+   |            interconnect  ->  DRAM                   |
+   +----------------------------------------------------+
+
+  Same idea, same descriptor format, same permission bits. The
+  difference is that the SMMU serves MANY devices through one
+  block, so it needs the transaction to say WHO is asking.
+
+  That identifier is the STREAMID, and it is the subject of the
+  next chapter.
+
+  Terminology: ARM calls it the SMMU (System MMU). The generic
+  term is IOMMU. Intel's is VT-d, AMD's is AMD-Vi, and they
+  differ in programming model but not in concept.</pre>
+
+<h2 id="notenough">Why the MMU alone is not enough</h2>
+
+<p>An SMMU is necessary and not sufficient. Several attack paths route around it entirely, and knowing which ones is what stops you from declaring the problem solved prematurely.</p>
+
+<pre><code>/* A natural question: why not just have the device use virtual
+   addresses through the CPU's MMU?
+
+   Three reasons it cannot work:
+
+   1. WHICH page tables? The CPU's MMU uses TTBR0/TTBR1 for the
+      CURRENTLY RUNNING process. A device operates asynchronously
+      — the process that started the transfer may not be running,
+      may have exited, or may be on another core.
+
+   2. The MMU is INSIDE the core. Physically, a device's
+      transactions do not pass through it. Routing them there
+      would mean routing all DMA through a CPU, which defeats the
+      point of DMA entirely.
+
+   3. Devices need their own POLICY. A device should be confined
+      to the buffers it was given — not to whatever the process
+      that programmed it can see. Those are different sets.
+
+   Hence a separate translation unit, on the device side of the
+   interconnect, with its own tables and its own notion of
+   identity.                                                */</code></pre>
+
+<h2 id="coherency">A second, separate problem</h2>
+
+<div class="warn">
+<b>Isolation and coherency are different issues</b>
+<p>DMA creates two problems and they are often confused:</p>
+<ul>
+<li><strong>Isolation</strong> — the device can reach memory it should not. Solved by the SMMU.</li>
+<li><strong>Coherency</strong> — the device and the CPU disagree about the <em>contents</em> of memory it
+legitimately reached. Solved by cache maintenance or by hardware coherency
+(<a href="arm-18-cache-maintenance.html">ARM 18</a>, <a href="arm-19-shareability.html">ARM 19</a>).</li>
+</ul>
+<p>An SMMU does not make DMA coherent, and cache maintenance does not make it isolated. A driver needs to get
+both right, which is exactly why the DMA API exists to handle them together
+(<a href="sec-07-dma-api.html">chapter 07</a>).</p>
+</div>
+
+<h2 id="where">Where the SMMU sits</h2>
+
+<p>Not every master on an SoC is behind an SMMU, and finding out which are is a per-chip investigation rather than an assumption. The ones that are not are your remaining exposure.</p>
+
+<pre class="diagram">Not every master goes through an SMMU. This is a SoC
+INTEGRATION decision, and it is the first thing to establish
+about any platform:
+
+   +------+  +------+  +------+  +------+  +------+
+   | GPU  |  | NPU  |  | DMA  |  | PCIe |  | PMU  |
+   +--+---+  +--+---+  +--+---+  +--+---+  |micro-|
+      |         |         |         |      |cntlr |
+   +--v---------v---------v---------v--+   +--+---+
+   |            SMMU                   |      |
+   +-----------------+-----------------+      | NO SMMU
+                     |                        | at all
+   +-----------------v------------------------v-------------+
+   |                    interconnect                         |
+   +---------------------------------------------------------+
+
+  The power-management microcontroller, a sensor hub, or a
+  debug/test port may have direct memory access with nothing in
+  front of it. Those masters are outside the SMMU's protection
+  entirely, and can only be constrained by an interconnect
+  FIREWALL (chapters 17-20).
+
+  So the layered design of chapter 01 is not theoretical: some
+  masters are covered by layer 2, some only by layer 4, and you
+  must know which is which for your SoC.</pre>
+
+<pre><code># what does Linux think is behind an IOMMU?
+ls /sys/kernel/iommu_groups/
+ls -l /sys/kernel/iommu_groups/*/devices/
+
+# is a specific device translated?
+ls /sys/bus/pci/devices/0000:01:00.0/iommu_group
+ls /sys/bus/platform/devices/*/iommu_group
+
+# a device with NO iommu_group symlink is NOT behind an SMMU
+for d in /sys/bus/platform/devices/*; do
+  [ -e "$d/iommu_group" ] || echo "no IOMMU: $(basename $d)"
+done</code></pre>
+
+<h2 id="groups">IOMMU groups</h2>
+
+<p>Devices that cannot be isolated from each other must be treated as one unit for security purposes. That grouping is forced by the hardware topology rather than chosen, and it constrains what you can safely pass through to a guest.</p>
+
+<pre class="diagram">The SMMU can only distinguish devices whose transactions carry
+DIFFERENT StreamIDs. Sometimes it cannot.
+
+  A PCIe bridge that does not support Access Control Services
+  may allow peer-to-peer traffic between devices behind it —
+  traffic that never reaches the SMMU at all. Two such devices
+  can DMA to each other regardless of what the SMMU says.
+
+  Linux therefore groups devices that CANNOT be isolated from
+  each other into one IOMMU GROUP, and treats the group as the
+  smallest unit of assignment:
+
+     /sys/kernel/iommu_groups/12/devices/
+         0000:01:00.0      <- a GPU
+         0000:01:00.1      <- its audio function
+
+  CONSEQUENCE: you cannot pass one device of a group to a VM and
+  keep the other on the host. VFIO refuses, because doing so
+  would be a false isolation guarantee.
+
+  This is a very common source of "why can't I pass through my
+  GPU" — the answer is usually that its group contains something
+  else, and the fix is a different slot, ACS support, or (with
+  full understanding of the risk) an ACS override.</pre>
+
+<h2 id="bypass">Bypass: the most common misconfiguration</h2>
+
+<div class="danger">
+<b>An SMMU that is not configured protects nothing</b>
+<p>A device whose StreamID has no valid Stream Table Entry can be handled in two ways: <strong>abort</strong>
+every transaction, or <strong>bypass</strong> translation entirely. Bypass means the device operates exactly
+as though no SMMU existed.</p>
+<p>Bypass is convenient during bring-up and catastrophic in production. Several real systems have shipped with
+it enabled because a device did not work otherwise and someone turned it on to unblock testing.</p>
+</div>
+
+<pre><code># Linux kernel command line options that matter here
+iommu.passthrough=1              # ALL devices bypass — debug only
+arm-smmu-v3.disable_bypass=1     # abort unmatched streams (default
+                                 # since 4.20, and the correct setting)
+iommu.strict=1                   # invalidate TLBs synchronously on
+                                 # unmap. strict=0 is faster and
+                                 # leaves a window where a freed page
+                                 # is still reachable by the device.
+
+# check what is actually in force
+cat /proc/cmdline
+dmesg | grep -iE 'smmu|iommu'
+#   arm-smmu-v3 2b400000.iommu: ias 48-bit, oas 48-bit (features 0x...)
+#   arm-smmu-v3 2b400000.iommu: allocated 65536 entry cmdq
+#   iommu: Default domain type: Translated
+
+# "Default domain type: Passthrough" means devices are NOT
+# being translated. On a production system that is a finding.</code></pre>
+
+<h2 id="tradeoffs">What it costs</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Cost</th><th>Magnitude</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Translation latency on a TLB miss</td><td>A page-table walk per miss, up to 24 accesses with two stages (<a href="arm-16-two-stage.html">ARM 16</a>)</td><td>SMMU TLBs, walk caches, huge pages</td></tr>
+<tr><td>Map/unmap cost per transfer</td><td>Page table edits plus invalidation commands</td><td>Persistent mappings, larger buffers, deferred invalidation</td></tr>
+<tr><td>Invalidation latency</td><td>A command queue round trip plus <code>CMD_SYNC</code></td><td><code>iommu.strict=0</code> — faster, and less safe</td></tr>
+<tr><td>Memory for tables</td><td>Stream tables scale with the StreamID space</td><td>Two-level stream tables</td></tr>
+<tr><td>Throughput on small transfers</td><td>Can be 10–30% on high-rate networking</td><td>Larger buffers, or ATS (<a href="sec-05-smmu-stages.html">ch. 05</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>These costs are why bypass is tempting and why <code>iommu.strict=0</code> exists. Both trade a real
+security property for measurable performance, and both should be a deliberate, documented decision rather than
+an accident.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A device writes outside its buffer and corrupts the kernel</td><td>No SMMU, or the device is in bypass</td></tr>
+<tr><td>Plugging in a Thunderbolt device compromises the machine</td><td>Unmediated DMA — the reason IOMMUs became mandatory on laptops</td></tr>
+<tr><td>Guest with a passed-through device corrupts the host</td><td>No stage-2 IOMMU translation</td></tr>
+<tr><td>Large DMA allocation fails on a long-running system</td><td>Physical fragmentation; scatter-gather via the SMMU avoids it</td></tr>
+<tr><td>32-bit device transfers are slow</td><td>Bounce buffers; an SMMU removes the need</td></tr>
+<tr><td>Cannot pass a GPU to a VM</td><td>Its IOMMU group contains other devices</td></tr>
+<tr><td><code>Default domain type: Passthrough</code> in dmesg</td><td>Translation disabled — a production finding</td></tr>
+<tr><td>Networking throughput drops ~20% after enabling the IOMMU</td><td>Map/unmap and invalidation cost on small packets</td></tr>
+<tr><td>DMA reads stale data even with the SMMU configured</td><td>A coherency problem, not an isolation one</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain in one sentence why the CPU's MMU does not constrain DMA.</li>
+  <li>Give three things an attacker with DMA access can do.</li>
+  <li>Name the four problems an IOMMU solves and say which two predate the security concern.</li>
+  <li>Give three reasons a device cannot simply use the CPU's page tables.</li>
+  <li>Distinguish the isolation problem from the coherency problem, with a symptom of each.</li>
+  <li>Explain why some masters have no SMMU and what constrains them instead.</li>
+  <li>Explain what an IOMMU group is and why VFIO refuses to split one.</li>
+  <li>Say what bypass mode is and why it is a production finding.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

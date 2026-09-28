@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a tiny transformer from scratch | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a tiny transformer from scratch</h1>
+<p class="lead">Build, train and run a character-level language model end to end. Every line traces back to
+a chapter in this track, it runs on a laptop CPU in minutes, and at the end you export it to C and run it
+on a microcontroller.</p>
+
+<h2 id="plan">What you will build</h2>
+
+<p>Everything in the track so far, assembled into one working system small enough to train on a laptop and deploy to a microcontroller. This is what you will end up with.</p>
+
+<pre class="diagram">   PART A   a character tokeniser              (chapter 16)
+   PART B   the model, in PyTorch          (chapters 19-22)
+   PART C   the training loop              (chapters 10, 11)
+   PART D   sampling and generation            (chapter 25)
+   PART E   quantise to int8 and export to C
+                                        (chapters 26, 27)
+
+   TARGET: a model that learns the structure of a text
+   corpus well enough to produce recognisable output.
+
+   THE SPECIFICATION:
+     vocabulary      ~65 characters
+     d_model         128
+     layers          4
+     heads           4
+     context         128 characters
+     parameters      ~800k
+     training        ~10 minutes on a laptop CPU,
+                     ~30 seconds on any GPU
+     int8 export     ~800 KB
+
+   THAT LAST NUMBER MATTERS: 800 KB does not fit on a
+   Cortex-M4 (chapter 27). Part E shrinks it to a version
+   that does, and the exercise of finding out WHY is more
+   instructive than being handed a model that already fits.
+
+   PREREQUISITES:
+     pip install torch numpy
+
+   THE DATA: any plain text file of a megabyte or more.
+   The classic choice is the concatenated works of
+   Shakespeare (input.txt, ~1.1 MB, widely available), but
+   USE SOMETHING YOU KNOW WELL - your own logs, a codebase,
+   a protocol dump. You will judge the output by whether it
+   looks right, and that requires knowing what right looks
+   like.</pre>
+
+<h2 id="a">Part A — data and tokenisation</h2>
+
+<p>Start with the data and the tokeniser, because every shape downstream is determined here and a mistake at this stage is invisible until training silently fails to learn.</p>
+
+<pre><code># ============ prepare.py ============
+import torch
+
+text = open('input.txt', 'r', encoding='utf-8').read()
+print(f"{len(text):,} characters")
+
+# CHARACTER-LEVEL TOKENISATION (chapter 16).
+# No BPE, no merge list, no vocabulary file - just the set
+# of characters that occur. Small vocabulary, long
+# sequences, and nothing to get wrong.
+chars = sorted(set(text))
+vocab_size = len(chars)
+print(f"vocab: {vocab_size} -> {''.join(chars)}")
+
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join(itos[i] for i in l)
+
+data = torch.tensor(encode(text), dtype=torch.long)
+
+# TRAIN/VALIDATION SPLIT (chapter 12).
+# NOTE: split by POSITION, not randomly - this is sequential
+# data, and shuffling would let the model see continuations
+# of its own training text.
+n = int(0.9 * len(data))
+train_data, val_data = data[:n], data[n:]
+
+BLOCK = 128        # context length
+BATCH = 32
+
+def get_batch(split):
+    d = train_data if split == 'train' else val_data
+    # random starting offsets, and stack into a batch
+    ix = torch.randint(len(d) - BLOCK - 1, (BATCH,))
+    x = torch.stack([d[i:i+BLOCK]     for i in ix])
+    y = torch.stack([d[i+1:i+BLOCK+1] for i in ix])
+    #                  ^^^ SHIFTED BY ONE. That is the
+    #                  entire supervision signal
+    #                  (chapter 23).
+    return x, y
+
+xb, yb = get_batch('train')
+print(xb.shape, yb.shape)     # (32, 128) (32, 128)
+print(repr(decode(xb[0][:40].tolist())))
+print(repr(decode(yb[0][:40].tolist())))
+# The second is the first, shifted left by one character.</code></pre>
+
+<h2 id="b">Part B — the model</h2>
+
+<p>The model itself, built from the components of chapters 19 to 22 with nothing hidden behind a framework abstraction.</p>
+
+<pre><code># ============ model.py ============
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Config:
+    vocab_size = 65
+    block_size = 128
+    n_layer    = 4
+    n_head     = 4
+    d_model    = 128
+    dropout    = 0.1
+
+class SelfAttention(nn.Module):
+    """Chapters 19 and 21."""
+    def __init__(self, c):
+        super().__init__()
+        assert c.d_model % c.n_head == 0
+        self.n_head = c.n_head
+        self.d_head = c.d_model // c.n_head
+        # Q, K, V in one matmul (chapter 04)
+        self.qkv  = nn.Linear(c.d_model, 3*c.d_model,
+                              bias=False)
+        self.proj = nn.Linear(c.d_model, c.d_model,
+                              bias=False)
+        self.drop = nn.Dropout(c.dropout)
+        self.p = c.dropout
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        # (B,T,C) -> (B,n_head,T,d_head): heads become a
+        # batch dimension (chapter 21)
+        sp = lambda t: t.view(B, T, self.n_head,
+                              self.d_head).transpose(1, 2)
+        q, k, v = sp(q), sp(k), sp(v)
+
+        # Flash Attention where available; is_causal gives
+        # the mask (chapter 19)
+        y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.p if self.training else 0.0)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.drop(self.proj(y))
+
+class MLP(nn.Module):
+    """Chapter 22. Two thirds of the parameters live here."""
+    def __init__(self, c):
+        super().__init__()
+        self.fc   = nn.Linear(c.d_model, 4*c.d_model)
+        self.proj = nn.Linear(4*c.d_model, c.d_model)
+        self.drop = nn.Dropout(c.dropout)
+    def forward(self, x):
+        return self.drop(self.proj(F.gelu(self.fc(x))))
+
+class Block(nn.Module):
+    """PRE-NORM, with both residuals (chapter 22)."""
+    def __init__(self, c):
+        super().__init__()
+        self.ln1, self.attn = nn.LayerNorm(c.d_model), SelfAttention(c)
+        self.ln2, self.mlp  = nn.LayerNorm(c.d_model), MLP(c)
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+class TinyGPT(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        self.wte = nn.Embedding(c.vocab_size, c.d_model)
+        self.wpe = nn.Embedding(c.block_size, c.d_model)
+        self.drop = nn.Dropout(c.dropout)
+        self.blocks = nn.ModuleList(
+            [Block(c) for _ in range(c.n_layer)])
+        self.ln_f = nn.LayerNorm(c.d_model)
+        self.head = nn.Linear(c.d_model, c.vocab_size,
+                              bias=False)
+        self.head.weight = self.wte.weight   # weight tying
+                                             # (chapter 17)
+
+        self.apply(self._init)
+        # scale residual projections by 1/sqrt(2*n_layer)
+        # (chapter 15)
+        for name, p in self.named_parameters():
+            if name.endswith('proj.weight'):
+                nn.init.normal_(p, 0.0,
+                    0.02 / math.sqrt(2 * c.n_layer))
+
+    def _init(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        assert T &lt;= self.c.block_size
+        pos = torch.arange(T, device=idx.device)
+        x = self.drop(self.wte(idx) + self.wpe(pos))
+        for b in self.blocks:
+            x = b(x)
+        logits = self.head(self.ln_f(x))
+
+        loss = None
+        if targets is not None:
+            # RAW LOGITS into cross_entropy (chapter 10)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new, T=0.8, top_k=None):
+        """Chapter 25. No KV cache here - at this size it is
+           unnecessary, and adding it is exercise 4."""
+        for _ in range(max_new):
+            # CROP to block_size: learned absolute positions
+            # have a hard limit (chapter 21)
+            ctx = idx[:, -self.c.block_size:]
+            logits, _ = self(ctx)
+            logits = logits[:, -1, :] / T       # last
+                                                # position
+            if top_k is not None:
+                v, _ = torch.topk(logits,
+                                  min(top_k, logits.size(-1)))
+                logits[logits &lt; v[:, [-1]]] = -float('inf')
+            probs = F.softmax(logits, dim=-1)
+            nxt = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, nxt), dim=1)
+        return idx
+
+model = TinyGPT(Config())
+print(f"{sum(p.numel() for p in model.parameters())/1e3:.0f}k "
+      f"parameters")</code></pre>
+
+<h2 id="c">Part C — training</h2>
+
+<p>The training loop, deliberately written to show the diagnostics rather than just the loss — because what you want from a first training run is information, not a number.</p>
+
+<pre><code># ============ train.py ============
+import math, time, torch
+
+cfg = Config(); cfg.vocab_size = vocab_size
+model = TinyGPT(cfg)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model.to(device)
+
+MAX_STEPS, WARMUP = 5000, 100
+PEAK_LR, MIN_LR   = 1e-3, 1e-4
+
+# AdamW, betas from chapter 11; no weight decay on
+# 1-D parameters (chapter 15)
+decay    = [p for p in model.parameters() if p.dim() >= 2]
+no_decay = [p for p in model.parameters() if p.dim() < 2]
+opt = torch.optim.AdamW(
+    [{'params': decay,    'weight_decay': 0.1},
+     {'params': no_decay, 'weight_decay': 0.0}],
+    lr=PEAK_LR, betas=(0.9, 0.95))
+
+def lr_at(step):                       # chapter 11
+    if step < WARMUP:
+        return PEAK_LR * step / WARMUP
+    p = (step - WARMUP) / (MAX_STEPS - WARMUP)
+    return MIN_LR + 0.5*(PEAK_LR-MIN_LR)*(1+math.cos(math.pi*p))
+
+@torch.no_grad()
+def estimate_loss(iters=50):
+    model.eval()                       # <<< chapter 15
+    out = {}
+    for split in ('train', 'val'):
+        losses = torch.zeros(iters)
+        for k in range(iters):
+            x, y = get_batch(split)
+            _, loss = model(x.to(device), y.to(device))
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+# ---- SANITY CHECK BEFORE TRAINING (chapter 15) ----
+x, y = get_batch('train')
+_, loss0 = model(x.to(device), y.to(device))
+print(f"step-0 loss {loss0.item():.4f}, "
+      f"expected ~{math.log(vocab_size):.4f}")
+# IF THESE DISAGREE, STOP AND FIND THE BUG. Do not train.
+
+t0 = time.time()
+for step in range(MAX_STEPS):
+    for g in opt.param_groups:
+        g['lr'] = lr_at(step)
+
+    x, y = get_batch('train')
+    _, loss = model(x.to(device), y.to(device))
+
+    opt.zero_grad(set_to_none=True)        # chapter 07
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+
+    if step % 500 == 0 or step == MAX_STEPS - 1:
+        l = estimate_loss()
+        print(f"step {step:5d}  train {l['train']:.4f}  "
+              f"val {l['val']:.4f}  "
+              f"ppl {math.exp(l['val']):.1f}  "
+              f"{time.time()-t0:.0f}s")
+
+torch.save({'model': model.state_dict(),
+            'stoi': stoi, 'itos': itos,
+            'cfg': cfg.__dict__}, 'tiny.pt')
+
+# ---- WHAT YOU SHOULD SEE ----
+# step     0  train 4.1745  val 4.1748   ppl 65.0
+# step  1000  train 1.9421  val 2.0134    ppl 7.5
+# step  3000  train 1.5502  val 1.6789    ppl 5.4
+# step  4999  train 1.4231  val 1.5993    ppl 4.9
+#
+# Loss starts at log(65) = 4.17 - a uniform distribution.
+# Perplexity 4.9 means the model is choosing between about
+# five characters at each step (chapter 10). For English
+# text that is roughly the right order.
+#
+# TRAIN AND VAL SHOULD TRACK EACH OTHER. If val turns
+# upward while train keeps falling, you are overfitting -
+# more data, more dropout, or fewer steps (chapter 12).</code></pre>
+
+<h2 id="d">Part D — generation</h2>
+
+<p>Generation, where the sampling parameters from chapter 25 stop being theory and start visibly changing what comes out.</p>
+
+<pre><code># ============ sample.py ============
+ck = torch.load('tiny.pt')
+cfg = Config()
+cfg.__dict__.update(ck['cfg'])
+model = TinyGPT(cfg); model.load_state_dict(ck['model'])
+model.eval()
+itos = ck['itos']
+decode = lambda l: ''.join(itos[i] for i in l)
+
+ctx = torch.zeros((1, 1), dtype=torch.long)   # start token
+out = model.generate(ctx, max_new=500, T=0.8, top_k=40)
+print(decode(out[0].tolist()))
+
+# ---- EXPERIMENT WITH TEMPERATURE (chapters 08, 25) ----
+for T in (0.2, 0.5, 0.8, 1.0, 1.5):
+    print(f"--- T = {T} ---")
+    print(decode(model.generate(ctx, 200, T=T)[0].tolist()))
+
+# T=0.2  repetitive, often loops on common words
+# T=0.8  the usual sweet spot - word-like, punctuated,
+#        structurally plausible
+# T=1.5  noise with occasional real words
+#
+# THE MODEL LEARNS, IN ROUGHLY THIS ORDER:
+#   ~200 steps    character frequencies; spaces
+#   ~500 steps    word-like letter clusters
+#   ~1500 steps   real short words, line structure
+#   ~3000 steps   punctuation, capitalisation, dialogue
+#                 formatting
+#   ~5000 steps   short grammatical phrases
+#
+# WATCHING THAT PROGRESSION IS THE POINT OF THIS PROJECT.
+# Sample every 500 steps and keep the outputs.
+
+# ---- CONDITIONED GENERATION ----
+prompt = "ROMEO:"
+ids = torch.tensor([[stoi[c] for c in prompt]])
+print(decode(model.generate(ids, 300, T=0.8)[0].tolist()))</code></pre>
+
+<h2 id="e">Part E — quantise and export to C</h2>
+
+<p>The final step is the one that connects this track to the rest of the curriculum: the same model, quantised and exported as C that runs with no framework at all.</p>
+
+<pre><code># ============ export.py ============
+"""Chapters 26 and 27: int8 symmetric per-channel
+   quantisation, and a C header the firmware can compile."""
+import numpy as np, torch
+
+ck = torch.load('tiny.pt')
+sd = ck['model']
+
+def quantise_per_channel(W):
+    """W: (out, in) torch tensor -> int8 array + per-row
+       scales. PER-CHANNEL, because per-tensor loses
+       measurable accuracy (chapter 26)."""
+    W = W.detach().float().numpy()
+    scale = np.abs(W).max(axis=1, keepdims=True) / 127.0
+    scale = np.maximum(scale, 1e-8)          # never divide
+                                             # by zero
+    q = np.clip(np.round(W / scale), -127, 127).astype(np.int8)
+    return q, scale.squeeze(1).astype(np.float32)
+
+total_fp32 = total_int8 = 0
+with open('model_weights.h', 'w') as f:
+    f.write("/* generated by export.py - do not edit */\n")
+    f.write("#ifndef MODEL_WEIGHTS_H\n"
+            "#define MODEL_WEIGHTS_H\n#include &lt;stdint.h&gt;\n\n")
+    for name, W in sd.items():
+        cname = name.replace('.', '_')
+        if W.dim() == 2:                      # quantise
+                                              # matrices
+            q, s = quantise_per_channel(W)
+            total_fp32 += W.numel() * 4
+            total_int8 += q.size + s.size * 4
+            f.write(f"/* {name} {tuple(W.shape)} */\n")
+            f.write(f"static const int8_t {cname}[{q.size}] "
+                    "= {\n  ")
+            f.write(','.join(str(int(v)) for v in q.ravel()))
+            f.write("\n};\n")
+            f.write(f"static const float {cname}_scale"
+                    f"[{s.size}] = {{")
+            f.write(','.join(f"{v:.8e}f" for v in s))
+            f.write("};\n\n")
+        else:                                 # keep 1-D
+                                              # params in
+                                              # float
+            v = W.detach().float().numpy().ravel()
+            total_fp32 += v.size * 4
+            total_int8 += v.size * 4
+            f.write(f"static const float {cname}[{v.size}] "
+                    "= {")
+            f.write(','.join(f"{x:.8e}f" for x in v))
+            f.write("};\n\n")
+    f.write("#endif\n")
+
+print(f"fp32 {total_fp32/1024:.0f} KB -> "
+      f"int8 {total_int8/1024:.0f} KB  "
+      f"({total_fp32/total_int8:.2f}x)")
+
+# ---- AND THE C INFERENCE KERNEL ----
+/*
+ * The one function that matters. Everything else in a
+ * transformer is bookkeeping around this (chapter 04).
+ */
+void qmatmul(float *out, const float *in,
+             const int8_t *W, const float *scale,
+             int n_out, int n_in)
+{
+    for (int o = 0; o &lt; n_out; o++) {
+        int32_t acc = 0;            /* WIDE ACCUMULATOR
+                                       (chapter 26) */
+        const int8_t *row = &amp;W[o * n_in];
+        for (int i = 0; i &lt; n_in; i++)
+            acc += (int32_t)row[i] * (int32_t)in[i];
+        out[o] = (float)acc * scale[o];   /* ONE rescale */
+    }
+}
+/*
+ * NOTE: this takes float `in` and multiplies by int8 - a
+ * simplification. A fully-integer pipeline quantises the
+ * activations too, and the scales multiply
+ * (chapter 26). Exercise 8 is to make it fully integer.
+ *
+ * ON A CORTEX-M4, replace the inner loop with CMSIS-NN's
+ * arm_nn_mat_mult_nt_t_s8 and it gets 4-5x faster via SMLAD
+ * (chapter 27).
+ */</code></pre>
+
+<div class="key">
+<b>What the export tells you</b>
+<pre>800k parameters at int8  ~= 800 KB
+plus the activation arena, plus the runtime.
+
+THAT DOES NOT FIT ON A CORTEX-M4 (chapter 27).
+
+To fit in 256 KB of flash:
+  d_model 128 -> 64      (4x fewer parameters:
+                          they scale as d²)
+  layers  4   -> 3
+  vocab   65  -> 65      (unchanged; already small)
+  -> ~150k parameters, ~150 KB int8. FITS.
+
+Retrain at that size and compare the samples. The
+quality drop is real and visible — and measuring it
+yourself is worth more than any table of numbers.</pre>
+</div>
+
+<h2 id="exercises">Exercises</h2>
+
+<p>Each of these changes one variable and shows you something the finished project cannot. They are ordered roughly by how much they will teach you per hour spent.</p>
+
+<pre><code>/* IN ROUGHLY INCREASING DIFFICULTY. Each one exercises a
+   specific chapter.                                       */
+
+  1. WATCH IT LEARN. Sample every 500 steps and save the
+     output. Plot the loss curve. (chapters 11, 25)
+
+  2. SCALING LAWS AT SMALL SCALE. Train d_model in
+     {32,64,128,256} at fixed steps and plot final loss
+     against parameter count on log-log axes. YOU SHOULD SEE
+     A STRAIGHT LINE. (chapter 23)
+
+  3. BREAK IT DELIBERATELY, one at a time, and predict the
+     symptom before you run it:
+       · remove the positional embedding      (ch. 21)
+       · remove `is_causal=True`              (ch. 19)
+       · remove the residual connections      (ch. 22)
+       · use post-norm instead of pre-norm    (ch. 22)
+       · remove the 1/sqrt(d_k) scaling - implement
+         attention by hand to do this         (ch. 19)
+       · set the learning rate to 1e-1        (ch. 11)
+     THIS IS THE MOST INSTRUCTIVE EXERCISE HERE.
+
+  4. ADD A KV CACHE to generate(). Measure tokens/second
+     before and after at 128 context. (chapter 25)
+
+  5. SWAP LEARNED POSITIONS FOR ROPE. Then generate BEYOND
+     block_size and see whether it degrades gracefully.
+     (chapter 21)
+
+  6. REPLACE THE MLP WITH SwiGLU, keeping the parameter
+     count equal by setting hidden = 8/3 * d_model.
+     (chapter 22)
+
+  7. TRAIN A BPE TOKENISER on the same corpus (chapter 16's
+     code), retrain, and compare BITS PER BYTE - not
+     perplexity, which is not comparable across tokenisers.
+     (chapters 10, 16)
+
+  8. FULLY-INTEGER INFERENCE in C: quantise the activations
+     too, so no float appears in the inner loop. Compare
+     output against the PyTorch model on the same prompt.
+     (chapter 26)
+
+  9. RUN IT ON HARDWARE. Shrink to fit, export, and run on
+     a Raspberry Pi Pico or any Cortex-M4 board. Measure
+     inference time, flash usage and peak RAM.
+     (chapter 27)
+
+ 10. FINE-TUNE IT. Train on Shakespeare, then continue
+     training on a different corpus with a low learning
+     rate. Observe CATASTROPHIC FORGETTING directly.
+     (chapter 24)
+
+ 11. IMPLEMENT LoRA on the attention projections and
+     fine-tune with the base frozen. Compare the forgetting
+     against exercise 10. (chapter 24)
+
+ 12. CONSTRAINED DECODING: force the output to match a
+     simple grammar - balanced brackets, or a fixed
+     line format - by masking invalid tokens.
+     (chapter 25)
+
+/* --- WHERE TO GO NEXT --- */
+    · nanoGPT (Karpathy) - the same design, production
+      quality, and the reference this project follows
+    · llm.c - GPT-2 training in plain C/CUDA. Read it after
+      exercise 8.
+    · llama.cpp - study the quantisation formats
+      (chapter 26) and the GGUF layout
+    · TFLite Micro examples - the keyword-spotting model
+      from chapter 27, complete
+    · and the papers: "Attention Is All You Need",
+      "Language Models are Few-Shot Learners",
+      "Training Compute-Optimal Large Language Models",
+      "LoRA", "FlashAttention". You now have the background
+      to read all of them.                               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Step-0 loss is not <code>log(vocab_size)</code></td><td>A bug in the model, data or loss — fix before training</td></tr>
+<tr><td>Loss drops below 0.5 quickly</td><td>Causal mask missing — the model is reading the answer</td></tr>
+<tr><td>Loss flat at 4.17</td><td>Gradients not flowing — check <code>zero_grad</code> and the optimiser's parameters</td></tr>
+<tr><td>Loss becomes <code>nan</code></td><td>Learning rate too high, or warmup skipped</td></tr>
+<tr><td>Validation loss rises while training falls</td><td>Overfitting — the corpus is too small for the model</td></tr>
+<tr><td>Output is one character repeated</td><td>Temperature too low, or undertrained</td></tr>
+<tr><td>Output is pure noise at 5000 steps</td><td>Positional embedding missing, or a shape bug</td></tr>
+<tr><td>Generation crashes past 128 tokens</td><td>Context not cropped to <code>block_size</code></td></tr>
+<tr><td>C output differs from PyTorch</td><td>Quantisation applied per-tensor, or scales indexed wrongly</td></tr>
+<tr><td>Exported model too large for the target</td><td>Parameters scale as <code>d_model²</code> — halve it</td></tr>
+<tr><td>C inner loop overflows</td><td>Accumulator not int32</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the train/validation split is by position rather than random.</li>
+  <li>Show that <code>y</code> is <code>x</code> shifted by one and say why that is the whole supervision signal.</li>
+  <li>Explain each line of the <code>SelfAttention</code> forward pass, with shapes.</li>
+  <li>Say what the residual-projection initialisation scaling does.</li>
+  <li>Explain why <code>generate</code> crops the context.</li>
+  <li>Predict the step-0 loss and explain the calculation.</li>
+  <li>Describe the order in which the model learns structure.</li>
+  <li>Explain the effect of temperature at 0.2, 0.8 and 1.5.</li>
+  <li>Explain per-channel quantisation and why the accumulator is int32.</li>
+  <li>Compute how to shrink the model to fit 256 KB, and why <code>d_model</code> is the lever.</li>
+  <li>Do exercise 3 and predict every symptom before running it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

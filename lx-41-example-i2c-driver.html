@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Example: a complete I2C client driver, annotated | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Example: a complete I2C client driver, annotated</h1>
+<p class="lead">Same structure as <a href="lx-40-example-char-driver.html">chapter 24</a>, one layer further
+down the map: this driver talks to a real chip over a real bus. Every line of a working temperature-sensor
+driver — device tree node, probe, register access through regmap, and a proper sysfs interface — plus the
+parts that are specific to I2C rather than to drivers in general.</p>
+
+<h2 id="target">The target, and how it is described</h2>
+
+<p>Everything a driver does follows from what the chip is and how the board wired it, so start there. Note especially which facts come from the datasheet and which come from the device tree — that division is the whole reason one driver works on many boards.</p>
+
+<pre class="diagram">   A TMP102-STYLE I2C TEMPERATURE SENSOR.
+
+     bus address   0x48 (set by an address pin on the board)
+     register 0x00 TEMP   - 16-bit, read-only, big-endian,
+                            12 significant bits, 0.0625 C/LSB
+     register 0x01 CONFIG - 16-bit, read/write
+
+   THE DRIVER NEVER CHOOSES ITS OWN ADDRESS OR BUS. Both come
+   from the DEVICE TREE (chapter 20), because they are facts
+   about the BOARD, not about the chip's driver - the same
+   driver binds to the same chip at a different address on a
+   different board with no code change at all.
+
+     &amp;i2c1 {
+             status = "okay";
+             clock-frequency = &lt;100000&gt;;      /* 100 kHz */
+
+             tmp102@48 {
+                     compatible = "ti,tmp102";
+                     reg = &lt;0x48&gt;;             /* &lt;-- the I2C
+                                                  address       */
+             };
+     };
+
+   THE MATCH CHAIN, end to end:
+     device tree "ti,tmp102"
+        -&gt; of_device_id table in the driver
+        -&gt; the I2C core calls probe() with a struct i2c_client
+           already bound to bus i2c1, address 0x48</pre>
+
+<h2 id="driver">The complete driver</h2>
+
+<p>The complete driver. Compare its shape with chapter 24's: the probe, the resource acquisition and the error handling are all recognisably the same, and only the parts that touch the bus differ.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/* tmp102-example.c - a complete I2C client driver. */
+
+#include &lt;linux/i2c.h&gt;
+#include &lt;linux/mod_devicetable.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/regmap.h&gt;
+#include &lt;linux/pm_runtime.h&gt;
+
+#define TMP102_REG_TEMP    0x00
+#define TMP102_REG_CONFIG  0x01
+
+struct tmp102 {
+        struct regmap *regmap;
+        struct device *dev;
+};
+
+/* ---------------------------------------------------------------
+   regmap configuration
+
+   regmap (chapter 26) turns "read register 0x00" into the
+   correct I2C transaction for THIS chip - here, 8-bit register
+   addresses holding 16-bit BIG-ENDIAN values. Doing this by
+   hand means i2c_smbus_read_word_data() plus a be16_to_cpu()
+   you will eventually forget on one path; declaring it once
+   makes every access correct by construction.
+   --------------------------------------------------------------- */
+static const struct regmap_config tmp102_regmap_config = {
+        .reg_bits     = 8,
+        .val_bits     = 16,
+        .val_format_endian = REGMAP_ENDIAN_BIG,
+        .max_register = TMP102_REG_CONFIG,
+};
+
+/* ---------------------------------------------------------------
+   Reading a temperature
+
+   The raw value is left-justified: 12 significant bits in the
+   TOP of a 16-bit word, so it must be shifted down by 4 before
+   scaling. Getting this wrong yields readings 16x too large -
+   which is the single most common bug when writing a sensor
+   driver from a datasheet.
+   --------------------------------------------------------------- */
+static int tmp102_read_millicelsius(struct tmp102 *t, int *out)
+{
+        unsigned int raw;
+        int ret;
+
+        ret = regmap_read(t-&gt;regmap, TMP102_REG_TEMP, &amp;raw);
+        if (ret)
+                return ret;             /* PROPAGATE, do not
+                                           invent a value        */
+
+        /* Sign-extend the 12-bit two's-complement value. */
+        {
+                s16 val = (s16)raw &gt;&gt; 4;   /* arithmetic shift  */
+                *out = val * 625 / 10;     /* 0.0625 C  -&gt;  m C  */
+        }
+        return 0;
+}
+
+/* ---------------------------------------------------------------
+   sysfs: one value per file (chapter 25)
+
+   This is deliberately a plain sysfs attribute so the whole
+   path stays visible. A production sensor driver would
+   register with hwmon or IIO instead and get a standard,
+   tool-discoverable ABI for free - see the note below.
+   --------------------------------------------------------------- */
+static ssize_t temp_show(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+        struct tmp102 *t = dev_get_drvdata(dev);
+        int milli, ret;
+
+        ret = pm_runtime_resume_and_get(dev);
+        if (ret &lt; 0)
+                return ret;
+
+        ret = tmp102_read_millicelsius(t, &amp;milli);
+
+        pm_runtime_mark_last_busy(dev);
+        pm_runtime_put_autosuspend(dev);
+
+        if (ret)
+                return ret;
+
+        return sysfs_emit(buf, "%d\n", milli);   /* not sprintf -
+                                                    sysfs_emit is
+                                                    bounds-safe   */
+}
+static DEVICE_ATTR_RO(temp);
+
+static struct attribute *tmp102_attrs[] = {
+        &amp;dev_attr_temp.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(tmp102);
+
+/* ---------------------------------------------------------------
+   probe
+
+   Called by the I2C core once the device tree node above has
+   been matched. The client is ALREADY bound to the right bus
+   and address - probe()'s job is to verify the chip is really
+   there, set it up, and publish its interface.
+   --------------------------------------------------------------- */
+static int tmp102_probe(struct i2c_client *client)
+{
+        struct device *dev = &amp;client-&gt;dev;
+        struct tmp102 *t;
+        unsigned int cfg;
+        int ret;
+
+        /* Refuse politely if the adapter cannot do what we need. */
+        if (!i2c_check_functionality(client-&gt;adapter,
+                                     I2C_FUNC_SMBUS_WORD_DATA))
+                return -EOPNOTSUPP;
+
+        t = devm_kzalloc(dev, sizeof(*t), GFP_KERNEL);
+        if (!t)
+                return -ENOMEM;
+
+        t-&gt;dev = dev;
+
+        t-&gt;regmap = devm_regmap_init_i2c(client,
+                                         &amp;tmp102_regmap_config);
+        if (IS_ERR(t-&gt;regmap))
+                return dev_err_probe(dev, PTR_ERR(t-&gt;regmap),
+                                     "regmap init failed\n");
+
+        /* PROVE THE CHIP IS ACTUALLY PRESENT. Without this, a
+           missing or mis-addressed device binds "successfully"
+           and only fails later, far from the real cause.      */
+        ret = regmap_read(t-&gt;regmap, TMP102_REG_CONFIG, &amp;cfg);
+        if (ret)
+                return dev_err_probe(dev, ret,
+                                     "no response at 0x%02x\n",
+                                     client-&gt;addr);
+
+        dev_set_drvdata(dev, t);
+
+        /* Runtime PM: let the chip sleep when unused (ch. 32). */
+        pm_runtime_set_autosuspend_delay(dev, 1000);
+        pm_runtime_use_autosuspend(dev);
+        pm_runtime_set_active(dev);
+        ret = devm_pm_runtime_enable(dev);
+        if (ret)
+                return ret;
+
+        dev_info(dev, "tmp102 at 0x%02x ready\n", client-&gt;addr);
+        return 0;
+        /* NOTE: no error-unwinding ladder at all. Every
+           allocation above is devm_ managed, so the driver core
+           releases them in reverse order automatically on
+           failure OR on unbind (chapter 33).                  */
+}
+
+/* ---------------------------------------------------------------
+   The match tables
+
+   of_match_table is what device-tree matching uses. The
+   i2c_device_id table is still worth providing: it is what
+   legacy board files and manual instantiation via
+   /sys/bus/i2c/.../new_device use.
+   --------------------------------------------------------------- */
+static const struct of_device_id tmp102_of_match[] = {
+        { .compatible = "ti,tmp102" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, tmp102_of_match);
+
+static const struct i2c_device_id tmp102_id[] = {
+        { "tmp102", 0 },
+        { }
+};
+MODULE_DEVICE_TABLE(i2c, tmp102_id);
+
+static struct i2c_driver tmp102_driver = {
+        .driver = {
+                .name           = "tmp102-example",
+                .of_match_table = tmp102_of_match,
+                .dev_groups     = tmp102_groups,  /* sysfs files,
+                                                     created and
+                                                     removed by the
+                                                     driver core   */
+        },
+        .probe    = tmp102_probe,
+        .id_table = tmp102_id,
+};
+module_i2c_driver(tmp102_driver);   /* generates init and exit  */
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Complete example I2C client driver");</code></pre>
+
+<div class="key">
+<b>Three things the I2C core did for you before <code>probe()</code> was ever called</b>
+<p>It parsed the device tree node, matched <code>compatible = "ti,tmp102"</code> against
+<code>tmp102_of_match</code>, and allocated a <code>struct i2c_client</code> already carrying the adapter for
+<code>i2c1</code> and the address <code>0x48</code>. That is why this driver contains no bus configuration, no
+address, and no code to find the controller — those are board facts the device tree supplied, and a driver
+that hard-codes any of them is a driver that only works on one board.</p>
+</div>
+
+<h2 id="i2cisms">What is specific to I2C here</h2>
+
+<p>Most of the driver above would look nearly identical for any bus. These are the parts that are genuinely specific to I2C — and each one follows from a physical property of how the bus is wired rather than from any kernel API decision.</p>
+
+<pre class="diagram">   MOST OF THE DRIVER ABOVE IS GENERIC DRIVER STRUCTURE -
+   identical in shape to the SPI driver in chapter 28. These
+   are the parts that are genuinely I2C-specific:
+
+   1. ADDRESSING IS PART OF THE BUS
+        Every transaction carries a 7-bit address. Two devices
+        at the same address on one bus is an unresolvable
+        board design error, not something a driver can work
+        around (chapter 07 of the bus track).
+
+   2. i2c_check_functionality()
+        Not every I2C adapter implements every transaction
+        type. Some cheap controllers cannot do SMBus block
+        transfers at all. Checking up front turns a confusing
+        runtime failure into a clear -EOPNOTSUPP at probe.
+
+   3. TRANSACTIONS CAN SLEEP, ALWAYS
+        An I2C transfer takes hundreds of microseconds to
+        milliseconds and the core may sleep waiting for it.
+        You therefore may NOT read an I2C register from an
+        interrupt handler or while holding a spinlock
+        (chapters 12 · 15). If an IRQ handler needs sensor
+        data, use a THREADED IRQ and read it in the thread.
+
+   4. ERRORS ARE NORMAL AND MUST BE PROPAGATED
+        A NAK, a stuck bus, or a device still busy all surface
+        as a negative return from regmap_read(). Sensor
+        drivers that silently return the last good value on
+        error are a recurring source of "the temperature froze
+        at 23 C" bug reports.
+
+   5. NO CHIP SELECT, AND NO WAY TO TELL WHO ANSWERED
+        Unlike SPI, presence detection is a real problem: the
+        only way to know a device is there is to attempt a
+        transaction and see whether anything ACKs - which is
+        exactly what the CONFIG read in probe() is doing.</pre>
+
+<h2 id="test">Testing it</h2>
+
+<p>Testing hardware drivers works from the bottom up: first prove the chip is electrically there, then that the driver bound to it, and only then that the values are right. Skipping the first step is how people spend a day debugging code when the problem was a wire.</p>
+
+<pre><code># 1. Is the chip physically there and answering?
+$ sudo i2cdetect -y 1
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+40: -- -- -- -- -- -- -- -- 48 -- -- -- -- -- -- --
+#                            ^^ the device ACKs at 0x48
+# If this shows nothing, STOP - it is wiring, power, pull-ups
+# or the wrong bus number. No driver can fix that.
+# ("UU" instead of an address means a driver is already bound.)
+
+# 2. Load the driver and confirm it bound.
+$ sudo insmod tmp102-example.ko
+$ dmesg | tail -1
+tmp102-example 1-0048: tmp102 at 0x48 ready
+#                ^ ^^^^
+#                bus 1, address 0x48
+
+$ ls /sys/bus/i2c/drivers/tmp102-example/
+1-0048  bind  uevent  unbind
+
+# 3. Read the value.
+$ cat /sys/bus/i2c/devices/1-0048/temp
+23500                     # millicelsius = 23.5 C
+
+# 4. Watch the actual bus traffic when you read it.
+$ sudo trace-cmd record -e i2c cat /sys/bus/i2c/devices/1-0048/temp
+$ trace-cmd report
+   i2c_write: i2c-1 #0 a=048 f=0000 l=1 [00]
+   i2c_read:  i2c-1 #1 a=048 f=0001 l=2
+   i2c_result: i2c-1 n=2 ret=2
+# Exactly one register-pointer write plus one 2-byte read -
+# which is what regmap generated from the config struct.</code></pre>
+
+<div class="tip">
+<b>A real sensor driver would use hwmon or IIO instead of raw sysfs</b>
+<p>The plain <code>temp</code> attribute above keeps the example self-contained, but it invents a private
+interface that no existing tool knows about. Registering with <strong>hwmon</strong>
+(<code>devm_hwmon_device_register_with_info</code>) would expose the standard <code>temp1_input</code> in
+millidegrees that <code>sensors</code> and every monitoring agent already read, and <strong>IIO</strong> does
+the same for ADCs, accelerometers and light sensors with buffered, timestamped sampling.
+<a href="lx-21-ioctl.html">Chapter 23</a>'s argument against inventing interfaces applies exactly as strongly
+to sysfs attributes as it does to ioctls.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>probe()</code> is never called</td><td>The device tree <code>compatible</code> does not match
+<code>of_match_table</code>, or the node is under a disabled bus — check
+<code>/sys/bus/i2c/devices/</code></td></tr>
+<tr><td>Readings are exactly 16× too large</td><td>The 12-bit value was not shifted down by 4 before
+scaling</td></tr>
+<tr><td>Readings are wildly wrong or byte-swapped</td><td>Endianness — the chip is big-endian and the regmap
+config says otherwise</td></tr>
+<tr><td><code>i2cdetect</code> shows nothing at the address</td><td>Hardware: wiring, power, missing pull-up
+resistors, or the wrong bus number — not a driver problem</td></tr>
+<tr><td><code>i2cdetect</code> shows <code>UU</code></td><td>Expected — a driver is already bound to that
+address, so the scan skips it</td></tr>
+<tr><td>"scheduling while atomic" when reading the sensor</td><td>An I2C transfer was attempted from an
+interrupt handler or under a spinlock — use a threaded IRQ</td></tr>
+<tr><td>The temperature stops changing but reads never fail</td><td>An error path is returning a cached value
+instead of propagating the negative return</td></tr>
+<tr><td>Driver works on one board, not another</td><td>Something board-specific was hard-coded instead of
+coming from the device tree</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what the device tree supplies and why the driver must not hard-code the bus or address.</li>
+  <li>Trace the match chain from <code>compatible</code> to <code>probe()</code>.</li>
+  <li>Explain why <code>probe()</code> reads a register before declaring success.</li>
+  <li>Explain why this driver has no error-unwinding ladder.</li>
+  <li>Explain why an I2C transfer may never happen in an interrupt handler, and what to do instead.</li>
+  <li>Explain what <code>regmap</code> generated on the wire, and verify it with a bus trace.</li>
+  <li>Convert the sysfs attribute to a hwmon registration and say what you gained.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

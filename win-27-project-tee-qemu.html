@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the trusted application, and running it on QEMU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the trusted application, and running it on QEMU</h1>
+<p class="lead">The secure half of the project: an OP-TEE trusted application written in C++, a bridge daemon
+that connects it to the Windows guest, and the two-VM QEMU topology that lets you run the whole thing on a
+laptop. Plus an honest accounting of which security properties this configuration demonstrates and which it
+only simulates.</p>
+
+<h2 id="topology">The topology</h2>
+
+<p>This project has more moving parts than any other in the track, so start with the map: which component runs where, and which boundary each message crosses. Everything afterwards is easier with that picture fixed.</p>
+
+<pre class="diagram">   ONE HOST MACHINE, THREE PROCESSES
+
+   +--------------------------+     +---------------------------+
+   |  QEMU instance A         |     |  QEMU instance B          |
+   |                          |     |                           |
+   |  Windows 11 ARM64        |     |  TF-A + OP-TEE + Linux    |
+   |    secteectl.exe         |     |    secteed  (bridge, C++) |
+   |    sectee.sys            |     |      |  libteec           |
+   |      |                   |     |      v                    |
+   |      | ivshmem PCI       |     |    /dev/tee0              |
+   +------|-------------------+     +------|--------------------+
+          |                                |   SMC
+          |                                v
+          |                         +---------------------+
+          |                         |  sectee_ta  S-EL0   |
+          |                         |  C++, RAII          |
+          |                         +---------------------+
+          |                                |
+          +--------------+-----------------+
+                         |
+              +----------v-----------+
+              |  ivshmem-server      |   stock QEMU utility.
+              |  (host process)      |   Hands both VMs the same
+              |  shared memory file  |   memory and relays
+              +----------------------+   doorbell interrupts.
+
+   Windows is a guest. OP-TEE is in a DIFFERENT guest. They meet
+   in a page of shared memory that the host mediates.
+
+   Nothing here is patched. ivshmem, ivshmem-server, the OP-TEE
+   QEMU manifest and Windows ARM64 are all stock.</pre>
+
+<div class="danger">
+<b>What this configuration does and does not prove</b>
+<p><strong>Does:</strong> that the driver, the ABI, the marshalling, the trusted application and the client
+are all correct; that a key generated inside OP-TEE signs digests the Windows guest computes; that CNG in the
+Windows kernel accepts those signatures. Every line of software is exercised for real.</p>
+<p><strong>Does not:</strong> demonstrate TrustZone isolation. The Windows guest is separated from the TA by
+<em>VM boundaries</em>, not by the NS bit. On production hardware the same driver reaches the same TA through
+<a href="win-26-project-tee-crypto-driver.html">TrEE</a> and the isolation is real; here it is a development
+harness. Never quote a QEMU run as evidence of a security property.</p>
+</div>
+
+<h2 id="cpp-ta">Why write a TA in C++</h2>
+
+<p>Not for templates or the STL — neither is available. For one thing only, and it is worth the whole
+chapter: <strong>destructors</strong>. Compare the C key-store TA of
+<a href="tee-21-project-keystore.html">OP-TEE chapter 21</a> with what follows.</p>
+
+<pre class="diagram">   THE C SHAPE, from chapter 22          THE C++ SHAPE
+
+   TEE_ObjectHandle  obj = NULL;         {
+   TEE_OperationHandle op = NULL;            PersistentKey key(id);
+   res = open(&amp;obj);                         if (!key) return key.Error();
+   if (res) goto out;
+   res = TEE_AllocateOperation(&amp;op...);      SignOperation op(key);
+   if (res) goto out;                        if (!op) return op.Error();
+   res = TEE_SetOperationKey(op, obj);
+   if (res) goto out;                        return op.Sign(digest, sig);
+   res = TEE_AsymmetricSignDigest(...);  }   // both freed here, on
+   out:                                      // EVERY path, in reverse
+       TEE_FreeOperation(op);                // order, including the
+       TEE_CloseObject(obj);                 // early returns
+       return res;
+
+   A leaked TEE_OperationHandle is not a tidiness problem. The
+   secure heap is a few tens of kilobytes (chapter 07); leak one
+   per request and the TA panics after a few thousand
+   operations, in production, weeks later, under load.
+
+   The goto ladder works. It also breaks the moment someone adds
+   a fourth resource in the middle and forgets one branch. RAII
+   makes that class of bug unrepresentable.</pre>
+
+<pre><code># ta/Makefile
+CFG_TEE_TA_LOG_LEVEL ?= 3
+BINARY = 3c8d1f60-5a72-4e91-b4d3-7e2a0f6c9b18
+-include $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk
+
+# ta/sub.mk
+global-incdirs-y += include
+srcs-y += sectee_ta.cpp
+
+# C++ in a TA needs the runtime switched off. There is no
+# unwinder, no typeinfo and no __cxa_atexit behind you.
+cxxflags-y += -fno-exceptions
+cxxflags-y += -fno-rtti
+cxxflags-y += -fno-use-cxa-atexit
+cxxflags-y += -fno-threadsafe-statics
+cxxflags-y += -std=c++17
+
+# And -fno-threadsafe-statics matters specifically: a function-
+# local static with a constructor would otherwise emit a call to
+# __cxa_guard_acquire, which does not exist here.</code></pre>
+
+<h2 id="ta">The trusted application</h2>
+
+<p>The trusted application is the code that runs inside the secure world, where the private key lives. It is an ordinary program with an unusual set of restrictions, and it never lets the key leave.</p>
+
+<pre><code>// ta/include/sectee_ta.h  -  shared with the bridge daemon.
+// Plain C so it can be included from either language.
+
+#ifndef SECTEE_TA_H
+#define SECTEE_TA_H
+
+#define SECTEE_TA_UUID \
+    { 0x3c8d1f60, 0x5a72, 0x4e91, \
+      { 0xb4, 0xd3, 0x7e, 0x2a, 0x0f, 0x6c, 0x9b, 0x18 } }
+
+#define TA_CMD_GET_PUBKEY 0
+#define TA_CMD_SIGN       1
+#define TA_CMD_COUNTER    2
+
+#define SECTEE_PUBKEY_LEN 64
+#define SECTEE_SIG_LEN    64
+#define SECTEE_DIGEST_LEN 32
+
+#endif</code></pre>
+
+<pre><code>// ta/user_ta_header_defines.h
+#ifndef USER_TA_HEADER_DEFINES_H
+#define USER_TA_HEADER_DEFINES_H
+
+#include "sectee_ta.h"
+
+#define TA_UUID SECTEE_TA_UUID
+
+// SINGLE_INSTANCE + KEEP_ALIVE: one copy, never unloaded, so the
+// counter and the loaded key survive between sessions. Without
+// KEEP_ALIVE the TA is torn down when the last session closes and
+// the next request pays a full load (chapter 14).
+#define TA_FLAGS (TA_FLAG_SINGLE_INSTANCE | TA_FLAG_INSTANCE_KEEP_ALIVE)
+
+#define TA_STACK_SIZE (4 * 1024)
+#define TA_DATA_SIZE  (32 * 1024)
+
+#define TA_CURRENT_TA_EXT_PROPERTIES \
+    { "gp.ta.description", USER_TA_PROP_TYPE_STRING, \
+      "SecTee signing service" }, \
+    { "gp.ta.version", USER_TA_PROP_TYPE_U32, \
+      &amp;(const uint32_t){ 0x0100 } }
+
+#endif</code></pre>
+
+<pre><code>// ta/sectee_ta.cpp
+
+extern "C" {
+#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include &lt;string.h&gt;
+}
+#include "sectee_ta.h"
+
+namespace {
+
+constexpr const char KEY_ID[]     = "sectee.key.v1";
+constexpr const char COUNTER_ID[] = "sectee.counter.v1";
+constexpr uint32_t   P256_BITS    = 256;
+
+// ---------------------------------------------------------------
+// RAII wrappers. Each owns exactly one TEE handle, is
+// non-copyable, and frees on destruction. This is the entire
+// argument for C++ here.
+// ---------------------------------------------------------------
+
+class Operation
+{
+public:
+    Operation(uint32_t alg, uint32_t mode, uint32_t maxKeyBits)
+    {
+        m_res = TEE_AllocateOperation(&amp;m_h, alg, mode, maxKeyBits);
+        if (m_res != TEE_SUCCESS) m_h = TEE_HANDLE_NULL;
+    }
+    ~Operation()
+    {
+        if (m_h != TEE_HANDLE_NULL) TEE_FreeOperation(m_h);
+    }
+
+    Operation(const Operation&amp;)            = delete;
+    Operation&amp; operator=(const Operation&amp;) = delete;
+
+    explicit operator bool() const { return m_res == TEE_SUCCESS; }
+    TEE_Result Error() const       { return m_res; }
+    TEE_OperationHandle Get() const { return m_h; }
+
+private:
+    TEE_OperationHandle m_h   = TEE_HANDLE_NULL;
+    TEE_Result          m_res = TEE_SUCCESS;
+};
+
+class TransientObject
+{
+public:
+    TransientObject(uint32_t type, uint32_t maxKeyBits)
+    {
+        m_res = TEE_AllocateTransientObject(type, maxKeyBits, &amp;m_h);
+        if (m_res != TEE_SUCCESS) m_h = TEE_HANDLE_NULL;
+    }
+    ~TransientObject()
+    {
+        if (m_h != TEE_HANDLE_NULL) TEE_FreeTransientObject(m_h);
+    }
+
+    TransientObject(const TransientObject&amp;)            = delete;
+    TransientObject&amp; operator=(const TransientObject&amp;) = delete;
+
+    explicit operator bool() const { return m_res == TEE_SUCCESS; }
+    TEE_Result Error() const        { return m_res; }
+    TEE_ObjectHandle Get() const    { return m_h; }
+    TEE_ObjectHandle* Put()         { return &amp;m_h; }
+
+private:
+    TEE_ObjectHandle m_h   = TEE_HANDLE_NULL;
+    TEE_Result       m_res = TEE_SUCCESS;
+};
+
+class PersistentObject
+{
+public:
+    PersistentObject() = default;
+
+    ~PersistentObject()
+    {
+        if (m_h != TEE_HANDLE_NULL) TEE_CloseObject(m_h);
+    }
+
+    PersistentObject(const PersistentObject&amp;)            = delete;
+    PersistentObject&amp; operator=(const PersistentObject&amp;) = delete;
+
+    TEE_Result Open(const char* id, size_t idLen, uint32_t flags)
+    {
+        return TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                                        id, idLen, flags, &amp;m_h);
+    }
+
+    TEE_Result Create(const char* id, size_t idLen, uint32_t flags,
+                      TEE_ObjectHandle attrs,
+                      const void* initial, size_t initialLen)
+    {
+        return TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+                                          id, idLen, flags, attrs,
+                                          initial, initialLen, &amp;m_h);
+    }
+
+    // Release ownership without closing - used when we hand the
+    // handle to TEE_CloseAndDeletePersistentObject1, which closes
+    // it for us. Double-closing a TEE handle panics the TA.
+    TEE_ObjectHandle Release()
+    {
+        TEE_ObjectHandle h = m_h;
+        m_h = TEE_HANDLE_NULL;
+        return h;
+    }
+
+    bool Valid() const           { return m_h != TEE_HANDLE_NULL; }
+    TEE_ObjectHandle Get() const { return m_h; }
+
+private:
+    TEE_ObjectHandle m_h = TEE_HANDLE_NULL;
+};
+
+// ---------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------
+
+// Open the signing key, generating it on first use.
+//
+// The private scalar is created by TEE_GenerateKey inside S-EL0 and
+// written into a persistent object that OP-TEE encrypts with a key
+// derived from the hardware unique key (OP-TEE chapter 15). It is
+// never serialised into a buffer, so it never exists anywhere the
+// normal world could observe even in principle.
+TEE_Result OpenOrCreateKey(PersistentObject&amp; out)
+{
+    TEE_Result res = out.Open(KEY_ID, sizeof(KEY_ID) - 1,
+                              TEE_DATA_FLAG_ACCESS_READ);
+    if (res == TEE_SUCCESS) return TEE_SUCCESS;
+    if (res != TEE_ERROR_ITEM_NOT_FOUND) return res;
+
+    IMSG("generating a new P-256 keypair");
+
+    TransientObject key(TEE_TYPE_ECDSA_KEYPAIR, P256_BITS);
+    if (!key) return key.Error();
+
+    TEE_Attribute curve;
+    TEE_InitValueAttribute(&amp;curve, TEE_ATTR_ECC_CURVE,
+                           TEE_ECC_CURVE_NIST_P256, 0);
+
+    res = TEE_GenerateKey(key.Get(), P256_BITS, &amp;curve, 1);
+    if (res != TEE_SUCCESS) return res;
+
+    // Persist the OBJECT, not bytes.
+    return out.Create(KEY_ID, sizeof(KEY_ID) - 1,
+                      TEE_DATA_FLAG_ACCESS_READ |
+                      TEE_DATA_FLAG_ACCESS_WRITE_META,
+                      key.Get(), nullptr, 0);
+    // `key` is freed here by its destructor, on every path above.
+}
+
+// Copy an ECC coordinate out, LEFT-PADDED to a fixed 32 bytes.
+//
+// TEE_GetObjectBufferAttribute returns the minimal encoding, so a
+// coordinate with a leading zero byte comes back 31 bytes long -
+// about one time in 256. Writing it flush-left produces a key that
+// works 99.6% of the time, which is the worst possible failure
+// rate: too rare to catch in testing, common enough to ship.
+TEE_Result GetCoordinate(TEE_ObjectHandle obj, uint32_t attrId,
+                         uint8_t out[32])
+{
+    uint8_t  tmp[32];
+    uint32_t len = sizeof(tmp);
+
+    TEE_Result res = TEE_GetObjectBufferAttribute(obj, attrId,
+                                                  tmp, &amp;len);
+    if (res != TEE_SUCCESS) return res;
+    if (len &gt; 32) return TEE_ERROR_BAD_STATE;
+
+    TEE_MemFill(out, 0, 32);
+    TEE_MemMove(out + (32 - len), tmp, len);
+    return TEE_SUCCESS;
+}
+
+// ---------------------------------------------------------------
+// TA_CMD_GET_PUBKEY   [0] memref out, 64 bytes
+// ---------------------------------------------------------------
+TEE_Result CmdGetPubkey(uint32_t ptypes, TEE_Param params[4])
+{
+    const uint32_t expected =
+        TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE);
+    if (ptypes != expected)
+    {
+        EMSG("ptypes 0x%08x expected 0x%08x", ptypes, expected);
+        return TEE_ERROR_BAD_PARAMETERS;
+    }
+    if (params[0].memref.size &lt; SECTEE_PUBKEY_LEN)
+    {
+        params[0].memref.size = SECTEE_PUBKEY_LEN;
+        return TEE_ERROR_SHORT_BUFFER;
+    }
+
+    PersistentObject key;
+    TEE_Result res = OpenOrCreateKey(key);
+    if (res != TEE_SUCCESS) return res;
+
+    uint8_t pub[SECTEE_PUBKEY_LEN];
+    res = GetCoordinate(key.Get(), TEE_ATTR_ECC_PUBLIC_VALUE_X, pub);
+    if (res != TEE_SUCCESS) return res;
+    res = GetCoordinate(key.Get(), TEE_ATTR_ECC_PUBLIC_VALUE_Y, pub + 32);
+    if (res != TEE_SUCCESS) return res;
+
+    // Write the output ONCE, at the end, on success only.
+    TEE_MemMove(params[0].memref.buffer, pub, SECTEE_PUBKEY_LEN);
+    params[0].memref.size = SECTEE_PUBKEY_LEN;
+    return TEE_SUCCESS;
+}
+
+// ---------------------------------------------------------------
+// TA_CMD_SIGN   [0] memref in  (32-byte digest)
+//               [1] memref out (64-byte signature)
+// ---------------------------------------------------------------
+TEE_Result CmdSign(uint32_t ptypes, TEE_Param params[4])
+{
+    const uint32_t expected =
+        TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+                        TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE);
+    if (ptypes != expected) return TEE_ERROR_BAD_PARAMETERS;
+
+    // Exactly 32 bytes or nothing. A fixed size means there is no
+    // length arithmetic in this function to get wrong.
+    if (params[0].memref.size != SECTEE_DIGEST_LEN)
+        return TEE_ERROR_BAD_PARAMETERS;
+    if (params[1].memref.size &lt; SECTEE_SIG_LEN)
+    {
+        params[1].memref.size = SECTEE_SIG_LEN;
+        return TEE_ERROR_SHORT_BUFFER;
+    }
+
+    if (TEE_CheckMemoryAccessRights(
+            TEE_MEMORY_ACCESS_READ | TEE_MEMORY_ACCESS_ANY_OWNER,
+            params[0].memref.buffer,
+            SECTEE_DIGEST_LEN) != TEE_SUCCESS)
+        return TEE_ERROR_ACCESS_DENIED;
+
+    // ONE fetch out of shared memory, then work on the copy. The
+    // normal world can rewrite that buffer at any instant,
+    // including between two reads of the same byte
+    // (OP-TEE chapter 20).
+    uint8_t digest[SECTEE_DIGEST_LEN];
+    TEE_MemMove(digest, params[0].memref.buffer, SECTEE_DIGEST_LEN);
+
+    PersistentObject key;
+    TEE_Result res = OpenOrCreateKey(key);
+    if (res != TEE_SUCCESS) return res;
+
+    Operation op(TEE_ALG_ECDSA_P256, TEE_MODE_SIGN, P256_BITS);
+    if (!op) return op.Error();
+
+    res = TEE_SetOperationKey(op.Get(), key.Get());
+    if (res != TEE_SUCCESS) return res;
+
+    uint8_t  sig[SECTEE_SIG_LEN];
+    uint32_t sigLen = sizeof(sig);
+
+    res = TEE_AsymmetricSignDigest(op.Get(), nullptr, 0,
+                                   digest, SECTEE_DIGEST_LEN,
+                                   sig, &amp;sigLen);
+    if (res != TEE_SUCCESS) return res;
+
+    TEE_MemMove(params[1].memref.buffer, sig, sigLen);
+    params[1].memref.size = sigLen;
+
+    TEE_MemFill(digest, 0, sizeof(digest));
+    return TEE_SUCCESS;
+    // op and key are released here, in reverse order, on this path
+    // and on all eight early returns above.
+}
+
+// ---------------------------------------------------------------
+// TA_CMD_COUNTER   [0] value inout: a = increment?, b unused
+//                                   out: a = low32, b = high32
+// ---------------------------------------------------------------
+TEE_Result CmdCounter(uint32_t ptypes, TEE_Param params[4])
+{
+    const uint32_t expected =
+        TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE);
+    if (ptypes != expected) return TEE_ERROR_BAD_PARAMETERS;
+
+    const bool increment = (params[0].value.a == 1);
+    uint64_t   value     = 0;
+
+    PersistentObject obj;
+    TEE_Result res = obj.Open(COUNTER_ID, sizeof(COUNTER_ID) - 1,
+                              TEE_DATA_FLAG_ACCESS_READ |
+                              TEE_DATA_FLAG_ACCESS_WRITE);
+
+    if (res == TEE_SUCCESS)
+    {
+        uint32_t got = 0;
+        res = TEE_ReadObjectData(obj.Get(), &amp;value, sizeof(value), &amp;got);
+        if (res != TEE_SUCCESS) return res;
+        if (got != sizeof(value)) value = 0;
+
+        if (increment)
+        {
+            value++;
+            res = TEE_SeekObjectData(obj.Get(), 0, TEE_DATA_SEEK_SET);
+            if (res != TEE_SUCCESS) return res;
+            res = TEE_WriteObjectData(obj.Get(), &amp;value, sizeof(value));
+            if (res != TEE_SUCCESS) return res;
+        }
+    }
+    else if (res == TEE_ERROR_ITEM_NOT_FOUND)
+    {
+        value = increment ? 1 : 0;
+        res = obj.Create(COUNTER_ID, sizeof(COUNTER_ID) - 1,
+                         TEE_DATA_FLAG_ACCESS_READ |
+                         TEE_DATA_FLAG_ACCESS_WRITE |
+                         TEE_DATA_FLAG_ACCESS_WRITE_META,
+                         TEE_HANDLE_NULL, &amp;value, sizeof(value));
+        if (res != TEE_SUCCESS) return res;
+    }
+    else
+    {
+        return res;
+    }
+
+    // A GP value parameter is a pair of u32, so a u64 goes across
+    // in two halves (OP-TEE chapter 12).
+    params[0].value.a = static_cast&lt;uint32_t&gt;(value &amp; 0xffffffffu);
+    params[0].value.b = static_cast&lt;uint32_t&gt;(value &gt;&gt; 32);
+    return TEE_SUCCESS;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------
+// The five entry points. extern "C" because OP-TEE's framework
+// looks them up by C linkage name.
+// ---------------------------------------------------------------
+extern "C" {
+
+TEE_Result TA_CreateEntryPoint(void)
+{
+    IMSG("sectee TA loaded");
+    return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void)
+{
+    IMSG("sectee TA unloaded");
+}
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t ptypes,
+                                    TEE_Param params[4],
+                                    void** sessCtx)
+{
+    (void)params;
+    if (ptypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+                                  TEE_PARAM_TYPE_NONE,
+                                  TEE_PARAM_TYPE_NONE,
+                                  TEE_PARAM_TYPE_NONE))
+        return TEE_ERROR_BAD_PARAMETERS;
+
+    *sessCtx = nullptr;   // no per-session state
+    return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void* sessCtx)
+{
+    (void)sessCtx;
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(void* sessCtx, uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+    (void)sessCtx;
+    switch (cmd)
+    {
+    case TA_CMD_GET_PUBKEY: return CmdGetPubkey(ptypes, params);
+    case TA_CMD_SIGN:       return CmdSign(ptypes, params);
+    case TA_CMD_COUNTER:    return CmdCounter(ptypes, params);
+    default:                return TEE_ERROR_NOT_SUPPORTED;
+    }
+}
+
+} // extern "C"</code></pre>
+
+<div class="warn">
+<b>Three C++ traps specific to a TA</b>
+<p><strong>Globals with constructors.</strong> There is no CRT to run them. Anything at file scope must be
+<code>constexpr</code> or a POD, which is why the constants above are <code>constexpr</code> and every
+stateful object is a local. <strong>Function-local statics.</strong> They emit
+<code>__cxa_guard_acquire</code> unless you pass <code>-fno-threadsafe-statics</code>.
+<strong>Double-free.</strong> <code>TEE_CloseAndDeletePersistentObject1</code> closes the handle itself, so an
+RAII wrapper must <code>Release()</code> first — closing a TEE handle twice panics the TA, and the panic
+appears on the secure console with a stack you will have to decode by hand
+(<a href="tee-19-debugging.html">OP-TEE chapter 19</a>).</p>
+</div>
+
+<h2 id="bridge">The bridge daemon</h2>
+
+<p>Something has to carry requests from the Windows side to the secure world, because the two do not share a transport. The bridge is that component, and it is deliberately thin — it moves bytes and makes no decisions.</p>
+
+<pre><code>// bridge/secteed.cpp
+//
+// Runs in the OP-TEE Linux guest. Owns the same shared memory the
+// Windows driver mapped, watches the sequence number, and turns
+// each request into a TEEC_InvokeCommand.
+//
+// Build:
+//   aarch64-linux-gnu-g++ -std=c++17 -O2 -o secteed secteed.cpp \
+//       -I$TEEC_EXPORT/include -L$TEEC_EXPORT/lib -lteec
+
+#include &lt;atomic&gt;
+#include &lt;cerrno&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstring&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+#include &lt;fcntl.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/stat.h&gt;
+
+extern "C" {
+#include &lt;tee_client_api.h&gt;
+}
+#include "../ta/include/sectee_ta.h"
+
+namespace {
+
+constexpr uint32_t MAILBOX_MAGIC    = 0x4D454554u;  // "TEEM"
+constexpr uint32_t MAILBOX_VERSION  = 1u;
+constexpr size_t   MAILBOX_DATA_OFF = 0x100;
+constexpr size_t   MAILBOX_DATA_MAX = 0x1000;
+
+// Byte-for-byte the layout the Windows driver declares. If these
+// two structs ever disagree the symptom is silent nonsense, so
+// keep them in one place if you can and assert the size if you
+// cannot.
+#pragma pack(push, 8)
+struct MailboxHeader
+{
+    uint32_t Magic;
+    uint32_t Version;
+    volatile int32_t Sequence;   // written by Windows
+    volatile int32_t Ack;        // written by us
+    uint32_t Command;
+    uint32_t InLength;
+    uint32_t OutLength;
+    int32_t  Result;
+};
+#pragma pack(pop)
+static_assert(sizeof(MailboxHeader) == 32, "layout drift");
+
+// RAII again, on this side too.
+class TeeSession
+{
+public:
+    TeeSession()
+    {
+        TEEC_Result res = TEEC_InitializeContext(nullptr, &amp;m_ctx);
+        if (res != TEEC_SUCCESS)
+            throw std::runtime_error("TEEC_InitializeContext: " +
+                                     std::to_string(res));
+        m_haveCtx = true;
+
+        TEEC_UUID uuid = SECTEE_TA_UUID;
+        uint32_t origin = 0;
+        res = TEEC_OpenSession(&amp;m_ctx, &amp;m_sess, &amp;uuid,
+                               TEEC_LOGIN_PUBLIC, nullptr,
+                               nullptr, &amp;origin);
+        if (res != TEEC_SUCCESS)
+            throw std::runtime_error("TEEC_OpenSession: " +
+                                     std::to_string(res) +
+                                     " origin " + std::to_string(origin));
+        m_haveSess = true;
+    }
+
+    ~TeeSession()
+    {
+        if (m_haveSess) TEEC_CloseSession(&amp;m_sess);
+        if (m_haveCtx)  TEEC_FinalizeContext(&amp;m_ctx);
+    }
+
+    TeeSession(const TeeSession&amp;)            = delete;
+    TeeSession&amp; operator=(const TeeSession&amp;) = delete;
+
+    // Returns the TEE_Result; fills out/outLen on success.
+    uint32_t Invoke(uint32_t cmd,
+                    const uint8_t* in, uint32_t inLen,
+                    uint8_t* out, uint32_t* outLen)
+    {
+        TEEC_Operation op{};
+        uint32_t origin = 0;
+
+        switch (cmd)
+        {
+        case TA_CMD_GET_PUBKEY:
+            op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT,
+                                             TEEC_NONE, TEEC_NONE,
+                                             TEEC_NONE);
+            op.params[0].tmpref.buffer = out;
+            op.params[0].tmpref.size   = *outLen;
+            break;
+
+        case TA_CMD_SIGN:
+            if (inLen != SECTEE_DIGEST_LEN) return TEEC_ERROR_BAD_PARAMETERS;
+            op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+                                             TEEC_MEMREF_TEMP_OUTPUT,
+                                             TEEC_NONE, TEEC_NONE);
+            op.params[0].tmpref.buffer = const_cast&lt;uint8_t*&gt;(in);
+            op.params[0].tmpref.size   = inLen;
+            op.params[1].tmpref.buffer = out;
+            op.params[1].tmpref.size   = *outLen;
+            break;
+
+        case TA_CMD_COUNTER:
+        {
+            if (inLen != sizeof(uint32_t)) return TEEC_ERROR_BAD_PARAMETERS;
+            uint32_t increment;
+            std::memcpy(&amp;increment, in, sizeof(increment));
+
+            op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INOUT,
+                                             TEEC_NONE, TEEC_NONE,
+                                             TEEC_NONE);
+            op.params[0].value.a = increment;
+            op.params[0].value.b = 0;
+
+            uint32_t res = TEEC_InvokeCommand(&amp;m_sess, cmd, &amp;op, &amp;origin);
+            if (res != TEEC_SUCCESS) return res;
+
+            uint64_t value = static_cast&lt;uint64_t&gt;(op.params[0].value.a) |
+                             (static_cast&lt;uint64_t&gt;(op.params[0].value.b) &lt;&lt; 32);
+            if (*outLen &lt; sizeof(value)) return TEEC_ERROR_SHORT_BUFFER;
+            std::memcpy(out, &amp;value, sizeof(value));
+            *outLen = sizeof(value);
+            return TEEC_SUCCESS;
+        }
+
+        default:
+            return TEEC_ERROR_NOT_SUPPORTED;
+        }
+
+        uint32_t res = TEEC_InvokeCommand(&amp;m_sess, cmd, &amp;op, &amp;origin);
+        if (res != TEEC_SUCCESS)
+        {
+            std::fprintf(stderr, "cmd %u -&gt; 0x%08x origin %u\n",
+                         cmd, res, origin);
+            return res;
+        }
+
+        *outLen = (cmd == TA_CMD_GET_PUBKEY)
+                ? op.params[0].tmpref.size
+                : op.params[1].tmpref.size;
+        return TEEC_SUCCESS;
+    }
+
+private:
+    TEEC_Context m_ctx{};
+    TEEC_Session m_sess{};
+    bool m_haveCtx  = false;
+    bool m_haveSess = false;
+};
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    const char* uio = (argc &gt; 1) ? argv[1] : "/dev/uio0";
+
+    try
+    {
+        // ivshmem in the Linux guest shows up as a uio device.
+        // map1 is BAR2, the shared memory.
+        int fd = open(uio, O_RDWR);
+        if (fd &lt; 0) throw std::runtime_error(std::string("open ") + uio);
+
+        // Size comes from sysfs; 1 MB is what we ask ivshmem-server for.
+        constexpr size_t SHM_SIZE = 1024 * 1024;
+
+        void* shm = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 1 * getpagesize());
+        if (shm == MAP_FAILED) throw std::runtime_error("mmap BAR2");
+
+        auto* hdr  = static_cast&lt;MailboxHeader*&gt;(shm);
+        auto* data = static_cast&lt;uint8_t*&gt;(shm) + MAILBOX_DATA_OFF;
+
+        TeeSession tee;   // opens the TA, and closes it on any throw
+
+        // Publish the magic LAST, after everything is ready. The
+        // Windows driver refuses to start until it sees this, so
+        // it doubles as a readiness handshake.
+        hdr-&gt;Version  = MAILBOX_VERSION;
+        hdr-&gt;Ack      = hdr-&gt;Sequence;
+        std::atomic_thread_fence(std::memory_order_release);
+        hdr-&gt;Magic    = MAILBOX_MAGIC;
+
+        std::printf("secteed: ready, waiting for the Windows guest\n");
+
+        int32_t lastSeq = hdr-&gt;Sequence;
+
+        for (;;)
+        {
+            // Wait for the doorbell. Reading the uio fd blocks
+            // until an interrupt arrives; the 32-bit value is the
+            // interrupt count.
+            uint32_t count = 0;
+            struct pollfd pfd { fd, POLLIN, 0 };
+
+            if (poll(&amp;pfd, 1, 1000) &gt; 0)
+                (void)!read(fd, &amp;count, sizeof(count));
+
+            const int32_t seq = hdr-&gt;Sequence;
+            if (seq == lastSeq) continue;      // spurious wake
+
+            // Observe the sequence number before the payload it
+            // announces. Mirrors the barrier on the Windows side.
+            std::atomic_thread_fence(std::memory_order_acquire);
+
+            const uint32_t cmd   = hdr-&gt;Command;
+            const uint32_t inLen = hdr-&gt;InLength;
+
+            uint32_t outLen = MAILBOX_DATA_MAX;
+            uint32_t result = TEEC_ERROR_GENERIC;
+
+            if (inLen &lt;= MAILBOX_DATA_MAX)
+            {
+                // Copy out of shared memory before use: the peer
+                // could rewrite it while we work. Same discipline
+                // the TA applies to ITS shared buffer.
+                static uint8_t inCopy[MAILBOX_DATA_MAX];
+                std::memcpy(inCopy, data, inLen);
+
+                result = tee.Invoke(cmd, inCopy, inLen, data, &amp;outLen);
+            }
+            else
+            {
+                outLen = 0;
+                result = TEEC_ERROR_BAD_PARAMETERS;
+            }
+
+            hdr-&gt;OutLength = (result == TEEC_SUCCESS) ? outLen : 0;
+            hdr-&gt;Result    = static_cast&lt;int32_t&gt;(result);
+
+            // Payload before Ack, always.
+            std::atomic_thread_fence(std::memory_order_release);
+            hdr-&gt;Ack = seq;
+
+            lastSeq = seq;
+        }
+    }
+    catch (const std::exception&amp; e)
+    {
+        std::fprintf(stderr, "secteed: %s\n", e.what());
+        return 1;
+    }
+}</code></pre>
+
+<h2 id="qemu">Running it</h2>
+
+<p>Running the whole arrangement without special hardware is what makes this project doable at all. These are the pieces and the order to bring them up in.</p>
+
+<pre><code># ---------------------------------------------------------------
+# 1. The shared-memory server. Start it first; both VMs connect.
+# ---------------------------------------------------------------
+$ ivshmem-server -F -l 1M -n 2 -S /tmp/ivshmem.sock -M sectee-shm
+#   -l 1M   one megabyte, matching SHM_SIZE
+#   -n 2    two interrupt vectors
+#   -F      foreground, so you can see peers connect
+
+# ---------------------------------------------------------------
+# 2. QEMU instance B: OP-TEE + Linux, with the TA and the bridge.
+#    Start from the standard OP-TEE QEMU v8 build (OP-TEE ch. 4).
+# ---------------------------------------------------------------
+$ cd ~/optee
+$ cp sectee/ta/*.ta out-br/target/lib/optee_armtz/
+$ cp sectee/bridge/secteed out-br/target/usr/bin/
+$ cd build &amp;&amp; make buildroot
+
+# Add the ivshmem device to the OP-TEE QEMU command line. The
+# OP-TEE build system generates it, so append via QEMU_EXTRA_ARGS:
+$ make run-only QEMU_EXTRA_ARGS="\
+    -chardev socket,path=/tmp/ivshmem.sock,id=ivsh \
+    -device ivshmem-doorbell,chardev=ivsh,vectors=2"
+
+# In the OP-TEE guest, once it boots:
+# modprobe uio_ivshmem 2>/dev/null || modprobe uio_pci_generic
+# ls /dev/uio*
+/dev/uio0
+# secteed /dev/uio0 &amp;
+secteed: ready, waiting for the Windows guest
+
+# ---------------------------------------------------------------
+# 3. QEMU instance A: Windows 11 ARM64.
+# ---------------------------------------------------------------
+$ qemu-system-aarch64 \
+    -M virt,gic-version=3 -cpu max -smp 4 -m 4G \
+    -bios QEMU_EFI.fd \
+    -device virtio-gpu-pci \
+    -device qemu-xhci -device usb-kbd -device usb-tablet \
+    -drive file=windows-arm64.qcow2,if=none,id=hd0,format=qcow2 \
+    -device virtio-blk-pci,drive=hd0 \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    -chardev socket,path=/tmp/ivshmem.sock,id=ivsh \
+    -device ivshmem-doorbell,chardev=ivsh,vectors=2
+
+# Windows is slow under TCG. On an ARM64 host add -accel hvf
+# (macOS) or -accel kvm (Linux) and it becomes usable.
+
+# ---------------------------------------------------------------
+# 4. In the Windows guest.
+# ---------------------------------------------------------------
+C:\&gt; bcdedit /set testsigning on   &amp;&amp; shutdown /r /t 0
+
+C:\&gt; pnputil /add-driver SecTee.inf /install
+Microsoft PnP Utility
+Adding driver package:  SecTee.inf
+Driver package added successfully.
+Published Name:         oem3.inf
+
+C:\&gt; secteectl.exe pubkey
+04a91f3c...e7b2
+
+# And on instance B's SECURE console, at that moment:
+I/TA: sectee TA loaded
+I/TA: generating a new P-256 keypair
+
+C:\&gt; echo hello from windows &gt; C:\msg.txt
+C:\&gt; secteectl.exe sign C:\msg.txt
+digest 9f2a7c...41
+sig    4b7d2e...91
+
+C:\&gt; secteectl.exe verify C:\msg.txt
+VALID
+
+C:\&gt; secteectl.exe counter
+0
+C:\&gt; secteectl.exe counter inc
+1
+C:\&gt; secteectl.exe counter inc
+2
+# Reboot instance B (not Windows) and the counter is still 2:
+# it lives in OP-TEE secure storage, not in the Windows guest.</code></pre>
+
+<h2 id="prove">Proving it independently</h2>
+
+<p>A security property you cannot verify from outside is not a property, it is a hope. This is the independent check, using tooling that knows nothing about your implementation.</p>
+
+<pre><code># Everything above trusted our own code to check our own code.
+# Take the artefacts out and verify with stock OpenSSL, which has
+# never heard of OP-TEE, ivshmem or Windows.
+
+# In Windows, capture the public key and a signature:
+C:\&gt; secteectl.exe pubkey &gt; C:\pub.hex
+C:\&gt; secteectl.exe sign C:\msg.txt &gt; C:\sig.txt
+
+# Copy them out, then on any Linux box:
+$ xxd -r -p pub.hex &gt; pub.raw          # 65 bytes: 04 || X || Y
+$ printf '3059301306072a8648ce3d020106082a8648ce3d030107034200' \
+    | xxd -r -p &gt; spki.der
+$ cat spki.der pub.raw &gt; pubkey.der
+$ openssl ec -pubin -inform DER -in pubkey.der -out pubkey.pem
+read EC key
+writing EC key
+
+# The TA emits raw r||s; OpenSSL wants DER. (CNG in the Windows
+# driver took the raw form directly - chapter 38.)
+$ python3 - "$(cat sig.txt)" &lt;&lt;'EOF' &gt; sig.der
+import sys, binascii
+raw = binascii.unhexlify(sys.argv[1].strip())
+r, s = raw[:32], raw[32:]
+def der_int(b):
+    b = b.lstrip(b'\x00') or b'\x00'
+    if b[0] &amp; 0x80: b = b'\x00' + b
+    return b'\x02' + bytes([len(b)]) + b
+body = der_int(r) + der_int(s)
+sys.stdout.buffer.write(b'\x30' + bytes([len(body)]) + body)
+EOF
+
+$ printf 'hello from windows\r\n' &gt; msg.txt   # note CRLF - Windows echo
+$ openssl dgst -sha256 -verify pubkey.pem -signature sig.der msg.txt
+Verified OK
+
+# THAT is the result. A signature over a digest computed by CNG in
+# a Windows ARM64 kernel driver, made by a key generated inside an
+# OP-TEE trusted application written in C++, verified by an
+# unrelated tool on a third machine.</code></pre>
+
+<div class="note">
+<b>The CRLF trap</b>
+<p><code>echo hello from windows &gt; C:\msg.txt</code> writes <code>hello from windows\r\n</code>, and
+<code>echo</code> also keeps any trailing space before the <code>&gt;</code>. If OpenSSL says
+<code>Verification Failure</code>, compare the digest the driver printed with
+<code>sha256sum msg.txt</code> before suspecting the crypto. Nine times out of ten the bytes differ, not the
+mathematics.</p>
+</div>
+
+<h2 id="extend">Extensions worth doing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Exercise</th><th>What it teaches</th></tr></thead>
+<tbody>
+<tr><td>Take the ivshmem MSI-X vector and complete requests from a DPC instead of polling</td><td>Interrupts and
+asynchronous request completion in WDF (<a href="win-17-resources-interrupts.html">chapter 18</a>)</td></tr>
+<tr><td>Make the queue parallel and give the mailbox four slots</td><td>Concurrency against a fixed-size
+resource, and OP-TEE's thread limit</td></tr>
+<tr><td>Add <code>IOCTL_SECTEE_SIGN_FILE</code> using <code>METHOD_OUT_DIRECT</code> and an MDL</td><td>Why
+buffered I/O stops paying at scale (<a href="win-18-wdf-dma.html">chapter 19</a>)</td></tr>
+<tr><td>Run Driver Verifier with pool tracking and IRQL checking against the driver</td><td>Every latent
+lifetime bug at once (<a href="win-21-verifier.html">chapter 22</a>)</td></tr>
+<tr><td>Register the driver as a CNG key-storage provider (KSP)</td><td>How a TEE-backed key becomes usable by
+CertEnroll, TLS and Windows Hello rather than only by your own client</td></tr>
+<tr><td>Have the TA sign the counter alongside the digest</td><td>Replay resistance
+(<a href="tee-17-time-rollback.html">OP-TEE chapter 17</a>)</td></tr>
+<tr><td>Point the driver at a real TrEE provider on Qualcomm silicon</td><td>Whether the transport seam was
+honestly abstract</td></tr>
+<tr><td>Run the hostile client from <a href="tee-20-ta-security.html">OP-TEE chapter 20</a> against the
+TA</td><td>Whether the validation is real</td></tr>
+<tr><td>Kill <code>secteed</code> mid-request and see what the driver does</td><td>Timeout handling, and why
+<code>STATUS_IO_TIMEOUT</code> beats hanging for ever</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>TA will not build: <code>undefined reference to __cxa_guard_acquire</code></td><td>A function-local
+static with a constructor; add <code>-fno-threadsafe-statics</code></td></tr>
+<tr><td>TA will not build: <code>__gxx_personality_v0</code></td><td>Exceptions still enabled — add
+<code>-fno-exceptions</code></td></tr>
+<tr><td>TA loads then panics immediately</td><td>A global object with a constructor that never ran; make it
+<code>constexpr</code> or move it into a function</td></tr>
+<tr><td>TA panics on the second request</td><td>Double-close — an RAII wrapper and
+<code>TEE_CloseAndDeletePersistentObject1</code> both released the same handle</td></tr>
+<tr><td><code>TEEC_OpenSession</code> returns <code>0xFFFF0008</code></td><td>The <code>.ta</code> is not in
+<code>/lib/optee_armtz</code>, or its filename does not match the UUID</td></tr>
+<tr><td><code>secteed</code>: cannot open <code>/dev/uio0</code></td><td>No uio driver bound to the ivshmem
+PCI function; check <code>lspci -k</code></td></tr>
+<tr><td>Windows driver: <code>STATUS_DEVICE_NOT_READY</code></td><td><code>secteed</code> not started, so the
+magic was never written</td></tr>
+<tr><td>Both sides running, every request times out</td><td>The two VMs connected to different
+<code>ivshmem-server</code> sockets, or <code>-n</code> too small for the vectors requested</td></tr>
+<tr><td>Ack seen but the reply is garbage</td><td><code>MailboxHeader</code> layout differs between the two
+sources — check the <code>static_assert</code></td></tr>
+<tr><td>Works once, then never again</td><td>Sequence and Ack out of step after an error path that did not
+write Ack</td></tr>
+<tr><td>Signature verifies in CNG, fails in OpenSSL</td><td>Raw r&#124;&#124;s not converted to DER</td></tr>
+<tr><td>Verification fails about 1 time in 128</td><td>ECC coordinates not left-padded to 32 bytes</td></tr>
+<tr><td>Counter resets when the OP-TEE guest reboots</td><td>Secure storage in <code>/data/tee</code> on a
+volatile rootfs — persist it, or enable RPMB</td></tr>
+<tr><td>Everything is unbearably slow</td><td>Windows under TCG. Use <code>-accel kvm</code> or
+<code>-accel hvf</code> on an ARM64 host</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the two-VM topology and name what crosses each boundary.</li>
+  <li>State plainly which security property this configuration demonstrates and which it only
+  simulates.</li>
+  <li>Give the single strongest reason to write a TA in C++, with a concrete failure it prevents.</li>
+  <li>Name three C++ features that need a runtime a TA does not have, and the flag that disables each.</li>
+  <li>Explain why the RAII wrapper needs a <code>Release()</code> method.</li>
+  <li>Point to the single-fetch copy and the <code>paramTypes</code> check in the TA source.</li>
+  <li>Explain the left-padding of ECC coordinates and the failure rate without it.</li>
+  <li>Explain why the bridge publishes the magic value last.</li>
+  <li>Identify both memory barriers in the mailbox protocol and say what each orders.</li>
+  <li>Explain why the bridge copies the input out of shared memory before using it.</li>
+  <li>Verify a signature end to end with stock OpenSSL and say what it proves about the driver, the
+  transport and the TA.</li>
+  <li>Describe what you would change to move this driver onto real Qualcomm silicon.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

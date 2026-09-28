@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GFP flags and allocation context | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>GFP flags and allocation context</h1>
+<p class="lead">The second argument to every allocation answers one question: <em>what may the kernel do to
+satisfy this request?</em> Get it wrong and you either deadlock the machine or crash with a message you will
+learn to recognise instantly.</p>
+
+<h2 id="why">Why a flag at all</h2>
+
+<p>Every allocation in the kernel takes a flag saying how hard the allocator may work to satisfy it. That sounds like a detail until you see what "working harder" involves: the allocator may need to write data to disk, and if it does that while your driver is holding a lock the disk driver needs, the machine stops permanently.</p>
+
+<pre class="diagram">When memory is short, the allocator has options:
+
+   · hand back a free page immediately          (always fine)
+   · reclaim: drop clean page cache             (fast, safe)
+   · write back dirty pages to disk             (SLOW, and it
+                                                 needs the I/O
+                                                 path - which
+                                                 may be YOUR
+                                                 driver)
+   · swap out anonymous memory                  (slower still)
+   · compact memory to make a contiguous run    (slow)
+   · invoke the OOM killer                      (drastic)
+   · give up and return NULL                    (honest)
+
+  Which of those are ALLOWED depends entirely on who is
+  asking. Consider:
+
+     your block driver's interrupt handler calls
+     kmalloc(GFP_KERNEL), memory is short, so the allocator
+     starts writing dirty pages back to disk - through your
+     driver - which is currently inside an interrupt handler
+     waiting for that same allocation.
+
+     DEADLOCK. The machine stops.
+
+  The GFP flags exist to make that impossible to express by
+  accident.</pre>
+
+<h2 id="main">The three you will use</h2>
+
+<p>The three flags below differ along exactly one axis that matters in practice — how hard the allocator is
+allowed to work, and for how long, before giving up — and that axis is set entirely by whether the calling
+code is permitted to sleep, which the deadlock example above showed is not optional information.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>May sleep</th><th>Use in</th><th>Behaviour when memory is short</th></tr></thead>
+<tbody>
+<tr><td><code>GFP_KERNEL</code></td><td><strong>Yes</strong></td><td>Process context: syscalls, ioctl, probe, workqueues</td><td>Reclaims, writes back, swaps, may OOM-kill. Rarely fails.</td></tr>
+<tr><td><code>GFP_ATOMIC</code></td><td>No</td><td>Interrupt handlers, softirqs, holding a spinlock</td><td>Uses emergency reserves, then <strong>fails immediately</strong>.</td></tr>
+<tr><td><code>GFP_NOWAIT</code></td><td>No</td><td>Anywhere you can handle failure</td><td>No reclaim, no reserves. Fails readily. Politer than <code>GFP_ATOMIC</code>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE RULE, and it is the whole chapter:
+
+     GFP_KERNEL  if you may sleep
+     GFP_ATOMIC  if you may not, and failure is a real problem
+     GFP_NOWAIT  if you may not, and failure is fine
+
+   "May I sleep?" is answered by your CONTEXT (chapter 02):
+
+     process context, no locks held    -> GFP_KERNEL
+     process context, spinlock held    -> GFP_ATOMIC/NOWAIT
+     softirq / tasklet / timer         -> GFP_ATOMIC/NOWAIT
+     hardirq handler                   -> GFP_ATOMIC/NOWAIT
+     RCU read-side critical section    -> GFP_ATOMIC/NOWAIT
+     with preemption or IRQs disabled  -> GFP_ATOMIC/NOWAIT  */
+
+/* GFP_ATOMIC IS NOT FREE. It dips into a small emergency
+   reserve that exists precisely so that the network stack can
+   allocate an skb during an interrupt storm. Draining it
+   affects the whole system.
+
+   So: do not reach for GFP_ATOMIC because it "always works".
+   It works less often than GFP_KERNEL, not more - it just
+   fails instead of waiting. If you find yourself needing large
+   or frequent GFP_ATOMIC allocations, the fix is to
+   PREALLOCATE at probe time, or to move the work to a
+   workqueue where you can sleep (chapter 15).             */</code></pre>
+
+<h2 id="composition">What they are made of</h2>
+
+<p>The flags you type are not primitives — each is a bundle of smaller modifiers, and knowing what they are made of explains why they behave the way they do rather than leaving them as names to memorise.</p>
+
+<pre><code>/* The named flags are compositions of modifiers: */
+
+   GFP_ATOMIC   = __GFP_HIGH | __GFP_KSWAPD_RECLAIM
+   GFP_KERNEL   = __GFP_RECLAIM | __GFP_IO | __GFP_FS
+   GFP_NOWAIT   = __GFP_KSWAPD_RECLAIM
+   GFP_NOIO     = __GFP_RECLAIM
+   GFP_NOFS     = __GFP_RECLAIM | __GFP_IO
+   GFP_USER     = GFP_KERNEL | __GFP_HARDWALL
+   GFP_DMA32    = __GFP_DMA32
+
+/* THE ACTION MODIFIERS:
+     __GFP_RECLAIM         may reclaim (implies it can sleep)
+     __GFP_IO              may start disk I/O
+     __GFP_FS              may call into filesystems
+     __GFP_HIGH            may use emergency reserves
+     __GFP_NOFAIL          retry forever. Never returns NULL.
+                           Discouraged, and for good reason.
+     __GFP_NORETRY         try once, give up quickly
+     __GFP_NOWARN          do not print the failure dump
+     __GFP_ZERO            zero the memory (= kzalloc)
+     __GFP_COMP            compound page, for higher orders
+     __GFP_MOVABLE         may be migrated (CMA-friendly)
+
+/* ZONE MODIFIERS - which physical memory: */
+     __GFP_DMA             the low DMA zone (ISA-era, 16 MB)
+     __GFP_DMA32           below 4 GB
+     (none)                anywhere in the normal zone
+
+/* On arm64 you rarely need the zone modifiers directly - the
+   DMA API handles addressing limits properly via the device's
+   dma_mask (chapter 30). Setting GFP_DMA32 by hand is usually
+   a sign someone worked around a missing dma_set_mask().  */</code></pre>
+
+<h2 id="noio">GFP_NOIO and GFP_NOFS: the recursion flags</h2>
+
+<p>These two flags solve one specific and rather subtle problem: an allocation made <em>inside</em> a subsystem must not cause the allocator to call back into that same subsystem to free memory. If it does, the subsystem re-enters itself while holding its own locks, and deadlocks.</p>
+
+<pre class="diagram">These exist for one reason: to stop the allocator calling back
+into the subsystem that is currently allocating.
+
+  GFP_NOFS   "reclaim, but do not call into filesystems"
+       Used BY filesystem code. Without it:
+         ext4 allocates -> reclaim -> writes back a dirty page
+         -> calls ext4 -> which is already holding a lock
+         -> deadlock.
+
+  GFP_NOIO   "reclaim, but do not start any I/O at all"
+       Used BY block and storage drivers, and in any code on
+       the writeback path. Without it:
+         your MMC driver allocates -> reclaim -> writes back
+         -> submits a request to your MMC driver -> which is
+         mid-allocation -> deadlock.
+
+  WHEN YOU NEED THEM: if your driver is in the storage or
+  filesystem path, or is called during suspend/resume while
+  the block layer is frozen.
+
+  THE MODERN WAY - scope, not per-call:
+
+     unsigned int flags = memalloc_noio_save();
+     ... everything in here, including code you call, behaves
+         as if GFP_NOIO ...
+     memalloc_noio_restore(flags);
+
+  This is better than passing GFP_NOIO down through every
+  function, because it also covers allocations made by library
+  code you did not write. The block and MMC layers do this for
+  you around resume, which is why you may see GFP_KERNEL
+  working in a resume path that "should" need GFP_NOIO.</pre>
+
+<h2 id="patterns">Patterns</h2>
+
+<p>In practice the choice collapses to a handful of situations that recur constantly. These are those situations, with the correct flag and the reasoning attached, so the decision becomes recognition rather than analysis.</p>
+
+<pre><code>/* --- 1. probe: the easy case ---------------------------- */
+static int my_probe(struct platform_device *pdev)
+{
+        struct my_dev *d;
+
+        /* process context, no locks -> GFP_KERNEL */
+        d = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+        ...
+}
+
+/* --- 2. interrupt handler: preallocate ------------------ */
+/* WRONG - allocating in an IRQ, where it can fail: */
+static irqreturn_t my_isr(int irq, void *data)
+{
+        struct my_event *e = kmalloc(sizeof(*e), GFP_ATOMIC);
+        if (!e)
+                return IRQ_HANDLED;     /* EVENT LOST */
+        ...
+}
+
+/* RIGHT - a preallocated pool, filled at probe: */
+struct my_dev {
+        struct my_event  events[MY_NR_EVENTS];  /* fixed pool */
+        DECLARE_KFIFO(fifo, struct my_event, MY_NR_EVENTS);
+};
+static irqreturn_t my_isr(int irq, void *data)
+{
+        struct my_dev *d = data;
+        struct my_event e = { .ts = ktime_get(), ... };
+
+        if (!kfifo_put(&amp;d-&gt;fifo, e))
+                d-&gt;overruns++;          /* counted, not lost
+                                           silently */
+        return IRQ_HANDLED;
+}
+/* An overrun counter is a far better failure mode than an
+   allocation that quietly returns NULL.                   */
+
+/* --- 3. spinlock held: allocate outside it -------------- */
+/* WRONG: */
+        spin_lock(&amp;d-&gt;lock);
+        p = kmalloc(size, GFP_KERNEL);   /* BUG: may sleep */
+        list_add(&amp;p-&gt;node, &amp;d-&gt;list);
+        spin_unlock(&amp;d-&gt;lock);
+
+/* RIGHT - allocate first, then take the lock: */
+        p = kmalloc(size, GFP_KERNEL);
+        if (!p)
+                return -ENOMEM;
+
+        spin_lock(&amp;d-&gt;lock);
+        list_add(&amp;p-&gt;node, &amp;d-&gt;list);
+        spin_unlock(&amp;d-&gt;lock);
+
+/* This restructuring - allocate outside, insert inside - is
+   the standard fix, and it is almost always possible.     */
+
+/* --- 4. a large, optional allocation -------------------- */
+        buf = kmalloc(SZ_1M, GFP_KERNEL | __GFP_NOWARN |
+                             __GFP_NORETRY);
+        if (!buf)
+                buf = vmalloc(SZ_1M);   /* fall back */
+/* kvmalloc() does exactly this for you: */
+        buf = kvmalloc(SZ_1M, GFP_KERNEL);
+        ...
+        kvfree(buf);
+/* Use kvmalloc when the buffer is CPU-only and you do not
+   care whether it is physically contiguous. Never for DMA. */</code></pre>
+
+<div class="key">
+<b>The design lesson underneath</b>
+<p>Almost every <code>GFP_ATOMIC</code> in a driver can be removed by allocating earlier. Fixed pools sized
+at probe time, kfifos, preallocated descriptor rings and mempools all trade a little memory for the
+guarantee that the hot path cannot fail. That trade is nearly always right in embedded work, where the
+memory budget is known and an allocation failure at 3 a.m. is not recoverable.</p>
+</div>
+
+<h2 id="mempool">Mempools: when failure is not an option</h2>
+
+<p>Some paths genuinely cannot cope with an allocation failure — the code that writes memory out to disk cannot fail to allocate, because allocating is how it makes memory available in the first place. For those cases the kernel offers a guaranteed reserve, set aside in advance.</p>
+
+<pre><code>/* A mempool keeps a guaranteed reserve. Allocation tries the
+   normal allocator first; if that fails, it takes from the
+   reserve; if the reserve is empty AND you may sleep, it waits
+   for something to be returned.                            */
+
+        mempool_t *pool;
+
+        pool = mempool_create_kmalloc_pool(MIN_NR, sizeof(struct req));
+        /* or with your own alloc/free callbacks:            */
+        pool = mempool_create(MIN_NR, mempool_alloc_slab,
+                              mempool_free_slab, my_cache);
+
+        p = mempool_alloc(pool, GFP_NOIO);
+        ...
+        mempool_free(p, pool);
+
+        mempool_destroy(pool);
+
+/* USED BY: the block layer, dm, md, and anything on the
+   writeback path - places where returning NULL would mean
+   losing data rather than failing a request.
+
+   THE GUARANTEE holds only if you RETURN objects promptly and
+   the reserve is sized for your maximum in-flight count. A
+   mempool with MIN_NR=4 and 8 concurrent requests will still
+   block.                                                    */</code></pre>
+
+<h2 id="debug">Catching mistakes</h2>
+
+<p>Getting the allocation context wrong usually does <em>not</em> fail immediately; it works fine until the machine is under load and then deadlocks in a way nobody can reproduce. These configuration options make the kernel check the rules on every call and complain loudly the first time you break one.</p>
+
+<pre><code># TURN THESE ON. They convert silent, rare, unreproducible
+# corruption into a loud message with a backtrace.
+
+    CONFIG_DEBUG_ATOMIC_SLEEP=y     # THE important one
+    CONFIG_PROVE_LOCKING=y          # lockdep
+    CONFIG_DEBUG_SPINLOCK=y
+    CONFIG_KASAN=y
+
+# What DEBUG_ATOMIC_SLEEP prints:
+
+  BUG: sleeping function called from invalid context at mm/slab.h:494
+  in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 431
+  Call trace:
+    dump_backtrace+0x0/0x1a0
+    show_stack+0x18/0x24
+    ___might_sleep+0x120/0x130
+    __might_sleep+0x4c/0x88
+    kmem_cache_alloc+0x40/0x2d0     &lt;-- the allocation
+    my_driver_handler+0x38/0xc0     &lt;-- YOUR CODE
+    ...
+
+# Reads as: my_driver_handler called kmem_cache_alloc in a
+# context where sleeping is illegal. Either the GFP flag is
+# wrong, or the allocation is in the wrong place.
+
+# FAULT INJECTION - test your error paths, which are otherwise
+# never exercised:
+    CONFIG_FAILSLAB=y
+    CONFIG_FAIL_PAGE_ALLOC=y
+    echo 10 > /sys/kernel/debug/failslab/probability
+    echo 100 > /sys/kernel/debug/failslab/times
+# Now 10% of allocations fail. Run your driver. Anything that
+# crashes is an unchecked return value - and you will find
+# some.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>BUG: sleeping function called from invalid context</code></td><td><code>GFP_KERNEL</code> in atomic context</td></tr>
+<tr><td>System deadlocks under memory pressure</td><td>Storage or filesystem driver allocating with <code>GFP_KERNEL</code> — needs <code>GFP_NOIO</code>/<code>NOFS</code></td></tr>
+<tr><td>Deadlock only during suspend/resume</td><td>Allocating on the frozen block path — use <code>memalloc_noio_save()</code></td></tr>
+<tr><td>Allocations fail in interrupts under load</td><td><code>GFP_ATOMIC</code> reserves exhausted — preallocate</td></tr>
+<tr><td>Events dropped during interrupt storms</td><td>Same; use a fixed pool and count overruns</td></tr>
+<tr><td>Works with plenty of RAM, fails on a small board</td><td>Unchecked allocation return values — use fault injection to find them</td></tr>
+<tr><td>Rare crash after an allocation failure</td><td>An error path that was never tested</td></tr>
+<tr><td>Sluggish under memory pressure</td><td><code>__GFP_NOFAIL</code> or heavy <code>GFP_KERNEL</code> use in a hot path</td></tr>
+<tr><td>Allocation failure dump with order 0</td><td>Genuine exhaustion, not fragmentation</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the deadlock GFP flags exist to prevent.</li>
+  <li>Choose between <code>GFP_KERNEL</code>, <code>GFP_ATOMIC</code> and <code>GFP_NOWAIT</code> for six
+  contexts.</li>
+  <li>Explain why <code>GFP_ATOMIC</code> is less reliable than <code>GFP_KERNEL</code>, not more.</li>
+  <li>Say when <code>GFP_NOIO</code> and <code>GFP_NOFS</code> are needed, and what
+  <code>memalloc_noio_save()</code> adds.</li>
+  <li>Rewrite an allocation under a spinlock so it is legal.</li>
+  <li>Replace an interrupt-context allocation with a preallocated pool.</li>
+  <li>Explain what a mempool guarantees and what breaks the guarantee.</li>
+  <li>Read a <code>DEBUG_ATOMIC_SLEEP</code> backtrace and name the two possible fixes.</li>
+  <li>Use fault injection to find an unchecked allocation in your own code.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

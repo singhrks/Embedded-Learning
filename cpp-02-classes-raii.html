@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Classes, encapsulation and RAII | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Classes, encapsulation and RAII</h1>
+<p class="lead">A class is a struct with functions, access control and a guaranteed destructor. That last
+property — deterministic destruction tied to scope — is what makes C++ worth using for systems code, and
+this chapter is about applying it to hardware.</p>
+
+<h2 id="basics">A class is a struct that cleans up</h2>
+
+<p>A class in C++ is a struct with functions and access control. Everything else in this chapter is built on that one idea, and in terms of memory layout a class with no virtual functions is exactly a C struct.</p>
+
+<pre><code>class Timer {
+        volatile uint32_t *base_;       /* private by default */
+        uint32_t period_;
+
+public:
+        explicit Timer(uintptr_t addr, uint32_t period)
+                : base_(reinterpret_cast&lt;volatile uint32_t *&gt;(addr)),
+                  period_(period)
+        {
+                base_[REG_PERIOD] = period_;
+                base_[REG_CTRL]   = CTRL_ENABLE;
+        }
+
+        ~Timer()
+        {
+                base_[REG_CTRL] = 0;    /* ALWAYS runs on scope
+                                           exit                */
+        }
+
+        void restart()      { base_[REG_COUNT] = 0; }
+        uint32_t value() const { return base_[REG_COUNT]; }
+
+private:
+        static constexpr size_t REG_COUNT  = 0;
+        static constexpr size_t REG_PERIOD = 1;
+        static constexpr size_t REG_CTRL   = 2;
+};
+
+/* `class` members are PRIVATE by default; `struct` members
+   are PUBLIC. That is the only difference between the two
+   keywords. Use `struct` for plain data, `class` when there
+   is an invariant to protect.
+
+/* `explicit` PREVENTS IMPLICIT CONVERSION: */
+        void f(Timer t);
+        f(0x40000000);          /* without explicit, this
+                                   COMPILES and silently
+                                   constructs a Timer from an
+                                   integer                   */
+/* Mark every single-argument constructor `explicit` unless
+   the implicit conversion is genuinely wanted. This is a
+   real bug class, and the fix costs one word.
+
+/* `const` ON A MEMBER FUNCTION means it does not modify the
+   object - and is checked. A const Timer& can call value()
+   but not restart(). Mark every member function const that
+   can be; it costs nothing and it documents intent
+   enforceably.                                             */</code></pre>
+
+<h2 id="init">Initialisation</h2>
+
+<p>How a member gets its initial value is more subtle than it looks: there is a difference between initialising it and assigning to it, and the order is fixed by the declaration rather than by what you write.</p>
+
+<pre><code>/* MEMBER INITIALISER LISTS initialise; assignment in the body
+   default-constructs and THEN assigns.                     */
+
+/* WORSE: */
+        Buffer(size_t n) {
+                size_ = n;              /* size_ was already
+                                           default-initialised */
+                data_ = new uint8_t[n]; /* ditto */
+        }
+
+/* BETTER: */
+        Buffer(size_t n)
+                : size_(n), data_(new uint8_t[n]) {}
+
+/* AND FOR A MEMBER WITH NO DEFAULT CONSTRUCTOR, or a const or
+   reference member, the initialiser list is the ONLY option:
+*/
+        class Driver {
+                Timer timer_;           /* no default ctor */
+                const uint32_t id_;
+                Bus&amp; bus_;              /* a reference */
+        public:
+                Driver(uintptr_t addr, uint32_t id, Bus&amp; b)
+                        : timer_(addr, 1000), id_(id), bus_(b) {}
+        };
+
+/* THE ORDER TRAP: members are initialised in DECLARATION
+   order, NOT in the order they appear in the initialiser
+   list.                                                    */
+        class Bad {
+                int b_;
+                int a_;
+        public:
+                Bad() : a_(1), b_(a_) {}   /* b_ initialised
+                                              FIRST, from an
+                                              uninitialised a_ */
+        };
+/* -Wreorder warns. Keep the list in declaration order.
+
+/* DEFAULT MEMBER INITIALISERS (C++11) - usually the clearest:
+*/
+        class Config {
+                uint32_t rate_  = 48000;
+                uint8_t  gain_  = 0;
+                bool     enabled_ = false;
+        public:
+                Config() = default;     /* uses the above */
+                explicit Config(uint32_t rate) : rate_(rate) {}
+                                        /* the others still
+                                           get their defaults */
+        };
+
+/* DELEGATING CONSTRUCTORS, to avoid duplication: */
+        Driver() : Driver(DEFAULT_ADDR, 0) {}
+        Driver(uintptr_t addr, uint32_t id) { ... }
+
+/* AND THE `{}` VERSUS `()` QUESTION: */
+        std::vector&lt;int&gt; a(5, 0);       /* 5 elements, all 0 */
+        std::vector&lt;int&gt; b{5, 0};       /* 2 elements: 5 and 0 */
+/* Brace initialisation prefers an initializer_list
+   constructor when one exists. Elsewhere braces are better -
+   they forbid narrowing conversions:                      */
+        int x{3.5};             /* ERROR - narrowing */
+        int y(3.5);             /* silently 3 */</code></pre>
+
+<h2 id="raii">RAII for hardware</h2>
+
+<p>Here is the pattern applied properly: acquire in the constructor, release in the destructor, and the compiler guarantees the release happens on every path out of the scope — including an early return.</p>
+
+<pre><code>/* THE PATTERN: acquire in the constructor, release in the
+   destructor. Then correctness does not depend on remembering
+   anything.                                                */
+
+/* --- a critical section --- */
+class InterruptLock {
+        uint32_t saved_;
+public:
+        InterruptLock() : saved_(disable_interrupts()) {}
+        ~InterruptLock() { restore_interrupts(saved_); }
+
+        InterruptLock(const InterruptLock&amp;) = delete;
+        InterruptLock&amp; operator=(const InterruptLock&amp;) = delete;
+};
+
+        void update_shared(void)
+        {
+                InterruptLock lock;     /* interrupts off */
+
+                if (error) return;      /* restored HERE */
+                shared_state++;
+        }                               /* and HERE */
+
+/* Every exit path restores. There is no `goto out` to forget.
+
+/* --- a peripheral clock --- */
+class ClockGate {
+        uint32_t mask_;
+public:
+        explicit ClockGate(uint32_t mask) : mask_(mask)
+                { CLOCK-&gt;ENABLE |= mask_; }
+        ~ClockGate() { CLOCK-&gt;ENABLE &amp;= ~mask_; }
+        /* non-copyable */
+};
+
+/* --- a chip-select line --- */
+class ChipSelect {
+        Gpio&amp; cs_;
+public:
+        explicit ChipSelect(Gpio&amp; cs) : cs_(cs) { cs_.clear(); }
+        ~ChipSelect() { cs_.set(); }
+};
+
+        void spi_transfer(...)
+        {
+                ChipSelect cs(cs_pin);          /* asserted */
+                for (auto b : data) {
+                        if (!spi_write(b))
+                                return;         /* DEASSERTED */
+                }
+        }                                       /* deasserted */
+
+/* --- a generic scope guard, for anything without a class --- */
+template&lt;typename F&gt;
+class ScopeExit {
+        F f_;
+        bool active_ = true;
+public:
+        explicit ScopeExit(F f) : f_(std::move(f)) {}
+        ~ScopeExit() { if (active_) f_(); }
+        void release() { active_ = false; }
+
+        ScopeExit(const ScopeExit&amp;) = delete;
+        ScopeExit(ScopeExit&amp;&amp; o) noexcept
+                : f_(std::move(o.f_)), active_(o.active_)
+                { o.active_ = false; }
+};
+
+template&lt;typename F&gt;
+ScopeExit&lt;F&gt; make_scope_exit(F f) { return ScopeExit&lt;F&gt;(f); }
+
+        auto guard = make_scope_exit([&amp;] { cleanup(); });
+        ...
+        guard.release();        /* commit - do NOT clean up */
+
+/* THE `release()` IS THE USEFUL PART: acquire resources,
+   register cleanup for each, and release the guards only when
+   everything succeeded. That gives transactional semantics
+   with no exception handling at all.                     */</code></pre>
+
+<div class="key">
+<b>Why this beats every C alternative</b>
+<p>The <code>goto out</code> ladder (<a href="lx-26-error-handling.html">Linux chapter 33</a>) is correct
+and requires the author to maintain it as the function changes. <code>devm_</code> and WDF parenting solve
+it for one specific framework. RAII solves it for <em>every</em> resource, in the language, checked by the
+compiler, and the generated code is identical. It is the reason to consider C++ even in a codebase that uses
+nothing else from it.</p>
+</div>
+
+<h2 id="hardware">Modelling a register block</h2>
+
+<p>RAII applies directly to hardware resources, not just memory. A class that owns a clock, a pin or a lock makes it structurally impossible to forget to release it.</p>
+
+<pre><code>/* A struct mapped onto MMIO gives you named, typed register
+   access with no runtime cost.                             */
+
+struct UartRegs {
+        volatile uint32_t DR;           /* 0x00 data */
+        volatile uint32_t RSR;          /* 0x04 */
+        volatile uint32_t _pad0[4];
+        volatile uint32_t FR;           /* 0x18 flags */
+        volatile uint32_t _pad1;
+        volatile uint32_t ILPR;         /* 0x20 */
+        volatile uint32_t IBRD;         /* 0x24 */
+        volatile uint32_t FBRD;         /* 0x28 */
+        volatile uint32_t LCRH;         /* 0x2C */
+        volatile uint32_t CR;           /* 0x30 */
+};
+static_assert(offsetof(UartRegs, CR) == 0x30,
+              "register layout mismatch");
+static_assert(sizeof(UartRegs) == 0x34);
+
+/* THE static_assert IS THE POINT: get the padding wrong and
+   the BUILD fails, rather than the device behaving strangely.
+   Put one on every register whose offset you care about.
+
+class Uart {
+        UartRegs *regs_;
+public:
+        explicit Uart(uintptr_t base)
+                : regs_(reinterpret_cast&lt;UartRegs *&gt;(base)) {}
+
+        void put(char c) {
+                while (regs_-&gt;FR &amp; FR_TXFF) { }   /* full */
+                regs_-&gt;DR = static_cast&lt;uint32_t&gt;(c);
+        }
+
+        void write(std::string_view s) {
+                for (char c : s) put(c);
+        }
+};
+
+        Uart uart{0x09000000};
+        uart.write("hello\n");
+
+/* GENERATES exactly the same loads and stores as the C
+   version - `regs_->DR = c` is one `str`, and the class
+   wrapper is entirely compiled away (chapter 14).
+
+/* A SAFER ALTERNATIVE for the field manipulation, using
+   templates so the shifts and masks are compile-time
+   constants (chapter 07):                                 */
+template&lt;uint32_t Mask, uint32_t Shift&gt;
+struct Field {
+        static constexpr uint32_t get(uint32_t reg)
+                { return (reg &amp; Mask) &gt;&gt; Shift; }
+        static constexpr uint32_t set(uint32_t reg, uint32_t v)
+                { return (reg &amp; ~Mask) | ((v &lt;&lt; Shift) &amp; Mask); }
+};
+        using Baud = Field&lt;0x0000FF00, 8&gt;;
+        regs_-&gt;CR = Baud::set(regs_-&gt;CR, 115200 / 16);</code></pre>
+
+<h2 id="statics">Static members</h2>
+
+<p>Objects with static storage duration have two problems in systems code: when their constructors run, and what happens if two of them depend on each other across translation units.</p>
+
+<pre><code>class Counter {
+        static inline int instances_ = 0;   /* C++17: define
+                                               IN the class */
+        int id_;
+public:
+        Counter() : id_(instances_++) {}
+        ~Counter() { instances_--; }
+
+        static int count() { return instances_; }
+        /* a static member function - no `this`, callable as
+           Counter::count()                                 */
+};
+
+/* BEFORE C++17 a static data member needed a definition in
+   exactly one translation unit:                            */
+        /* header */  class C { static int x; };
+        /* one .cpp */ int C::x = 0;
+/* `static inline` removes that, and it is one of C++17's
+   most practically useful small features.
+
+/* STATIC CONSTEXPR members need no definition at all and cost
+   nothing: */
+        class Uart {
+                static constexpr uint32_t FR_TXFF = 1u &lt;&lt; 5;
+                static constexpr size_t   FIFO_DEPTH = 16;
+        };
+/* Scoped, typed, and compiled away entirely - strictly better
+   than a #define in every respect.                        */</code></pre>
+
+<h2 id="pimpl">Hiding the implementation</h2>
+
+<p>Hiding a class's implementation behind a pointer removes it from the header, which cuts compile times and breaks dependency chains — at the cost of an indirection and, usually, an allocation.</p>
+
+<pre><code>/* THE PROBLEM: a class's private members are in its header,
+   so changing them recompiles every user - and exposes
+   internals.
+
+/* PIMPL - a pointer to the implementation: */
+
+        /* driver.hpp */
+        class Driver {
+                struct Impl;
+                std::unique_ptr&lt;Impl&gt; impl_;
+        public:
+                Driver();
+                ~Driver();              /* MUST be declared
+                                           here and DEFINED in
+                                           the .cpp, where
+                                           Impl is complete  */
+                Driver(Driver&amp;&amp;) noexcept;
+                Driver&amp; operator=(Driver&amp;&amp;) noexcept;
+
+                void start();
+                int  read();
+        };
+
+        /* driver.cpp */
+        struct Driver::Impl {
+                Uart uart;
+                std::array&lt;uint8_t, 256&gt; buffer;
+                ...
+        };
+        Driver::Driver() : impl_(std::make_unique&lt;Impl&gt;()) {}
+        Driver::~Driver() = default;    /* here, not in the
+                                           header             */
+        void Driver::start() { impl_-&gt;uart.enable(); }
+
+/* THE COST: a heap allocation and an indirection per call. On
+   embedded that is usually too much, and the alternatives
+   are:
+     · an abstract interface with a factory (a vtable, but no
+       extra allocation)
+     · fixed-size storage: aligned_storage sized by a
+       static_assert against sizeof(Impl)
+     · simply accepting that private members are visible in
+       the header, which for firmware is normally fine
+
+   USE PIMPL for libraries with a stable ABI. Do not use it
+   for firmware.                                            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A member has a garbage value in the constructor</td><td>Members initialise in <em>declaration</em> order — <code>-Wreorder</code></td></tr>
+<tr><td>An integer silently became an object</td><td>Non-<code>explicit</code> single-argument constructor</td></tr>
+<tr><td>A resource leaks despite RAII</td><td>The object was copied — delete or implement the copy operations (<a href="cpp-03-special-members.html">ch. 03</a>)</td></tr>
+<tr><td>Destructor runs twice on the same handle</td><td>Same cause</td></tr>
+<tr><td>Register writes reordered or elided</td><td>Missing <code>volatile</code> on the register struct</td></tr>
+<tr><td>Device behaves as if registers are shifted</td><td>Padding wrong — add <code>static_assert</code> on offsets</td></tr>
+<tr><td>Two elements instead of five in a vector</td><td>Braces selected the <code>initializer_list</code> constructor</td></tr>
+<tr><td>Narrowing conversion accepted silently</td><td>Used <code>()</code> instead of <code>{}</code></td></tr>
+<tr><td>"incomplete type" error on a Pimpl destructor</td><td>Destructor defaulted in the header</td></tr>
+<tr><td>Link error on a static data member</td><td>No definition — use <code>static inline</code> (C++17)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the only difference between <code>class</code> and <code>struct</code>.</li>
+  <li>Explain why every single-argument constructor should be <code>explicit</code>.</li>
+  <li>Explain member initialisation order and the bug it causes.</li>
+  <li>Say when an initialiser list is mandatory.</li>
+  <li>Explain the <code>{}</code> versus <code>()</code> difference, both ways round.</li>
+  <li>Write RAII wrappers for an interrupt lock, a clock gate and a chip select.</li>
+  <li>Write a scope guard with a <code>release()</code> and explain what it enables.</li>
+  <li>Map a register block with a struct and prove the layout with <code>static_assert</code>.</li>
+  <li>Explain why <code>static constexpr</code> members beat <code>#define</code>.</li>
+  <li>Explain Pimpl, its cost, and when not to use it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

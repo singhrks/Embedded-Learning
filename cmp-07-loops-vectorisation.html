@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loop optimisation and vectorisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Loop optimisation and vectorisation</h1>
+<p class="lead">Programs spend most of their time in loops, so compilers spend most of their effort there.
+This chapter covers the transformations, why a loop fails to vectorise, and how to find out which reason
+applies to yours.</p>
+
+<h2 id="transforms">The loop transformations</h2>
+
+<pre><code>/* --- LICM: loop-invariant code motion -------------------- */
+        for (i = 0; i &lt; n; i++)
+                a[i] = b[i] * (x * y);      /* x*y each time */
+   -&gt;   t = x * y;
+        for (i = 0; i &lt; n; i++)
+                a[i] = b[i] * t;
+
+/* LICM is why manually hoisting is usually unnecessary - AND
+   why it sometimes IS necessary: the compiler can only hoist
+   what it can prove is invariant. A call it cannot see into,
+   or a load it cannot prove is unaliased, stays inside.  */
+
+/* --- STRENGTH REDUCTION on induction variables ---------- */
+        for (i = 0; i &lt; n; i++)
+                a[i * 4] = 0;           /* a multiply per
+                                           iteration        */
+   -&gt;   for (p = a; p &lt; a + n*4; p += 4)
+                *p = 0;                 /* an add           */
+
+/* --- LOOP ROTATION: while -&gt; do-while ------------------- */
+        while (cond) { body }
+   -&gt;   if (cond) { do { body } while (cond); }
+/* One test per iteration instead of a test plus a jump, and
+   the loop body becomes a single block ending in a
+   conditional branch - which is what most later loop passes
+   require. Nearly every loop is rotated first.          */
+
+/* --- LOOP UNROLLING ------------------------------------- */
+        for (i = 0; i &lt; n; i++)
+                a[i] = b[i] + 1;
+   -&gt;   for (i = 0; i &lt; n - 3; i += 4) {
+                a[i]   = b[i]   + 1;
+                a[i+1] = b[i+1] + 1;
+                a[i+2] = b[i+2] + 1;
+                a[i+3] = b[i+3] + 1;
+        }
+        for (; i &lt; n; i++)              /* the EPILOGUE, for
+                a[i] = b[i] + 1;           the remainder    */
+
+/* WHY: fewer branches, more instruction-level parallelism,
+   and it exposes vectorisation. COST: code size, and on a
+   small I-cache that can lose more than it gains.
+        #pragma GCC unroll 4
+        #pragma clang loop unroll_count(4)
+        #pragma clang loop unroll(disable)              */
+
+/* --- LOOP FUSION ---------------------------------------- */
+        for (i = 0; i &lt; n; i++) a[i] = b[i];
+        for (i = 0; i &lt; n; i++) c[i] = a[i] * 2;
+   -&gt;   for (i = 0; i &lt; n; i++) { a[i] = b[i];
+                                  c[i] = a[i] * 2; }
+/* One pass over memory instead of two - a cache win
+   (CA chapter 14), often larger than the arithmetic saving. */
+
+/* --- LOOP INTERCHANGE ----------------------------------- */
+        for (j = 0; j &lt; n; j++)
+                for (i = 0; i &lt; n; i++)
+                        a[i][j] = 0;    /* STRIDE n - a cache
+                                           miss per element */
+   -&gt;   for (i = 0; i &lt; n; i++)
+                for (j = 0; j &lt; n; j++)
+                        a[i][j] = 0;    /* stride 1          */
+/* THE SINGLE BIGGEST WIN available on array code, and one the
+   compiler often cannot do because it cannot prove the
+   interchange is legal. Writing the loops in the right order
+   is worth more than any flag.                          */
+
+/* --- LOOP UNSWITCHING ----------------------------------- */
+        for (i = 0; i &lt; n; i++) {
+                if (flag) do_a(i); else do_b(i);
+        }
+   -&gt;   if (flag) for (i = 0; i &lt; n; i++) do_a(i);
+        else      for (i = 0; i &lt; n; i++) do_b(i);
+/* Hoist a loop-invariant condition out, at the cost of
+   duplicating the loop.                                  */
+
+/* --- IDIOM RECOGNITION ---------------------------------- */
+        for (i = 0; i &lt; n; i++) a[i] = 0;
+   -&gt;   memset(a, 0, n * sizeof(*a));
+        for (i = 0; i &lt; n; i++) a[i] = b[i];
+   -&gt;   memcpy(a, b, n * sizeof(*a));
+/* Which is why hand-written copy loops are not faster than
+   memcpy - they usually BECOME memcpy. And why
+   -ffreestanding code still needs memcpy to exist
+   (C track chapter 20).                                 */</code></pre>
+
+<h2 id="simd">Vectorisation</h2>
+
+<pre class="diagram">SIMD: one instruction, several data elements.
+
+   SCALAR, 4 iterations:
+      ldr  w1, [x0]        a[0]
+      add  w1, w1, #1
+      str  w1, [x2]
+      ... x4
+
+   VECTOR, 1 iteration:
+      ldr  q0, [x0]        a[0..3], 128 bits at once
+      add  v0.4s, v0.4s, v1.4s      four adds
+      str  q0, [x2]
+
+  ARM's SIMD:
+     NEON (Advanced SIMD)   fixed 128-bit registers v0-v31.
+                            Universally available on ARMv8-A.
+     SVE / SVE2             VECTOR-LENGTH AGNOSTIC: the same
+                            binary runs on 128-bit and
+                            2048-bit implementations, using
+                            predicates and a loop that adapts.
+                            Server and newer mobile parts.
+
+  ELEMENT ARRANGEMENTS on a 128-bit NEON register:
+     v0.16b   16 x  8-bit
+     v0.8h     8 x 16-bit
+     v0.4s     4 x 32-bit
+     v0.2d     2 x 64-bit
+
+  THE THEORETICAL SPEEDUP is the element count - 4x for
+  32-bit. THE REAL SPEEDUP is usually 2-3x, because loads,
+  stores and loop overhead do not vectorise, and memory
+  bandwidth often becomes the limit (CA chapter 18).</pre>
+
+<h2 id="whyfail">Why a loop does not vectorise</h2>
+
+<pre><code>/* --- 1. LOOP-CARRIED DEPENDENCE ------------------------- */
+        for (i = 1; i &lt; n; i++)
+                a[i] = a[i-1] + 1;      /* each iteration
+                                           needs the previous */
+/* Genuinely not vectorisable. Restructure the algorithm, or
+   accept it.                                             */
+
+/* BUT THIS ONE IS FINE: */
+        for (i = 1; i &lt; n; i++)
+                a[i-1] = a[i] + 1;      /* reads ahead of
+                                           writes - safe    */
+
+/* --- 2. POSSIBLE ALIASING ------------------------------- */
+        void add(int *a, int *b, int *c, int n) {
+                for (int i = 0; i &lt; n; i++)
+                        a[i] = b[i] + c[i];
+        }
+/* The compiler cannot prove a, b and c do not overlap. It
+   will either refuse, or - more commonly at -O3 - emit a
+   RUNTIME ALIAS CHECK and two versions of the loop.
+
+   THE FIX: */
+        void add(int * restrict a, const int * restrict b,
+                 const int * restrict c, int n)
+/* `restrict` PROMISES no aliasing through these pointers for
+   the object's lifetime. Break the promise and you get
+   undefined behaviour and wrong results - so only use it
+   when it is true.                                        */
+
+/* --- 3. NON-CONTIGUOUS ACCESS --------------------------- */
+        for (i = 0; i &lt; n; i++)
+                sum += a[i].field;      /* stride = sizeof
+                                           the struct        */
+/* Gather/scatter is possible on SVE but slow, and NEON has no
+   general gather. THE FIX is a data layout change:
+   structure-of-arrays instead of array-of-structures.    */
+
+        /* AoS - poor for SIMD */
+        struct P { float x, y, z; } points[N];
+        /* SoA - vectorises perfectly */
+        struct { float x[N], y[N], z[N]; } points;
+
+/* --- 4. CONTROL FLOW INSIDE THE LOOP -------------------- */
+        for (i = 0; i &lt; n; i++)
+                if (a[i] &gt; 0)
+                        b[i] = a[i];
+/* Vectorisable via MASKING - compute all lanes, then blend by
+   a predicate. NEON can do this; SVE does it natively. But an
+   early `break` cannot be vectorised at all, because the trip
+   count is not known in advance.                        */
+
+/* --- 5. FUNCTION CALLS --------------------------------- */
+        for (i = 0; i &lt; n; i++)
+                a[i] = sinf(b[i]);
+/* Needs a VECTORISED VERSION of the function. libmvec
+   provides these for the maths functions; -ffast-math or
+   -fveclib=libmvec may enable their use. A call to a
+   function the compiler cannot see blocks vectorisation
+   entirely.                                              */
+
+/* --- 6. UNKNOWN TRIP COUNT OR COMPLEX EXIT ------------- */
+        while (*p) { ... p++; }     /* length unknown */
+/* Some of these can be vectorised speculatively; most are
+   not.                                                    */
+
+/* --- 7. REDUCTIONS ON FLOATING POINT ------------------- */
+        for (i = 0; i &lt; n; i++) sum += a[i];
+/* FP addition is NOT ASSOCIATIVE (CA chapter 03), so
+   reordering changes the result. The compiler will not do it
+   by default. Options:
+        -ffast-math          (dangerous - relaxes everything)
+        -fassociative-math   (narrower)
+        #pragma omp simd reduction(+:sum)   (explicit consent)
+   INTEGER reductions vectorise freely, because integer
+   addition IS associative - modulo wrapping, which is why
+   unsigned is easier here too.                          */</code></pre>
+
+<div class="key">
+<b>Ask the compiler why</b>
+<pre><code>gcc  -O3 -fopt-info-vec-missed
+clang -O3 -Rpass-missed=loop-vectorize \
+          -Rpass-analysis=loop-vectorize</code></pre>
+<p>These print the specific reason each loop failed: "loop not vectorized: cannot identify array bounds",
+"unsafe dependent memory operations", "value that could not be identified as reduction". That output turns
+vectorisation from guesswork into a checklist, and it is the single most useful flag in this chapter.</p>
+</div>
+
+<h2 id="helping">Helping the compiler</h2>
+
+<pre><code>/* --- restrict, when it is true -------------------------- */
+        void saxpy(int n, float a,
+                   const float * restrict x,
+                   float * restrict y)
+        {
+                for (int i = 0; i &lt; n; i++)
+                        y[i] = a * x[i] + y[i];
+        }
+
+/* --- tell it about alignment ---------------------------- */
+        float *p = __builtin_assume_aligned(ptr, 16);
+        alignas(16) float buf[N];
+/* An aligned vector load is faster than an unaligned one on
+   many cores, and knowing the alignment lets the compiler
+   skip the prologue that handles the misaligned head.   */
+
+/* --- pragmas ------------------------------------------- */
+        #pragma GCC ivdep               /* ignore assumed
+                                           dependences      */
+        #pragma clang loop vectorize(enable)
+        #pragma clang loop vectorize_width(4) interleave_count(2)
+        #pragma omp simd                /* OpenMP - portable */
+        #pragma omp simd reduction(+:sum)
+
+/* --- write loops the compiler can analyse --------------- */
+        /* HARD: */
+        for (p = start; p != end; p = p-&gt;next)   /* pointer
+                                                    chasing */
+        /* EASY: */
+        for (i = 0; i &lt; n; i++)                  /* counted,
+                                                    contiguous */
+
+        /* HARD: a loop with several exits */
+        /* EASY: one entry, one exit, known trip count */
+
+/* --- and when nothing works, intrinsics ---------------- */
+#include &lt;arm_neon.h&gt;
+
+void add_neon(int32_t *a, const int32_t *b,
+              const int32_t *c, int n)
+{
+        int i;
+
+        for (i = 0; i &lt;= n - 4; i += 4) {
+                int32x4_t vb = vld1q_s32(b + i);
+                int32x4_t vc = vld1q_s32(c + i);
+                int32x4_t va = vaddq_s32(vb, vc);
+                vst1q_s32(a + i, va);
+        }
+        for (; i &lt; n; i++)              /* the tail */
+                a[i] = b[i] + c[i];
+}
+
+/* INTRINSICS ARE THE LAST RESORT: they are target-specific,
+   they do not adapt to a wider vector unit, and they are
+   easy to get subtly wrong. Try, in order:
+     1. restructure the loop and the data layout
+     2. restrict, alignment, pragmas
+     3. intrinsics
+     4. hand-written assembly
+   and MEASURE at each step - the auto-vectoriser is
+   frequently within 10% of hand-written intrinsics on simple
+   kernels, and it improves with every compiler release. */</code></pre>
+
+<h2 id="reading">Reading vectorised output</h2>
+
+<pre><code>; float sum(const float *a, int n)
+;     { float s = 0; for (int i=0;i&lt;n;i++) s += a[i];
+;       return s; }
+; aarch64, -O3 -ffast-math
+
+sum:
+        cmp     w1, #0
+        b.le    .Lzero
+        ...
+        movi    v0.4s, #0               ; accumulator, 4 lanes
+        movi    v1.4s, #0               ; a SECOND accumulator
+.Lvector:
+        ldp     q2, q3, [x0], #32       ; load 8 floats
+        fadd    v0.4s, v0.4s, v2.4s     ; interleaved, to hide
+        fadd    v1.4s, v1.4s, v3.4s     ; FP latency
+        subs    x8, x8, #8
+        b.ne    .Lvector
+
+        fadd    v0.4s, v0.4s, v1.4s     ; combine accumulators
+        faddp   v0.4s, v0.4s, v0.4s     ; horizontal reduce
+        faddp   s0, v0.2s               ; ...to one scalar
+        ...
+.Lscalar:                               ; the epilogue, for
+        ldr     s1, [x0], #4            ; the remaining
+        fadd    s0, s0, s1              ; elements
+        subs    w8, w8, #1
+        b.ne    .Lscalar
+        ret
+
+/* THE SHAPE TO RECOGNISE:
+     1. a guard for small n
+     2. possibly a runtime alias check
+     3. the VECTOR BODY, often unrolled with several
+        accumulators to hide latency (ARM chapter 10)
+     4. a HORIZONTAL REDUCTION to combine lanes
+     5. a SCALAR EPILOGUE for the remainder
+
+   `q0`, `v0.4s`, `faddp` - the presence of these means it
+   vectorised. All-scalar `s0`, `w0` means it did not.
+
+   AND NOTE `-ffast-math` was required for this one, because
+   the reduction reorders FP additions.                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Loop not vectorised, no obvious reason</td><td>Ask: <code>-fopt-info-vec-missed</code></td></tr>
+<tr><td>"unsafe dependent memory operations"</td><td>Possible aliasing — try <code>restrict</code></td></tr>
+<tr><td>Two copies of the loop in the assembly</td><td>Runtime alias check — <code>restrict</code> removes it</td></tr>
+<tr><td>Vectorises for <code>float</code> but not the reduction</td><td>FP associativity — needs explicit consent</td></tr>
+<tr><td>Vectorised but no faster</td><td>Memory bandwidth bound, not compute bound</td></tr>
+<tr><td>Slower after <code>-O3</code></td><td>Code growth from unrolling; I-cache pressure</td></tr>
+<tr><td>Array-of-structs loop will not vectorise</td><td>Strided access — restructure to struct-of-arrays</td></tr>
+<tr><td>Cache misses dominate</td><td>Loop order — interchange so the innermost stride is 1</td></tr>
+<tr><td>Hand-written copy loop no faster than <code>memcpy</code></td><td>It became <code>memcpy</code></td></tr>
+<tr><td>Results differ with <code>-ffast-math</code></td><td>Expected — it permits reassociation (<a href="ca-03-floating-point.html">CA ch. 03</a>)</td></tr>
+<tr><td>Intrinsics beaten by autovectorisation</td><td>Common. Measure before hand-writing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name eight loop transformations and what each buys.</li>
+  <li>Explain why loop rotation happens before other loop passes.</li>
+  <li>Explain why loop interchange is often the largest available win.</li>
+  <li>Explain idiom recognition and its consequence for freestanding builds.</li>
+  <li>Describe NEON's element arrangements and how SVE differs.</li>
+  <li>List seven reasons a loop fails to vectorise, with a fix for each.</li>
+  <li>Use <code>-fopt-info-vec-missed</code> on a real loop and act on the output.</li>
+  <li>Explain what <code>restrict</code> promises and the cost of lying.</li>
+  <li>Convert an array-of-structures layout to structure-of-arrays and explain why it helps.</li>
+  <li>Recognise the five parts of a vectorised loop in assembly.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

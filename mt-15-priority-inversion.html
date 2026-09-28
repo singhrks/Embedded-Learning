@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Priority inversion and real-time concurrency | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Priority inversion and real-time concurrency</h1>
+<p class="lead">A high-priority thread blocked behind a low-priority one is not a scheduling curiosity; it
+is the failure that put Mars Pathfinder into a reset loop on another planet. This chapter covers the
+mechanism, the two standard fixes, and what "real-time" actually demands of concurrent code.</p>
+
+<h2 id="mechanism">The mechanism</h2>
+
+<p>A high-priority thread blocked indefinitely by a low-priority one sounds impossible — priority should decide who runs. Seeing exactly how a third thread turns a short lock hold into an unbounded delay is what makes the fixes obvious.</p>
+
+<pre class="diagram">   Three threads. H high, M medium, L low. H and L share a
+   mutex; M shares nothing.
+
+   time --&gt;
+
+   L    [--lock--][ running ]
+   M                        [======== running, forever =======]
+   H              [wants the lock ... blocked ... blocked ....]
+
+   1. L takes the mutex and starts work.
+   2. H becomes runnable, preempts L, and blocks on the mutex.
+   3. L is runnable again - but M, which is higher priority
+      than L, preempts it.
+   4. L never runs, so it never releases the mutex, so H never
+      runs.
+
+   H is now effectively running at L's priority, and is
+   blocked by M - a thread it outranks and shares nothing
+   with. That is UNBOUNDED PRIORITY INVERSION: the delay has
+   no upper bound, because any number of medium-priority
+   threads can keep arriving.
+
+   BOUNDED inversion - H waiting while L finishes its critical
+   section - is unavoidable and fine. You bound it by keeping
+   critical sections short. It is the UNBOUNDED case, caused
+   by a third thread, that must be designed out.</pre>
+
+<div class="key">
+<b>Mars Pathfinder, 1997</b>
+<p>The lander began resetting on the Martian surface. A high-priority bus-management task shared a mutex with
+a low-priority meteorological task; a medium-priority communications task preempted the low one, the
+high-priority task missed its deadline, and the watchdog rebooted the spacecraft. The fix was uploaded from
+Earth: enable priority inheritance on that mutex — a flag that VxWorks supported and that had been left
+off.</p>
+</div>
+
+<h2 id="fixes">The two protocols</h2>
+
+<p>Two standard remedies, both of which work by temporarily raising the priority of whoever holds the lock. They differ in when the raise happens, which affects both overhead and worst-case behaviour.</p>
+
+<pre><code>/* PRIORITY INHERITANCE (PI)
+   While L holds a mutex that H wants, L runs at H's priority.
+   As soon as it releases, it drops back.                    */
+
+pthread_mutexattr_t a;
+pthread_mutexattr_init(&amp;a);
+pthread_mutexattr_setprotocol(&amp;a, PTHREAD_PRIO_INHERIT);
+pthread_mutex_init(&amp;m, &amp;a);
+
+/*   L    [--lock--][boosted to H's priority][unlock]
+     M                                       [ runs ]
+     H              [blocked][----------------------][runs]
+
+   M can no longer preempt L, because L is temporarily as
+   important as H. The inversion is now BOUNDED by the length
+   of L's critical section.
+
+   Cost: the scheduler must track the boost, and inheritance
+   is TRANSITIVE - if L is itself blocked on a mutex held by
+   K, K gets boosted too. Chains are handled but cost more.
+
+   This is the default choice, and what Linux's PREEMPT_RT,
+   VxWorks and QNX use.                                     */
+
+
+/* PRIORITY CEILING (PCP / immediate ceiling)
+   Every mutex is given a CEILING: the priority of the
+   highest-priority thread that will ever take it. Any thread
+   that acquires it is immediately raised to the ceiling.   */
+
+pthread_mutexattr_setprotocol(&amp;a, PTHREAD_PRIO_PROTECT);
+pthread_mutexattr_setprioceiling(&amp;a, 80);
+
+/*   Advantages over inheritance:
+       * no boost tracking at runtime - the raise is
+         unconditional and cheap
+       * prevents DEADLOCK among ceiling-protected mutexes,
+         provably, because a thread can only ever block on a
+         mutex whose ceiling exceeds its current priority
+       * better worst-case analysis for certification
+
+     Disadvantages:
+       * you must know every user of every mutex in advance,
+         and keep the ceilings correct as the code changes
+       * a low-priority thread is boosted even when no
+         high-priority thread wants the lock - it "wastes"
+         priority
+
+   Use PCP in certified systems where the thread set is fixed
+   and analysed. Use PI everywhere else.                    */</code></pre>
+
+<div class="warn">
+<b>Only mutexes can do this</b>
+<p>Priority inheritance requires an <strong>owner</strong>. A semaphore has none — anyone may post it — so
+there is nobody to boost. The same applies to condition variables, barriers, and hand-rolled spinlocks. If
+you are using a binary semaphore as a mutex in a real-time system
+(<a href="mt-09-semaphores-barriers.html">chapter 9</a>), you have no protection against unbounded inversion.
+This is the single strongest argument for using a real mutex.</p>
+</div>
+
+<h2 id="realtime">What real-time actually requires</h2>
+
+<p>Priority inversion is not an academic curiosity: it is the failure that nearly ended a Mars mission, and the diagnosis and fix are a genuinely instructive piece of engineering history.</p>
+
+<pre class="diagram">   "Real-time" does not mean fast. It means BOUNDED.
+   A system with a guaranteed 10 ms response is real-time.
+   One that is usually 10 us and occasionally 200 ms is not.
+
+   THE THINGS THAT MUST BE BOUNDED
+
+   1. every critical section          measurable, short
+   2. priority inversion              PI or PCP mutexes
+   3. memory allocation               PREALLOCATE. malloc has
+                                      unbounded worst case and
+                                      its own locks
+   4. page faults                     mlockall(MCL_CURRENT |
+                                      MCL_FUTURE) - a demand
+                                      page fault is milliseconds
+   5. interrupt latency               threaded IRQs, or a small
+                                      bounded top half
+   6. the scheduler itself            SCHED_FIFO/RR/DEADLINE,
+                                      not CFS
+   7. lock acquisition                fair (ticket/FIFO) locks,
+                                      or no locks at all
+   8. cache and TLB behaviour         pinning, and sometimes
+                                      cache partitioning
+
+   MISS ANY ONE and the system has an unbounded tail, however
+   good the other seven are. This is why real-time work feels
+   like removing things rather than adding them.</pre>
+
+<pre><code>/* The standard preamble for a real-time thread on Linux. */
+
+#include &lt;sched.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;malloc.h&gt;
+
+void rt_setup(void)
+{
+        /* 1. Never be swapped or demand-paged. */
+        mlockall(MCL_CURRENT | MCL_FUTURE);
+
+        /* 2. Stop the allocator returning memory to the OS and
+              having to fault it back in. */
+        mallopt(M_TRIM_THRESHOLD, -1);
+        mallopt(M_MMAP_MAX, 0);
+
+        /* 3. Touch the whole stack now, so no fault later. */
+        char scratch[512 * 1024];
+        memset(scratch, 0, sizeof scratch);
+
+        /* 4. Real-time policy. */
+        struct sched_param p = { .sched_priority = 80 };
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &amp;p);
+
+        /* 5. Pin, and use a core isolated with isolcpus and
+              nohz_full so the kernel stops interrupting it. */
+        cpu_set_t s; CPU_ZERO(&amp;s); CPU_SET(3, &amp;s);
+        sched_setaffinity(0, sizeof s, &amp;s);
+}
+
+/* And a PI mutex for anything shared with a lower-priority
+   thread: */
+pthread_mutexattr_t a;
+pthread_mutexattr_init(&amp;a);
+pthread_mutexattr_setprotocol(&amp;a, PTHREAD_PRIO_INHERIT);
+pthread_mutex_init(&amp;shared_lock, &amp;a);
+
+/* THEN MEASURE, because every one of those steps is a claim: */
+$ cyclictest -t1 -p80 -a3 -i200 -m -n -l 10000000
+T: 0 (1234) P:80 I:200 C:10000000 Min:2 Act:3 Avg:3 Max:14
+/* Max is the number that matters. Run it for hours, under
+   load, with the real workload running. A Max that grows the
+   longer you run means something is unbounded.             */</code></pre>
+
+<h2 id="inversion-else">Inversion outside the scheduler</h2>
+
+<p>The same shape of problem appears wherever a scarce resource is held by something the scheduler has deprioritised — not only with mutexes, and not only with thread priorities.</p>
+
+<pre><code>/* The same shape appears wherever a queue is shared. */
+
+  A LOCK CONVOY
+    Many threads pass one lock in strict FIFO order. Each
+    releases, the next is woken, but the releaser immediately
+    tries again and now queues at the back. Throughput
+    collapses to one handoff per context switch (~µs) even
+    though the critical section is nanoseconds.
+    FIX: barging (unfair) locks, or shard the data.
+
+  THE THUNDERING HERD
+    N threads woken for one item; N-1 immediately sleep again.
+    FIX: signal instead of broadcast (chapter 8), or a queue
+    per worker.
+
+  I/O PRIORITY INVERSION
+    A high-priority thread blocks on a page from a file whose
+    read was queued behind a low-priority thread's bulk copy.
+    FIX: ionice, cgroup I/O weights, or read ahead.
+
+  MEMORY ALLOCATOR INVERSION
+    Your RT thread calls malloc, which takes the arena lock a
+    low-priority thread holds while the allocator does an
+    mmap. Unbounded, and invisible in your source.
+    FIX: preallocate. This is why RT code has pools.
+
+  In every case the pattern is: a scarce serialised resource,
+  and a scheduling policy that does not know about it.      */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>High-priority thread misses deadlines under load</td><td>Unbounded priority inversion — enable
+<code>PTHREAD_PRIO_INHERIT</code></td></tr>
+<tr><td>Watchdog resets the system intermittently</td><td>The Pathfinder failure, exactly</td></tr>
+<tr><td>Raising a thread's priority made latency worse</td><td>It now blocks on a lock held by something it
+outranks</td></tr>
+<tr><td>Latency fine in test, terrible in production</td><td>Medium-priority load absent in test is the third
+thread in the inversion</td></tr>
+<tr><td>Occasional millisecond spikes in an RT loop</td><td>A page fault, a <code>malloc</code>, or a
+migration — one of the eight bounds is missing</td></tr>
+<tr><td>Binary semaphore gives no protection</td><td>Semaphores have no owner, so no inheritance</td></tr>
+<tr><td>Throughput collapses at a specific thread count</td><td>A lock convoy</td></tr>
+<tr><td><code>cyclictest</code> Max grows the longer you run</td><td>Something is unbounded; the average is
+irrelevant</td></tr>
+<tr><td>Works on bare metal, misses deadlines in a VM</td><td>The vCPU is descheduled by the host
+(<a href="virt-08-vcpu-switch.html">virtualisation chapter 08</a>)</td></tr>
+<tr><td><code>pthread_mutexattr_setprotocol</code> returns ENOTSUP</td><td>The platform has no PI mutexes —
+a design constraint you must plan around</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the three-thread inversion and say which thread causes the unbounded part.</li>
+  <li>Distinguish bounded from unbounded inversion and say which is acceptable.</li>
+  <li>Explain priority inheritance and what "transitive" means for it.</li>
+  <li>Explain priority ceiling, and give one advantage and one disadvantage over inheritance.</li>
+  <li>Explain why a semaphore cannot offer either protocol.</li>
+  <li>Define real-time in one sentence without using the word "fast".</li>
+  <li>List the eight things that must be bounded, and name what breaks each.</li>
+  <li>Write the real-time thread preamble and justify every step.</li>
+  <li>Explain what <code>cyclictest</code>'s Max tells you that Avg does not.</li>
+  <li>Describe a lock convoy and how it differs from ordinary contention.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

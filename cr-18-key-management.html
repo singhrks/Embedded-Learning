@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Key management and secure storage | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Key management and secure storage</h1>
+<p class="lead">Cryptography converts the problem of protecting a lot of data into the problem of
+protecting a small key. That is a good trade only if you actually protect the key — and on a device an
+attacker can hold in their hand, that is the hardest part of the whole system.</p>
+
+<h2 id="lifecycle">The key lifecycle</h2>
+
+<p>Keys are generated, distributed, used, rotated and destroyed, and most real compromises happen in one of those transitions rather than against the algorithm. Managing the whole lifecycle is the actual engineering problem.</p>
+
+<pre class="diagram">   GENERATE -> STORE -> USE -> ROTATE -> DESTROY
+        |         |       |        |         |
+   good entropy   |   never in     |     verifiably
+   (chapter 02)   |   plaintext    |     unrecoverable
+                  |   outside the  |
+             hardware-backed,      |
+             never exported   before the limits
+                              (chapter 09)
+
+   AT EVERY STAGE, ASK:
+     · who can read this key?
+     · what happens if the device is stolen and
+       decapsulated?
+     · what happens if the manufacturing database leaks?
+     · what happens when this key must be replaced?
+     · how do we know it was destroyed?
+
+   THE HIERARCHY, and the whole design follows from it:
+
+     ROOT OF TRUST      in hardware fuses or a PUF.
+                        NEVER READABLE BY SOFTWARE.
+        |  KDF (chapter 10)
+        +-- storage key         encrypts the filesystem
+        +-- attestation key     proves device identity
+        +-- firmware key        decrypts update images
+        +-- per-session keys    ephemeral, from ECDHE
+
+   THE ROOT IS USED ONLY AS A KDF INPUT, and ideally only
+   inside a hardware block that will not reveal it. Every
+   working key is derived, so every working key is
+   REPLACEABLE by changing its context string - without
+   touching the root.</pre>
+
+<h2 id="never">Where keys must never be</h2>
+
+<p>A short list of things that must never happen to a key. Each appears regularly in shipped products, usually because it was convenient during development and never removed.</p>
+
+<pre><code>/* --- 1. HARDCODED IN FIRMWARE --- */
+    static const uint8_t key[16] = { 0xde, 0xad, ... };
+
+    Anyone with the firmware image has the key. And firmware
+    images are on vendor download pages, extracted from SPI
+    flash with a $20 clip, or dumped over an unprotected
+    JTAG port. `strings` and `binwalk` find them in seconds;
+    entropy analysis finds them even when obfuscated.
+
+    AND THE MULTIPLIER: it is the SAME KEY IN EVERY UNIT. One
+    extraction compromises the entire product line, past and
+    future. This is the single most common serious flaw in
+    shipped IoT devices.
+
+/* --- 2. IN A REPOSITORY --- */
+    Committed keys live in git history forever. Rotating
+    after a leak means rotating on every device that ever
+    received the old one. Automated scanners find published
+    keys within minutes of a push.
+
+/* --- 3. IN LOGS, TRACES OR CRASH DUMPS --- */
+    printf("key=%s", key)  - and it goes to a UART pad
+    somebody can solder to, or to a cloud crash reporter, or
+    into a support bundle a customer emails you.
+
+/* --- 4. IN SWAP, HIBERNATION IMAGES OR CORE DUMPS --- */
+    On Linux: mlock() the buffer, disable core dumps for the
+    process, and prefer the kernel keyring or a TEE
+    (see the isolation track).
+
+/* --- 5. LEFT IN MEMORY AFTER USE --- */
+    void f(void) {
+        uint8_t key[32];
+        derive(key);
+        use(key);
+        memset(key, 0, 32);   /* &lt;-- THE COMPILER MAY DELETE
+                                     THIS. The buffer is dead
+                                     afterwards, so the store
+                                     is "unobservable" and
+                                     dead-store elimination
+                                     removes it. */
+    }
+
+    /* USE ONE OF: */
+    explicit_bzero(key, sizeof key);           /* BSD, glibc */
+    memset_s(key, sizeof key, 0, sizeof key);  /* C11 annex K */
+    mbedtls_platform_zeroize(key, sizeof key);
+    sodium_memzero(key, sizeof key);
+    SecureZeroMemory(key, sizeof key);         /* Windows */
+
+    /* AND REMEMBER THE COPIES: a value in a register, a
+       stack spill, a DMA buffer, an unencrypted cache line.
+       Zeroing is best-effort; keeping the key in hardware
+       and never materialising it is the real answer.     */
+
+/* --- 6. THE SAME KEY FOR TWO PURPOSES --- */
+    Derive (chapter 10). Always.
+
+/* --- 7. TRANSPORTED FROM THE FACTORY --- */
+    If a key is generated outside the device and injected,
+    then it existed somewhere else, and that somewhere is now
+    part of your attack surface for the life of the product.
+    GENERATE ON-DEVICE, INSIDE THE SECURE ELEMENT
+    (chapter 16).                                         */</code></pre>
+
+<h2 id="hardware">Hardware key storage</h2>
+
+<p>The strongest protection is a key the software never sees at all — generated inside hardware and used there. This is what the various forms of that look like and what each actually guarantees.</p>
+
+<pre><code>/* IN INCREASING ORDER OF ASSURANCE AND COST.             */
+
+/* --- OTP FUSES / eFUSE --- */
+    One-time programmable bits in the SoC. Blown at
+    manufacture.
+      + cannot be changed, so cannot be rolled back
+      + readable by the boot ROM before software runs
+      - LIMITED SPACE, often a few hundred bits
+      - VISIBLE UNDER A MICROSCOPE if not protected;
+        decapsulation and optical or e-beam probing recovers
+        fuse state on older processes
+      - and once burned, WRONG IS FOREVER
+
+    USE FOR: root public key HASHES (chapter 16), device
+    serials, anti-rollback counters, lifecycle state.
+    PREFER NOT TO USE FOR: raw symmetric secrets, unless the
+    fuse block is a "hidden" region readable only by the
+    crypto engine.
+
+/* --- A HIDDEN/HW-ONLY KEY REGION --- */
+    Many SoCs have fuses wired DIRECTLY INTO THE AES ENGINE
+    and readable by nothing else. Software says "encrypt with
+    the hardware key"; software never sees the key. This is
+    the minimum bar for a device-unique storage key, and it
+    is often free on parts you already use - check the TRM.
+
+/* --- PUF: physically unclonable function --- */
+    Derives a key from manufacturing variation in SRAM
+    start-up values or ring oscillators, with error
+    correction and helper data.
+      + NO KEY IS STORED AT ALL - it exists only while
+        powered
+      + resistant to at-rest extraction
+      - needs careful error correction; helper data must not
+        leak the key
+      - ageing and temperature drift must be handled
+
+/* --- SECURE ELEMENT / SE --- */
+    A separate chip (ATECC608, SE050, OPTIGA) on I2C or SPI.
+      + keys GENERATED INSIDE and never exported
+      + tamper detection, active meshes, sensors
+      + certified against physical attack (Common Criteria)
+      + a monotonic counter and a real RNG
+      - an EXTERNAL BUS, so bind it to the host: the bus
+        traffic must be authenticated, or an attacker just
+        replays "authentication succeeded"
+
+/* --- TPM --- */
+    Standardised (TCG). PCRs for measured boot, sealing
+    (release a key only if the PCRs match an expected boot
+    state), attestation, monotonic counters. Discrete or
+    firmware.
+
+/* --- A TEE --- */
+    TrustZone and a trusted OS. Keys live in secure world
+    memory that the normal world cannot address at all. Much
+    more flexible than an SE, and much larger attack surface.
+    The isolation track covers this in depth.
+
+/* --- HSM --- */
+    For the SERVER side: the CA and signing keys. FIPS 140-3
+    Level 3+, tamper-responding, with multi-party
+    authorisation. YOUR FIRMWARE SIGNING KEY BELONGS IN ONE,
+    not on a build server (chapter 15).
+
+/* THE PRINCIPLE THAT UNIFIES ALL OF THESE:
+
+     THE BEST KEY STORAGE IS ONE WHERE THE KEY NEVER EXISTS
+     IN CPU-ADDRESSABLE MEMORY. You hand data in, you get
+     results out, and no software bug can leak what software
+     never held.                                          */</code></pre>
+
+<div class="key">
+<b>The Linux equivalents</b>
+<pre>keyctl / the kernel keyring   keys held in kernel memory,
+                              not in your process
+trusted keys                  sealed to a TPM or a TEE;
+                              userspace sees only a blob
+dm-crypt / LUKS2              volume key wrapped by an
+                              Argon2id-derived key (ch. 10)
+fscrypt                       per-directory file encryption
+Op-TEE + a TA                 keys never leave secure world</pre>
+<p>See the Linux track for the driver-side mechanics.</p>
+</div>
+
+<h2 id="atrest">Encrypting data at rest</h2>
+
+<p>When a key must be stored, it has to be protected by something — which raises the obvious question of what protects that, and where the recursion terminates.</p>
+
+<pre><code>/* --- THE KEY WRAPPING PATTERN, and use it everywhere --- */
+
+    DEK   Data Encryption Key    encrypts the actual data
+    KEK   Key Encryption Key     encrypts the DEK
+
+    stored:  wrapped_DEK = AES-KW(KEK, DEK)
+             ciphertext  = AES-GCM(DEK, data)
+
+/* WHY THE INDIRECTION:
+     · ROTATE THE KEK without re-encrypting terabytes -
+       unwrap and rewrap one small blob
+     · wrap the SAME DEK under SEVERAL KEKs: a user
+       password, a recovery key, a corporate escrow key
+     · the DEK can be random and full-strength even when the
+       KEK comes from a weak password
+     · CRYPTO-ERASE: destroy the wrapped DEK and the data is
+       instantly unrecoverable, however many copies exist.
+       This is how a "secure erase" completes in
+       milliseconds on an SSD.
+
+/* --- FULL-DISK ENCRYPTION AND THE SECTOR PROBLEM --- */
+    A disk sector must be encrypted in place: same size in,
+    same size out. THERE IS NO ROOM FOR A NONCE OR A TAG.
+
+    So FDE uses XTS-AES: a tweakable block cipher where the
+    SECTOR NUMBER is the tweak. Same plaintext in different
+    sectors gives different ciphertext.
+
+    AND THE HONEST LIMITATION: XTS PROVIDES NO INTEGRITY. An
+    attacker who can write to the disk can flip ciphertext
+    bits and corrupt the plaintext in a controlled,
+    block-local way. FDE protects a LOST OR STOLEN device; it
+    does not protect against an attacker who can modify the
+    storage while you keep using it.
+
+    IF YOU NEED INTEGRITY TOO: dm-verity for read-only
+    volumes (a Merkle tree, chapter 07), dm-integrity plus
+    dm-crypt for read-write, or a filesystem with built-in
+    authentication.
+
+/* --- FOR AN MCU WITH EXTERNAL FLASH --- */
+    struct record {
+        uint32_t version;      /* AAD - anti-rollback */
+        uint8_t  nonce[12];    /* from a monotonic counter */
+        uint8_t  ciphertext[N];
+        uint8_t  tag[16];
+    };
+
+    key = KDF(hw_unique_key, "config storage v1");
+
+    /* THE THREE THINGS TO GET RIGHT:
+       1. THE NONCE COUNTER MUST SURVIVE RESET. In flash,
+          not RAM. If it can ever restart, use
+          AES-GCM-SIV or XChaCha20 (chapter 09).
+       2. THE VERSION IS AUTHENTICATED, so an attacker
+          cannot restore an old config blob - that is a
+          rollback attack on your settings, and it is how
+          "factory reset the password" attacks work.
+       3. THE KEY IS DEVICE-UNIQUE, so a blob copied from
+          one unit does not decrypt on another.
+
+    /* AND ON WEAR LEVELLING: flash controllers move and copy
+       blocks. An "overwritten" secret may still be present
+       in a remapped block. Never rely on overwriting flash
+       to destroy a secret - CRYPTO-ERASE instead: destroy
+       the key and let the ciphertext rot.               */</code></pre>
+
+<h2 id="rotation">Rotation, revocation and destruction</h2>
+
+<p>Keys should change periodically, and doing so without breaking anything requires designing for it up front. Retrofitting rotation onto a deployed system is substantially harder.</p>
+
+<pre><code>/* --- WHY ROTATE --- */
+    · the AEAD usage limits (chapter 09)
+    · to bound the damage from an undetected compromise
+    · because someone left the company
+    · because an algorithm aged out
+
+/* --- HOW, WITHOUT AN OUTAGE --- */
+    Every stored or transmitted object carries a KEY ID:
+
+      struct blob {
+          uint8_t  key_id;      /* which key encrypted this */
+          uint8_t  nonce[12];
+          ...
+      };
+
+    ROLLOUT:
+      1. deploy the new key everywhere; keep accepting both
+      2. switch WRITERS to the new key
+      3. re-encrypt or let old data expire
+      4. remove the old key
+
+    A DESIGN WITH NO KEY ID CANNOT BE ROTATED WITHOUT A FLAG
+    DAY. Add the field on day one; it costs one byte.
+
+/* --- DESTRUCTION --- */
+    · overwrite the RAM copy with an explicit zeroise
+    · CRYPTO-ERASE anything on flash or disk
+    · blow a fuse to disable a key slot, if the hardware
+      supports it
+    · and for an HSM, use its documented zeroise procedure -
+      and get the certificate of destruction
+
+/* --- LIFECYCLE STATES, which the SoC usually enforces --- */
+      BLANK       -> nothing provisioned, debug wide open
+      DEVELOPMENT -> keys provisioned, JTAG open, TEST KEYS
+                     ONLY
+      SECURED     -> production keys, DEBUG DISABLED,
+                     secure boot enforced
+      RMA         -> a controlled path back to debug, which
+                     MUST ERASE ALL SECRETS FIRST
+      DECOMMISSIONED -> keys destroyed
+
+    THE TRANSITIONS ARE ONE-WAY AND FUSE-BACKED. THE RMA PATH
+    IS THE DANGEROUS ONE: if a returned device can be put
+    back into debug WITHOUT erasing its keys, an attacker
+    with physical access has a key extraction procedure that
+    the vendor documented for them. Verify that your SoC's
+    RMA transition erases, and that it cannot be triggered
+    without an authenticated command.
+
+/* --- AND FINALLY, THE PART THAT IS NOT TECHNICAL --- */
+    Write down, before the product ships:
+      · every key in the system, and where it lives
+      · who can access each one, and how that is enforced
+      · the rotation procedure for each
+      · what happens when each one is compromised
+      · who is called, and in what order
+
+    A COMPROMISE RESPONSE PLAN WRITTEN DURING AN INCIDENT IS
+    NOT A PLAN. The devices are in the field; the options
+    you have are the ones you designed in.               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Every unit of a product shares a key</td><td>Hardcoded in firmware — one extraction breaks the line</td></tr>
+<tr><td>Key found by <code>strings</code> on the image</td><td>Key compiled in</td></tr>
+<tr><td>Key recovered from a core dump</td><td><code>memset</code> optimised away, or no <code>mlock</code></td></tr>
+<tr><td>Config blob copied between devices works</td><td>Storage key not device-unique</td></tr>
+<tr><td>Old settings restored to bypass a lock</td><td>Version not authenticated — rollback on stored data</td></tr>
+<tr><td>Secret still present after "erase"</td><td>Flash wear levelling — needed crypto-erase</td></tr>
+<tr><td>Disk contents corrupted in a controlled way</td><td>XTS gives confidentiality, not integrity</td></tr>
+<tr><td>Secure element bypassed entirely</td><td>Unauthenticated I2C bus — responses replayed</td></tr>
+<tr><td>Cannot roll a key without a flag day</td><td>No key ID in the wire or storage format</td></tr>
+<tr><td>Returned device yields production keys</td><td>RMA transition re-enables debug without erasing</td></tr>
+<tr><td>Nonce repeats after a brownout</td><td>Counter kept in RAM instead of flash</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the key hierarchy and explain why only derived keys are ever used.</li>
+  <li>List seven places a key must never be, with the concrete attack for each.</li>
+  <li>Explain why <code>memset</code> may not clear a key and name three portable alternatives.</li>
+  <li>Compare fuses, PUFs, secure elements, TPMs, TEEs and HSMs on assurance and cost.</li>
+  <li>State the principle that unifies all good key storage.</li>
+  <li>Explain the DEK/KEK pattern and four things it enables.</li>
+  <li>Explain why FDE uses XTS and what XTS does not provide.</li>
+  <li>Write the three rules for encrypting a config blob on external flash.</li>
+  <li>Explain crypto-erase and why flash wear levelling makes it necessary.</li>
+  <li>Describe a zero-downtime key rotation and the one field it requires.</li>
+  <li>List the lifecycle states and say why RMA is the dangerous transition.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

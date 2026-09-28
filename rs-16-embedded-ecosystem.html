@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The embedded Rust ecosystem: PAC, HAL, RTIC, Embassy | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The embedded Rust ecosystem: PAC, HAL, RTIC, Embassy</h1>
+<p class="lead">The layered architecture that lets a driver written once run on every supported chip. This
+is the ecosystem's central achievement, and it has no equivalent in the C world where every vendor HAL is
+incompatible with every other.</p>
+
+<h2 id="layers">The layers</h2>
+
+<p>The embedded Rust ecosystem is unusually well layered, and knowing which layer you are working at tells you which crate to reach for and what it will assume.</p>
+
+<pre class="diagram">   +--------------------------------------------------+
+   |  APPLICATION                                      |
+   |  your firmware, or RTIC / Embassy tasks           |
+   +--------------------------------------------------+
+   |  DEVICE DRIVERS - portable                        |
+   |  generic over embedded-hal traits, so ONE driver  |
+   |  works on every chip                              |
+   +--------------------------------------------------+
+   |  embedded-hal   - THE TRAIT DEFINITIONS           |
+   |  SpiDevice, I2c, OutputPin, DelayNs, ...          |
+   +--------------------------------------------------+
+   |  HAL - per chip family                            |
+   |  stm32f4xx-hal, nrf52840-hal, esp-hal, rp2040-hal |
+   |  implements the traits; owns clocks, pins, DMA    |
+   +--------------------------------------------------+
+   |  PAC - Peripheral Access Crate                    |
+   |  GENERATED from the vendor's SVD file by svd2rust.|
+   |  Typed, safe register access. Contains the unsafe.|
+   +--------------------------------------------------+
+   |  cortex-m / riscv - the core itself               |
+   |  NVIC, SysTick, SCB, critical sections            |
+   +--------------------------------------------------+
+   |  cortex-m-rt - the startup and vector table       |
+   +--------------------------------------------------+
+
+   THE PAYOFF: a driver for an SPI display depends only on
+   embedded-hal. It compiles for STM32, nRF, ESP32 and RP2040
+   with no #ifdef, no porting layer, and no runtime cost -
+   because the concrete SPI type is a generic parameter,
+   monomorphised at the call site (chapter 06).
+
+   COMPARE C, where an ST driver uses HAL_SPI_Transmit, a
+   Nordic one uses nrfx_spim_xfer, and porting means
+   rewriting. crates.io has hundreds of sensor and display
+   drivers that work everywhere, because they were written
+   against one trait set.</pre>
+
+<h2 id="pac">The PAC</h2>
+
+<p>The lowest layer is generated rather than written, which is why register access is both safe and exhaustive in a way hand-written C headers rarely are.</p>
+
+<pre><code>/* GENERATED from the vendor's CMSIS-SVD file - the same XML
+   that generates the C headers - by svd2rust. So it covers
+   every register and field the vendor documented.        */
+
+    use stm32f4xx_hal::pac;
+
+    let p = pac::Peripherals::take().unwrap();  // SINGLETON
+                                                // (chapter 02)
+
+    // enable the GPIOC clock
+    p.RCC.ahb1enr.modify(|_, w| w.gpiocen().set_bit());
+
+    // set PC13 as output
+    p.GPIOC.moder.modify(|_, w| w.moder13().output());
+
+    // write it
+    p.GPIOC.bsrr.write(|w| w.bs13().set_bit());
+
+    // read a field
+    let mode = p.GPIOC.moder.read().moder13().bits();
+
+/* THE THREE ACCESS METHODS, and the distinction matters: */
+    reg.read()                  // -&gt; R, with field accessors
+    reg.write(|w| ...)          // RESET value, then your
+                                // changes. Fields you do not
+                                // mention are RESET.
+    reg.modify(|r, w| ...)      // read-modify-write. Fields
+                                // you do not mention are
+                                // PRESERVED.
+    unsafe { reg.write_with_zero(|w| ...) }   // start from
+                                              // zero
+
+/* USING `write` WHERE `modify` WAS MEANT is the commonest PAC
+   bug: it silently resets every other field in the register.
+
+/* WHAT THE TYPE SYSTEM GIVES YOU:
+     · a field name for every documented bit
+     · enum values for enumerated fields:
+         w.moder13().output()  not  w.bits(0b01)
+     · WRITE-ONLY fields cannot be read
+     · READ-ONLY fields cannot be written
+     · out-of-range values are compile errors
+     · a register that does not exist on this part is not in
+       the crate at all
+
+/* GENERATE ONE for a chip that has no crate: */
+    svd2rust -i vendor.svd --target cortex-m
+    form -i lib.rs -o src/ &amp;&amp; rm lib.rs
+    cargo fmt
+
+/* THE PAC IS TOO LOW-LEVEL FOR APPLICATION CODE - it is the
+   register map, not a driver. Use the HAL, and drop to the
+   PAC for the occasional register the HAL does not expose.
+   Every HAL re-exports its PAC for exactly that.        */</code></pre>
+
+<h2 id="hal">The HAL</h2>
+
+<p>Above the registers sits a chip-specific abstraction, and it uses the type system to make several classes of configuration error impossible to compile.</p>
+
+<pre><code>    use stm32f4xx_hal::{pac, prelude::*, gpio::Output,
+                        spi::Spi};
+
+    let dp = pac::Peripherals::take().unwrap();
+
+    // 1. CLOCKS - a builder that VALIDATES the configuration
+    let rcc = dp.RCC.constrain();
+    let clocks = rcc.cfgr
+        .use_hse(25.MHz())
+        .sysclk(100.MHz())
+        .pclk1(50.MHz())
+        .freeze();              // computes the PLL settings,
+                                // PANICS if impossible
+
+    // 2. SPLIT the GPIO port into individual PINS
+    let gpioa = dp.GPIOA.split();
+    let gpioc = dp.GPIOC.split();
+
+    // 3. CONFIGURE pins - the TYPE changes (chapter 02)
+    let mut led = gpioc.pc13.into_push_pull_output();
+    let sck  = gpioa.pa5.into_alternate();
+    let miso = gpioa.pa6.into_alternate();
+    let mosi = gpioa.pa7.into_alternate();
+
+    // 4. CONSTRUCT a peripheral, CONSUMING the pins
+    let spi = Spi::new(dp.SPI1, (sck, miso, mosi),
+                       Mode { polarity: IdleLow,
+                              phase: CaptureOnFirstTransition },
+                       1.MHz(), &amp;clocks);
+
+    // gpioa.pa5 no longer exists - it was MOVED into the SPI.
+    // Nothing else can reconfigure it. That is the ownership
+    // model applied to hardware (chapter 02).
+
+    led.set_high();
+    spi.write(&amp;[0x01, 0x02]).unwrap();
+
+/* WHAT THE HAL ADDS OVER THE PAC:
+     · clock tree configuration, computed and validated
+     · pin type-states, so a misconfigured pin is a compile
+       error
+     · peripherals that CONSUME their pins, preventing
+       conflicts
+     · implementations of the embedded-hal traits
+     · DMA integration
+     · sensible defaults
+
+/* AND THE TYPE-STATE PAYOFF: */
+    let pin = gpioa.pa5.into_floating_input();
+    spi = Spi::new(dp.SPI1, (pin, ...), ...);
+    // ERROR: expected Pin&lt;'A', 5, Alternate&lt;5&gt;&gt;,
+    //        found Pin&lt;'A', 5, Input&lt;Floating&gt;&gt;
+/* A wrong pin configuration - the single commonest embedded
+   bring-up bug - is caught by the compiler with a message
+   naming the expected mode.                              */</code></pre>
+
+<div class="key">
+<b>Ownership applied to hardware</b>
+<p>The <code>Peripherals::take()</code> singleton, the <code>split()</code> that yields one value per pin,
+and constructors that <em>consume</em> their pins together mean that two drivers cannot claim the same
+hardware. Not by convention, not by review — the second attempt does not compile. That is the single most
+valuable thing the embedded Rust ecosystem does, and it is a direct application of
+<a href="rs-02-ownership.html">chapter 02</a>.</p>
+</div>
+
+<h2 id="ehal">Writing a portable driver</h2>
+
+<p>This is the payoff of the whole stack: a driver written against the shared traits works on every microcontroller whose HAL implements them.</p>
+
+<pre><code>use embedded_hal::spi::SpiDevice;
+use embedded_hal::digital::OutputPin;
+use embedded_hal::delay::DelayNs;
+
+pub struct Display&lt;SPI, DC, RST&gt; {
+    spi: SPI,
+    dc: DC,
+    rst: RST,
+}
+
+impl&lt;SPI, DC, RST, E&gt; Display&lt;SPI, DC, RST&gt;
+where
+    SPI: SpiDevice&lt;Error = E&gt;,
+    DC:  OutputPin,
+    RST: OutputPin,
+{
+    pub fn new(spi: SPI, dc: DC, rst: RST) -> Self {
+        Self { spi, dc, rst }
+    }
+
+    pub fn init(&amp;mut self, delay: &amp;mut impl DelayNs)
+            -> Result&lt;(), Error&lt;E&gt;&gt;
+    {
+        self.rst.set_low().map_err(|_| Error::Pin)?;
+        delay.delay_ms(10);
+        self.rst.set_high().map_err(|_| Error::Pin)?;
+        delay.delay_ms(120);
+
+        self.command(0x11)?;            // sleep out
+        delay.delay_ms(120);
+        self.command(0x29)?;            // display on
+        Ok(())
+    }
+
+    fn command(&amp;mut self, c: u8) -> Result&lt;(), Error&lt;E&gt;&gt; {
+        self.dc.set_low().map_err(|_| Error::Pin)?;
+        self.spi.write(&amp;[c]).map_err(Error::Spi)
+    }
+
+    pub fn data(&amp;mut self, d: &amp;[u8]) -> Result&lt;(), Error&lt;E&gt;&gt; {
+        self.dc.set_high().map_err(|_| Error::Pin)?;
+        self.spi.write(d).map_err(Error::Spi)
+    }
+}
+
+/* THIS COMPILES for STM32, nRF52, ESP32, RP2040 and every
+   other chip with a HAL - unchanged. Publish it to crates.io
+   and it works for everyone.
+
+/* THE embedded-hal 1.0 TRAITS worth knowing: */
+    digital::{InputPin, OutputPin, StatefulOutputPin}
+    spi::{SpiBus, SpiDevice}        // Device includes CS
+                                    // management
+    i2c::I2c
+    delay::DelayNs
+    pwm::SetDutyCycle
+    embedded-hal-async::*           // the async versions,
+                                    // for Embassy
+    embedded-io::{Read, Write}      // byte streams
+    embedded-can, embedded-storage, embedded-nal
+
+/* THE DRIVER-AUTHOR CONVENTIONS:
+     · be generic over the traits, never over a concrete HAL
+     · take ownership of the peripherals you need
+     · define your own error enum, wrapping the bus error
+     · provide both blocking and async versions where it
+       matters
+     · no_std, and no default features that need std
+     · document the wiring in the crate docs             */</code></pre>
+
+<h2 id="rtic">RTIC</h2>
+
+<p>A concurrency framework built on the interrupt controller rather than on threads, with scheduling analysis done at compile time.</p>
+
+<pre><code>use rtic::app;
+
+#[app(device = stm32f4xx_hal::pac, peripherals = true,
+      dispatchers = [EXTI0, EXTI1])]
+mod app {
+    use super::*;
+
+    #[shared]                   // shared between tasks -
+    struct Shared {             // access requires .lock()
+        counter: u32,
+    }
+
+    #[local]                    // owned by exactly one task -
+    struct Local {              // NO locking needed
+        led: Output&lt;'static&gt;,
+    }
+
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local) {
+        let dp = cx.device;
+        // ... configure clocks, pins, peripherals ...
+        blink::spawn().unwrap();
+        (Shared { counter: 0 }, Local { led })
+    }
+
+    #[task(binds = TIM2, shared = [counter], priority = 3)]
+    fn on_timer(mut cx: on_timer::Context) {
+        cx.shared.counter.lock(|c| *c += 1);
+    }
+
+    #[task(local = [led], priority = 1)]
+    async fn blink(cx: blink::Context) {
+        loop {
+            cx.local.led.toggle();      // NO LOCK - it is
+                                        // local
+            Mono::delay(500.millis()).await;
+        }
+    }
+
+    #[idle(shared = [counter])]
+    fn idle(mut cx: idle::Context) -> ! {
+        loop {
+            let n = cx.shared.counter.lock(|c| *c);
+            cortex_m::asm::wfi();       // sleep until an
+                                        // interrupt
+        }
+    }
+}
+
+/* WHAT RTIC DOES AT COMPILE TIME:
+
+   · PRIORITY ASSIGNMENT: each task has a fixed priority,
+     mapped onto NVIC priorities.
+   · RESOURCE ANALYSIS: it computes each shared resource's
+     PRIORITY CEILING - the highest priority of any task
+     using it - and `lock()` raises BASEPRI only to that
+     ceiling.
+   · SO: a resource shared only between tasks of EQUAL
+     priority needs NO critical section at all, and lock()
+     compiles to nothing. A resource shared between priority
+     1 and 3 raises BASEPRI to 3 for the duration - blocking
+     only what could conflict, not all interrupts.
+   · DEADLOCK IS IMPOSSIBLE: the Stack Resource Policy
+     guarantees it, and the analysis is done by the macro.
+   · `#[local]` resources need no synchronisation at all,
+     because the type system proves one owner.
+
+   THIS IS A REAL-TIME KERNEL WITH NO RUNTIME. There is no
+   scheduler loop, no task control blocks, no context
+   switching code - the NVIC does the scheduling, and RTIC
+   only computes the correct priority masks. The generated
+   code is what a careful engineer would hand-write, and the
+   analysis is what they would get wrong.                */</code></pre>
+
+<h2 id="embassy">Embassy</h2>
+
+<p>The other approach: async/await as the concurrency model for firmware, which reads very differently from a state machine and compiles to something similar.</p>
+
+<pre><code>use embassy_executor::Spawner;
+use embassy_stm32::{gpio::{Level, Output, Speed}, i2c::I2c};
+use embassy_sync::{channel::Channel,
+                   blocking_mutex::raw::ThreadModeRawMutex};
+use embassy_time::{Duration, Timer};
+
+static CHANNEL: Channel&lt;ThreadModeRawMutex, Reading, 8&gt;
+        = Channel::new();
+
+#[embassy_executor::task]
+async fn blink(mut led: Output&lt;'static&gt;) {
+    loop {
+        led.toggle();
+        Timer::after_millis(500).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn sensor(mut i2c: I2c&lt;'static, Async&gt;) {
+    let mut buf = [0u8; 2];
+    loop {
+        // a real DMA transfer - the core SLEEPS during it
+        i2c.write_read(0x48, &amp;[0x00], &amp;mut buf).await.unwrap();
+        CHANNEL.send(Reading(i16::from_be_bytes(buf))).await;
+        Timer::after_secs(1).await;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+
+    spawner.spawn(blink(Output::new(p.PC13, Level::Low,
+                                    Speed::Low))).unwrap();
+    spawner.spawn(sensor(i2c)).unwrap();
+
+    loop {
+        let r = CHANNEL.receive().await;
+        defmt::info!("reading: {}", r.0);
+    }
+}
+
+/* WHAT EMBASSY PROVIDES:
+     · an async executor with no heap and no per-task stacks
+       (chapter 17)
+     · HALs for STM32, nRF, RP2040, ESP32 with ASYNC drivers
+       that use DMA and interrupts rather than polling
+     · embassy-time: timers, delays, timeouts
+     · embassy-sync: Channel, Mutex, Signal, PubSub - all
+       no-alloc
+     · embassy-net: a full TCP/IP stack
+     · embassy-usb: a USB device stack
+     · AUTOMATIC POWER MANAGEMENT: the executor executes WFI
+       when nothing is ready, so an idle system draws
+       microamps with no code from you
+
+/* RTIC OR EMBASSY?
+
+     RTIC     PREEMPTIVE, priority-driven, hard real-time.
+              Compile-time resource analysis. Best when
+              latency bounds matter and the work is
+              interrupt-shaped.
+
+     EMBASSY  COOPERATIVE, async. Best when the work is
+              I/O-shaped - network, USB, several sensors -
+              and readability matters. Sequential-looking
+              code for concurrent logic.
+
+     BOTH TOGETHER: RTIC can run an Embassy executor in a
+     low-priority task, giving hard real-time for the
+     critical path and async for everything else. That
+     combination is increasingly the answer for a complex
+     device.                                              */</code></pre>
+
+<h2 id="tooling">Tooling and where to look</h2>
+
+<p>The debugging and flashing tools, which are one of the ecosystem's genuine strengths and are worth setting up before you need them.</p>
+
+<pre><code># --- INSTALL ---
+    rustup target add thumbv7em-none-eabihf   # Cortex-M4F
+    rustup target add thumbv6m-none-eabi      # M0/M0+
+    rustup target add riscv32imac-unknown-none-elf
+    cargo install probe-rs-tools cargo-binutils cargo-embed \
+                  flip-link cargo-generate
+    rustup component add llvm-tools
+
+# --- START A PROJECT from a template ---
+    cargo generate --git https://github.com/rust-embedded/cortex-m-quickstart
+    cargo generate --git https://github.com/embassy-rs/embassy \
+                   template
+
+# --- THE DAILY LOOP ---
+    cargo run --release         # build, flash, run, stream
+                                # logs
+    cargo embed                 # a TUI with RTT
+    probe-rs attach --chip STM32F411RETx
+    cargo size --release -- -A
+    cargo bloat --release -n 20
+
+# --- WHERE TO LOOK ---
+    https://docs.rust-embedded.org/book/       the Embedded
+                                               Book
+    https://docs.rust-embedded.org/discovery/  a hands-on
+                                               course
+    https://embassy.dev/book/
+    https://rtic.rs/
+    https://github.com/rust-embedded/awesome-embedded-rust
+    the Matrix room #rust-embedded:matrix.org
+
+# --- MATURITY, honestly, as of 2026 ---
+    EXCELLENT:  Cortex-M (STM32, nRF, RP2040/2350), ESP32,
+                RISC-V
+    GOOD:       Cortex-A bare metal, drivers for common
+                sensors and displays
+    EMERGING:   safety certification (Ferrocene is qualified
+                for ISO 26262 and IEC 61508), vendor support,
+                DSP-heavy work
+    THIN:       obscure MCUs, some vendor radio stacks,
+                certified medical and avionics toolchains
+
+# CHECK THAT YOUR SPECIFIC CHIP HAS A MAINTAINED HAL before
+# committing. A PAC alone is workable but means writing the
+# HAL layer yourself.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td><code>Peripherals::take()</code> returns <code>None</code></td><td>Called twice — by design</td></tr>
+<tr><td>"expected <code>Alternate&lt;5&gt;</code>, found <code>Input</code>"</td><td>Pin not configured for that peripheral — the type-state working</td></tr>
+<tr><td>A register field was reset unexpectedly</td><td>Used <code>write</code> where <code>modify</code> was meant</td></tr>
+<tr><td>The peripheral does nothing</td><td>Clock not enabled — the HAL usually does it, the PAC does not</td></tr>
+<tr><td><code>clocks.freeze()</code> panics</td><td>The requested clock tree is unachievable — read the constraint it names</td></tr>
+<tr><td>A driver will not compile on another chip</td><td>It depends on a concrete HAL rather than <code>embedded-hal</code></td></tr>
+<tr><td>RTIC reports a priority error</td><td>A real ceiling violation, found at compile time</td></tr>
+<tr><td>An RTIC task never runs</td><td>Not spawned, or no dispatcher interrupt free</td></tr>
+<tr><td>Embassy task stalls everything</td><td>A blocking call or a loop with no await (<a href="rs-14-async.html">ch. 17</a>)</td></tr>
+<tr><td>Power never drops</td><td>Polling instead of awaiting a real interrupt</td></tr>
+<tr><td>No HAL for your chip</td><td>Generate a PAC with svd2rust and write the thin HAL layer</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the layer diagram and say what each layer contributes.</li>
+  <li>Explain what a PAC is generated from and what its type system prevents.</li>
+  <li>Distinguish <code>read</code>, <code>write</code> and <code>modify</code>, and the bug from
+  confusing two.</li>
+  <li>Explain how <code>take</code>, <code>split</code> and consuming constructors prevent hardware
+  conflicts.</li>
+  <li>Show how pin type-states catch a misconfiguration at compile time.</li>
+  <li>Write a driver generic over <code>embedded-hal</code> and say why it is portable and free.</li>
+  <li>Explain what RTIC computes at compile time and why some locks cost nothing.</li>
+  <li>Explain why RTIC cannot deadlock.</li>
+  <li>Write an Embassy application with two tasks and a channel.</li>
+  <li>Choose between RTIC and Embassy for two different products, and say when to use both.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

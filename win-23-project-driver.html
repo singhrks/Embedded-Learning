@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the KMDF ring-buffer driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the KMDF ring-buffer driver</h1>
+<p class="lead">A complete, working Windows driver you build, sign, install and break yourself. It needs no
+hardware — it installs as a software device — and it exercises queues, IOCTLs, asynchronous completion,
+timers, locking and the full PnP lifecycle. Deliberately the same problem as the Linux project in
+<a href="lx-28-project-ringbuf.html">chapter 36</a>, so the comparison teaches as much as the code.</p>
+
+<h2 id="what">What you are building</h2>
+
+<p>This is the first full project, and it deliberately uses nearly everything from the preceding chapters at once. Read this section before writing anything — knowing what the finished driver does makes the code far easier to hold in your head.</p>
+
+<pre class="diagram">   \\.\RingBuf                    a software device
+
+   WriteFile()                    push bytes into a ring
+   ReadFile()                     pop bytes; BLOCKS if empty,
+                                  completing asynchronously
+   IOCTL_RB_GET_STATS             counters
+   IOCTL_RB_RESET                 empty it
+   IOCTL_RB_SET_CONFIG            capacity policy
+
+   A periodic timer generates synthetic data, standing in for
+   an interrupt - so the asynchronous completion path is real
+   even without hardware.
+
+  WHAT IT EXERCISES:
+     WDF object model and contexts       (chapter 14)
+     the device lifecycle                (chapter 15)
+     default and manual queues           (chapter 16)
+     asynchronous completion from a DPC  (chapter 11)
+     IOCTL design and validation         (chapter 17)
+     spinlocks and IRQL discipline       (chapters 03, 10)
+     an INF and installation             (chapter 20)
+     Driver Verifier and WinDbg          (chapters 22, 23)
+
+  That is most of the track, in about 600 lines.</pre>
+
+<h2 id="files">The files</h2>
+
+<p>A real driver is several files, split so that the interface applications depend on is separate from the implementation that may change freely. That separation is the ABI distinction from chapter 01 made concrete.</p>
+
+<pre><code>ringbuf\
+  ringbuf.h          shared with user mode - the ABI
+  driver.h           internal definitions
+  driver.c           DriverEntry, EvtDeviceAdd
+  queue.c            the I/O callbacks
+  ring.c             the buffer itself
+  ringbuf.inf
+  ringbuf.vcxproj
+  test\
+    rbtest.c         the client (chapter 26)</code></pre>
+
+<h2 id="abi">ringbuf.h — the shared ABI</h2>
+
+<p>Start with the header, because it is the part you can never change once an application uses it. Everything else in this project can be rewritten; these definitions are a promise.</p>
+
+<pre><code>#pragma once
+
+#include &lt;initguid.h&gt;
+
+// {8F3A2B1C-4D5E-6F70-8192-A3B4C5D6E7F8}
+DEFINE_GUID(GUID_DEVINTERFACE_RINGBUF,
+    0x8f3a2b1c, 0x4d5e, 0x6f70, 0x81, 0x92,
+    0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8);
+
+#define RB_DEVICE_TYPE   0x8123
+
+typedef struct _RB_STATS {
+        UINT32 Capacity;
+        UINT32 Used;
+        UINT64 BytesWritten;
+        UINT64 BytesRead;
+        UINT64 Drops;
+        UINT64 TimerTicks;
+        UINT32 PendingReads;
+        UINT32 Reserved[7];        /* MUST be zero */
+} RB_STATS, *PRB_STATS;
+
+typedef struct _RB_CONFIG {
+        UINT32 Overwrite;          /* 0 or 1 */
+        UINT32 TimerPeriodMs;      /* 0 disables the generator */
+        UINT32 Reserved[6];
+} RB_CONFIG, *PRB_CONFIG;
+
+#define IOCTL_RB_GET_STATS \
+    CTL_CODE(RB_DEVICE_TYPE, 0x800, METHOD_BUFFERED, \
+             FILE_READ_ACCESS)
+
+#define IOCTL_RB_RESET \
+    CTL_CODE(RB_DEVICE_TYPE, 0x801, METHOD_BUFFERED, \
+             FILE_WRITE_ACCESS)
+
+#define IOCTL_RB_SET_CONFIG \
+    CTL_CODE(RB_DEVICE_TYPE, 0x802, METHOD_BUFFERED, \
+             FILE_WRITE_ACCESS)
+
+#define IOCTL_RB_GET_CONFIG \
+    CTL_CODE(RB_DEVICE_TYPE, 0x803, METHOD_BUFFERED, \
+             FILE_READ_ACCESS)
+
+/* NOTE the Access fields: GET_* need only read access,
+   SET_* and RESET require write. The I/O manager enforces
+   this before the driver sees the request (chapter 17) -
+   free, correct access control.                          */</code></pre>
+
+<h2 id="driverh">driver.h</h2>
+
+<p>The private header holds the device context — the per-device state the framework hands back to you on every callback — and the declarations shared between the driver's own source files.</p>
+
+<pre><code>#pragma once
+
+#include &lt;ntddk.h&gt;
+#include &lt;wdf.h&gt;
+#include "ringbuf.h"
+
+#define RB_POOL_TAG        'FBgR'      /* shows as "RgBF" */
+#define RB_DEFAULT_CAPACITY 4096
+#define RB_MAX_CAPACITY     (1 * 1024 * 1024)
+
+typedef struct _RB_CONTEXT {
+        WDFDEVICE       Device;
+        WDFQUEUE        DefaultQueue;
+        WDFQUEUE        PendingReadQueue;   /* manual */
+        WDFTIMER        Timer;
+        WDFSPINLOCK     Lock;
+
+        PUCHAR          Buffer;
+        ULONG           Capacity;           /* power of two */
+        ULONG           Head;               /* free-running */
+        ULONG           Tail;
+
+        BOOLEAN         Overwrite;
+        ULONG           TimerPeriodMs;
+
+        ULONG64         BytesWritten;
+        ULONG64         BytesRead;
+        ULONG64         Drops;
+        ULONG64         TimerTicks;
+        ULONG           PendingReads;
+} RB_CONTEXT, *PRB_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RB_CONTEXT, RbGetContext)
+
+DRIVER_INITIALIZE                      DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD              RbEvtDeviceAdd;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP         RbEvtDeviceCleanup;
+EVT_WDF_IO_QUEUE_IO_READ               RbEvtIoRead;
+EVT_WDF_IO_QUEUE_IO_WRITE              RbEvtIoWrite;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL     RbEvtIoDeviceControl;
+EVT_WDF_TIMER                          RbEvtTimer;
+
+/* ring.c - all callers must hold ctx-&gt;Lock */
+ULONG RbUsed(_In_ PRB_CONTEXT Ctx);
+ULONG RbSpace(_In_ PRB_CONTEXT Ctx);
+ULONG RbPush(_In_ PRB_CONTEXT Ctx, _In_reads_bytes_(Len)
+             const UCHAR *Src, _In_ ULONG Len);
+ULONG RbPop(_In_ PRB_CONTEXT Ctx, _Out_writes_bytes_(Len)
+            UCHAR *Dst, _In_ ULONG Len);
+VOID  RbCompletePendingReads(_In_ PRB_CONTEXT Ctx);</code></pre>
+
+<h2 id="driverc">driver.c</h2>
+
+<p>This file is the entry point and the device lifecycle: what happens at load, at device arrival, and at each power transition. Compare it with chapter 15's sequence as you read.</p>
+
+<pre><code>#include "driver.h"
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text (INIT, DriverEntry)
+#pragma alloc_text (PAGE, RbEvtDeviceAdd)
+#endif
+
+NTSTATUS
+DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
+            _In_ PUNICODE_STRING RegistryPath)
+{
+        WDF_DRIVER_CONFIG config;
+        NTSTATUS status;
+
+        WDF_DRIVER_CONFIG_INIT(&amp;config, RbEvtDeviceAdd);
+
+        status = WdfDriverCreate(DriverObject, RegistryPath,
+                                 WDF_NO_OBJECT_ATTRIBUTES,
+                                 &amp;config, WDF_NO_HANDLE);
+        if (!NT_SUCCESS(status))
+                KdPrint(("ringbuf: WdfDriverCreate 0x%x\n",
+                         status));
+
+        return status;
+}
+
+NTSTATUS
+RbEvtDeviceAdd(_In_ WDFDRIVER Driver,
+               _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+        WDF_OBJECT_ATTRIBUTES attributes;
+        WDF_IO_QUEUE_CONFIG queueConfig;
+        WDF_TIMER_CONFIG timerConfig;
+        WDFDEVICE device;
+        PRB_CONTEXT ctx;
+        NTSTATUS status;
+
+        UNREFERENCED_PARAMETER(Driver);
+        PAGED_CODE();
+
+        /* buffered I/O: the framework copies user buffers for
+           us, safe at any IRQL (chapter 08)                */
+        WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+
+        /* who may open it (chapter 04). Administrators and
+           SYSTEM only - tighten or loosen deliberately.    */
+        {
+                DECLARE_CONST_UNICODE_STRING(sddl,
+                        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+                status = WdfDeviceInitAssignSDDLString(
+                                DeviceInit, &amp;sddl);
+                if (!NT_SUCCESS(status))
+                        return status;
+        }
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attributes,
+                                                RB_CONTEXT);
+        attributes.EvtCleanupCallback = RbEvtDeviceCleanup;
+
+        status = WdfDeviceCreate(&amp;DeviceInit, &amp;attributes,
+                                 &amp;device);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        ctx = RbGetContext(device);
+        ctx-&gt;Device        = device;
+        ctx-&gt;Capacity      = RB_DEFAULT_CAPACITY;
+        ctx-&gt;TimerPeriodMs = 100;
+        ctx-&gt;Overwrite     = TRUE;
+
+        /* the ring itself - NON-PAGED, because the timer DPC
+           touches it at DISPATCH_LEVEL (chapter 07)        */
+        ctx-&gt;Buffer = (PUCHAR)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        ctx-&gt;Capacity, RB_POOL_TAG);
+        if (ctx-&gt;Buffer == NULL)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        /* a lock, parented to the device (chapter 14) */
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attributes);
+        attributes.ParentObject = device;
+        status = WdfSpinLockCreate(&amp;attributes, &amp;ctx-&gt;Lock);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* the default queue - parallel dispatch */
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                        WdfIoQueueDispatchParallel);
+        queueConfig.EvtIoRead          = RbEvtIoRead;
+        queueConfig.EvtIoWrite         = RbEvtIoWrite;
+        queueConfig.EvtIoDeviceControl = RbEvtIoDeviceControl;
+
+        status = WdfIoQueueCreate(device, &amp;queueConfig,
+                        WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;ctx-&gt;DefaultQueue);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* the manual queue for pending reads. NOT power
+           managed, because the timer DPC retrieves from it
+           (chapter 16).                                    */
+        WDF_IO_QUEUE_CONFIG_INIT(&amp;queueConfig,
+                        WdfIoQueueDispatchManual);
+        queueConfig.PowerManaged = WdfFalse;
+
+        status = WdfIoQueueCreate(device, &amp;queueConfig,
+                        WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;ctx-&gt;PendingReadQueue);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* the data generator, standing in for an interrupt */
+        WDF_TIMER_CONFIG_INIT_PERIODIC(&amp;timerConfig,
+                                       RbEvtTimer,
+                                       ctx-&gt;TimerPeriodMs);
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attributes);
+        attributes.ParentObject = device;
+
+        status = WdfTimerCreate(&amp;timerConfig, &amp;attributes,
+                                &amp;ctx-&gt;Timer);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* publish the interface LAST (chapter 18) */
+        status = WdfDeviceCreateDeviceInterface(device,
+                        &amp;GUID_DEVINTERFACE_RINGBUF, NULL);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        WdfTimerStart(ctx-&gt;Timer,
+                      WDF_REL_TIMEOUT_IN_MS(ctx-&gt;TimerPeriodMs));
+
+        KdPrint(("ringbuf: ready, %lu bytes\n", ctx-&gt;Capacity));
+        return STATUS_SUCCESS;
+}
+
+VOID
+RbEvtDeviceCleanup(_In_ WDFOBJECT Object)
+{
+        PRB_CONTEXT ctx = RbGetContext(Object);
+
+        /* stop the timer AND WAIT (chapter 11) - otherwise it
+           can fire against the buffer we are about to free */
+        if (ctx-&gt;Timer)
+                WdfTimerStop(ctx-&gt;Timer, TRUE);
+
+        if (ctx-&gt;Buffer) {
+                ExFreePoolWithTag(ctx-&gt;Buffer, RB_POOL_TAG);
+                ctx-&gt;Buffer = NULL;
+        }
+
+        /* every WDF object is parented to the device and dies
+           with it - no other cleanup needed (chapter 14)   */
+}</code></pre>
+
+<h2 id="ringc">ring.c</h2>
+
+<p>The ring buffer itself, deliberately kept free of any framework code. Isolating the pure logic like this is what makes it testable and what makes the locking easy to reason about.</p>
+
+<pre><code>#include "driver.h"
+
+/* Free-running Head and Tail; unsigned wraparound removes the
+   full-versus-empty ambiguity entirely. Same trick as the
+   Linux version (chapter 36).                             */
+
+ULONG RbUsed(_In_ PRB_CONTEXT Ctx)
+{
+        return Ctx-&gt;Head - Ctx-&gt;Tail;
+}
+
+ULONG RbSpace(_In_ PRB_CONTEXT Ctx)
+{
+        return Ctx-&gt;Capacity - RbUsed(Ctx);
+}
+
+ULONG
+RbPush(_In_ PRB_CONTEXT Ctx,
+       _In_reads_bytes_(Len) const UCHAR *Src, _In_ ULONG Len)
+{
+        ULONG n, first, mask = Ctx-&gt;Capacity - 1;
+
+        if (Ctx-&gt;Overwrite) {
+                if (Len &gt; Ctx-&gt;Capacity) {
+                        Src += Len - Ctx-&gt;Capacity;
+                        Ctx-&gt;Drops += Len - Ctx-&gt;Capacity;
+                        Len = Ctx-&gt;Capacity;
+                }
+                if (Len &gt; RbSpace(Ctx)) {
+                        ULONG discard = Len - RbSpace(Ctx);
+
+                        Ctx-&gt;Tail  += discard;
+                        Ctx-&gt;Drops += discard;
+                }
+                n = Len;
+        } else {
+                n = min(Len, RbSpace(Ctx));
+        }
+
+        first = min(n, Ctx-&gt;Capacity - (Ctx-&gt;Head &amp; mask));
+        RtlCopyMemory(Ctx-&gt;Buffer + (Ctx-&gt;Head &amp; mask),
+                      Src, first);
+        if (n &gt; first)
+                RtlCopyMemory(Ctx-&gt;Buffer, Src + first,
+                              n - first);
+
+        Ctx-&gt;Head         += n;
+        Ctx-&gt;BytesWritten += n;
+        return n;
+}
+
+ULONG
+RbPop(_In_ PRB_CONTEXT Ctx,
+      _Out_writes_bytes_(Len) UCHAR *Dst, _In_ ULONG Len)
+{
+        ULONG n, first, mask = Ctx-&gt;Capacity - 1;
+
+        n = min(Len, RbUsed(Ctx));
+
+        first = min(n, Ctx-&gt;Capacity - (Ctx-&gt;Tail &amp; mask));
+        RtlCopyMemory(Dst, Ctx-&gt;Buffer + (Ctx-&gt;Tail &amp; mask),
+                      first);
+        if (n &gt; first)
+                RtlCopyMemory(Dst + first, Ctx-&gt;Buffer,
+                              n - first);
+
+        Ctx-&gt;Tail      += n;
+        Ctx-&gt;BytesRead += n;
+        return n;
+}
+
+/* Called from the timer DPC and from write, WITHOUT the lock
+   held - it takes the lock itself around each pop.        */
+VOID
+RbCompletePendingReads(_In_ PRB_CONTEXT Ctx)
+{
+        WDFREQUEST request;
+        NTSTATUS status;
+
+        for (;;) {
+                PVOID buffer;
+                size_t bufLen;
+                ULONG got;
+
+                status = WdfIoQueueRetrieveNextRequest(
+                                Ctx-&gt;PendingReadQueue,
+                                &amp;request);
+                if (!NT_SUCCESS(status))
+                        break;      /* nobody waiting */
+
+                /* WE NOW OWN THIS REQUEST. It cannot be
+                   cancelled behind us (chapter 16) - so it
+                   MUST be completed on every path below.  */
+
+                status = WdfRequestRetrieveOutputBuffer(request,
+                                1, &amp;buffer, &amp;bufLen);
+                if (!NT_SUCCESS(status)) {
+                        WdfRequestComplete(request, status);
+                        continue;
+                }
+
+                WdfSpinLockAcquire(Ctx-&gt;Lock);
+                got = RbPop(Ctx, (PUCHAR)buffer,
+                            (ULONG)min(bufLen, MAXULONG));
+                if (got)
+                        Ctx-&gt;PendingReads--;
+                WdfSpinLockRelease(Ctx-&gt;Lock);
+
+                if (got == 0) {
+                        /* raced - nothing left. Put it back
+                           rather than completing it with
+                           zero, which userspace would read as
+                           end of file (chapter 21 of the
+                           Linux track).                    */
+                        status = WdfRequestForwardToIoQueue(
+                                request, Ctx-&gt;PendingReadQueue);
+                        if (!NT_SUCCESS(status))
+                                WdfRequestComplete(request,
+                                                   status);
+                        break;
+                }
+
+                WdfRequestCompleteWithInformation(request,
+                                STATUS_SUCCESS, got);
+        }
+}</code></pre>
+
+<h2 id="queuec">queue.c</h2>
+
+<p>Where requests actually arrive. This is chapter 16's queues and chapter 17's IOCTLs in their final form, including the cancellation handling that the bench test will never exercise on its own.</p>
+
+<pre><code>#include "driver.h"
+
+VOID
+RbEvtIoRead(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+            _In_ size_t Length)
+{
+        PRB_CONTEXT ctx = RbGetContext(
+                        WdfIoQueueGetDevice(Queue));
+        PVOID buffer;
+        size_t bufLen;
+        ULONG got;
+        NTSTATUS status;
+
+        if (Length == 0) {
+                WdfRequestComplete(Request, STATUS_SUCCESS);
+                return;
+        }
+
+        status = WdfRequestRetrieveOutputBuffer(Request, 1,
+                                                &amp;buffer, &amp;bufLen);
+        if (!NT_SUCCESS(status)) {
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        got = RbPop(ctx, (PUCHAR)buffer,
+                    (ULONG)min(bufLen, MAXULONG));
+        if (got == 0)
+                ctx-&gt;PendingReads++;
+        WdfSpinLockRelease(ctx-&gt;Lock);
+
+        if (got) {
+                WdfRequestCompleteWithInformation(Request,
+                                STATUS_SUCCESS, got);
+                return;
+        }
+
+        /* nothing available - park it. The framework now owns
+           cancellation and cleanup for this request.      */
+        status = WdfRequestForwardToIoQueue(Request,
+                                ctx-&gt;PendingReadQueue);
+        if (!NT_SUCCESS(status)) {
+                WdfSpinLockAcquire(ctx-&gt;Lock);
+                ctx-&gt;PendingReads--;
+                WdfSpinLockRelease(ctx-&gt;Lock);
+                WdfRequestComplete(Request, status);
+        }
+}
+
+VOID
+RbEvtIoWrite(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+             _In_ size_t Length)
+{
+        PRB_CONTEXT ctx = RbGetContext(
+                        WdfIoQueueGetDevice(Queue));
+        PVOID buffer;
+        size_t bufLen;
+        ULONG pushed;
+        NTSTATUS status;
+
+        if (Length == 0) {
+                WdfRequestComplete(Request, STATUS_SUCCESS);
+                return;
+        }
+
+        status = WdfRequestRetrieveInputBuffer(Request, 1,
+                                               &amp;buffer, &amp;bufLen);
+        if (!NT_SUCCESS(status)) {
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        pushed = RbPush(ctx, (const UCHAR *)buffer,
+                        (ULONG)min(bufLen, MAXULONG));
+        WdfSpinLockRelease(ctx-&gt;Lock);
+
+        /* wake anyone waiting - OUTSIDE the lock, because
+           completing a request can be slow                */
+        if (pushed)
+                RbCompletePendingReads(ctx);
+
+        WdfRequestCompleteWithInformation(Request,
+                        STATUS_SUCCESS, pushed);
+}
+
+VOID
+RbEvtTimer(_In_ WDFTIMER Timer)
+{
+        PRB_CONTEXT ctx = RbGetContext(
+                        WdfTimerGetParentObject(Timer));
+        UCHAR sample[16];
+        ULONG i;
+
+        /* DISPATCH_LEVEL. No paged memory, no blocking
+           (chapter 03).                                    */
+
+        WdfSpinLockAcquire(ctx-&gt;Lock);
+        ctx-&gt;TimerTicks++;
+        for (i = 0; i &lt; sizeof(sample); i++)
+                sample[i] = (UCHAR)(ctx-&gt;TimerTicks + i);
+        RbPush(ctx, sample, sizeof(sample));
+        WdfSpinLockRelease(ctx-&gt;Lock);
+
+        RbCompletePendingReads(ctx);
+}
+
+VOID
+RbEvtIoDeviceControl(_In_ WDFQUEUE Queue,
+                     _In_ WDFREQUEST Request,
+                     _In_ size_t OutputBufferLength,
+                     _In_ size_t InputBufferLength,
+                     _In_ ULONG IoControlCode)
+{
+        PRB_CONTEXT ctx = RbGetContext(
+                        WdfIoQueueGetDevice(Queue));
+        NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+        size_t info = 0;
+
+        UNREFERENCED_PARAMETER(OutputBufferLength);
+        UNREFERENCED_PARAMETER(InputBufferLength);
+
+        switch (IoControlCode) {
+
+        case IOCTL_RB_GET_STATS: {
+                PRB_STATS st;
+
+                status = WdfRequestRetrieveOutputBuffer(Request,
+                                sizeof(RB_STATS),
+                                (PVOID *)&amp;st, NULL);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                RtlZeroMemory(st, sizeof(*st));
+
+                WdfSpinLockAcquire(ctx-&gt;Lock);
+                st-&gt;Capacity     = ctx-&gt;Capacity;
+                st-&gt;Used         = RbUsed(ctx);
+                st-&gt;BytesWritten = ctx-&gt;BytesWritten;
+                st-&gt;BytesRead    = ctx-&gt;BytesRead;
+                st-&gt;Drops        = ctx-&gt;Drops;
+                st-&gt;TimerTicks   = ctx-&gt;TimerTicks;
+                st-&gt;PendingReads = ctx-&gt;PendingReads;
+                WdfSpinLockRelease(ctx-&gt;Lock);
+
+                info = sizeof(RB_STATS);
+                status = STATUS_SUCCESS;
+                break;
+        }
+
+        case IOCTL_RB_RESET:
+                WdfSpinLockAcquire(ctx-&gt;Lock);
+                ctx-&gt;Head = ctx-&gt;Tail = 0;
+                WdfSpinLockRelease(ctx-&gt;Lock);
+                status = STATUS_SUCCESS;
+                break;
+
+        case IOCTL_RB_SET_CONFIG: {
+                PRB_CONFIG cfg;
+                RB_CONFIG local;
+
+                status = WdfRequestRetrieveInputBuffer(Request,
+                                sizeof(RB_CONFIG),
+                                (PVOID *)&amp;cfg, NULL);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                /* COPY IN, then validate the copy
+                   (chapter 17)                             */
+                RtlCopyMemory(&amp;local, cfg, sizeof(local));
+
+                if (local.Overwrite &gt; 1) {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+                if (local.TimerPeriodMs &gt; 10000) {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+
+                WdfSpinLockAcquire(ctx-&gt;Lock);
+                ctx-&gt;Overwrite     = (BOOLEAN)local.Overwrite;
+                ctx-&gt;TimerPeriodMs = local.TimerPeriodMs;
+                WdfSpinLockRelease(ctx-&gt;Lock);
+
+                WdfTimerStop(ctx-&gt;Timer, FALSE);
+                if (local.TimerPeriodMs)
+                        WdfTimerStart(ctx-&gt;Timer,
+                                WDF_REL_TIMEOUT_IN_MS(
+                                        local.TimerPeriodMs));
+
+                status = STATUS_SUCCESS;
+                break;
+        }
+
+        case IOCTL_RB_GET_CONFIG: {
+                PRB_CONFIG cfg;
+
+                status = WdfRequestRetrieveOutputBuffer(Request,
+                                sizeof(RB_CONFIG),
+                                (PVOID *)&amp;cfg, NULL);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                RtlZeroMemory(cfg, sizeof(*cfg));
+                cfg-&gt;Overwrite     = ctx-&gt;Overwrite;
+                cfg-&gt;TimerPeriodMs = ctx-&gt;TimerPeriodMs;
+                info = sizeof(RB_CONFIG);
+                status = STATUS_SUCCESS;
+                break;
+        }
+
+        default:
+                break;
+        }
+
+        WdfRequestCompleteWithInformation(Request, status, info);
+}</code></pre>
+
+<h2 id="inf">ringbuf.inf</h2>
+
+<p>Without an INF nothing installs, so this file is what turns a compiled binary into something Windows will load. It is short, and every line of it matters.</p>
+
+<pre><code>[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = ringbuf.cat
+DriverVer   = 03/15/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+ringbuf.sys = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64,NTarm64
+
+; a ROOT-enumerated software device - no hardware needed
+[Standard.NTamd64]
+%DeviceDesc% = RingBuf_Install, root\ringbuf
+
+[Standard.NTarm64]
+%DeviceDesc% = RingBuf_Install, root\ringbuf
+
+[RingBuf_Install.NT]
+CopyFiles = RingBuf_CopyFiles
+
+[RingBuf_CopyFiles]
+ringbuf.sys
+
+[RingBuf_Install.NT.Services]
+AddService = ringbuf, 0x00000002, RingBuf_Service
+
+[RingBuf_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\ringbuf.sys
+
+[RingBuf_Install.NT.Wdf]
+KmdfService = ringbuf, RingBuf_wdfsect
+
+[RingBuf_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+ProviderName = "Embedded Learning Hub"
+DiskName     = "RingBuf Installation Disk"
+DeviceDesc   = "RingBuf Test Device"
+ServiceDesc  = "RingBuf Driver"</code></pre>
+
+<h2 id="build">Building and installing</h2>
+
+<p>With everything written, this is the loop you will repeat dozens of times: build, deploy to the test machine, install, exercise, read the trace. Making it fast is worth the setup effort.</p>
+
+<pre><code># --- On the DEVELOPMENT machine ---
+    msbuild ringbuf.vcxproj /p:Configuration=Debug \
+            /p:Platform=x64
+    ; the WDK template signs it with a test certificate
+
+# --- On the TEST machine (a VM), once ---
+    bcdedit /set testsigning on
+    bcdedit /debug on
+    bcdedit /dbgsettings serial debugport:1 baudrate:115200
+    shutdown /r /t 0
+
+# --- Install ---
+    certmgr /add ringbuf.cer /s /r localMachine root
+    certmgr /add ringbuf.cer /s /r localMachine trustedpublisher
+
+    pnputil /add-driver ringbuf.inf /install
+    devcon install ringbuf.inf root\ringbuf
+
+# --- Verify it started ---
+    devcon status root\ringbuf
+      root\ringbuf\0000
+          Name: RingBuf Test Device
+          Driver is running.
+
+    ; and in Device Manager, under System devices
+
+# --- The development loop, scripted ---
+    devcon remove root\ringbuf
+    pnputil /delete-driver oem12.inf /uninstall /force
+    ; rebuild, copy over
+    pnputil /add-driver ringbuf.inf /install
+    devcon install ringbuf.inf root\ringbuf
+
+# --- Turn the verifiers on immediately (chapter 22) ---
+    verifier /flags 0x209BB /driver ringbuf.sys
+    shutdown /r /t 0</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<div class="key">
+<b>Break it deliberately. Each of these produces a specific, diagnosable failure.</b>
+<ol>
+<li><strong>Remove the spinlock</strong> from <code>RbEvtIoWrite</code>. Run several writers and a reader.
+Watch the counters drift. Then re-add it.</li>
+<li><strong>Allocate the buffer from paged pool.</strong> Enable Verifier's force-IRQL flag. The timer DPC
+now bugchecks with 0xA immediately, rather than in three weeks
+(<a href="win-02-irql.html">chapter 03</a>).</li>
+<li><strong>Complete a forwarded request.</strong> In <code>RbEvtIoRead</code>, call
+<code>WdfRequestComplete</code> after <code>WdfRequestForwardToIoQueue</code>. WDF Verifier catches it
+(<a href="win-13-wdf-objects.html">chapter 14</a>).</li>
+<li><strong>Make the pending queue power-managed.</strong> Let the device idle, then read. The request
+never completes — and <code>!wdfdevicequeues</code> shows the queue not dispatching
+(<a href="win-15-wdf-queues.html">chapter 16</a>).</li>
+<li><strong>Drop <code>WdfTimerStop(..., TRUE)</code></strong> from cleanup. Uninstall while the timer is
+running. With special pool on, you get a use-after-free bugcheck naming your driver.</li>
+<li><strong>Skip the <code>RtlZeroMemory</code></strong> in <code>GET_STATS</code>. The reserved fields now
+leak whatever was in the buffer — an information disclosure, in one deleted line.</li>
+<li><strong>Remove the validation</strong> from <code>SET_CONFIG</code> and pass a huge
+<code>TimerPeriodMs</code>. Then run the WDK's IoAttack fuzzer against it and see what else it
+finds.</li>
+<li><strong>Change <code>IOCTL_RB_RESET</code> to <code>FILE_ANY_ACCESS</code></strong> and reset the
+buffer from a read-only handle. Observe that the platform was preventing this for free
+(<a href="win-16-ioctls.html">chapter 17</a>).</li>
+<li><strong>Leak pool:</strong> remove the <code>ExFreePoolWithTag</code>. Install and uninstall ten times
+with pool tracking on. Bugcheck 0xC4, Arg1 = 0x62, with the allocation stack.</li>
+<li><strong>Add a feature:</strong> support several concurrent readers, each with an independent read
+position. This requires per-file-object state (<a href="win-15-wdf-queues.html">chapter 16</a>) and changes
+the ring's semantics — think carefully about what "consumed" means with several readers.</li>
+<li><strong>Add an <code>EvtIoStop</code> handler</strong> and verify the machine can now sleep with a
+read pending.</li>
+<li><strong>Convert to a real interrupt.</strong> If you have any PCIe device with a documented register
+map, replace the timer with a <code>WDFINTERRUPT</code> (<a href="win-17-resources-interrupts.html">chapter
+18</a>). The queue and completion logic does not change at all — which is the point.</li>
+</ol>
+</div>
+
+<h2 id="review">The review pass</h2>
+
+<p>Before considering it finished, read your own code the way a reviewer would. These are the questions that will actually be asked, and finding the answers yourself is considerably less painful than being told.</p>
+
+<pre><code># Before you call it finished:
+
+# 1. Static analysis, clean (chapter 22)
+    msbuild /p:RunCodeAnalysis=true
+    ; and Static Driver Verifier
+
+# 2. Driver Verifier, standard flags, through a full test run
+
+# 3. Low resources simulation
+    verifier /flags 0x209BF /driver ringbuf.sys
+    ; expect to find unchecked allocations; there is at least
+    ; one obvious candidate in EvtDeviceAdd
+
+# 4. 50 install/uninstall cycles
+# 5. 50 disable/enable cycles
+    for /L %i in (1,1,50) do devcon disable root\ringbuf &amp; \
+                             devcon enable root\ringbuf
+
+# 6. Sleep and resume with a read pending
+    pwrtest /sleep /c:5
+
+# 7. The HLK Device Fundamentals tests (chapter 21)
+
+# 8. IoAttack against the IOCTL interface (chapter 17)
+
+# STEPS 3, 5 AND 8 find the most. Step 6 finds the
+# EvtIoStop omission specifically.</code></pre>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the ring buffer must be in non-paged pool.</li>
+  <li>Justify the choice of buffered I/O and the SDDL string.</li>
+  <li>Explain why the pending queue is not power-managed.</li>
+  <li>State the request ownership rule and find every place the code honours it.</li>
+  <li>Explain why <code>RbCompletePendingReads</code> is called outside the lock.</li>
+  <li>Explain the requeue-on-zero path and what bug it prevents.</li>
+  <li>Justify the Access field on each IOCTL.</li>
+  <li>Explain why <code>RtlZeroMemory</code> on the output struct is a security control.</li>
+  <li>Complete exercises 1 through 9 and describe each symptom.</li>
+  <li>Complete at least one of exercises 10 to 12.</li>
+  <li>Pass the eight-step review with no findings.</li>
+</ul>
+
+<div class="tip">
+<b>Next</b>
+<p><a href="win-24-project-client.html">Chapter 26</a> builds the user-mode client: device discovery by
+interface GUID, synchronous and overlapped I/O, and a benchmark that shows what the asynchronous path
+actually buys.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

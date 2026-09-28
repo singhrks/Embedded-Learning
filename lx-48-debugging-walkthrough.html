@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging in practice: four bugs, hunted end to end | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging in practice: four bugs, hunted end to end</h1>
+<p class="lead"><a href="lx-27-debugging.html">Chapter 34</a> gave you the tools. This chapter uses them. Four
+real bugs — a crash, a silence, a delayed crash and an intermittent one — each followed from the symptom you
+are actually handed to the line that caused it, including the wrong turns worth not taking. Read it as four
+worked examples rather than as reference material.</p>
+
+<div class="key">
+<b>The one principle underneath all four</b>
+<p>Ask the cheapest question that eliminates the most possibilities. Every hunt below is an application of
+that: not "what is wrong with my code" — which is unanswerable — but "is the device even there", "was it
+allocated or freed", "which context was I in". Each answer removes half the search space, and each one costs
+seconds. Reading code in the hope of spotting the bug is the most expensive question available, and it goes
+last, not first.</p>
+</div>
+
+<h2 id="bug1">Bug 1 — the crash: an oops during probe</h2>
+
+<p>This is the most approachable kind of failure, because the kernel has already done most of the work for you:
+it tells you where it died and what it was touching. The skill is knowing which five lines of the dump matter
+and ignoring the other forty.</p>
+
+<pre><code># WHAT YOU ARE HANDED:
+
+$ sudo insmod mydrv.ko
+Killed
+$ dmesg | tail -40
+Unable to handle kernel NULL pointer dereference at virtual
+        address 0000000000000018
+Mem abort info:
+  ESR = 0x0000000096000005
+  EC = 0x25: DABT (current EL), IL = 32 bits
+  FSC = 0x05: level 1 translation fault
+Data abort info:
+  ISV = 0, ISS = 0x00000005
+  CM = 0, WnR = 0
+Internal error: Oops: 96000005 [#1] PREEMPT SMP
+Modules linked in: mydrv(O+)
+CPU: 1 PID: 412 Comm: insmod Tainted: G           O  6.12.0 #1
+pc : mydrv_probe+0x8c/0x1f0 [mydrv]
+lr : platform_probe+0x70/0xd0
+Call trace:
+ mydrv_probe+0x8c/0x1f0 [mydrv]
+ platform_probe+0x70/0xd0
+ really_probe+0xbc/0x2a8
+ driver_probe_device+0x3c/0x118
+ ...</code></pre>
+
+<p>Four facts in that dump answer almost the whole question, and the rest is noise on a first pass. Reading them
+in this order turns a wall of hex into a specific line of your code.</p>
+
+<pre class="diagram">   1. "NULL pointer dereference at ... 0000000000000018"
+
+        NOT simply "a NULL pointer". The address is 0x18 = 24
+        DECIMAL. Something did ptr-&gt;member where ptr was NULL
+        and `member` sits 24 BYTES INTO THE STRUCTURE. That
+        offset is the single most useful number in the dump.
+
+   2. "WnR = 0"
+
+        Write-not-Read. 0 means it was a READ. So the code was
+        reading a field, not assigning to one - which usually
+        halves the candidate lines immediately.
+
+   3. "pc : mydrv_probe+0x8c/0x1f0 [mydrv]"
+
+        The faulting instruction is 0x8c bytes into
+        mydrv_probe, which is 0x1f0 bytes long. This is an
+        exact location, not an approximation.
+
+   4. The call trace, read TOP-DOWN
+
+        mydrv_probe was called by platform_probe, called by
+        really_probe. So this is the driver core binding your
+        device - you are in probe, not in some later path.
+        Nothing above your function is suspicious; the bug is
+        yours.</pre>
+
+<p>Now turn those two numbers — the function offset and the structure offset — into a line of source and a
+field name. Two tools do this, and neither requires reproducing the bug again.</p>
+
+<pre><code># THE OFFSET INTO THE FUNCTION -> A SOURCE LINE:
+$ ./scripts/faddr2line mydrv.ko mydrv_probe+0x8c
+mydrv_probe+0x8c/0x1f0:
+mydrv_probe at /home/you/mydrv/mydrv.c:118
+
+$ sed -n '118p' mydrv.c
+        dev_info(dev, "fifo depth %u\n", d-&gt;cfg-&gt;fifo_depth);
+
+# THE OFFSET INTO THE STRUCT -> A FIELD NAME:
+$ pahole -C mydev_config mydrv.ko
+struct mydev_config {
+        unsigned int  nr_channels;   /*   0   4 */
+        unsigned int  reserved;      /*   4   4 */
+        ...
+        unsigned int  fifo_depth;    /*  24   4 */   &lt;-- 0x18
+        ...
+};
+
+# So: d->cfg was NULL, and the code read cfg->fifo_depth at
+# offset 24. Both numbers agree. That is the bug, located
+# without ever re-running it.</code></pre>
+
+<pre><code>/* THE CAUSE, back in the source: */
+
+        d-&gt;cfg = of_device_get_match_data(dev);
+        dev_info(dev, "fifo depth %u\n", d-&gt;cfg-&gt;fifo_depth);
+        /*                                ^^^^^^ unchecked   */
+
+/* of_device_get_match_data() returns NULL when the matched
+   of_device_id entry has no .data - which is exactly what
+   happens when someone adds a new compatible string to the
+   table and forgets the .data field:                       */
+
+static const struct of_device_id my_of_match[] = {
+        { .compatible = "vendor,mydev-v2", .data = &amp;v2_config },
+        { .compatible = "vendor,mydev-v3" },   /* &lt;-- no .data */
+        { }
+};
+
+/* THE FIX - check it, as chapter 33 says to check every
+   return:                                                  */
+        d-&gt;cfg = of_device_get_match_data(dev);
+        if (!d-&gt;cfg)
+                return -EINVAL;</code></pre>
+
+<div class="tip">
+<b>What this generalises to</b>
+<p>A NULL dereference plus a non-zero offset is always the same three-step hunt: the faulting address gives you
+the field offset, <code>faddr2line</code> gives you the source line, and <code>pahole</code> names the member.
+Getting fluent with those two commands turns most oopses into a two-minute job — and it is worth building the
+module with <code>CONFIG_DEBUG_INFO=y</code> before you need them, because both require it.</p>
+</div>
+
+<h2 id="bug2">Bug 2 — the silence: probe never runs at all</h2>
+
+<p>This one is harder than a crash, because there is no error message anywhere. The module loads, nothing
+happens, and <code>dmesg</code> is empty. Debugging an <em>absence</em> needs a different approach: rather than
+following a failure backwards, you walk the chain of things that must each have happened and find the first one
+that did not.</p>
+
+<pre class="diagram">   THE CHAIN, and every link is separately checkable:
+
+     1. the device tree node exists in the running kernel
+              |
+     2. its status is "okay" (not "disabled")
+              |
+     3. a struct device was created from it
+              |
+     4. the driver is loaded
+              |
+     5. the driver's compatible string MATCHES the node's
+              |
+     6. probe() is called
+              |
+     7. probe() returns 0
+
+   ASK THEM IN ORDER. Whichever is the first "no" is your
+   bug, and checking all seven takes under a minute.</pre>
+
+<pre><code># 1 and 2 - is the node there, and is it enabled?
+$ ls /proc/device-tree/soc/ | grep mydev
+mydev@1c000000
+$ cat /proc/device-tree/soc/mydev@1c000000/status; echo
+disabled                     # &lt;-- FOUND IT, in most cases
+
+# (If status is "okay", or the property is absent - which
+#  also means enabled - carry on.)
+
+# 3 - did a device get created?
+$ ls /sys/bus/platform/devices/ | grep mydev
+1c000000.mydev               # yes, the device exists
+
+# 4 - is the driver actually loaded?
+$ lsmod | grep mydrv
+mydrv                  16384  0
+
+# 5 - is anything bound to the device?
+$ ls -l /sys/bus/platform/devices/1c000000.mydev/driver
+ls: cannot access '.../driver': No such file or directory
+#    ^ nothing claimed it. So the MATCH failed.
+
+# WHICH compatible does the DEVICE advertise?
+$ cat /sys/bus/platform/devices/1c000000.mydev/uevent
+DRIVER=
+OF_NAME=mydev
+OF_COMPATIBLE_0=vendor,mydev-v3
+OF_COMPATIBLE_N=1
+
+# WHICH does the DRIVER accept?
+$ modinfo mydrv.ko | grep alias
+alias:          of:N*T*Cvendor,mydev-v2C*
+alias:          of:N*T*Cvendor,mydev-v2
+
+#   device says:  vendor,mydev-v3
+#   driver says:  vendor,mydev-v2
+#   They do not match. That is the entire bug.</code></pre>
+
+<p>The five most common causes all show up at a specific step of that walk, which is why doing it in order is
+worth more than any single command.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Fails at step</th><th>Usual cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>1 — no node</td><td>The <code>.dtb</code> being booted is not the one you edited</td><td>Check what
+the bootloader actually loaded; rebuild and reinstall the DTB</td></tr>
+<tr><td>2 — <code>disabled</code></td><td>The SoC <code>.dtsi</code> disables it by default and the board file
+never enabled it</td><td><code>status = "okay";</code> in the board's node</td></tr>
+<tr><td>3 — no device</td><td>The node is outside a bus that gets populated, or its parent is disabled</td><td>
+Check the parent node too — a disabled parent silently disables every child</td></tr>
+<tr><td>4 — not loaded</td><td>Missing <code>MODULE_DEVICE_TABLE</code>, so autoloading never happens</td><td>
+Add it, then <code>depmod -a</code></td></tr>
+<tr><td>5 — no match</td><td>A typo, or a compatible string added to the DT but not the driver</td><td>Compare
+<code>uevent</code> with <code>modinfo</code>, exactly as above</td></tr>
+<tr><td>6 — probe deferred forever</td><td>A resource provider never appears</td><td><code>cat
+/sys/kernel/debug/devices_deferred</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>The deferred-probe list is the one people never find</b>
+<p>If probe runs but keeps returning <code>-EPROBE_DEFER</code> (<a href="lx-17-device-model.html">chapter
+19</a>), the device sits in a queue and nothing is ever printed at the default log level — so it looks exactly
+like a match failure. <code>/sys/kernel/debug/devices_deferred</code> lists every device still waiting and,
+usefully, which resource each is waiting for. Check it before concluding that matching is broken.</p>
+</div>
+
+<h2 id="bug3">Bug 3 — the delayed crash: use-after-free</h2>
+
+<p>Here the machine crashes minutes after the mistake, in code that has nothing to do with the bug — the
+hardest kind to reason about, and the kind KASAN was built to eliminate. With it enabled, a bug that would have
+taken days becomes a report that names both the guilty line and the moment the memory was freed.</p>
+
+<pre><code># THE SYMPTOM WITHOUT KASAN: random crashes, minutes after
+# unbinding the device, in unrelated subsystems. Different
+# backtrace every time. Unreproducible on demand.
+
+# REBUILD WITH KASAN (chapter 18) AND IT BECOMES THIS:
+
+BUG: KASAN: slab-use-after-free in mydrv_work+0x2c/0xf0 [mydrv]
+Read of size 4 at addr ffff0000c8a41218 by task kworker/1:2/89
+
+Call trace:
+ mydrv_work+0x2c/0xf0 [mydrv]          &lt;-- WHO TOUCHED IT
+ process_one_work+0x1f4/0x448
+ worker_thread+0x6c/0x458
+
+Allocated by task 412:                  &lt;-- WHERE IT CAME FROM
+ mydrv_probe+0x40/0x1f0 [mydrv]
+ platform_probe+0x70/0xd0
+
+Freed by task 455:                      &lt;-- AND WHO KILLED IT
+ mydrv_remove+0x38/0x60 [mydrv]
+ platform_remove+0x28/0x60
+ device_release_driver_internal+0x1cc/0x228</code></pre>
+
+<p>Those three backtraces are the complete story, and they should be read as a single sentence rather than as
+three separate stack traces.</p>
+
+<pre class="diagram">   "A WORK ITEM read memory that mydrv_remove had already
+    freed."
+
+   Which immediately tells you the shape of the bug WITHOUT
+   reading any code: remove() ran while a work item was still
+   queued or running. The work item then dereferenced the
+   driver state that remove() had just released.
+
+   THE RACE:
+
+     remove()                    kworker
+     --------                    -------
+                                 (work queued earlier by the
+                                  interrupt handler)
+     devm frees d
+     module unloads
+                                 mydrv_work(d) runs
+                                 reads d-&gt;something   &lt;-- BOOM
+
+   THIS IS EXACTLY chapter 13's question - "who frees this,
+   and when?" - answered wrongly. remove() is not the moment
+   the object stops being reachable; it is only the moment
+   the DEVICE goes away.</pre>
+
+<pre><code>/* THE FIX, and there are two levels of it. */
+
+/* LEVEL 1 - stop the work before releasing anything: */
+static void mydrv_remove(struct platform_device *pdev)
+{
+        struct mydev *d = platform_get_drvdata(pdev);
+
+        cancel_work_sync(&amp;d-&gt;work);      /* BLOCKS until any
+                                            running instance
+                                            finishes, and
+                                            cancels a queued
+                                            one                */
+        /* only now is it safe for d to go away */
+}
+
+/* NOTE the ordering trap with devm_ (chapter 33): managed
+   resources are freed AFTER remove() returns, so putting
+   cancel_work_sync() in remove() is correct. Registering it
+   with devm_add_action_or_reset() at probe time works too,
+   and is tidier - but doing NEITHER, and relying on the work
+   "probably not being queued", is the bug above.           */
+
+/* LEVEL 2 - if the object can outlive the device for OTHER
+   reasons too (an open file descriptor, say), cancelling is
+   not enough and it needs a real reference count:          */
+        kref_put(&amp;d-&gt;refcount, mydev_release);
+/* chapter 13 covers this properly. The rule of thumb: if the
+   only other user is your own deferred work, cancel_work_sync
+   is sufficient and simpler. If USER SPACE can still hold the
+   object, you need refcounting.                             */</code></pre>
+
+<div class="danger">
+<b>Turn KASAN on before you need it, not after</b>
+<p>The bug above is essentially unfindable without KASAN and essentially trivial with it — the difference is
+not skill, it is whether the option was enabled when the crash happened. It costs roughly 2–3× slower
+execution and about an eighth more memory, which is irrelevant on a development board and buys you the two
+extra backtraces that make the report self-explanatory. Enable it in every development build, along with
+lockdep and <code>CONFIG_DEBUG_ATOMIC_SLEEP</code>, and leave them on.</p>
+</div>
+
+<h2 id="bug4">Bug 4 — the intermittent: fine on the bench, fails under load</h2>
+
+<p>The last kind is the one that damages schedules: everything works during testing and fails at a customer
+site, or once a day, or only when the system is busy. These almost always turn out to be context or timing
+bugs that were present from the first day and simply had no opportunity to fire — and the fix is usually to
+make them deterministic rather than to catch them in the act.</p>
+
+<pre><code># THE REPORT: "the board locks up after a few hours, but only
+# when the network is busy." Nothing in dmesg on the customer's
+# build.
+
+# STEP 1 - do NOT try to reproduce it as-is. Rebuild with the
+# checkers turned on and run the same workload. Now:
+
+BUG: sleeping function called from invalid context
+        at kernel/locking/mutex.c:283
+in_atomic(): 1, irqs_disabled(): 0, non_block: 0,
+        pid: 0, name: swapper/0
+preempt_count: 101, expected: 0
+CPU: 0 PID: 0 Comm: swapper/0 Tainted: G  O  6.12.0 #1
+Call trace:
+ __might_sleep+0x4c/0x60
+ mutex_lock+0x28/0x90
+ mydrv_timer_fn+0x2c/0xa0 [mydrv]      &lt;-- yours
+ call_timer_fn+0x38/0x1c0
+ __run_timers+0x230/0x298
+ run_timer_softirq+0x40/0x80           &lt;-- SOFTIRQ context</code></pre>
+
+<p>The dump names the mistake outright, but the interesting question is why it stayed hidden for hours of
+testing — and the answer is a genuinely useful piece of kernel knowledge rather than bad luck.</p>
+
+<pre class="diagram">   THE MISTAKE: a timer callback takes a mutex.
+
+     Timer callbacks run in SOFTIRQ context (chapter 15).
+     Softirq context MAY NOT SLEEP (chapter 02).
+     mutex_lock() MAY sleep.
+     Therefore this is always, unconditionally wrong.
+
+   SO WHY DID IT WORK FOR HOURS?
+
+     BECAUSE mutex_lock() ONLY SLEEPS IF THE MUTEX IS
+     CONTENDED. An uncontended mutex_lock() takes the fast
+     path - a single atomic operation - and returns
+     immediately without ever calling schedule().
+
+     On an idle bench system, nothing else held that mutex,
+     so the call never slept and nothing went wrong.
+
+     Under load, another thread held it, the timer callback
+     tried to sleep in softirq context, and the kernel died.
+
+   THIS IS THE GENERAL SHAPE OF "WORKS ON MY MACHINE":
+   the bug was 100% present from day one. What varied was
+   whether the conditions existed to EXPRESS it. Which is
+   why the fix is never "add a retry" and always "find the
+   rule that was broken".</pre>
+
+<pre><code>/* THE FIX - move the work somewhere it is allowed to sleep,
+   which is exactly what chapter 15's workqueue is for:     */
+
+static void mydrv_timer_fn(struct timer_list *t)
+{
+        struct mydev *d = from_timer(d, t, timer);
+
+        schedule_work(&amp;d-&gt;work);        /* softirq-safe */
+}
+
+static void mydrv_work(struct work_struct *w)
+{
+        struct mydev *d = container_of(w, struct mydev, work);
+
+        mutex_lock(&amp;d-&gt;lock);           /* process context -
+                                           sleeping is legal */
+        ...
+        mutex_unlock(&amp;d-&gt;lock);
+}
+
+/* OR, if the critical section is genuinely short and must
+   stay in the timer, use a spinlock instead - but then
+   NOTHING inside it may sleep either (chapter 12).         */</code></pre>
+
+<div class="key">
+<b>The rule for every intermittent bug</b>
+<p>Do not chase the symptom; make the bug deterministic. Rebuild with <code>CONFIG_DEBUG_ATOMIC_SLEEP</code>,
+<code>CONFIG_PROVE_LOCKING</code> and KASAN, then run the workload again. These checkers do not wait for the
+bad thing to happen — they verify the <em>rules</em> on every single call, so a violation is reported the
+first time the code path executes, whether or not the timing that would actually corrupt something ever
+occurs. An intermittent bug that survives all three checkers is rare; an intermittent bug found by them in
+ten minutes is the normal outcome.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Start here</th></tr></thead>
+<tbody>
+<tr><td>Oops with a small faulting address like <code>0x18</code></td><td>NULL plus a field offset —
+<code>faddr2line</code> for the line, <code>pahole</code> for the member</td></tr>
+<tr><td><code>insmod</code> succeeds, nothing happens, dmesg empty</td><td>Walk the seven-step bind chain in
+order; it is almost always the compatible string or <code>status</code></td></tr>
+<tr><td>Device node exists but has no <code>driver</code> symlink</td><td>Matching failed — compare
+<code>uevent</code> against <code>modinfo</code></td></tr>
+<tr><td>Probe runs repeatedly and never completes</td><td><code>/sys/kernel/debug/devices_deferred</code> —
+a resource provider is missing</td></tr>
+<tr><td>Random crashes after unbinding a device</td><td>Rebuild with KASAN; read the "Freed by" backtrace</td></tr>
+<tr><td>KASAN names a work item as the reader</td><td>Missing <code>cancel_work_sync()</code> in
+<code>remove()</code></td></tr>
+<tr><td>Fails only under load, never on the bench</td><td>An uncontended lock hid a sleeping-in-atomic bug —
+turn on the checkers rather than trying to reproduce</td></tr>
+<tr><td>Crash backtrace points at unrelated subsystems each time</td><td>Memory corruption, not a bug in the
+code you are looking at — KASAN</td></tr>
+<tr><td>The tools all report nothing and it still fails</td><td>Question the assumption that it is software:
+check the clock, the supply, and the bus with a scope</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Given an oops, name the four facts you extract first and what each tells you.</li>
+  <li>Convert a <code>function+0x8c</code> offset into a source line.</li>
+  <li>Explain how a faulting address of <code>0x18</code> identifies a structure member.</li>
+  <li>List the seven links in the bind chain, in order, and the command that checks each.</li>
+  <li>Explain why a deferred probe looks identical to a failed match, and where to look instead.</li>
+  <li>Read a KASAN report and say what its three backtraces mean together.</li>
+  <li>Explain why freeing in <code>remove()</code> races with a queued work item, and give two fixes.</li>
+  <li>Explain why an uncontended <code>mutex_lock()</code> can hide a sleeping-in-atomic bug for months.</li>
+  <li>Say what you would enable before trying to reproduce any intermittent failure.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

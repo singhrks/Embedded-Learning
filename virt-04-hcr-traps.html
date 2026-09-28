@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HCR_EL2: choosing what traps | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>HCR_EL2: choosing what traps</h1>
+<p class="lead">One 64-bit register decides, bit by bit, which operations a guest may perform for itself and
+which must be brought to the hypervisor for adjudication. Every design decision about isolation, fidelity and
+performance in an ARM hypervisor is ultimately expressed here.</p>
+
+<h2 id="idea">The idea</h2>
+
+<p>One register decides most of what a guest may do unsupervised. Reading it as a list of policy decisions rather than a bit field is what makes the rest of this chapter straightforward.</p>
+
+<pre class="diagram">   guest at EL1 executes:  MSR SCTLR_EL1, x0
+
+        HCR_EL2.TVM == 0                 HCR_EL2.TVM == 1
+        ----------------                 ----------------
+        the write happens.               EXCEPTION to EL2.
+        No exception. Full speed.        ESR_EL2.EC = 0x18
+                                         (trapped MSR/MRS)
+                                         ISS encodes the register,
+                                         the direction and Rt.
+
+                                         hypervisor decides what
+                                         "writing SCTLR_EL1" should
+                                         mean for THIS guest, then
+                                         ERETs.
+
+   That is the entire mechanism. HCR_EL2 has about forty such
+   bits; each one moves a class of operation from "free" to
+   "mediated". Your hypervisor's personality is the bit pattern
+   you choose.</pre>
+
+<h2 id="bits">The bits that matter</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bit</th><th>Name</th><th>Set it to…</th></tr></thead>
+<tbody>
+<tr><td><strong>VM</strong></td><td>Virtualisation enable</td><td>Turn on stage-2 translation. Without this,
+guest "physical" addresses are real physical addresses. The master switch</td></tr>
+<tr><td><strong>RW</strong></td><td>Register width</td><td>1 = EL1 is AArch64, 0 = AArch32 guest</td></tr>
+<tr><td><strong>IMO / FMO / AMO</strong></td><td>IRQ / FIQ / SError mask override</td><td>Route physical
+IRQ/FIQ/SError to EL2 instead of EL1, and enable the corresponding virtual interrupt</td></tr>
+<tr><td><strong>VI / VF / VSE</strong></td><td>Virtual IRQ / FIQ / SError pending</td><td>Assert a virtual
+interrupt into the guest. Software writes the bit; the guest sees an interrupt</td></tr>
+<tr><td><strong>TWI / TWE</strong></td><td>Trap WFI / WFE</td><td>Catch an idling guest so you can schedule
+someone else</td></tr>
+<tr><td><strong>TSC</strong></td><td>Trap SMC</td><td>Intercept the guest's secure-monitor calls so EL2 can
+filter or forward them</td></tr>
+<tr><td><strong>TVM / TRVM</strong></td><td>Trap virtual-memory register writes / reads</td><td>Catch
+<code>SCTLR_EL1</code>, <code>TTBR*_EL1</code>, <code>TCR_EL1</code>, <code>MAIR_EL1</code>… Needed for
+shadowing tricks; expensive, usually off</td></tr>
+<tr><td><strong>TTLB</strong></td><td>Trap TLB maintenance</td><td>Catch guest <code>TLBI</code>. Usually off:
+VMID tagging makes guest TLBIs safe</td></tr>
+<tr><td><strong>TID0-TID3</strong></td><td>Trap ID register groups</td><td>Present a synthetic CPU. TID3 is the
+one that hides features you have not implemented</td></tr>
+<tr><td><strong>TGE</strong></td><td>Trap general exceptions</td><td>With VHE: EL0 belongs to the host, not a
+guest. Routes EL0 exceptions to EL2</td></tr>
+<tr><td><strong>E2H</strong></td><td>EL2 host</td><td>The VHE switch — remaps <code>*_EL1</code> accesses at
+EL2 onto EL2 registers. See <a href="virt-09-vhe.html">chapter 09</a></td></tr>
+<tr><td><strong>PTW</strong></td><td>Protected table walk</td><td>A stage-1 walk that hits device memory at
+stage 2 becomes a fault rather than undefined behaviour</td></tr>
+<tr><td><strong>FB</strong></td><td>Force broadcast</td><td>Guest TLBI/cache ops become inner-shareable
+broadcasts, so the guest need not know it is on SMP</td></tr>
+<tr><td><strong>DC</strong></td><td>Default cacheable</td><td>Force stage-1 to look cacheable while the guest's
+MMU is off — used during guest boot</td></tr>
+<tr><td><strong>TACR / TIDCP / TSW / TPC / TPU</strong></td><td>Trap aux control, implementation-defined,
+cache ops</td><td>Cache maintenance and vendor registers; TSW in particular matters for set/way ops</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="typical">What a real hypervisor sets</h2>
+
+<p>The difference between what a hypervisor <em>could</em> trap and what it actually traps is the difference between correct and usable. This is a realistic configuration.</p>
+
+<pre><code>/* Close to what KVM/arm64 programs for a normal 64-bit guest.
+   Compare arch/arm64/include/asm/kvm_arm.h.                 */
+
+  HCR_GUEST_FLAGS =
+        HCR_TSC          /* trap SMC: EL2 sees and filters them   */
+      | HCR_TSW          /* trap set/way cache ops - a guest doing
+                            "clean by set/way" would operate on
+                            the WHOLE cache, including other VMs  */
+      | HCR_TWE          /* trap WFE  -> yield the pCPU           */
+      | HCR_TWI          /* trap WFI  -> block the vCPU thread    */
+      | HCR_VM           /* stage-2 ON                            */
+      | HCR_PTW          /* protected table walk                  */
+      | HCR_TID3         /* trap ID regs: show a sanitised CPU    */
+      | HCR_FMO | HCR_IMO /* physical FIQ/IRQ come to EL2, and
+                             virtual FIQ/IRQ become available     */
+      | HCR_AMO          /* same for SError                       */
+      | HCR_RW           /* AArch64 guest                         */
+      | HCR_FB           /* broadcast the guest's TLBI/cache ops  */
+      | HCR_BSU_IS       /* barriers upgrade to inner-shareable   */
+      | HCR_TACR         /* trap ACTLR_EL1                        */
+      | HCR_TIDCP;       /* trap impl-defined registers           */
+
+/* Notice what is DELIBERATELY ABSENT:
+
+     no TVM   - the guest may write TTBR0_EL1/SCTLR_EL1 freely.
+                Stage-2 makes that safe, and trapping every page
+                table change would destroy performance.
+
+     no TTLB  - the guest may invalidate its own TLB entries.
+                VMID tagging means it can only hit its own.
+
+     no TRVM  - reads of VM registers are harmless.
+
+   Each absent bit is a decision that the HARDWARE already
+   provides the isolation, so software should stay out of the
+   way. That is the whole art.                                */</code></pre>
+
+<div class="key">
+<b>The rule of thumb</b>
+<p>Trap when you must maintain state the guest cannot be allowed to own, or when the guest would otherwise
+observe the truth. Do not trap when stage-2 or VMID tagging already contains the damage. Every unnecessary
+trap bit is a permanent tax on every guest, for ever.</p>
+</div>
+
+<h2 id="tsw">A worked example: why TSW exists</h2>
+
+<p>One bit is worth working through in full, because the reason it exists is not obvious and the reasoning generalises to half the other bits.</p>
+
+<pre><code>/* AArch64 cache maintenance comes in two flavours:      */
+
+    DC CIVAC, x0     /* clean+invalidate by VIRTUAL ADDRESS.
+                        Goes through stage 1 and stage 2, so it
+                        can only ever touch memory this guest
+                        actually owns.  SAFE - do not trap.   */
+
+    DC CISW,  x0     /* clean+invalidate by SET AND WAY.
+                        Addresses a physical cache location by
+                        geometry. There is no address, so there
+                        is nothing for stage 2 to constrain.
+
+                        A guest looping over every set and way -
+                        which is exactly what Linux does when it
+                        turns its MMU off during boot or kexec -
+                        would clean and invalidate lines
+                        belonging to OTHER VMs and to the
+                        hypervisor.                            */
+
+/* Hence HCR_EL2.TSW. The guest traps, and the hypervisor does
+   something equivalent-but-safe. KVM's historical answer was to
+   flush the guest's own stage-2 mappings instead; modern KVM
+   mostly just makes the operation a no-op after ensuring the
+   guest's memory is coherent, because a guest with stage-2
+   enabled has no legitimate need for set/way operations.
+
+   This is the general shape of every trap handler you will
+   write: the guest asked for something that means one thing on
+   bare metal and something dangerous under virtualisation, and
+   you must supply the SPIRIT of the request, not the letter. */</code></pre>
+
+<h2 id="decode">Decoding a trap when it arrives</h2>
+
+<p>A trap arrives as an exception with the details spread across three registers. Decoding it in a fixed order turns a hex dump into a sentence.</p>
+
+<pre><code>/* Every trap to EL2 leaves the reason in ESR_EL2. */
+
+    ESR_EL2[31:26]  EC   exception class
+    ESR_EL2[25]     IL   instruction length (1 = 32-bit)
+    ESR_EL2[24:0]   ISS  class-specific syndrome
+
+  EC values you will meet constantly:
+
+    0x01  trapped WFI/WFE                 (HCR.TWI/TWE)
+    0x03  trapped MCR/MRC cp15            (AArch32 guest)
+    0x07  trapped SVE/FP/SIMD             (CPTR_EL2)
+    0x16  HVC from AArch64                (deliberate hypercall)
+    0x17  SMC from AArch64                (HCR.TSC)
+    0x18  trapped MSR/MRS/system insn     (HCR.TVM, TID*, TACR...)
+    0x20  instruction abort, lower EL     (stage-2 fetch fault)
+    0x24  data abort, lower EL            (stage-2 data fault)
+
+/* For EC=0x18 the ISS names the register precisely: */
+
+    ISS[21:20] Op0   ISS[19:17] Op2   ISS[16:14] Op1
+    ISS[13:10] CRn   ISS[9:5]   Rt    ISS[4:1]   CRm
+    ISS[0]     Direction: 0 = write (MSR), 1 = read (MRS)
+
+/* So a handler looks like: */
+
+static int handle_sysreg_trap(struct vcpu *v)
+{
+        u64 esr  = read_sysreg(esr_el2);
+        u32 iss  = esr & 0x1ffffff;
+        int rt   = (iss &gt;&gt; 5) & 0x1f;
+        bool is_read = iss & 1;
+
+        const struct sysreg_desc *d = find_desc(iss);
+        if (!d)
+                return inject_undefined(v);   /* guest gets UNDEF */
+
+        if (is_read)
+                vcpu_set_reg(v, rt, d-&gt;get(v));
+        else
+                d-&gt;set(v, vcpu_get_reg(v, rt));
+
+        /* ALWAYS advance past the trapping instruction, or you
+           will execute it again, for ever.                    */
+        vcpu_skip_instr(v);
+        return 1;
+}</code></pre>
+
+<div class="warn">
+<b>Forgetting <code>vcpu_skip_instr</code></b>
+<p>The guest re-executes the same instruction, traps again, and the VM appears to hang while burning 100% of
+a physical CPU. It is the single most common bug when hand-writing a trap handler, and it looks like a
+livelock rather than a crash. If a guest is stuck, check the exit counter — a constant, enormous exit rate
+with no progress is this bug.</p>
+</div>
+
+<h2 id="friends">The other trap registers</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>Controls</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>CPTR_EL2</code></td><td>FP/SIMD, SVE, SME, trace</td><td>Trap the first FP use so you can
+save/restore the register file lazily — a large win, since many guests never touch SVE</td></tr>
+<tr><td><code>MDCR_EL2</code></td><td>Debug, PMU, trace buffers</td><td>Hide or partition the PMU; stop a
+guest from single-stepping the host</td></tr>
+<tr><td><code>HSTR_EL2</code></td><td>AArch32 CP15 access by CRn</td><td>Only for 32-bit guests; a bitmask of
+coprocessor register groups</td></tr>
+<tr><td><code>HFGRTR_EL2</code> / <code>HFGWTR_EL2</code> etc.</td><td>Fine-grained traps
+(ARMv8.6)</td><td>Trap one individual register rather than a whole group — much cheaper than TVM when you
+need exactly one</td></tr>
+<tr><td><code>HCRX_EL2</code></td><td>Extended HCR bits (ARMv8.7)</td><td>Ran out of bits in
+<code>HCR_EL2</code>; newer controls live here</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="observe">Watching traps on a live system</h2>
+
+<p>All of this can be watched on a running system rather than reasoned about, and doing so once is worth more than reading the section twice.</p>
+
+<pre><code># Every exit KVM takes is counted and typed.
+
+$ sudo perf stat -e 'kvm:*' -a sleep 5
+        12,043  kvm:kvm_entry
+        12,043  kvm:kvm_exit
+         8,911  kvm:kvm_mmio
+           520  kvm:kvm_wfx_arm64
+            17  kvm:kvm_hvc_arm64
+
+$ sudo perf record -e kvm:kvm_exit -a -- sleep 5
+$ sudo perf script | head
+# the ESR_EL2 value is in the event, so you can bucket exits by EC
+
+# Or read the per-VM counters directly:
+$ sudo cat /sys/kernel/debug/kvm/*/vcpu0/*exits* 2>/dev/null
+
+# A healthy compile-in-a-VM: a few thousand exits per second,
+# nearly all MMIO to virtio queues.
+# A sick one: hundreds of thousands, dominated by kvm_wfx or by
+# MMIO to an emulated legacy device.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest hangs, one pCPU pinned at 100%, huge exit count</td><td>Trap handler not advancing the guest PC
+— the same instruction traps for ever</td></tr>
+<tr><td>Guest takes an unexpected undefined-instruction exception</td><td>A trapped system register with no
+handler; the hypervisor injected UNDEF</td></tr>
+<tr><td>Guest detects features the host cannot provide, then crashes</td><td><code>TID3</code> not set, or ID
+registers not sanitised — the guest read the real feature bits</td></tr>
+<tr><td>Host memory corruption when a guest boots or kexecs</td><td><code>TSW</code> clear: guest set/way cache
+maintenance reached lines outside the VM</td></tr>
+<tr><td>Idle guest still consumes a full pCPU</td><td><code>TWI</code> clear, so <code>WFI</code> parks the
+physical core instead of yielding the vCPU thread</td></tr>
+<tr><td>Guest's secure-monitor calls reach EL3 unfiltered</td><td><code>TSC</code> clear — SMCs pass straight
+through EL2</td></tr>
+<tr><td>Terrible performance on fork-heavy workloads</td><td><code>TVM</code> set unnecessarily: every page
+table register write is an exit</td></tr>
+<tr><td>Guest FP state corrupted across a vCPU switch</td><td><code>CPTR_EL2</code> lazy-FP logic wrong — trap
+taken but state not saved before reuse</td></tr>
+<tr><td>Guest PMU counts host activity</td><td><code>MDCR_EL2</code> not partitioning the PMU</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>HCR_EL2.VM</code> turns on and what happens without it.</li>
+  <li>Explain the IMO/FMO pair: what they route, and what they simultaneously enable.</li>
+  <li>Give three bits KVM sets and three it deliberately leaves clear, with the reasoning for each.</li>
+  <li>Explain why <code>DC CIVAC</code> is safe to leave untrapped but <code>DC CISW</code> is not.</li>
+  <li>Decode an <code>ESR_EL2</code> with <code>EC=0x18</code> down to the specific register and
+  direction.</li>
+  <li>Say what happens if a trap handler returns without advancing the guest PC, and how it presents.</li>
+  <li>Name the register that controls FP/SVE trapping and explain lazy FP save.</li>
+  <li>Explain what fine-grained traps buy you over <code>TVM</code>.</li>
+  <li>Measure the exit rate of a running guest and classify the exits by cause.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

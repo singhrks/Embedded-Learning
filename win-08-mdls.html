@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDLs and locked memory | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>MDLs and locked memory</h1>
+<p class="lead">A Memory Descriptor List describes where a virtual buffer really lives in physical memory.
+It is how Windows hands user pages to a DMA engine, how a driver reaches a buffer from a DPC, and how one
+buffer gets two mappings — and it has a strict ownership protocol you must not violate.</p>
+
+<h2 id="what">What an MDL describes</h2>
+
+<p>An MDL answers one question: which physical pages sit behind this virtual address range? That matters because a device performing DMA cannot use virtual addresses, and because pages that are not locked can be moved or paged out while you are using them.</p>
+
+<pre class="diagram">   A virtual buffer:
+
+     0x00007ff6'12345678, length 12288 (3 pages)
+
+   is scattered in physical memory:
+
+     +-------------+   page 1  -&gt; PFN 0x1A2B3
+     +-------------+   page 2  -&gt; PFN 0x0C4D5   (not adjacent)
+     +-------------+   page 3  -&gt; PFN 0x39E10
+
+   THE MDL captures exactly that:
+
+   +----------------------------------------+
+   |  MDL HEADER                            |
+   |    Next          chain to another MDL  |
+   |    Size                                |
+   |    MdlFlags      locked? mapped? ...   |
+   |    Process       whose address space   |
+   |    MappedSystemVa  the kernel mapping  |
+   |    StartVa       page-aligned base     |
+   |    ByteCount     length                |
+   |    ByteOffset    offset into the first |
+   |                  page                  |
+   +----------------------------------------+
+   |  PFN ARRAY:  0x1A2B3 0x0C4D5 0x39E10   |
+   +----------------------------------------+
+
+   THE ACCESSORS - use these, never the fields directly:
+
+     MmGetMdlVirtualAddress(mdl)   the original VA
+     MmGetMdlByteCount(mdl)        length
+     MmGetMdlByteOffset(mdl)       offset in the first page
+     MmGetMdlPfnArray(mdl)         the page frame numbers
+     MmGetSystemAddressForMdlSafe(mdl, priority)
+                                   a KERNEL VA, any context
+
+   NOTE ByteOffset: a buffer rarely starts on a page boundary,
+   so the first page is partial. Code that assumes
+   page-aligned data - a DMA descriptor builder, for example -
+   must account for it, and forgetting is a classic
+   off-by-a-few-bytes corruption.</pre>
+
+<h2 id="why">Why they exist</h2>
+
+<p>A Memory Descriptor List solves one underlying problem: a virtual address is only meaningful in the context
+that created it, and DMA hardware, other threads and other processes do not share that context. A user-mode
+pointer means nothing to a DMA engine, which speaks physical addresses; it means nothing inside a DPC, which
+runs in an arbitrary thread's context (<a href="win-11-threads.html">chapter 12</a>); and it means nothing once
+the page it points at has been paged out, which can happen at any moment unless something locks it down. An MDL
+is the single structure that solves all of these at once: it locks the pages so they cannot be paged out, it
+records their physical addresses in a PFN array so DMA hardware can use it directly with no copy, and it can be
+mapped to a system-wide virtual address that is valid in <em>any</em> context — a DPC, a different process, or
+the original caller — because system space is shared by every process.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Problem</th><th>What the MDL solves</th></tr></thead>
+<tbody>
+<tr><td>A DMA engine needs physical addresses</td><td>The PFN array <em>is</em> the physical description</td></tr>
+<tr><td>User pages can be paged out mid-transfer</td><td><code>MmProbeAndLockPages</code> pins them</td></tr>
+<tr><td>A user VA is meaningless in a DPC</td><td>Map it to a system VA valid in any context</td></tr>
+<tr><td>A user VA is meaningless in another process</td><td>Same</td></tr>
+<tr><td>Copying large buffers is expensive</td><td>No copy at all — describe, do not duplicate</td></tr>
+<tr><td>The buffer is not physically contiguous</td><td>Scatter-gather, straight from the PFN array</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The Linux analogue is roughly a <code>struct scatterlist</code> plus <code>get_user_pages()</code>
+(<a href="lx-24-dma-api.html">chapter 30</a>): the same two jobs — pin the pages, describe them physically —
+combined into one object.</p>
+
+<h2 id="lifecycle">The ownership protocol</h2>
+
+<p>MDLs come with an ownership protocol that must be followed exactly. Each step has a matching undo, they must happen in order, and skipping one leaks locked pages — which the system cannot reclaim until reboot.</p>
+
+<pre><code>/* The steps, and every one of them must be undone. */
+
+/* 1. ALLOCATE - describes the buffer, does nothing yet */
+        PMDL mdl = IoAllocateMdl(buffer,        /* VA        */
+                                 length,
+                                 FALSE,         /* secondary */
+                                 FALSE,         /* charge
+                                                   quota     */
+                                 NULL);         /* no IRP    */
+        if (mdl == NULL)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+/* 2. PROBE AND LOCK - pins the pages, fills the PFN array.
+      CAN RAISE. Must be at IRQL <= APC_LEVEL, in the
+      process that owns the buffer.                        */
+        __try {
+                MmProbeAndLockPages(mdl,
+                                    UserMode,   /* or KernelMode */
+                                    IoWriteAccess);
+                                    /* IoReadAccess, IoWriteAccess,
+                                       IoModifyAccess       */
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                IoFreeMdl(mdl);
+                return GetExceptionCode();
+        }
+
+/* 3. MAP, if the CPU will touch it */
+        PVOID kva = MmGetSystemAddressForMdlSafe(mdl,
+                        NormalPagePriority | MdlMappingNoExecute);
+        if (kva == NULL) {
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+                return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+/* 4. USE IT - kva is valid at ANY IRQL, in ANY process */
+        RtlCopyMemory(kva, source, length);
+
+/* 5. UNWIND, in exactly reverse order */
+        MmUnlockPages(mdl);     /* unmaps too, if mapped */
+        IoFreeMdl(mdl);
+
+/* THE ACCESS ARGUMENT IS A SECURITY CONTROL. IoWriteAccess
+   means "the driver will WRITE this buffer", and the memory
+   manager verifies the caller has write permission to it.
+   Requesting IoReadAccess and then writing corrupts a
+   read-only mapping - possibly a shared code page.       */
+
+/* AND `UserMode` versus `KernelMode`, exactly as in
+   chapter 04: pass UserMode when the buffer came from a user
+   request, so the access check is enforced.             */</code></pre>
+
+<div class="danger">
+<b>Locked pages are a system-wide resource</b>
+<p><code>MmProbeAndLockPages</code> removes pages from the pageable pool for as long as the MDL is locked.
+A driver that locks unbounded amounts, or fails to unlock on an error path, degrades the whole machine and
+eventually causes <code>STATUS_WORKING_SET_QUOTA</code> failures for everyone. Bound how much you lock,
+unlock on <em>every</em> path, and never hold a lock across an operation with no timeout.</p>
+</div>
+
+<h2 id="irp">MDLs the I/O manager gives you</h2>
+
+<p>Most of the time you do not build an MDL at all; the I/O manager built one for you and attached it to the request. Knowing which field to read, and what it already guarantees, saves a great deal of unnecessary code.</p>
+
+<pre><code>/* With METHOD_DIRECT (chapter 08), the I/O manager has
+   already done steps 1 and 2 for you.                     */
+
+        PMDL mdl = Irp-&gt;MdlAddress;
+
+        if (mdl == NULL)
+                return STATUS_INVALID_PARAMETER;
+
+        PVOID kva = MmGetSystemAddressForMdlSafe(mdl,
+                        NormalPagePriority | MdlMappingNoExecute);
+        if (kva == NULL)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        ULONG len = MmGetMdlByteCount(mdl);
+
+        ... use it ...
+
+/* DO NOT UNLOCK OR FREE IT. IoCompleteRequest does that.
+   Calling MmUnlockPages on an IRP's MDL is a double-unlock
+   and bugchecks.
+
+   THE RULE: whoever allocated the MDL frees it. If the I/O
+   manager built it, the I/O manager tears it down.       */
+
+/* IN WDF you rarely see the MDL at all: */
+        status = WdfRequestRetrieveOutputBuffer(Request, minLen,
+                                                &amp;buffer, &amp;len);
+        /* the framework maps it and checks the length */
+
+        /* unless you want the MDL, for DMA: */
+        status = WdfRequestRetrieveOutputWdmMdl(Request, &amp;mdl);</code></pre>
+
+<h2 id="double">Double mapping</h2>
+
+<p>The same physical pages can be visible at two different virtual addresses at once — the user's and a kernel one you create. This is how a driver reads a user buffer safely from an arbitrary context, and it has one important rule about which address is valid where.</p>
+
+<pre><code>/* An MDL can describe pages that are ALSO mapped somewhere
+   else. That gives you a second view of the same physical
+   memory - and it is how a driver shares a buffer with user
+   mode.                                                     */
+
+/* --- kernel buffer, mapped into a user process ----------- */
+
+        PVOID kernelBuf;
+        PMDL  mdl;
+        PVOID userVa = NULL;
+
+        kernelBuf = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                    size, TAG);
+        if (!kernelBuf)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        mdl = IoAllocateMdl(kernelBuf, size, FALSE, FALSE, NULL);
+        if (!mdl) { ... }
+
+        MmBuildMdlForNonPagedPool(mdl);   /* non-paged pool is
+                                             already resident -
+                                             no probe needed  */
+
+        __try {
+                userVa = MmMapLockedPagesSpecifyCache(
+                                mdl,
+                                UserMode,
+                                MmCached,
+                                NULL,       /* let it choose */
+                                FALSE,
+                                NormalPagePriority);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+                goto err;
+        }
+
+        /* userVa is now valid IN THE CURRENT PROCESS ONLY.
+           Return it to the caller; they see the same physical
+           memory the driver writes.                        */
+
+        /* teardown, IN THE SAME PROCESS: */
+        MmUnmapLockedPages(userVa, mdl);
+        IoFreeMdl(mdl);
+        ExFreePoolWithTag(kernelBuf, TAG);
+
+/* THE RULES for a shared mapping, and they are strict:
+     · map and unmap in the SAME process context. Doing it
+       from a system thread maps into the wrong address space.
+     · unmap BEFORE the process exits, or in IRP_MJ_CLEANUP
+       (chapter 05) - which is exactly what CLEANUP is for.
+     · the user can write anything into it at any time. Treat
+       every byte as hostile, exactly as with a shared TEE
+       buffer (isolation chapter 09).
+     · never share memory containing anything the user should
+       not see - the whole page is exposed, not just your
+       struct.
+
+   THIS IS A REAL SECURITY BOUNDARY, and shared-memory
+   interfaces are where driver security reviews concentrate.
+   Prefer IOCTLs unless the throughput genuinely demands
+   sharing.                                                */</code></pre>
+
+<h2 id="partial">Partial MDLs</h2>
+
+<p>Sometimes you need to describe only a slice of a buffer — one chunk of a large transfer, say. Rather than building a new MDL from scratch, you can derive one that refers to part of an existing one.</p>
+
+<pre><code>/* Describe a SUB-RANGE of an existing MDL, without locking
+   anything again. Used to split a large transfer into
+   hardware-sized chunks.                                    */
+
+        PMDL partial = IoAllocateMdl(
+                        (PUCHAR)MmGetMdlVirtualAddress(sourceMdl)
+                                + offset,
+                        chunkLength,
+                        FALSE, FALSE, NULL);
+        if (!partial)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        IoBuildPartialMdl(sourceMdl,        /* the parent   */
+                          partial,
+                          (PUCHAR)MmGetMdlVirtualAddress(sourceMdl)
+                                  + offset,
+                          chunkLength);
+
+        ... use `partial` for one hardware transfer ...
+
+        IoFreeMdl(partial);      /* free ONLY the partial -
+                                    do NOT unlock; the parent
+                                    owns the lock            */
+
+/* THE OWNERSHIP RULE AGAIN: the partial MDL borrows the
+   parent's locked pages. Unlocking through the partial
+   corrupts the parent's state and bugchecks later.
+
+   AND: the parent must outlive every partial derived from it.
+   Completing the parent IRP while a partial is still in
+   flight is a use-after-free with a DMA engine writing into
+   it - about the worst failure mode available.           */</code></pre>
+
+<h2 id="chains">MDL chains</h2>
+
+<p>A single logical transfer may span several separate buffers. MDLs can be linked together so that a device's scatter-gather engine can walk them as one operation.</p>
+
+<pre><code>/* MDLs link through -&gt;Next, describing a discontiguous
+   logical buffer - used heavily by the network stack, where
+   a packet is a header MDL plus a payload MDL.            */
+
+        PMDL mdl;
+        ULONG total = 0;
+
+        for (mdl = firstMdl; mdl != NULL; mdl = mdl-&gt;Next) {
+                PVOID va = MmGetSystemAddressForMdlSafe(mdl,
+                                LowPagePriority |
+                                MdlMappingNoExecute);
+                if (va == NULL)
+                        return STATUS_INSUFFICIENT_RESOURCES;
+
+                ProcessChunk(va, MmGetMdlByteCount(mdl));
+                total += MmGetMdlByteCount(mdl);
+        }
+
+/* ALWAYS WALK THE WHOLE CHAIN. Code that handles only the
+   first MDL works perfectly for small transfers and silently
+   truncates large ones - a data-loss bug that appears only
+   under load, which is the hardest kind to attribute.    */</code></pre>
+
+<h2 id="debug">Debugging MDLs</h2>
+
+<p>When a transfer produces the wrong data, the question is usually whether the MDL describes what you think it describes. The debugger can print it, which settles that immediately.</p>
+
+<pre><code># In WinDbg (chapter 23):
+
+    dt nt!_MDL ffff8a0c12345678
+       +0x000 Next             : (null)
+       +0x008 Size             : 0n56
+       +0x00a MdlFlags         : 0x2004
+       +0x010 Process          : 0xffff8a0c`11223344 _EPROCESS
+       +0x018 MappedSystemVa   : 0xffffcb01`23456000
+       +0x020 StartVa          : 0x00007ff6`12345000
+       +0x028 ByteCount        : 0x3000
+       +0x02c ByteOffset       : 0x678
+
+# DECODE MdlFlags - this tells you the MDL's state:
+    0x0001  MDL_MAPPED_TO_SYSTEM_VA
+    0x0002  MDL_PAGES_LOCKED
+    0x0004  MDL_SOURCE_IS_NONPAGED_POOL
+    0x0008  MDL_ALLOCATED_FIXED_SIZE
+    0x0010  MDL_PARTIAL
+    0x0020  MDL_PARTIAL_HAS_BEEN_MAPPED
+    0x0040  MDL_IO_PAGE_READ
+    0x0080  MDL_WRITE_OPERATION
+    0x1000  MDL_IO_SPACE
+
+# So 0x2004 = SOURCE_IS_NONPAGED_POOL | (0x2000 internal).
+# No PAGES_LOCKED bit -> it was never probed and locked, which
+# is a bug if you expected it to be.
+
+    !pte 0xffff8a0c12345678         # is this VA mapped?
+    !pfn 0x1a2b3                    # one physical page's state
+    !process 0 7                    # locked pages per process
+
+# DRIVER VERIFIER (chapter 22) checks MDL rules aggressively:
+#   unlocking an MDL you did not lock
+#   freeing a mapped MDL
+#   using an MDL after completion
+#   mapping in the wrong process
+# Every one of these is otherwise an intermittent crash.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck in <code>MmUnlockPages</code></td><td>Unlocked an MDL you did not lock, or unlocked twice</td></tr>
+<tr><td>Bugcheck completing an IRP</td><td>Freed or unlocked the IRP's MDL yourself</td></tr>
+<tr><td><code>MmGetSystemAddressForMdlSafe</code> returns NULL</td><td>Memory pressure — a real case to handle</td></tr>
+<tr><td>Mapping fails on modern Windows</td><td>Missing <code>MdlMappingNoExecute</code></td></tr>
+<tr><td>Data corrupt by a few bytes at the start</td><td><code>ByteOffset</code> ignored — the first page is partial</td></tr>
+<tr><td>Large transfers truncated</td><td>Only the first MDL of a chain processed</td></tr>
+<tr><td>User mapping is invalid</td><td>Mapped in a different process than the one using it</td></tr>
+<tr><td>Crash when the user process exits</td><td>Mapping not torn down in <code>IRP_MJ_CLEANUP</code></td></tr>
+<tr><td>DMA writes into freed memory</td><td>Parent MDL completed while a partial was still in flight</td></tr>
+<tr><td>System degrades, working-set errors</td><td>Unbounded or leaked locked pages</td></tr>
+<tr><td>Read-only page corrupted</td><td>Locked with <code>IoReadAccess</code>, then written</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe an MDL's contents and name the accessor for each field.</li>
+  <li>Explain why <code>ByteOffset</code> exists and what ignoring it breaks.</li>
+  <li>List the six problems MDLs solve.</li>
+  <li>Write the full allocate-lock-map-unmap-unlock-free sequence with correct error unwinding.</li>
+  <li>Explain the access argument as a security control.</li>
+  <li>Say who owns an IRP's MDL and what happens if you free it.</li>
+  <li>Map a kernel buffer into user space and list the four rules for doing it safely.</li>
+  <li>Explain partial MDLs and the ownership rule they impose.</li>
+  <li>Walk an MDL chain and say what breaks if you do not.</li>
+  <li>Decode <code>MdlFlags</code> in WinDbg and say what a missing <code>PAGES_LOCKED</code> bit
+  means.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

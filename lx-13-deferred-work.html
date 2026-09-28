@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deferred work: softirqs, tasklets and workqueues | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Deferred work: softirqs, tasklets and workqueues</h1>
+<p class="lead">An interrupt handler must be short. Everything it cannot do goes somewhere else — and Linux
+offers four somewhere-elses, differing in whether they can sleep, how soon they run, and how much they cost.
+Choosing is easy once you know the trade.</p>
+
+<h2 id="why">The top half / bottom half split</h2>
+
+<p>An interrupt handler runs with that interrupt — and often others — disabled, so every microsecond it spends is added directly to the worst-case latency of the entire machine. The universal solution is to do the bare minimum in the handler and push the real work somewhere it can take its time.</p>
+
+<pre class="diagram">   device raises IRQ
+        |
+        v
+   TOP HALF (hard IRQ handler)
+        · interrupts may be disabled
+        · MUST BE FAST - microseconds
+        · CANNOT SLEEP
+        · do only: acknowledge the device, stop it
+          re-interrupting, grab the minimum state
+        |
+        +--&gt; schedule the bottom half
+        |
+        v
+   return IRQ_HANDLED
+        ...
+        |
+        v
+   BOTTOM HALF, later
+        · the actual work: parse the data, wake readers,
+          submit the next transfer, log the error
+        · may or may not sleep, depending which kind
+
+  WHY: while your handler runs, that interrupt is masked, and
+  on many systems others are too. Every microsecond spent in a
+  top half is added directly to the worst-case interrupt
+  latency of the WHOLE SYSTEM (chapter 11).</pre>
+
+<h2 id="four">The four mechanisms</h2>
+
+<p>All four exist to move work out of the interrupt top half described above, but they differ on the one
+property that decides which a driver author is actually allowed to reach for: whether the deferred work can
+sleep, since anything that needs to allocate with <code>GFP_KERNEL</code>, take a mutex, or wait on hardware
+cannot run in the two non-sleeping mechanisms at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Can sleep</th><th>Runs on</th><th>Latency</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>Softirq</strong></td><td>No</td><td>The CPU that raised it</td><td>Very low</td><td>Core subsystems only — you cannot add one</td></tr>
+<tr><td><strong>Tasklet</strong></td><td>No</td><td>The CPU that scheduled it</td><td>Low</td><td><strong>Deprecated.</strong> Do not use in new code</td></tr>
+<tr><td><strong>Workqueue</strong></td><td><strong>Yes</strong></td><td>Any CPU, a kworker thread</td><td>Scheduler-dependent</td><td><strong>The default choice</strong></td></tr>
+<tr><td><strong>Threaded IRQ</strong></td><td><strong>Yes</strong></td><td>A dedicated thread per IRQ</td><td>Low, and prioritisable</td><td><strong>Best for device work</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The short answer</b>
+<p>For work arising from an interrupt on your device: use a <strong>threaded IRQ</strong>. For work arising
+from anywhere else — a timer, a syscall path that must not block, a retry — use a <strong>workqueue</strong>.
+You will almost never need anything else, and tasklets are actively being removed from the kernel.</p>
+</div>
+
+<h2 id="threaded">Threaded interrupts</h2>
+
+<p>This is the mechanism most driver work should use, and it is the easiest to get right: the kernel runs the second half of your handler in an ordinary kernel thread, so it may sleep, take mutexes, and talk to slow buses — none of which is possible in a hard interrupt handler.</p>
+
+<pre><code>/* The modern pattern, and the one to reach for first. */
+
+static irqreturn_t my_hardirq(int irq, void *dev_id)
+{
+        struct my_dev *d = dev_id;
+        u32 status;
+
+        status = readl(d-&gt;base + REG_STATUS);
+        if (!(status &amp; INT_PENDING))
+                return IRQ_NONE;        /* not ours - important
+                                           on a shared line   */
+
+        /* acknowledge and mask, so it stops asserting */
+        writel(status, d-&gt;base + REG_STATUS);
+
+        d-&gt;pending_status = status;     /* hand it over */
+
+        return IRQ_WAKE_THREAD;         /* run the thread fn */
+}
+
+static irqreturn_t my_thread_fn(int irq, void *dev_id)
+{
+        struct my_dev *d = dev_id;
+
+        /* PROCESS CONTEXT. We may sleep here: */
+        mutex_lock(&amp;d-&gt;lock);
+        process_data(d, d-&gt;pending_status);   /* can be slow  */
+        mutex_unlock(&amp;d-&gt;lock);
+
+        wake_up_interruptible(&amp;d-&gt;wq);
+
+        return IRQ_HANDLED;
+}
+
+        ret = devm_request_threaded_irq(&amp;pdev-&gt;dev, irq,
+                                        my_hardirq,
+                                        my_thread_fn,
+                                        IRQF_ONESHOT,
+                                        dev_name(&amp;pdev-&gt;dev),
+                                        d);
+
+/* IRQF_ONESHOT keeps the interrupt MASKED until the thread
+   function finishes. Essential for level-triggered interrupts
+   and for slow buses - without it a device that keeps
+   asserting will re-interrupt immediately and livelock the
+   CPU.
+
+/* THE DEGENERATE CASE, and it is very common - pass NULL for
+   the hard handler and the core provides one that just wakes
+   the thread: */
+        devm_request_threaded_irq(dev, irq, NULL, my_thread_fn,
+                                  IRQF_ONESHOT, name, d);
+/* This is exactly right for I2C and SPI devices, where you
+   cannot even READ the status register without sleeping.  */
+
+/* WHY THREADED IRQs ARE BETTER THAN A WORKQUEUE HERE:
+     · one thread per interrupt, so no sharing with unrelated
+       work
+     · it can be given a real-time priority and pinned
+     · on PREEMPT_RT this is the default for ALL interrupts,
+       so your driver already matches the model
+     · the masking is handled for you                       */</code></pre>
+
+<h2 id="workqueue">Workqueues</h2>
+
+<p>When work is not tied to an interrupt at all — a retry, a delayed poll, a slow initialisation — a workqueue is the general-purpose way to run it in a context that may sleep. It is the default answer for "do this later, properly."</p>
+
+<pre><code>#include &lt;linux/workqueue.h&gt;
+
+/* --- simple: use the shared system queue ----------------- */
+struct my_dev {
+        struct work_struct  work;
+        ...
+};
+
+static void my_work_fn(struct work_struct *w)
+{
+        struct my_dev *d = container_of(w, struct my_dev, work);
+
+        /* process context - CAN SLEEP */
+        mutex_lock(&amp;d-&gt;lock);
+        do_slow_thing(d);
+        mutex_unlock(&amp;d-&gt;lock);
+}
+
+        INIT_WORK(&amp;d-&gt;work, my_work_fn);
+        schedule_work(&amp;d-&gt;work);        /* queue it */
+
+/* --- delayed work ---------------------------------------- */
+        struct delayed_work poll_work;
+
+        INIT_DELAYED_WORK(&amp;d-&gt;poll_work, poll_fn);
+        schedule_delayed_work(&amp;d-&gt;poll_work,
+                              msecs_to_jiffies(100));
+        /* and to re-arm from inside poll_fn, for a poller: */
+        schedule_delayed_work(&amp;d-&gt;poll_work, HZ);
+
+/* --- your own workqueue, when you need control ----------- */
+        d-&gt;wq = alloc_workqueue("my_dev_wq",
+                                WQ_UNBOUND | WQ_MEM_RECLAIM,
+                                1);           /* max_active */
+        if (!d-&gt;wq)
+                return -ENOMEM;
+
+        queue_work(d-&gt;wq, &amp;d-&gt;work);
+        ...
+        destroy_workqueue(d-&gt;wq);    /* drains first */
+
+/* THE FLAGS THAT MATTER:
+     WQ_MEM_RECLAIM   guarantees a rescuer thread, so the queue
+                      can make progress under memory pressure.
+                      REQUIRED if your work is on a memory
+                      reclaim path (a storage or swap driver).
+     WQ_UNBOUND       not tied to a CPU; the scheduler places
+                      it. Better for long-running work.
+     WQ_HIGHPRI       runs ahead of normal work
+     WQ_FREEZABLE     stops during suspend
+     max_active = 1   serialises - only one work item at a
+                      time, which often replaces a lock
+
+/* CANCELLING - and this is where drivers leak or crash: */
+        cancel_work_sync(&amp;d-&gt;work);           /* WAITS */
+        cancel_delayed_work_sync(&amp;d-&gt;poll_work);
+        flush_workqueue(d-&gt;wq);
+
+/* In remove(), you MUST use the _sync forms. cancel_work()
+   without _sync returns immediately, the work may still be
+   running, and it will touch your freed device structure
+   moments later.                                           */</code></pre>
+
+<div class="danger">
+<b>The teardown ordering bug</b>
+<pre><code>static void my_remove(struct platform_device *pdev)
+{
+        struct my_dev *d = platform_get_drvdata(pdev);
+
+        /* 1. STOP THE SOURCE first - no new work can arrive */
+        free_irq(d-&gt;irq, d);            /* or devm handles it */
+        writel(0, d-&gt;base + REG_INT_ENABLE);
+
+        /* 2. THEN cancel what is already queued, and WAIT   */
+        cancel_delayed_work_sync(&amp;d-&gt;poll_work);
+        cancel_work_sync(&amp;d-&gt;work);
+        del_timer_sync(&amp;d-&gt;timer);
+
+        /* 3. ONLY NOW is it safe to free anything          */
+}</code></pre>
+<p>Reverse steps 1 and 2 and the interrupt re-queues the work after you cancelled it. Skip the
+<code>_sync</code> and the work runs against freed memory. Both produce crashes minutes later, in unrelated
+code, and both are found instantly by KASAN.</p>
+</div>
+
+<h2 id="timers">Timers</h2>
+
+<p>Sometimes the trigger is time rather than an event: poll again in 500 ms, give up if the device has not answered in two seconds. Linux offers two timer mechanisms with very different resolutions and very different costs, and picking the wrong one gives you either jitter or wasted CPU.</p>
+
+<pre><code>/* --- timer_list: jiffy-resolution, runs in SOFTIRQ ------- */
+#include &lt;linux/timer.h&gt;
+
+static void my_timer_fn(struct timer_list *t)
+{
+        struct my_dev *d = from_timer(d, t, timer);
+        /* SOFTIRQ CONTEXT - cannot sleep */
+        schedule_work(&amp;d-&gt;work);        /* punt if you must */
+}
+
+        timer_setup(&amp;d-&gt;timer, my_timer_fn, 0);
+        mod_timer(&amp;d-&gt;timer, jiffies + msecs_to_jiffies(500));
+        ...
+        del_timer_sync(&amp;d-&gt;timer);      /* _sync, always */
+
+/* Resolution is one jiffy = 1/CONFIG_HZ, typically 1-10 ms,
+   and timers fire LATE, never early. Fine for timeouts and
+   watchdogs; useless for precise periods.                 */
+
+/* --- hrtimer: nanosecond resolution ---------------------- */
+#include &lt;linux/hrtimer.h&gt;
+
+static enum hrtimer_restart my_hr_fn(struct hrtimer *t)
+{
+        struct my_dev *d = container_of(t, struct my_dev, hrt);
+
+        /* HARD IRQ context by default - be quick */
+        do_sample(d);
+
+        hrtimer_forward_now(t, ns_to_ktime(1000000));  /* 1 ms */
+        return HRTIMER_RESTART;
+}
+
+        hrtimer_init(&amp;d-&gt;hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+        d-&gt;hrt.function = my_hr_fn;
+        hrtimer_start(&amp;d-&gt;hrt, ns_to_ktime(1000000),
+                      HRTIMER_MODE_REL);
+        ...
+        hrtimer_cancel(&amp;d-&gt;hrt);
+
+/* Use hrtimer_forward_now() to re-arm a PERIODIC timer -
+   it advances from the scheduled time, so the period does not
+   drift with handler latency. Re-arming from "now" instead
+   accumulates error, which is the classic sampling-rate
+   bug.                                                     */
+
+/* --- short delays, no timer at all ----------------------- */
+        udelay(10);          /* BUSY-WAITS. atomic-safe.
+                                Under ~10us only.           */
+        ndelay(100);
+        mdelay(5);           /* busy-waits MILLISECONDS -
+                                almost always wrong          */
+
+        usleep_range(100, 200);   /* SLEEPS. process context.
+                                     Give a range so the
+                                     kernel can coalesce it.  */
+        msleep(20);               /* sleeps, coarse           */
+
+/* NEVER mdelay() in a driver unless a datasheet demands a
+   busy-wait. It burns a CPU for the whole duration with
+   preemption implications for everything else.            */</code></pre>
+
+<h2 id="tasklet">Tasklets, and why not</h2>
+
+<p>You will meet tasklets constantly in existing drivers and in older tutorials, so it is worth knowing what they are — and equally worth knowing that they are on their way out and should not appear in anything you write today.</p>
+
+<pre><code>/* You will see these in existing drivers: */
+        DECLARE_TASKLET(my_tasklet, my_tasklet_fn);
+        tasklet_schedule(&amp;my_tasklet);
+
+/* THEY ARE DEPRECATED. Reasons:
+     · they run in softirq context, so they cannot sleep -
+       yet they are used for work that wants to
+     · a tasklet cannot be preempted, so a long one is a
+       latency bug that nothing reports
+     · the same tasklet never runs concurrently on two CPUs,
+       which sounds helpful but hides races that appear the
+       moment someone converts it
+     · they are being actively removed from the tree
+
+   IF YOU ARE MAINTAINING ONE, convert it:
+        tasklet doing work that can sleep -> threaded IRQ
+        tasklet doing quick work          -> the hard IRQ
+                                             handler itself
+        tasklet used for deferral         -> workqueue      */</code></pre>
+
+<h2 id="choose">Choosing</h2>
+
+<p>With four mechanisms available the decision can feel arbitrary, but in practice it collapses to one question — may this work sleep — followed by how urgent it is.</p>
+
+<pre class="diagram">   Work arises from MY DEVICE'S INTERRUPT?
+        |
+        +-- and it can sleep, or takes more than ~10 us
+        |      -&gt; THREADED IRQ
+        |
+        +-- and it is a few register writes
+               -&gt; do it in the hard handler. Deferring it
+                  costs more than doing it.
+
+   Work arises from ELSEWHERE?
+        |
+        +-- must run periodically, precise timing
+        |      -&gt; hrtimer (+ workqueue if it must sleep)
+        |
+        +-- must run periodically, approximate
+        |      -&gt; delayed_work, re-armed
+        |
+        +-- must run once, soon, and may sleep
+        |      -&gt; workqueue
+        |
+        +-- must run once, after a delay
+               -&gt; delayed_work, or timer_list for a timeout
+
+   And on a memory-reclaim path (storage, swap):
+        -&gt; a dedicated workqueue with WQ_MEM_RECLAIM</pre>
+
+<h2 id="observe">Observing</h2>
+
+<p>Deferred work is easy to get subtly wrong in ways that only show up as latency. All of these mechanisms are visible from user space, so you can confirm what actually ran, how often, and how long it took rather than assuming.</p>
+
+<pre><code># Softirq activity:
+    cat /proc/softirqs
+    # HI, TIMER, NET_TX, NET_RX, BLOCK, TASKLET, SCHED,
+    # HRTIMER, RCU - per CPU
+
+# ksoftirqd busy = softirq load so high it was pushed to a
+# thread. On an embedded system that usually means network or
+# timer pressure:
+    top -H | grep ksoftirq
+
+# Workqueue state:
+    ls /sys/bus/workqueue/devices/
+    cat /sys/bus/workqueue/devices/my_dev_wq/max_active
+    # and with CONFIG_WQ_WATCH:
+    dmesg | grep "workqueue.*hogged CPU"
+
+# Tracing - the useful one:
+    trace-cmd record -e workqueue -e irq -e timer
+    trace-cmd report
+    # shows workqueue_queue_work / execute_start / execute_end,
+    # so you can measure how long each item took and how long
+    # it waited
+
+# Stuck work is reported automatically:
+    BUG: workqueue lockup - pool cpus=0 flags=0x0 nice=0
+         stuck for 32s!
+# Means a work item blocked forever, starving everything else
+# on that queue. Common cause: work item A waiting on work
+# item B, both on the same single-threaded queue.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Crash after <code>rmmod</code> or unbind</td><td>Work, timer or IRQ not cancelled with a <code>_sync</code> variant</td></tr>
+<tr><td>Crash in work function touching freed memory</td><td>Cancelled the work before stopping the interrupt that re-queues it</td></tr>
+<tr><td>Interrupt storm, system livelocks</td><td>Level-triggered IRQ not masked — missing <code>IRQF_ONESHOT</code></td></tr>
+<tr><td><code>BUG: scheduling while atomic</code> in a timer</td><td><code>timer_list</code> callbacks run in softirq — cannot sleep</td></tr>
+<tr><td><code>workqueue lockup ... stuck for 32s</code></td><td>A work item blocked, or two items on one queue waiting on each other</td></tr>
+<tr><td>Work runs much later than expected</td><td>Shared system queue behind other work — use your own</td></tr>
+<tr><td>Deadlock under memory pressure</td><td>Reclaim-path work without <code>WQ_MEM_RECLAIM</code></td></tr>
+<tr><td>Sampling period drifts</td><td>Re-armed from "now" instead of <code>hrtimer_forward_now()</code></td></tr>
+<tr><td>High CPU with nothing running</td><td><code>mdelay()</code> busy-waiting</td></tr>
+<tr><td><code>ksoftirqd</code> at high CPU</td><td>Softirq load exceeding what can be handled inline</td></tr>
+<tr><td>Two work items corrupt shared state</td><td>Concurrent execution on different CPUs — use <code>max_active = 1</code> or a lock</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the top-half / bottom-half split and why top halves must be short.</li>
+  <li>Compare the four mechanisms on sleeping, latency and cost.</li>
+  <li>Write a threaded IRQ handler and explain <code>IRQF_ONESHOT</code>.</li>
+  <li>Say when to pass NULL as the hard handler.</li>
+  <li>Write a work item, a delayed work item and a private workqueue.</li>
+  <li>Give the correct teardown order and explain both bugs the wrong order causes.</li>
+  <li>Say when <code>WQ_MEM_RECLAIM</code> is required.</li>
+  <li>Distinguish <code>timer_list</code> from <code>hrtimer</code>, and re-arm a periodic timer without
+  drift.</li>
+  <li>Choose between <code>udelay</code>, <code>usleep_range</code> and <code>msleep</code>.</li>
+  <li>Explain why tasklets are deprecated and what replaces them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

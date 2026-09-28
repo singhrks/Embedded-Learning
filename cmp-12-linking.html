@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Static and dynamic linking | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Static and dynamic linking</h1>
+<p class="lead">Combining object files into a program: symbol resolution, the archive rules that make link
+order matter, linker scripts for bare metal, and the shared-library machinery that resolves calls at run
+time.</p>
+
+<h2 id="job">What the linker does</h2>
+
+<pre class="diagram">   INPUT:   a.o  b.o  libc.a  libfoo.so
+   OUTPUT:  a.out
+
+   1. READ every input, collecting sections and symbols.
+
+   2. RESOLVE symbols: for every UND reference, find a
+      definition.
+
+   3. For ARCHIVES (.a), pull in ONLY the members that
+      resolve a currently-undefined symbol. This is where
+      link order comes from.
+
+   4. LAYOUT: assign an address to every output section,
+      merging like-named input sections.
+         .text  = a.o(.text) + b.o(.text) + ...
+         .data  = a.o(.data) + b.o(.data) + ...
+
+   5. RELOCATE: now that every address is known, patch every
+      hole (chapter 11).
+
+   6. Emit PROGRAM HEADERS describing what the loader should
+      map, with what permissions.
+
+   THE ORDER OF STEPS 2 AND 3 IS THE WHOLE STORY behind the
+   most confusing linker errors, so it is worth being precise:
+   the linker processes inputs LEFT TO RIGHT, maintaining a
+   set of currently-undefined symbols. An archive is scanned
+   ONCE, at the position where it appears.</pre>
+
+<h2 id="order">Link order</h2>
+
+<pre><code># THE RULE: a library must appear AFTER the objects that need
+# it.
+
+    gcc main.o -lfoo            # WORKS
+    gcc -lfoo main.o            # "undefined reference to
+                                #  foo_init"
+
+/* WHY: when the linker reaches -lfoo in the second case,
+   nothing is undefined yet, so it takes NOTHING from the
+   archive. Then main.o introduces undefined symbols, and the
+   archive is already behind it.                          */
+
+# CIRCULAR DEPENDENCIES between two libraries:
+    gcc main.o -lfoo -lbar -lfoo      # repeat it
+    gcc main.o -Wl,--start-group -lfoo -lbar -Wl,--end-group
+    ; the group is rescanned until no new symbols are resolved
+
+# THE GRANULARITY IS THE ARCHIVE MEMBER (one .o), not the
+# function. Pulling in one function from a member drags in the
+# whole member - and everything IT references. This is why:
+#   · a static library should have one function per source
+#     file if size matters
+#   · linking a "small" helper can pull in printf, and with it
+#     the entire formatted-output machinery and locale support
+
+# FORCE INCLUSION, when a member is needed for its side
+# effects (a constructor, a registration table):
+    -Wl,--whole-archive -lfoo -Wl,--no-whole-archive
+    -u symbol_name              ; pretend this symbol is
+                                ; undefined, forcing the
+                                ; member in
+
+# THIS IS A REAL EMBEDDED PROBLEM: a driver registered by a
+# constructor in a static library is silently absent, because
+# nothing referenced it. --whole-archive or an explicit -u is
+# the fix.</code></pre>
+
+<h2 id="static">Static libraries</h2>
+
+<pre><code># A .a is just an ar archive of .o files, plus an index.
+
+    ar rcs libmath.a add.o sub.o mul.o
+    ar t libmath.a              ; list members
+    ar x libmath.a add.o        ; extract one
+    nm libmath.a                ; symbols, per member
+    ranlib libmath.a            ; rebuild the symbol index
+
+    gcc main.c -L. -lmath -o prog
+    gcc -static main.c -o prog  ; link EVERYTHING statically
+
+# PROPERTIES:
+#   + no runtime dependencies; one file to deploy
+#   + no dynamic loader cost at startup
+#   + the linker can do whole-program optimisation
+#     (--gc-sections, LTO)
+#   + no symbol interposition, so calls are direct
+#   - larger binaries if many programs share the library
+#   - a library fix requires relinking every program
+#   - glibc's static linking has caveats: getaddrinfo, NSS
+#     and dlopen still need the matching shared libraries at
+#     run time, which defeats the point
+
+# FOR FULLY STATIC BINARIES, use musl:
+    musl-gcc -static main.c -o prog
+    ; or a musl-based cross toolchain. This is what most
+    ; container and embedded images do.
+
+# EMBEDDED PRACTICE: static linking is the norm. There is no
+# dynamic loader on bare metal, the memory saving of sharing
+# does not apply with one program, and the determinism is
+# worth a great deal.</code></pre>
+
+<h2 id="gc">Dead code elimination at link time</h2>
+
+<pre><code># By default the linker keeps whole SECTIONS. Put each
+# function and variable in its own section and it can drop
+# the unused ones.
+
+    gcc -ffunction-sections -fdata-sections -c *.c
+    gcc -Wl,--gc-sections *.o -o prog
+
+    # see what was dropped:
+    gcc -Wl,--gc-sections -Wl,--print-gc-sections ...
+
+# TYPICAL SAVING on embedded code: 20-50%. On a
+# flash-constrained part this is the single highest-value
+# linker flag.
+
+# KEEP something the linker would drop:
+    __attribute__((used))              /* in the source */
+    KEEP(*(.isr_vector))               /* in the linker
+                                          script - REQUIRED
+                                          for vector tables */
+    -Wl,--undefined=symbol
+
+# AND THE OTHER SIZE TOOLS:
+    -Wl,--icf=all              ; identical code folding: merge
+                               ; byte-identical functions
+                               ; (lld and gold)
+    -flto                      ; whole-program optimisation
+                               ; (chapter 06)
+    -Os / -Oz
+    strip / --strip-debug
+
+# MEASURE, do not guess:
+    size -A prog
+    bloaty prog -d compileunits,symbols
+    ; bloaty attributes every byte to a source file and
+    ; symbol, which turns "the binary is too big" into a
+    ; ranked list.</code></pre>
+
+<h2 id="scripts">Linker scripts</h2>
+
+<pre><code>/* On bare metal you must tell the linker where memory IS.
+   This is a realistic script for a Cortex-M or an ARM64
+   firmware image.                                          */
+
+ENTRY(Reset_Handler)
+
+MEMORY
+{
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+    RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_stack_size = 4K;
+
+SECTIONS
+{
+    .isr_vector :
+    {
+        KEEP(*(.isr_vector))    /* KEEP: never gc this */
+    } &gt; FLASH
+
+    .text :
+    {
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+        . = ALIGN(4);
+        _etext = .;             /* define a symbol at the
+                                   current location         */
+    } &gt; FLASH
+
+    /* .data is STORED in flash, RUN from RAM - so it has two
+       addresses: a Load Memory Address and a Virtual Memory
+       Address.                                            */
+    .data : AT (_etext)
+    {
+        _sdata = .;
+        *(.data .data.*)
+        . = ALIGN(4);
+        _edata = .;
+    } &gt; RAM
+
+    .bss :
+    {
+        _sbss = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        _ebss = .;
+    } &gt; RAM
+
+    .stack (NOLOAD) :
+    {
+        . = ALIGN(8);
+        . = . + _stack_size;
+        _stack_top = .;
+    } &gt; RAM
+
+    /DISCARD/ : { *(.comment) *(.ARM.attributes) }
+}
+
+/* THE LMA/VMA DISTINCTION IS THE KEY IDEA for firmware:
+   initialised data must be STORED somewhere non-volatile and
+   COPIED to RAM before main() runs. The startup code does
+   it:                                                      */
+
+void Reset_Handler(void)
+{
+        extern uint32_t _etext, _sdata, _edata, _sbss, _ebss;
+        uint32_t *src = &amp;_etext;
+        uint32_t *dst = &amp;_sdata;
+
+        while (dst &lt; &amp;_edata)           /* copy .data from
+                dst++ = src++;             flash to RAM     */
+
+        dst = &amp;_sbss;
+        while (dst &lt; &amp;_ebss)            /* zero .bss */
+                *dst++ = 0;
+
+        __libc_init_array();            /* C++ constructors */
+        main();
+        while (1) ;
+}
+
+/* USEFUL SCRIPT CONSTRUCTS:
+     .           the current location counter
+     ALIGN(n)
+     ADDR(sec), LOADADDR(sec), SIZEOF(sec)
+     PROVIDE(sym = value)    define only if not already
+     ASSERT(cond, "message") FAIL THE LINK on a condition -
+                             e.g. ASSERT(_ebss &lt; _stack_top,
+                             "RAM overflow")
+     NOLOAD                  reserve space, emit no data
+
+/* THE ASSERT IS UNDERUSED and worth adopting: a link that
+   fails with "RAM overflow" is far better than a firmware
+   image that overwrites its own stack at run time.      */
+
+# See the default script:
+    ld --verbose
+    gcc -Wl,--verbose ...
+# and the final layout:
+    gcc -Wl,-Map=out.map ...
+    ; the map file shows every section's address and size, and
+    ; WHY each object was included. Read it when something is
+    ; unexpectedly present.</code></pre>
+
+<h2 id="shared">Shared libraries</h2>
+
+<pre><code># Build one:
+    gcc -fPIC -c foo.c bar.c
+    gcc -shared -Wl,-soname,libfoo.so.1 \
+        -o libfoo.so.1.2.3 foo.o bar.o
+    ln -s libfoo.so.1.2.3 libfoo.so.1
+    ln -s libfoo.so.1 libfoo.so
+
+# THE THREE NAMES:
+#   libfoo.so           the LINKER name - what -lfoo finds
+#   libfoo.so.1         the SONAME - what the loader records
+#                       in the executable and searches for
+#   libfoo.so.1.2.3     the real file
+#
+# THE SONAME IS THE ABI VERSION. Change the ABI
+# incompatibly -> bump it to .so.2, and old binaries keep
+# using .so.1. Get this wrong and you break every program on
+# the system.
+
+# -fPIC IS REQUIRED for shared library code: the library may
+# be mapped at any address, so it must not contain absolute
+# addresses (chapter 13).
+
+# --- Inspecting ---
+    ldd prog                    ; what it needs
+    readelf -d prog             ; the DYNAMIC section:
+                                ; NEEDED, SONAME, RPATH
+    readelf --dyn-syms libfoo.so
+    objdump -T libfoo.so        ; the dynamic symbol table
+
+# --- Finding libraries at run time, in order ---
+#   1. DT_RPATH in the executable (deprecated)
+#   2. LD_LIBRARY_PATH
+#   3. DT_RUNPATH
+#   4. /etc/ld.so.cache        (built by ldconfig)
+#   5. /lib, /usr/lib
+#
+    LD_LIBRARY_PATH=/opt/lib ./prog
+    LD_DEBUG=libs ./prog        ; trace the search
+    LD_DEBUG=all ./prog
+    ldconfig -p | grep foo
+
+# --- $ORIGIN, for relocatable installs ---
+    gcc -Wl,-rpath,'$ORIGIN/../lib' ...
+    ; resolves relative to the EXECUTABLE's location, so the
+    ; whole tree can be moved. This is how self-contained
+    ; application bundles work.</code></pre>
+
+<h2 id="symbols">Symbol interposition</h2>
+
+<pre><code>/* In a dynamic link, the FIRST definition found wins - across
+   the whole process. That is interposition, and it is both a
+   feature and a hazard.                                    */
+
+# LD_PRELOAD: insert a library before all others
+    LD_PRELOAD=./mymalloc.so ./prog
+    ; every call to malloc now goes to yours
+
+/* WRITING ONE: */
+#define _GNU_SOURCE
+#include &lt;dlfcn.h&gt;
+
+void *malloc(size_t size)
+{
+        static void *(*real_malloc)(size_t);
+
+        if (!real_malloc)
+                real_malloc = dlsym(RTLD_NEXT, "malloc");
+
+        void *p = real_malloc(size);
+        log_allocation(p, size);
+        return p;
+}
+
+/* USES: profiling, leak tracking, fault injection, sandboxing,
+   and - the reason security people care - hijacking.
+
+/* THE COST OF ALLOWING IT: every call to a global function
+   from within a shared library must go through the PLT, in
+   case someone interposed. That is why:
+        -fvisibility=hidden          hide internals
+        -Bsymbolic                   bind internal references
+                                     directly
+        __attribute__((visibility("hidden")))
+   are worth using: they make intra-library calls direct, and
+   they stop your internals becoming part of your ABI.
+
+/* VERSION SCRIPTS - the disciplined way: */
+        {
+          global:
+            foo_init;
+            foo_process;
+            foo_shutdown;
+          local:
+            *;                  /* everything else hidden */
+        };
+    gcc -shared -Wl,--version-script=foo.map ...
+
+/* This is what a well-maintained library ships. It makes the
+   exported set explicit and reviewable, rather than
+   "whatever happened not to be static".                 */</code></pre>
+
+<div class="key">
+<b>Static or shared, for embedded work</b>
+<p>On bare metal there is no choice: static. On embedded Linux, the trade is real — shared libraries save
+flash and RAM when several programs use them, and static linking gives determinism, faster startup, no
+version skew, and lets LTO and <code>--gc-sections</code> see the whole program. Most modern embedded images
+static-link the application against musl and keep only a handful of shared libraries. Measure both for your
+image; the answer depends on how many binaries you ship.</p>
+</div>
+
+<h2 id="linkers">The linkers</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Linker</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>ld.bfd</code></td><td>The classic GNU linker. Most features, most target support, slowest.</td></tr>
+<tr><td><code>ld.gold</code></td><td>Faster, ELF only. Now deprecated and unmaintained.</td></tr>
+<tr><td><code>lld</code></td><td>LLVM's. Very fast, good diagnostics, ICF, ThinLTO. <code>-fuse-ld=lld</code></td></tr>
+<tr><td><code>mold</code></td><td>The fastest available; a drop-in for most uses. <code>-fuse-ld=mold</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Switching is usually one flag and worth trying on a large
+# project - link time can drop by 5-10x:
+    gcc -fuse-ld=lld ...
+    gcc -fuse-ld=mold ...
+    ld --version
+
+# WHEN IT MATTERS: an incremental build's wall time is often
+# dominated by the link, not the compile. On a kernel or a
+# large C++ application the difference between bfd and mold is
+# minutes per build.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"undefined reference" despite the library being listed</td><td>Library before the object that needs it — put <code>-l</code> last</td></tr>
+<tr><td>"undefined reference" only in a static build</td><td>Circular archive dependency — use <code>--start-group</code></td></tr>
+<tr><td>A constructor in a static library never runs</td><td>Nothing referenced that member — <code>--whole-archive</code> or <code>-u</code></td></tr>
+<tr><td>Vector table missing from the image</td><td>Garbage collected — needs <code>KEEP()</code></td></tr>
+<tr><td>Firmware runs from flash but variables are wrong</td><td><code>.data</code> not copied from LMA to VMA by the startup code</td></tr>
+<tr><td>Silent stack/heap collision at run time</td><td>No <code>ASSERT</code> in the linker script</td></tr>
+<tr><td>"cannot find -lfoo"</td><td>Missing <code>-L</code>, or no <code>libfoo.so</code> symlink</td></tr>
+<tr><td>Runs on the build host, "cannot open shared object" on target</td><td>Library not deployed, or the SONAME differs</td></tr>
+<tr><td>Program picks up the wrong library version</td><td>Search order — check with <code>LD_DEBUG=libs</code></td></tr>
+<tr><td>Upgrading a library breaks every binary</td><td>SONAME not bumped on an incompatible change</td></tr>
+<tr><td>Internal function called through the PLT</td><td>Default visibility — use a version script</td></tr>
+<tr><td>Binary much bigger than expected</td><td>No <code>--gc-sections</code>; run <code>bloaty</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the linker's six steps in order.</li>
+  <li>Explain why link order matters and give three ways to handle circularity.</li>
+  <li>Explain archive-member granularity and its size consequence.</li>
+  <li>Say why a constructor in a static library may never run, and two fixes.</li>
+  <li>Enable section-level garbage collection and measure the saving.</li>
+  <li>Write a linker script with MEMORY, SECTIONS and an ASSERT.</li>
+  <li>Explain LMA versus VMA and write the startup code that bridges them.</li>
+  <li>Explain the three shared-library names and what the SONAME governs.</li>
+  <li>Trace the runtime library search with <code>LD_DEBUG</code>.</li>
+  <li>Explain symbol interposition, its cost, and how a version script controls it.</li>
+  <li>Compare static and shared linking for an embedded image.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

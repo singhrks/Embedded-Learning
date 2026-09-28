@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power management and runtime PM | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Power management and runtime PM</h1>
+<p class="lead">On a battery-powered device, a driver that never lets its hardware sleep is a bug — even if
+it works perfectly. Two independent mechanisms handle it: system suspend, for the whole machine, and runtime
+PM, for one idle device.</p>
+
+<h2 id="two">Two mechanisms, one set of callbacks</h2>
+
+<p>Power management in Linux is two separate mechanisms that share one set of callbacks, which is why it initially looks more complicated than it is. One handles an idle device on a running system; the other handles the whole machine going to sleep.</p>
+
+<pre class="diagram">  SYSTEM SUSPEND                RUNTIME PM
+  --------------                ----------
+  the whole machine sleeps      ONE device sleeps while the
+  user or policy initiated      system runs
+  everything goes down in       reference counted: sleeps when
+    dependency order            nobody is using it
+  .suspend / .resume            .runtime_suspend /
+                                  .runtime_resume
+
+  THEY COMPOSE. A device may be runtime-suspended when system
+  suspend arrives, and must handle that. The core helps:
+
+     pm_runtime_force_suspend()
+     pm_runtime_force_resume()
+
+  used as the system callbacks, do the right thing in both
+  cases.
+
+  THE STATES a device moves through:
+
+     RPM_ACTIVE      powered, usable
+        |  usage_count drops to 0, autosuspend delay expires
+        v
+     RPM_SUSPENDING  .runtime_suspend running
+        |
+        v
+     RPM_SUSPENDED   powered down
+        |  someone calls pm_runtime_get()
+        v
+     RPM_RESUMING    .runtime_resume running
+        |
+        v
+     RPM_ACTIVE</pre>
+
+<h2 id="runtime">Runtime PM</h2>
+
+<p>This is the one a driver author works with daily: powering your device down when nobody is using it, and back up when someone is, automatically and without user space knowing. It is reference counting applied to power.</p>
+
+<pre><code>#include &lt;linux/pm_runtime.h&gt;
+
+/* --- probe: opt in --------------------------------------- */
+static int mydev_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        ...
+
+        /* the hardware IS on at this point, so tell the core */
+        pm_runtime_set_active(dev);
+
+        /* wait this long after the last use before suspending -
+           avoids thrashing on a bursty workload             */
+        pm_runtime_set_autosuspend_delay(dev, 1000);   /* ms  */
+        pm_runtime_use_autosuspend(dev);
+
+        /* from here, the core may call our callbacks */
+        pm_runtime_enable(dev);
+
+        /* devm form, which handles disable on unbind: */
+        ret = devm_pm_runtime_enable(dev);
+        if (ret)
+                return ret;
+
+        ...
+        /* let it go idle once probe is done */
+        pm_runtime_put_autosuspend(dev);
+        return 0;
+}
+
+/* --- the callbacks --------------------------------------- */
+static int mydev_runtime_suspend(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+
+        /* save anything the hardware will forget */
+        regcache_cache_only(d-&gt;regmap, true);
+        regcache_mark_dirty(d-&gt;regmap);
+
+        clk_disable_unprepare(d-&gt;clk);
+        regulator_disable(d-&gt;vdd);
+        return 0;
+}
+
+static int mydev_runtime_resume(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+        int ret;
+
+        ret = regulator_enable(d-&gt;vdd);
+        if (ret)
+                return ret;
+
+        ret = clk_prepare_enable(d-&gt;clk);
+        if (ret)
+                goto err_reg;
+
+        /* the hardware came up from reset - restore it
+           (chapter 26)                                      */
+        regcache_cache_only(d-&gt;regmap, false);
+        ret = regcache_sync(d-&gt;regmap);
+        if (ret)
+                goto err_clk;
+
+        return 0;
+
+err_clk:
+        clk_disable_unprepare(d-&gt;clk);
+err_reg:
+        regulator_disable(d-&gt;vdd);
+        return ret;
+}
+
+/* --- wrapping every hardware access ---------------------- */
+static ssize_t mydev_read(struct file *f, char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+        struct mydev *d = ...;
+        int ret;
+
+        /* resume if needed, and BLOCK until it is up */
+        ret = pm_runtime_resume_and_get(d-&gt;dev);
+        if (ret &lt; 0)
+                return ret;
+
+        ... touch the hardware ...
+
+        pm_runtime_mark_last_busy(d-&gt;dev);
+        pm_runtime_put_autosuspend(d-&gt;dev);
+        return ret;
+}
+
+/* USE pm_runtime_resume_and_get(), not the older
+   pm_runtime_get_sync(). The older one leaves the usage
+   count INCREMENTED on failure, so an error path that
+   returns without a put() pins the device awake forever.
+   resume_and_get() drops it for you on error. This is a real
+   and very common leak in older drivers.                   */</code></pre>
+
+<div class="key">
+<b>The reference-counting discipline</b>
+<p>Every path that touches hardware must be bracketed by a get and a put — <em>including every error
+path</em>. An unbalanced get pins the device permanently awake, which looks like "power management does not
+work" and is invisible in testing. An unbalanced put lets the device suspend under an active user, which
+looks like random hardware failure. Both are found immediately by watching
+<code>/sys/.../power/runtime_status</code> while exercising the driver.</p>
+</div>
+
+<h2 id="system">System suspend</h2>
+
+<p>When the whole machine suspends, every driver is asked to save whatever state it needs and stop its hardware. The difficulty is that on resume the device may have lost everything, or may not have — and your code has to work either way.</p>
+
+<pre><code>static int mydev_suspend(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+
+        /* refuse if we are mid-operation and cannot stop */
+        if (mydev_busy(d))
+                return -EBUSY;      /* aborts the suspend */
+
+        /* stop new work, quiesce the hardware */
+        disable_irq(d-&gt;irq);
+        mydev_stop(d);
+
+        /* if this device can wake the system, arm it */
+        if (device_may_wakeup(dev))
+                enable_irq_wake(d-&gt;irq);
+
+        return 0;
+}
+
+static int mydev_resume(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+
+        if (device_may_wakeup(dev))
+                disable_irq_wake(d-&gt;irq);
+
+        mydev_hw_init(d);          /* it came up from reset */
+        enable_irq(d-&gt;irq);
+        return 0;
+}
+
+/* --- declaring them -------------------------------------- */
+static const struct dev_pm_ops mydev_pm_ops = {
+        SYSTEM_SLEEP_PM_OPS(mydev_suspend, mydev_resume)
+        RUNTIME_PM_OPS(mydev_runtime_suspend,
+                       mydev_runtime_resume, NULL)
+};
+
+/* or, when the runtime callbacks do the whole job: */
+static const struct dev_pm_ops mydev_pm_ops = {
+        SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+                                pm_runtime_force_resume)
+        SET_RUNTIME_PM_OPS(mydev_runtime_suspend,
+                           mydev_runtime_resume, NULL)
+};
+
+static struct platform_driver mydev_driver = {
+        .driver = {
+                .name = "my-device",
+                .pm   = pm_ptr(&amp;mydev_pm_ops),
+                ...
+        },
+        ...
+};
+/* pm_ptr() compiles the reference away when CONFIG_PM is off,
+   so the ops struct is discarded rather than kept as dead
+   weight. Pair it with __maybe_unused or the
+   DEFINE_*_DEV_PM_OPS macros on the callbacks.            */</code></pre>
+
+<h2 id="phases">Suspend phases</h2>
+
+<p>Suspend does not happen in one step. There are several phases, running in a defined order with progressively more of the system disabled, and knowing which phase you are in tells you what you are still allowed to do.</p>
+
+<pre class="diagram">System suspend runs in stages, and which one you need depends
+on what your callback must do:
+
+   prepare()          may sleep, may allocate. Last chance to
+                      refuse.
+   suspend()          the normal one. Interrupts enabled,
+                      may sleep. USE THIS.
+   suspend_late()     after other devices; still can sleep
+   suspend_noirq()    interrupts DISABLED. Only for interrupt
+                      controllers and things that must be last.
+                      Cannot sleep on anything that needs an
+                      interrupt - which includes most I2C and
+                      SPI transfers.
+
+   ... the system sleeps ...
+
+   resume_noirq()
+   resume_early()
+   resume()           the normal one
+   complete()
+
+  THE ORDERING GUARANTEE: children suspend before parents, and
+  resume after them. So an I2C client suspends before its bus
+  controller - which is what makes it safe to talk to the chip
+  in .suspend but not in .suspend_noirq.
+
+  IF YOU NEED I2C/SPI IN A CALLBACK, it must be in
+  .suspend/.resume, not the _noirq variants. Putting it later
+  produces a hang at suspend that is very hard to diagnose,
+  because the console is usually gone by then.</pre>
+
+<h2 id="wakeup">Wakeup sources</h2>
+
+<p>Some devices must be able to wake the machine — a power button, a network packet, an alarm. That requires the device to stay partly powered and its interrupt to remain armed, and it has to be declared explicitly.</p>
+
+<pre><code>/* A device that can wake the system - a button, an RTC alarm,
+   a network packet, a modem interrupt.                     */
+
+/* in probe: */
+        device_init_wakeup(dev, true);      /* capable */
+        /* or, respecting the DT: */
+        if (device_property_read_bool(dev, "wakeup-source"))
+                device_init_wakeup(dev, true);
+
+/* in suspend: */
+        if (device_may_wakeup(dev))
+                enable_irq_wake(d-&gt;irq);
+
+/* USERSPACE CONTROLS whether it is ENABLED: */
+        cat /sys/devices/.../power/wakeup       # enabled/disabled
+        echo enabled > /sys/devices/.../power/wakeup
+
+/* device_init_wakeup() says "this CAN wake"; the sysfs file
+   says "this SHOULD". Respect device_may_wakeup(), which
+   combines them - a driver that always arms its wakeup
+   ignores a user decision and drains the battery.        */
+
+/* SEE WHAT WOKE THE SYSTEM: */
+        cat /sys/kernel/debug/wakeup_sources
+        dmesg | grep -i wakeup
+        cat /sys/power/pm_wakeup_irq</code></pre>
+
+<h2 id="observe">Watching it work</h2>
+
+<p>Power management fails quietly: the device simply never sleeps, and the only symptom is a battery that drains. These interfaces show you what actually happened, which is the only reliable way to know your callbacks are doing anything.</p>
+
+<pre><code># Per-device runtime PM state - the file to watch:
+    cat /sys/devices/platform/.../power/runtime_status
+      active | suspended | suspending | resuming
+    cat .../power/runtime_active_time      # ms awake
+    cat .../power/runtime_suspended_time   # ms asleep
+    cat .../power/autosuspend_delay_ms
+    cat .../power/control                  # auto | on
+
+# FORCE a device to stay awake, to test whether PM is the
+# cause of a bug:
+    echo on > /sys/devices/.../power/control
+    # and back:
+    echo auto > /sys/devices/.../power/control
+
+# Test system suspend:
+    echo mem > /sys/power/state          # suspend-to-RAM
+    echo freeze > /sys/power/state       # s2idle - lighter
+    cat /sys/power/state                 # what is supported
+
+# Suspend for a fixed time using the RTC, so you get back:
+    rtcwake -m mem -s 10
+
+# WHEN SUSPEND FAILS, this names the device:
+    echo 1 > /sys/power/pm_debug_messages
+    dmesg | grep -i "PM:"
+      PM: suspend of devices aborted after ...
+      my-device: PM: failed to suspend: error -16
+
+# Where the time goes during suspend/resume:
+    echo 1 > /sys/power/pm_print_times
+    dmesg | grep "PM: "
+      call my-device+ returned 0 after 12043 usecs
+# A device taking hundreds of milliseconds is your resume
+# latency, and users notice it.
+
+# Power usage attribution, on hardware that supports it:
+    cat /sys/kernel/debug/pm_genpd/pm_genpd_summary
+    powertop</code></pre>
+
+<h2 id="genpd">Power domains</h2>
+
+<p>On an SoC, blocks share power rails — several peripherals may sit in one power domain that can only be switched off when every device in it is idle. The kernel models this explicitly, which is why your device sometimes stays powered despite doing everything correctly.</p>
+
+<pre><code>/* Several devices often share one power rail or one clock
+   domain in silicon. The genpd framework models that: the
+   domain powers down only when EVERY device in it is idle. */
+
+        /* device tree: */
+        my_device: device@1c000000 {
+                compatible = "vendor,my-device";
+                power-domains = &lt;&amp;pd_periph&gt;;
+        };
+
+/* You usually need no driver code at all - the core attaches
+   the device to the domain and the domain's own driver
+   handles the rail. Your runtime_suspend runs first, then the
+   domain powers off if nobody else is holding it.
+
+   THE CONSEQUENCE worth understanding: your device may not
+   actually lose power when it suspends, because a sibling is
+   still active. So resume must be correct whether or not the
+   hardware was reset - which is another argument for
+   regcache_sync() rather than assuming a known state.     */
+
+/* SEE THE DOMAINS: */
+        cat /sys/kernel/debug/pm_genpd/pm_genpd_summary
+        domain          status    children   performance
+        pd_periph       on                   0
+            /device:1c000000.my-device  active
+            /device:1c001000.other      suspended</code></pre>
+
+<h2 id="checklist">A PM review checklist</h2>
+
+<p>Runtime PM bugs are almost never caught by ordinary functional testing, because the device usually stays
+powered throughout a quick test run — they surface only once the system is idle long enough to suspend, which
+makes this checklist worth running deliberately during review rather than trusting that testing will find the
+gaps.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Check</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Every hardware access bracketed by get/put</td><td>Otherwise you touch a powered-down device</td></tr>
+<tr><td>Every error path drops its reference</td><td>Otherwise the device never sleeps</td></tr>
+<tr><td><code>pm_runtime_resume_and_get</code>, not <code>get_sync</code></td><td>Avoids the failure-path count leak</td></tr>
+<tr><td>Resume restores <em>all</em> register state</td><td>The hardware may have been reset</td></tr>
+<tr><td>Resume works even if it was <em>not</em> reset</td><td>A shared power domain may have stayed on</td></tr>
+<tr><td>Suspend refuses (<code>-EBUSY</code>) if mid-operation</td><td>Better than corrupting a transfer</td></tr>
+<tr><td>No I2C/SPI in <code>_noirq</code> phases</td><td>The bus is already suspended</td></tr>
+<tr><td>Wakeup respects <code>device_may_wakeup()</code></td><td>The user's choice, not yours</td></tr>
+<tr><td>Interrupts disabled before suspending the hardware</td><td>Avoids a handler on a dead device</td></tr>
+<tr><td>Tested with <code>rtcwake</code> in a loop</td><td>Suspend bugs are often intermittent</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device never runtime-suspends</td><td>Unbalanced <code>get</code>, often on an error path</td></tr>
+<tr><td><code>runtime_status</code> stuck at <code>active</code></td><td>Same, or <code>power/control</code> is <code>on</code></td></tr>
+<tr><td>Crash or timeout on the first access after idle</td><td>Hardware access without a <code>get</code></td></tr>
+<tr><td>Device misbehaves after resume</td><td>Register state not restored — use <code>regcache_sync()</code></td></tr>
+<tr><td>Works after system resume, not after runtime resume</td><td>Resume assumes a full reset that did not happen</td></tr>
+<tr><td>Suspend hangs the machine</td><td>I2C/SPI access in a <code>_noirq</code> callback</td></tr>
+<tr><td>Suspend aborts with <code>-EBUSY</code></td><td>Your <code>.suspend</code> refused — usually correct</td></tr>
+<tr><td>System wakes immediately</td><td>A wakeup source armed that should not be — check <code>pm_wakeup_irq</code></td></tr>
+<tr><td>Device cannot wake the system</td><td><code>enable_irq_wake()</code> not called, or wakeup disabled in sysfs</td></tr>
+<tr><td>Resume takes hundreds of milliseconds</td><td><code>pm_print_times</code> names the device</td></tr>
+<tr><td>Battery drains with the screen off</td><td>Some device never suspending — check every <code>runtime_status</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish system suspend from runtime PM and say how they compose.</li>
+  <li>Enable runtime PM in probe with autosuspend, and explain each call.</li>
+  <li>Write runtime suspend and resume callbacks with correct error unwinding.</li>
+  <li>Bracket a hardware access correctly, including the error path.</li>
+  <li>Explain why <code>pm_runtime_resume_and_get</code> replaced <code>get_sync</code>.</li>
+  <li>Name the suspend phases and say which may talk to an I2C device.</li>
+  <li>Explain the parent/child ordering guarantee.</li>
+  <li>Implement a wakeup source that respects the user's setting.</li>
+  <li>Use <code>rtcwake</code>, <code>pm_print_times</code> and <code>runtime_status</code> to verify
+  behaviour.</li>
+  <li>Explain why resume must work whether or not the hardware was reset.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

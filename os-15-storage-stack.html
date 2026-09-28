@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The block layer and the storage stack | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The block layer and the storage stack</h1>
+<p class="lead">Between a filesystem's "read block 12345" and a device actually moving data sits a stack whose
+job is to merge, reorder, queue and account for requests. Understanding it explains most storage performance
+behaviour, and all storage latency surprises.</p>
+
+<h2 id="stack">The stack</h2>
+
+<p>Between a write call and a platter or flash cell sit half a dozen layers, each capable of buffering, reordering or merging your request. Knowing the layers is what lets you reason about latency and durability at all.</p>
+
+<pre class="diagram">   application:  read(fd, buf, 4096)
+        │
+   ┌────▼──────────────────────────────────────────┐
+   │  VFS / page cache                              │  cache hit? done.
+   └────┬──────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────┐
+   │  filesystem (ext4)                             │  file offset →
+   │                                                │  block numbers
+   └────┬──────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────┐
+   │  BLOCK LAYER                                   │
+   │    struct bio  →  struct request               │
+   │    merging, I/O scheduler, per-CPU queues      │
+   └────┬──────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────┐
+   │  device mapper / MD  (optional)                │  LVM, RAID,
+   │                                                │  dm-crypt
+   └────┬──────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────┐
+   │  SCSI / NVMe / MMC driver                      │  build commands
+   └────┬──────────────────────────────────────────┘
+   ┌────▼──────────────────────────────────────────┐
+   │  host controller driver (AHCI, NVMe, UFS)      │  DMA, doorbells
+   └────┬──────────────────────────────────────────┘
+        ▼
+     device
+
+Each layer can transform, split, merge or delay the request. That is
+why the I/O your application issues rarely resembles the I/O the
+device sees.</pre>
+
+<h2 id="bio">bio and request</h2>
+
+<p>Requests travel through the storage stack as data structures rather than function calls, which is what allows them to be queued, merged and completed asynchronously.</p>
+
+<pre><code>/* A `bio` is the unit of I/O submitted to the block layer: a
+   target device, a starting sector, and a scatter-gather list of
+   memory pages.                                                */
+
+struct bio {
+        struct block_device *bi_bdev;
+        blk_opf_t            bi_opf;      /* READ, WRITE, FLUSH,
+                                             DISCARD, ZONE_APPEND */
+        struct bvec_iter     bi_iter;     /* sector, size, index  */
+        struct bio_vec      *bi_io_vec;   /* page, offset, len[]  */
+        bio_end_io_t        *bi_end_io;   /* completion callback  */
+};
+
+/* Note the scatter-gather list: the pages need not be contiguous
+   in physical memory. The device's DMA engine walks the list.
+   This is why the DMA API and the SMMU matter here — see the
+   security track.                                             */
+
+/* A `request` is one or more merged bios, ready for a driver. */</code></pre>
+
+<h2 id="merging">Merging and scheduling</h2>
+
+<p>Adjacent small requests are combined into fewer larger ones before reaching the device, because the cost of an operation is dominated by fixed overhead rather than by size.</p>
+
+<pre class="diagram">The block layer's two big optimisations:
+
+  MERGING — adjacent requests become one
+     read sectors 100-107    ┐
+     read sectors 108-115    ├─► one request, sectors 100-131
+     read sectors 116-123    │
+     read sectors 124-131    ┘
+     · front merge, back merge, or a completely new request
+     · limited by max_sectors_kb and max_segments
+
+  SORTING / SCHEDULING — reorder to suit the device
+     on a rotational disk, seeking is 5-10 ms and sequential
+     access is ~1000x faster, so ordering by sector is decisive.
+     On an SSD, "seeking" is free and the scheduler mostly gets
+     out of the way.
+
+  This is why `iostat` often shows fewer, larger requests reaching
+  the device than the application issued — and why an application
+  doing 4 KB sequential writes can still achieve full bandwidth.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Scheduler</th><th>Idea</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>none</code></td><td>No reordering; straight to the device</td><td><strong>NVMe</strong> — the device has thousands of queue entries and reorders better than you can</td></tr>
+<tr><td><code>mq-deadline</code></td><td>Two sorted queues plus expiry deadlines, so nothing starves</td><td>SATA SSDs, mixed workloads, latency-sensitive work</td></tr>
+<tr><td><code>bfq</code></td><td>Budget Fair Queueing — proportional share per process, strong interactivity</td><td>Desktops, rotational disks, containers needing fairness</td></tr>
+<tr><td><code>kyber</code></td><td>Latency-target based; throttles to hit a goal</td><td>Fast devices with a latency SLO</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>cat /sys/block/nvme0n1/queue/scheduler
+#   [none] mq-deadline kyber bfq
+echo mq-deadline &gt; /sys/block/sda/queue/scheduler
+
+# the queue tunables that actually matter
+/sys/block/X/queue/
+    nr_requests          queue depth at the block layer
+    read_ahead_kb        sequential prefetch (128 default)
+    max_sectors_kb       largest single request
+    rotational           1 = disk, 0 = SSD; affects scheduler defaults
+    add_random           entropy contribution — turn off on SSDs
+    nomerges             disable merging (debugging only)
+    write_cache          "write back" or "write through"</code></pre>
+
+<h2 id="blkmq">blk-mq: why the old design broke</h2>
+
+<p>A single request queue with one lock became the bottleneck once devices got fast enough. The multi-queue design removes that by giving each processor its own path to the hardware.</p>
+
+<pre class="diagram">SINGLE-QUEUE (pre-2013)
+   all CPUs ──► one request queue, one spinlock ──► device
+   Fine at 200 IOPS. At 1,000,000 IOPS the lock IS the bottleneck,
+   and every submission bounces a cache line between sockets.
+
+MULTI-QUEUE (blk-mq)
+   CPU0 ─► software queue 0 ┐
+   CPU1 ─► software queue 1 ├─► hardware queue 0 ─► device
+   CPU2 ─► software queue 2 ├─► hardware queue 1 ─► (NVMe has up
+   CPU3 ─► software queue 3 ┘                        to 64K queues)
+
+   · per-CPU submission: no shared lock on the fast path
+   · completion interrupts are steered back to the submitting CPU,
+     so the completion finds the data cache-warm
+   · maps naturally onto NVMe, which was designed with the same model
+
+  This is the same insight as per-CPU runqueues in the scheduler
+  (OS chapter 06): at scale, the shared structure is the problem.</pre>
+
+<h2 id="devices">Device characteristics</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>HDD</th><th>SATA SSD</th><th>NVMe SSD</th><th>Optane / PMEM</th></tr></thead>
+<tbody>
+<tr><td>Random read latency</td><td>5–10 ms</td><td>~100 µs</td><td>~20–80 µs</td><td>&lt;1 µs</td></tr>
+<tr><td>Random IOPS</td><td>~100</td><td>~50–100 k</td><td>~500 k–1 M+</td><td>Millions</td></tr>
+<tr><td>Sequential</td><td>100–250 MB/s</td><td>~550 MB/s</td><td>2–14 GB/s</td><td>Very high</td></tr>
+<tr><td>Seek penalty</td><td><strong>Enormous</strong></td><td>None</td><td>None</td><td>None</td></tr>
+<tr><td>Queue depth benefit</td><td>Small</td><td>Large</td><td><strong>Essential</strong></td><td>—</td></tr>
+<tr><td>Bottleneck</td><td>Mechanics</td><td>Controller, SATA link</td><td>Sometimes the <em>software</em> stack</td><td>Software, entirely</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The inversion</b>
+<p>On a hard disk, software overhead was irrelevant — a 10 µs kernel path next to a 10 ms seek. On NVMe the
+device responds in 20 µs and the kernel path can be a comparable fraction of that. This is why
+<code>io_uring</code>, polled I/O and SPDK exist: at these speeds the operating system itself is the thing to
+optimise away.</p>
+</div>
+
+<pre><code># polled I/O: spin instead of taking a completion interrupt.
+# Burns CPU, removes interrupt and context-switch latency.
+echo 1 &gt; /sys/block/nvme0n1/queue/io_poll
+# with io_uring: IORING_SETUP_IOPOLL</code></pre>
+
+<h2 id="queuedepth">Queue depth and Little's Law</h2>
+
+<p>How many requests are outstanding at once determines whether a device is kept busy — and past a point, adds latency without adding throughput. The right value is measurable rather than guessable.</p>
+
+<pre class="diagram">   throughput = queue_depth / latency          (Little's Law)
+
+   NVMe device: 80 µs latency per operation
+
+     QD = 1    →  1 / 80µs   =    12,500 IOPS
+     QD = 32   →  32 / 80µs  =   400,000 IOPS
+     QD = 128  →  128 / 80µs = 1,600,000 IOPS (until saturation)
+
+  A single-threaded, synchronous application can NEVER exceed
+  QD=1 performance, no matter how fast the device is. This is the
+  single most common storage benchmarking mistake — measuring a
+  million-IOPS drive with `dd` and concluding it does 12,500.
+
+  To get depth you need: async I/O (io_uring, libaio), multiple
+  threads, or readahead doing it for you.
+
+  But depth costs LATENCY: at QD=128 each request waits behind 127
+  others. Throughput and latency trade off exactly as in CA
+  chapter 18.</pre>
+
+<pre><code># measure properly, with depth and parallelism
+fio --name=randread --ioengine=io_uring --direct=1 \
+    --rw=randread --bs=4k --iodepth=32 --numjobs=4 \
+    --size=4G --runtime=60 --group_reporting
+
+# --direct=1 bypasses the page cache. Without it you are
+# benchmarking RAM, which is the second most common mistake.</code></pre>
+
+<h2 id="directio">Direct I/O</h2>
+
+<p>Bypassing the page cache entirely gives an application complete control over its own buffering, which is what databases want and what most other programs should not use.</p>
+
+<pre><code>int fd = open("file", O_RDWR | O_DIRECT);
+/* Bypasses the page cache entirely. Requires that the buffer,
+   the file offset and the length are all aligned to the device's
+   logical block size — usually 512 or 4096 bytes.            */
+
+void *buf;
+posix_memalign(&amp;buf, 4096, size);      /* aligned allocation */
+pread(fd, buf, 4096, offset);          /* all three aligned  */
+
+/* Use O_DIRECT when:
+     · the application has its own cache (databases)
+     · the data will not be re-read, and caching it would evict
+       something useful
+     · you are benchmarking the device
+
+   Do NOT use it as a general speed-up. It removes readahead and
+   write coalescing, so naive sequential access gets SLOWER.  */</code></pre>
+
+<h2 id="dm">Device mapper and RAID</h2>
+
+<p>Block devices can be stacked, with one presenting a virtual device backed by others — which is how RAID, encryption, snapshots and logical volumes are all implemented on the same mechanism.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Target</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>dm-linear</code></td><td>Maps a range to another device — the building block of LVM</td></tr>
+<tr><td><code>dm-crypt</code></td><td>Transparent encryption (LUKS)</td></tr>
+<tr><td><code>dm-thin</code></td><td>Thin provisioning and snapshots</td></tr>
+<tr><td><code>dm-cache</code>, <code>bcache</code></td><td>Use an SSD as a cache in front of a disk</td></tr>
+<tr><td><code>dm-verity</code></td><td>Cryptographically verified read-only device — Android Verified Boot and confidential container images depend on it</td></tr>
+<tr><td><code>md</code></td><td>Software RAID 0/1/5/6/10</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>lsblk                          # the full stack, visually
+dmsetup table                  # device mapper targets in use
+cat /proc/mdstat               # RAID status and rebuild progress
+
+/* RAID 5's write hole: a partial stripe update that is
+   interrupted by power loss leaves data and parity inconsistent,
+   and the inconsistency is invisible until a later rebuild
+   reconstructs wrong data. Journals, battery-backed cache or a
+   COW filesystem (btrfs/ZFS RAID) address it.               */</code></pre>
+
+<h2 id="cgroup">I/O control and isolation</h2>
+
+<p>When several workloads share one device, something must arbitrate, or one of them will monopolise it. I/O control groups are how a system bounds that.</p>
+
+<pre><code># cgroup v2 io controller — limit or weight a container's I/O
+echo "259:0 rbps=10485760 wbps=5242880 riops=1000 wiops=500" \
+     &gt; /sys/fs/cgroup/mygroup/io.max
+echo "default 100" &gt; /sys/fs/cgroup/mygroup/io.weight
+
+# io.latency: guarantee a latency target for a priority group,
+# throttling others when it is exceeded
+echo "259:0 target=10000" &gt; /sys/fs/cgroup/critical/io.latency
+
+# per-process I/O priority (works with BFQ / CFQ-style schedulers)
+ionice -c 3 -p PID             # idle class
+ionice -c 2 -n 7 ./backup      # best-effort, lowest priority</code></pre>
+
+<h2 id="observing">Observing</h2>
+
+<p>Storage problems are almost always diagnosable from counters rather than guesswork. These are the ones that distinguish a slow device from a badly-shaped workload.</p>
+
+<pre><code>iostat -xz 1
+#  Device  r/s   w/s  rkB/s  wkB/s  rareq-sz  aqu-sz  r_await w_await %util
+#                                             ^depth  ^latency        ^busy
+#  %util is MISLEADING on SSDs: a device that can serve 32 requests
+#  in parallel shows 100% "utilisation" while nearly idle. Use
+#  aqu-sz and await instead.
+
+iotop -o                        # which processes are doing I/O
+pidstat -d 1
+
+# per-request tracing
+blktrace -d /dev/sda -o - | blkparse -i -
+btt -i trace.bin                # latency breakdown by stage:
+                                # Q2G queue→get, G2I insert,
+                                # I2D issue→device, D2C device→complete
+                                # This tells you WHICH LAYER is slow.
+
+# eBPF one-liners
+biolatency-bpfcc                # latency histogram
+biosnoop-bpfcc                  # every I/O with process and latency
+biotop-bpfcc
+
+# where is the time going overall?
+cat /proc/pressure/io           # PSI — stall percentage</code></pre>
+
+<div class="tip">
+<b>Diagnosing "the disk is slow"</b>
+<p>Work down the stack. <code>iostat</code> <code>await</code> high but <code>aqu-sz</code> low means the
+<em>device</em> is slow. <code>aqu-sz</code> high means you are queueing — the device is saturated, or the
+scheduler is holding requests. If application latency is high but <code>await</code> is low, the problem is
+above the block layer: filesystem metadata, <code>fsync</code>, or the page cache. <code>btt</code> resolves
+this precisely by breaking one request's life into stages.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>NVMe benchmarks at a fraction of its rating</td><td>Queue depth 1 — synchronous single-threaded I/O</td></tr>
+<tr><td>Benchmark shows impossible throughput</td><td>Hitting the page cache; use <code>--direct=1</code></td></tr>
+<tr><td><code>%util</code> is 100% but the device is fine</td><td><code>%util</code> is meaningless for parallel devices</td></tr>
+<tr><td><code>O_DIRECT</code> made things slower</td><td>Lost readahead and write coalescing</td></tr>
+<tr><td><code>O_DIRECT</code> returns <code>EINVAL</code></td><td>Buffer, offset or length not block-aligned</td></tr>
+<tr><td>Write latency spikes every few seconds</td><td>Writeback flushing dirty pages; tune <code>vm.dirty_*</code></td></tr>
+<tr><td>Backup job destroys interactive latency</td><td>No I/O isolation; use <code>ionice</code>, BFQ or cgroup <code>io.latency</code></td></tr>
+<tr><td>SSD gets slower over months</td><td>No TRIM; the FTL cannot garbage collect</td></tr>
+<tr><td>RAID 5 array corrupt after power loss</td><td>The write hole</td></tr>
+<tr><td>Random reads far slower than sequential on a disk</td><td>Seek time — the fundamental HDD characteristic</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the layers between <code>read()</code> and the device, and what each may change.</li>
+  <li>Explain what a <code>bio</code> contains and why it is a scatter-gather list.</li>
+  <li>Explain merging and why it matters more on rotational media.</li>
+  <li>Say which I/O scheduler suits NVMe and why.</li>
+  <li>Explain why blk-mq replaced the single request queue.</li>
+  <li>Use Little's Law to explain why a synchronous program cannot saturate an NVMe drive.</li>
+  <li>Give two legitimate uses of <code>O_DIRECT</code> and one common misuse.</li>
+  <li>Explain why <code>%util</code> is misleading on SSDs and what to read instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

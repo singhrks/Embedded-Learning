@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALPC: the mechanism behind almost everything | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>ALPC: the mechanism behind almost everything</h1>
+<p class="lead">Advanced Local Procedure Call is one of the least user-visible mechanisms in Windows and one
+of the most load-bearing: RPC, COM, most Win32 API calls that need to reach a system service, and the
+communication between a user-mode process and the kernel-mode components that back it all ultimately run over
+ALPC. This chapter is what it actually is, and why it matters even to a driver author who never calls it
+directly.</p>
+
+<h2 id="what">A message-passing IPC mechanism, kernel-mediated</h2>
+
+<p>ALPC is one of the least visible mechanisms in Windows and one of the most load-bearing — almost every local system service is reached through it. It is worth knowing even if you never call it directly, because it explains a great deal of what you see in traces.</p>
+
+<pre class="diagram">   ALPC connects two processes on the SAME MACHINE (the
+   "local" in Local Procedure Call - it has nothing to do
+   with the network; that is RPC's job, which can layer
+   itself ON TOP of ALPC when both endpoints are local).
+
+   +-------------+                        +-------------+
+   | CLIENT      |                        | SERVER       |
+   | process     |                        | process      |
+   |             |   ALPC PORT OBJECT     |             |
+   |  NtAlpcSend |------------------------&gt;| NtAlpcSend  |
+   |  Message()  |   (an object manager   |  Message()  |
+   |             |    object, named or    |             |
+   |  NtAlpc     |    unnamed, living in  |  NtAlpc     |
+   |  ReceiveMsg |    the object          |  ReceiveMsg |
+   |  ()         |    namespace exactly   |  ()         |
+   |             |    like the objects    |             |
+   |             |    from chapter 31)    |             |
+   +-------------+                        +-------------+
+              \                            /
+               \                          /
+                +------------------------+
+                |  KERNEL - copies the    |
+                |  message between the    |
+                |  two processes'         |
+                |  address spaces, and    |
+                |  can attach the         |
+                |  SENDER'S SECURITY      |
+                |  CONTEXT to the message |
+                |  (impersonation - see   |
+                |  below)                 |
+                +------------------------+
+
+   THE KERNEL SITS IN THE MIDDLE OF EVERY MESSAGE, which is
+   exactly what makes ALPC suitable as a trust boundary: a
+   server process can know, with kernel-enforced certainty,
+   exactly which process and which security context a
+   message came from - something a naive shared-memory or
+   named-pipe scheme built entirely in user mode cannot
+   offer with the same guarantee.</pre>
+
+<h2 id="who">Who actually uses it, constantly, without you noticing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Component</th><th>What it uses ALPC for</th></tr></thead>
+<tbody>
+<tr><td><strong>RPC</strong></td><td>When client and server are on the same machine, the RPC runtime silently
+chooses ALPC as the transport instead of named pipes or TCP — most local RPC traffic in Windows is,
+underneath, ALPC</td></tr>
+<tr><td><strong>CSRSS</strong></td><td>Every Win32 process talks to the Client/Server Runtime Subsystem over
+ALPC for a range of Win32-specific operations the native NT API alone does not cover</td></tr>
+<tr><td><strong>LSASS</strong></td><td>Logon, authentication and credential operations flow through ALPC to
+the Local Security Authority Subsystem — which is exactly why LSASS's ALPC port is a security-sensitive
+target attackers try to reach</td></tr>
+<tr><td><strong>The kernel's own subsystems</strong></td><td>Several executive components use ALPC internally
+to talk to user-mode helper processes — the print spooler's relationship with driver isolation host processes
+is one visible example</td></tr>
+<tr><td><strong>Debuggers</strong></td><td>The Windows debugging model uses ALPC-based communication for
+parts of the debug object protocol between the debugger and the debuggee's kernel-side debug support</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="ports">Ports, messages, and the connect/communication split</h2>
+
+<p>ALPC uses two distinct kinds of port, and the split is not an implementation detail: it is precisely what prevents one client from interfering with another's session on a shared service.</p>
+
+<pre class="diagram">   ALPC USES TWO KINDS OF PORT, and the split exists
+   specifically to prevent a class of confusion (and abuse)
+   that a single shared port would allow.
+
+   1. THE CONNECTION PORT
+        Created once by the SERVER, named in the object
+        namespace (chapter 31) so clients can find it, e.g.
+        \RPC Control\somename. This port does ONE thing:
+        accept incoming connection REQUESTS.
+
+   2. THE COMMUNICATION PORT (created per client)
+        When a client connects, the kernel creates a
+        DEDICATED pair of communication ports - one handle
+        for the client, one for the server - private to
+        that single client/server relationship. All the
+        actual message traffic for that session flows over
+        this private pair, never over the original
+        connection port.
+
+   THIS MEANS a malicious or buggy client cannot see, inject
+   into, or interfere with another client's session merely
+   by having a handle to the well-known connection port -
+   the connection port ONLY ever hands out new, isolated
+   communication channels, it never itself carries session
+   data.</pre>
+
+<h2 id="impersonation">Impersonation: the security payoff of kernel mediation</h2>
+
+<p>Because the kernel handles every message, it can attach the sender's identity to it — which lets a privileged server safely act on behalf of an unprivileged caller without accidentally lending it that privilege.</p>
+
+<pre><code>/* Because the KERNEL copies every ALPC message, it can
+   attach the sending thread's security context to the
+   message, and the receiving server can - if it chooses -
+   IMPERSONATE the client for the duration of handling that
+   one request.                                             */
+
+/* On the SERVER side, conceptually (RPC and many system
+   services do this under the hood; you rarely call the raw
+   ALPC impersonation primitives directly):
+
+     - receive a message from a client
+     - impersonate the client's security context
+     - perform the requested operation AS THE CLIENT, so
+       every access check the operation triggers is
+       evaluated against the CLIENT's rights, not the
+       server's - this is why a low-privilege client cannot
+       use a highly-privileged server as a confused deputy
+       to perform actions it could not do itself
+     - revert to the server's own identity before continuing
+       to serve other, unrelated requests
+
+/* THIS IS THE SAME UNDERLYING TOKEN MECHANISM described in
+   chapter 36, applied specifically to the "a server is
+   acting on behalf of many different, mutually distrusting
+   clients" problem - and it is precisely why services like
+   LSASS and the print spooler can safely serve requests
+   from many different users at different privilege levels
+   without one user's request being able to borrow the
+   SERVICE's own elevated identity by accident.            */
+</code></pre>
+
+<h2 id="observing">Seeing ALPC in practice</h2>
+
+<p>ALPC traffic is largely invisible to the usual tools, which is a genuine gap worth knowing about in advance. These are the ways to see it when you need to.</p>
+
+<pre><code># Process Explorer / Process Hacker: a process's Handles
+# view shows ALPC Port handles directly, by name where the
+# port is named - useful for confirming which service a
+# given process is actually talking to.
+
+kd&gt; !alpc /p ffffc001a2b3c0        # dump one ALPC port object
+kd&gt; !alpc /m ffffc001a2b410        # dump one in-flight message
+
+# Sysinternals' Process Monitor does NOT show ALPC traffic
+# directly (unlike file, registry and network I/O) - the
+# message CONTENTS are opaque to it, which is a genuine gap
+# in the standard tracing toolkit and one reason ALPC-based
+# communication (LSASS, CSRSS) is comparatively hard to
+# black-box trace compared with file or registry activity.
+
+# Event Tracing for Windows (chapter 35) DOES have an ALPC
+# provider (Microsoft-Windows-Kernel-ALPC) capable of
+# tracing connect/send/receive events, which is the
+# practical way to actually observe this traffic when you
+# need to.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Local RPC call is fast, remote is slow</td><td>Same API, different transport — local RPC silently
+uses ALPC, remote uses a network transport</td></tr>
+<tr><td>A hung LSASS or CSRSS freezes seemingly unrelated apps</td><td>Many processes block waiting on an ALPC
+reply from that service</td></tr>
+<tr><td>Process Monitor shows nothing for a known IPC operation</td><td>The traffic is over ALPC, which
+Process Monitor does not decode — use ETW instead</td></tr>
+<tr><td>A server performs an operation with the wrong privilege level</td><td>It failed to impersonate the
+client, or reverted impersonation too late</td></tr>
+<tr><td>One client's malformed request affects another client</td><td>Should not happen — each client gets an
+isolated communication port; investigate as a genuine bug if seen</td></tr>
+<tr><td>A named ALPC port is visible but connecting fails</td><td>The connection port only grants a private
+communication channel — check the server's own accept logic and security filtering</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what ALPC actually is, and how it differs from RPC despite RPC often using it underneath.</li>
+  <li>Name three Windows components that rely on ALPC constantly.</li>
+  <li>Explain the connection-port versus communication-port split and what security problem it prevents.</li>
+  <li>Explain why the kernel sitting in the middle of every message enables impersonation.</li>
+  <li>Describe what impersonation protects against, using the confused-deputy framing.</li>
+  <li>Explain why Process Monitor cannot show ALPC message contents, and what tool can.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

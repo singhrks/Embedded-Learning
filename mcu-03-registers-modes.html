@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registers, modes and the two stack pointers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Registers, modes and the two stack pointers</h1>
+<p class="lead">Sixteen registers, two modes, two privilege levels and two stack pointers. That is the entire
+programmer's model, and the whole of an RTOS context switch is built from it. This chapter is the reference
+you will come back to when writing chapter 18.</p>
+
+<h2 id="regfile">The register file</h2>
+
+<pre class="diagram">   +-------+
+   |  R0   |  \
+   |  R1   |   |  Caller-saved (AAPCS): arguments and
+   |  R2   |   |  scratch. The HARDWARE stacks these
+   |  R3   |  /   on exception entry.
+   +-------+
+   |  R4   |  \
+   |  R5   |   |
+   |  R6   |   |
+   |  R7   |   |  Callee-saved. The hardware does NOT
+   |  R8   |   |  stack these. If your context switch
+   |  R9   |   |  needs them saved, you save them.
+   |  R10  |   |
+   |  R11  |  /
+   +-------+
+   |  R12  |     IP, intra-procedure scratch. Hardware-stacked.
+   +-------+
+   |  R13  |     SP - banked! MSP or PSP (see below)
+   +-------+
+   |  R14  |     LR, link register. Hardware-stacked.
+   +-------+
+   |  R15  |     PC. Hardware-stacked.
+   +-------+
+   |  xPSR |     Program status. Hardware-stacked.
+   +-------+
+
+   The eight hardware-stacked registers are exactly
+   R0-R3, R12, LR, PC, xPSR. That set is chosen to match
+   the procedure call standard's caller-saved set, which
+   is what makes a plain C function a legal handler.</pre>
+
+<p>Note what is absent compared with AArch64: no <code>X0–X30</code>, no separate <code>SP_EL0</code> and
+<code>SP_EL1</code> per exception level, no <code>ELR</code>. The M profile is deliberately small.</p>
+
+<h2 id="xpsr">xPSR: three registers at one address</h2>
+
+<pre><code>/* xPSR is the union of three views, and you can read them
+   individually or together.                                 */
+
+/*  31 30 29 28 27      24        16      9  8       0
+   +--+--+--+--+--+-----+--+-------+------+---------+
+   | N| Z| C| V| Q|     |T |  ICI  |      | ISR_NUM |
+   +--+--+--+--+--+-----+--+-------+------+---------+
+     APSR (flags)        ^   EPSR         IPSR
+                         |
+                     THUMB BIT - must be 1, always.        */
+
+/* APSR - condition flags, exactly as on any ARM core.
+   Q is the DSP saturation sticky flag.
+
+   IPSR - which exception is executing. 0 means Thread mode,
+   i.e. ordinary code. This is how you answer "am I in an
+   interrupt?" at runtime:                                   */
+
+static inline int in_handler_mode(void)
+{
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+    return ipsr != 0;
+}
+
+/* An RTOS uses precisely this to decide whether a call is
+   the ISR-safe variant. FreeRTOS's configASSERT checks on
+   xQueueSend versus xQueueSendFromISR come down to this
+   register (chapter 19).
+
+   EPSR - execution state, including the T bit. It cannot be
+   written directly by software; it is restored from the
+   stacked xPSR on exception return. Clearing the T bit in a
+   stacked frame is a reliable way to fault on return.       */
+</code></pre>
+
+<h2 id="modes">Two modes, two privilege levels</h2>
+
+<pre class="diagram">                  PRIVILEGED          UNPRIVILEGED
+
+   HANDLER mode   always here         cannot happen
+   (in an
+    exception)    Uses MSP.
+                  IPSR != 0.
+
+   THREAD mode    reset lands here    optional; set by
+   (ordinary                          writing CONTROL.nPRIV
+    code)         Uses MSP or PSP,
+                  chosen by
+                  CONTROL.SPSEL      An RTOS runs tasks
+                                     here, with the MPU
+                                     enforcing isolation
+                                     (chapter 14).
+
+   Handler mode is ALWAYS privileged. There is no way to take
+   an interrupt into unprivileged code, which is why fault
+   handlers can always reach the fault registers.</pre>
+
+<pre><code>/* The CONTROL register - only three bits, both of which
+   you will use in an RTOS.                                  */
+
+/*   bit 2  FPCA   floating-point context active (read-only
+                   to you; the hardware sets it)
+     bit 1  SPSEL  0 = use MSP in Thread mode
+                   1 = use PSP in Thread mode
+     bit 0  nPRIV  0 = Thread mode privileged
+                   1 = Thread mode unprivileged            */
+
+static inline void switch_to_psp_unprivileged(void)
+{
+    __asm volatile ("msr control, %0" :: "r" (0x3) : "memory");
+    __asm volatile ("isb");          /* MANDATORY - see below */
+}
+
+/* The ISB is not optional. Writing CONTROL changes how the
+   very next instruction fetches its stack; without a barrier
+   the pipeline may already hold instructions decoded under
+   the old setting. This is the single most common omission
+   in hand-written RTOS startup code, and it produces a fault
+   that moves when you add a printf.                         */
+</code></pre>
+
+<div class="danger">
+<b>You cannot raise your own privilege</b>
+<p><code>CONTROL.nPRIV</code> can be set from privileged code to drop to unprivileged, but unprivileged code
+cannot clear it — the write is ignored. The only way back to privileged execution is to take an exception,
+which is exactly what an <code>SVC</code> instruction is for. That is the entire system-call mechanism of an
+M-profile RTOS, and it is the same idea as <code>svc</code> on Cortex-A with about one percent of the
+machinery.</p>
+</div>
+
+<h2 id="stacks">Two stack pointers, and why</h2>
+
+<p>R13 is banked: there are two physical registers, and which one you see as <code>SP</code> depends on the
+mode and <code>CONTROL.SPSEL</code>.</p>
+
+<pre class="diagram">   MSP - Main Stack Pointer
+     Reset value loaded from vector table entry 0.
+     Used by: Handler mode, always.
+              Thread mode when SPSEL = 0.
+     Holds: interrupt frames, and the main() stack in a
+            bare-metal program.
+
+   PSP - Process Stack Pointer
+     Not initialised by hardware; you set it.
+     Used by: Thread mode when SPSEL = 1.
+     Holds: the current task's stack in an RTOS.
+
+   BARE METAL              RTOS
+   +-----------+           +-----------+   +-----------+
+   |   main()  | MSP       | task A    |   | task B    | PSP
+   |   + ISRs  |           | stack     |   | stack     | (switched)
+   +-----------+           +-----------+   +-----------+
+                                 |
+                           +-----------+
+                           |   ISRs    | MSP (shared, one only)
+                           +-----------+
+
+   The split means an interrupt storm cannot overflow a
+   task's stack into another task's data - ISRs have their
+   own stack. It also means you size the MSP for the worst
+   nesting depth of interrupts, and each PSP for one task.
+   That is a far easier budget to get right than one stack
+   for everything.</pre>
+
+<pre><code>/* Reading and writing the banked pointers. */
+
+static inline uint32_t get_psp(void)
+{
+    uint32_t r; __asm volatile ("mrs %0, psp" : "=r" (r)); return r;
+}
+static inline void set_psp(uint32_t v)
+{
+    __asm volatile ("msr psp, %0" :: "r" (v));
+}
+
+/* Note there is no barrier needed after MSR PSP itself -
+   you are not changing WHICH stack pointer is in use, only
+   its value. The barrier is needed after writing CONTROL,
+   which changes the selection.                              */
+</code></pre>
+
+<h2 id="excreturn">EXC_RETURN: the magic LR value</h2>
+
+<p>On exception entry the hardware does not put a return address in <code>LR</code>. It puts a special
+pattern with the top 24 bits set, encoding which stack to unwind from and whether FP state is present.</p>
+
+<pre><code>/* EXC_RETURN values you will actually see (ARMv7-M):
+
+   0xFFFFFFF1  return to Handler mode, MSP,  no FP frame
+   0xFFFFFFF9  return to Thread  mode, MSP,  no FP frame
+   0xFFFFFFFD  return to Thread  mode, PSP,  no FP frame
+   0xFFFFFFE9  return to Thread  mode, MSP,  with FP frame
+   0xFFFFFFED  return to Thread  mode, PSP,  with FP frame
+
+     bit 2 = 1  ->  return uses PSP
+     bit 4 = 0  ->  extended (FP) stack frame
+     bit 3 = 1  ->  returning to Thread mode                */
+
+/* Executing BX LR with this value in LR is what returns from
+   an exception - there is no ERET instruction. The core sees
+   the 0xFF... pattern in a branch target and interprets it
+   as "unstack and return" rather than an address.
+
+   A context switch works by CHANGING which stack PSP points
+   at while inside PendSV, then returning with 0xFFFFFFFD.
+   The hardware unstacks the new task's frame and the CPU is
+   simply running different code. Chapter 18 builds this.    */
+</code></pre>
+
+<div class="key">
+<b>This is the whole trick of an M-profile context switch</b>
+<p>There is no privileged "load all registers" instruction and no dedicated switch mechanism. You save R4–R11
+by hand, change <code>PSP</code>, restore R4–R11 from the new stack, and <code>BX</code> to
+<code>EXC_RETURN</code>. The hardware's automatic unstacking does the rest. Once you see that the exception
+return path <em>is</em> the switch, the twenty lines of assembly in chapter 18 stop looking like magic.</p>
+</div>
+
+<h2 id="masking">Interrupt masking registers</h2>
+
+<pre><code>/* Three ways to turn interrupts off, in increasing subtlety. */
+
+/* PRIMASK - one bit. Blocks everything except NMI and
+   HardFault. The blunt instrument.                          */
+__disable_irq();          /* cpsid i  -> PRIMASK = 1 */
+/* ... critical section ... */
+__enable_irq();           /* cpsie i  -> PRIMASK = 0 */
+
+/* FAULTMASK - like PRIMASK but also blocks HardFault.
+   Cleared automatically on exception return. Rarely used
+   outside fault recovery.                                   */
+
+/* BASEPRI - block only interrupts at or below a priority.
+   ARMv7-M and above only. This is what an RTOS uses, so
+   that high-priority "zero-latency" interrupts keep running
+   through kernel critical sections.                         */
+__set_BASEPRI(5 &lt;&lt; (8 - __NVIC_PRIO_BITS));
+/* ... kernel critical section ...
+   Interrupts of priority 0-4 still fire and must NOT call
+   any RTOS API. Priorities 5+ are blocked and may.          */
+__set_BASEPRI(0);
+
+/* Note the shift. Priority bits are stored in the HIGH bits
+   of the byte, so a part with 4 implemented bits treats
+   0x50 and 0x5F identically. Forgetting the shift is why
+   "my BASEPRI does nothing" is a common question - writing
+   5 instead of 5&lt;&lt;4 sets a priority so low it blocks
+   nothing. Chapter 08 covers this properly.                 */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Fault a few instructions after writing <code>CONTROL</code></td><td>Missing <code>ISB</code>; the
+pipeline still holds instructions decoded for the old stack</td></tr>
+<tr><td>Fault moves or vanishes when you add a print</td><td>Same missing barrier — you changed the pipeline
+timing</td></tr>
+<tr><td>Task stacks corrupt each other under interrupt load</td><td>Tasks and ISRs sharing MSP; move tasks to
+PSP</td></tr>
+<tr><td>Unprivileged code cannot regain privilege</td><td>Correct and by design — use <code>SVC</code></td></tr>
+<tr><td>Context switch corrupts variables in some tasks</td><td>R4–R11 not saved; the hardware only stacks the
+caller-saved eight</td></tr>
+<tr><td>Corruption appears only once two tasks use float</td><td>FP registers not saved; check
+<code>EXC_RETURN</code> bit 4</td></tr>
+<tr><td>Fault on exception return</td><td>Stacked xPSR has the T bit clear, or <code>EXC_RETURN</code> was
+overwritten</td></tr>
+<tr><td><code>BASEPRI</code> appears to do nothing</td><td>Value not shifted into the implemented high priority
+bits</td></tr>
+<tr><td><code>BASEPRI</code> does not exist</td><td>ARMv6-M core — only <code>PRIMASK</code> is
+available</td></tr>
+<tr><td>RTOS assert fires inside an ISR</td><td>Called the non-<code>FromISR</code> API; the kernel checked
+<code>IPSR</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the eight registers stacked by hardware and explain why that particular set.</li>
+  <li>Say which registers a context switch must save by hand, and why.</li>
+  <li>Explain how to determine at runtime whether you are in an interrupt.</li>
+  <li>State the two modes and two privilege levels, and which combination cannot occur.</li>
+  <li>Explain why an <code>ISB</code> is required after writing <code>CONTROL</code>.</li>
+  <li>Give two concrete benefits of running tasks on PSP and interrupts on MSP.</li>
+  <li>Explain how unprivileged code can legitimately reach privileged execution.</li>
+  <li>Decode <code>0xFFFFFFFD</code> as an <code>EXC_RETURN</code> value.</li>
+  <li>Describe how changing PSP inside PendSV performs a task switch.</li>
+  <li>Explain the difference between PRIMASK and BASEPRI, and why an RTOS prefers the latter.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

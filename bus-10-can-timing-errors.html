@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAN: bit timing, error states and bus-off | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>CAN: bit timing, error states and bus-off</h1>
+<p class="lead">Two things distinguish a CAN node that works from one that mostly works: a sample point set
+where the standard wants it, and an understanding of the error counters that decide whether a misbehaving node
+is allowed to keep talking.</p>
+
+<h2 id="segments">The bit, divided</h2>
+
+<pre class="diagram">   A CAN bit is divided into TIME QUANTA (tq), and the
+   division is what you configure - not a baud rate divisor.
+
+   |&lt;--------------- one bit time ------------------&gt;|
+   +--------+------------------+--------------------+
+   |  SYNC  |    PROP + PS1    |        PS2         |
+   |  1 tq  |                  |                    |
+   +--------+------------------+--------------------+
+                               ^
+                          SAMPLE POINT
+
+   SYNC_SEG   always 1 tq. Edges are expected here.
+   PROP_SEG   compensates for the physical propagation
+              delay to the far end of the bus and back.
+   PHASE_SEG1 buffer, can be LENGTHENED to resync.
+   PHASE_SEG2 buffer, can be SHORTENED to resync.
+
+   SAMPLE POINT = (SYNC + PROP + PS1) / total, as a
+   percentage of the bit.
+
+   TARGET: 75-80% for most rates; CANopen and DeviceNet
+   specify 87.5%. LATE, not in the middle - because
+   arbitration requires the signal to have propagated to
+   the far end AND BACK before anyone samples (chapter 09).
+
+   THIS IS THE SINGLE MOST COMMON CAN CONFIGURATION ERROR.
+   A sample point at 50% works perfectly on a short bench
+   bus and fails on a long vehicle harness, because the
+   round trip no longer fits. The symptom is a bus that
+   works until the cable gets longer.
+
+   SJW (SynchronisationJumpWidth): how many tq the resync
+   may adjust by, 1-4. It absorbs the accumulated difference
+   between two nodes' oscillators. Set it to 1 for tight
+   clocks, higher if you must tolerate sloppy ones.</pre>
+
+<h2 id="calc">Calculating it</h2>
+
+<pre><code>/* GOAL: 500 kbit/s from a 42 MHz peripheral clock, sample
+   point at 87.5%.                                         */
+
+/*  tq per bit is chosen first. More tq gives finer control
+    of the sample point; fewer allows higher bit rates.
+    8-25 is the usual range; 16 is a good default.
+
+    prescaler = f_clk / (bitrate * tq_per_bit)
+              = 42e6 / (500000 * 16)
+              = 5.25            -> NOT AN INTEGER.
+
+    Try tq = 14:
+              = 42e6 / (500000 * 14) = 6      -> exact.
+
+    Now divide 14 tq to place the sample point:
+      SYNC = 1
+      TSEG1 (prop + ps1) = 11
+      TSEG2 (ps2)        = 2
+      total = 1 + 11 + 2 = 14
+      sample = (1 + 11) / 14 = 85.7%     -> close enough
+
+    Registers hold "value minus one" (mcu chapter 11):     */
+
+CAN1-&gt;BTR = ((6u - 1u)  &lt;&lt; 0)      /* BRP  = 6            */
+          | ((11u - 1u) &lt;&lt; 16)     /* TS1  = 11 tq        */
+          | ((2u - 1u)  &lt;&lt; 20)     /* TS2  = 2 tq         */
+          | ((1u - 1u)  &lt;&lt; 24);    /* SJW  = 1 tq         */
+
+/* VERIFY BY MEASUREMENT, not by arithmetic. Put a scope on
+   CANH and measure one bit's width: it must be 2.00 us for
+   500 kbit/s. An error of even 1% will cause errors on a
+   long bus with a node at the tolerance limit.
+
+   EVERY NODE ON THE BUS MUST USE THE SAME BIT RATE, and
+   should use a similar sample point. They need NOT use the
+   same tq count or prescaler - only the resulting bit time
+   and a compatible sample point matter.
+
+   ONLINE CALCULATORS EXIST and are worth using: the
+   constraint set (integer prescaler, tq range, sample point
+   target, SJW) is genuinely fiddly and errors are silent. */
+</code></pre>
+
+<div class="warn">
+<b>Bit timing can only be changed in initialisation mode</b>
+<p>The <code>BTR</code> register is writable only while the peripheral is in initialisation mode, and writes
+are silently ignored otherwise. Code that configures timing after starting the controller produces a node
+running at whatever the reset default was — usually wrong, and usually diagnosed as a wiring problem. Set
+timing before leaving init, and read the register back to confirm it took.</p>
+</div>
+
+<h2 id="errors">Error confinement</h2>
+
+<pre class="diagram">   CAN assumes nodes will fail, and contains them
+   automatically. Two counters per node:
+
+     TEC - transmit error counter
+     REC - receive error counter
+
+   ROUGHLY: an error while transmitting adds 8 to TEC; an
+   error while receiving adds 1 to REC; a SUCCESS subtracts
+   1 from the relevant counter.
+
+   The 8:1 asymmetry is deliberate: a node that is itself
+   broken accumulates errors eight times faster than the
+   innocent nodes that merely witness them. The faulty node
+   is therefore confined first, and the bus survives.
+
+   THREE STATES:
+
+   ERROR ACTIVE      TEC &lt; 128 and REC &lt; 128
+     Normal. Transmits ACTIVE error frames (6 dominant
+     bits), which destroy the offending frame for everyone.
+
+   ERROR PASSIVE     TEC &gt;= 128 or REC &gt;= 128
+     Still communicates, but transmits PASSIVE error frames
+     (6 RECESSIVE bits) which do not disturb others. It
+     also waits 8 extra bit times before transmitting,
+     yielding to healthy nodes.
+
+   BUS-OFF           TEC &gt;= 256
+     Disconnected. Transmits nothing, ACKs nothing, has no
+     effect on the bus at all.
+
+   +---------------+  TEC or REC &gt;= 128   +----------------+
+   | ERROR ACTIVE  |--------------------&gt; | ERROR PASSIVE  |
+   |               | &lt;------------------- |                |
+   +---------------+  both &lt; 128          +----------------+
+                                                   |
+                                        TEC &gt;= 256 |
+                                                   v
+                                          +----------------+
+                                          |    BUS-OFF     |
+                                          +----------------+
+                                                   |
+                          128 x 11 recessive bits, |
+                          and software permission  |
+                                                   v
+                                            ERROR ACTIVE
+
+   RECOVERY FROM BUS-OFF requires observing 128 occurrences
+   of 11 consecutive recessive bits - i.e. the bus being
+   idle - which takes at least 128 x 11 bit times. At
+   500 kbit/s that is about 2.8 ms.</pre>
+
+<h2 id="handling">Handling bus-off in software</h2>
+
+<pre><code>/* Whether recovery is automatic is a configuration choice,
+   and the right answer depends on the product.            */
+
+/* AUTOMATIC (ABOM): the hardware recovers as soon as the
+   128x11 condition is met. Convenient, and it hides the
+   fault - a node with a broken transceiver will cycle
+   in and out of bus-off forever, and nobody notices.      */
+CAN1-&gt;MCR |= CAN_MCR_ABOM;
+
+/* MANUAL: software decides. Preferred in anything that
+   must report faults, because it lets you count and
+   rate-limit.                                             */
+void CAN1_SCE_IRQHandler(void)
+{
+    uint32_t esr = CAN1-&gt;ESR;
+
+    if (esr &amp; CAN_ESR_BOFF) {
+        stats.bus_off_count++;
+        stats.last_lec = (esr &gt;&gt; 4) &amp; 7u;   /* last error code */
+
+        if (stats.bus_off_count &lt; 5) {
+            can_restart();                  /* try again    */
+        } else {
+            /* Repeated bus-off is a HARDWARE fault: a
+               shorted bus, a missing terminator, a wrong
+               bit rate, or a dead transceiver. Retrying
+               forever hides it. Report and stay off.      */
+            fault_latch(FAULT_CAN_BUS);
+        }
+    }
+}
+
+/* THE LAST ERROR CODE names the cause, and it is genuinely
+   diagnostic:
+
+     1 STUFF   more than 5 identical bits -> noise, or a
+               node at the wrong bit rate
+     2 FORM    a fixed-form field was wrong -> bit rate or
+               a node speaking a different protocol
+     3 ACK     nobody acknowledged -> you are alone on the
+               bus, or the others are bus-off, or CANH/CANL
+               are swapped
+     4 BIT1    sent recessive, read dominant -> another
+               node is stuck dominant, or a short to ground
+     5 BIT0    sent dominant, read recessive -> your
+               transceiver is not driving; check its
+               standby pin and supply
+     6 CRC     corruption in transit -> noise or termination
+
+   ACK error on a bench setup with one node is normal and
+   expected (chapter 09). ACK error in a running vehicle
+   means everyone else has gone quiet.                     */
+</code></pre>
+
+<h2 id="filters">Acceptance filters</h2>
+
+<pre><code>/* A busy bus carries thousands of frames per second, and
+   most are not yours. Filtering in HARDWARE is essential -
+   waking the CPU for every frame would dominate the load. */
+
+/* MASK MODE: check only the bits the mask selects.
+     accept if (received_id &amp; mask) == (filter_id &amp; mask)  */
+
+/* Accept 0x100-0x10F: the low nibble is "don't care".     */
+CAN1-&gt;sFilterRegister[0].FR1 = (0x100u &lt;&lt; 21);   /* id      */
+CAN1-&gt;sFilterRegister[0].FR2 = (0x7F0u &lt;&lt; 21);   /* mask    */
+
+/* LIST MODE: accept exactly these identifiers, no mask.
+   Use when you want a handful of unrelated IDs.           */
+
+/* DESIGN CONSEQUENCE: assign IDs so that the messages one
+   node cares about share a bit pattern. If a node needs
+   0x101, 0x205 and 0x3C2, no single mask captures them and
+   you burn three filter banks. If those messages were
+   numbered 0x110, 0x111, 0x112 one filter does it.
+
+   This is why CAN ID allocation is a system design task
+   done up front, in a spreadsheet, balancing:
+     - priority (lower = more urgent, chapter 09)
+     - filterability (group by consumer)
+     - room to grow
+
+   Retrofitting an ID scheme after the software is written
+   is genuinely painful, which is why standard higher-layer
+   protocols - CANopen, J1939 - specify one for you.       */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works on the bench, fails with a long harness</td><td>Sample point too early — set it to 75–87.5%</td></tr>
+<tr><td>Bit timing register has no effect</td><td>Written outside initialisation mode</td></tr>
+<tr><td>Errors between two specific nodes only</td><td>Their bit rates differ slightly; measure a bit with a
+scope</td></tr>
+<tr><td>Node goes bus-off immediately</td><td>Alone on the bus (ACK error), or CANH/CANL swapped</td></tr>
+<tr><td>LEC reads BIT0 persistently</td><td>Transceiver not driving — check its standby/enable pin and
+supply</td></tr>
+<tr><td>LEC reads BIT1 persistently</td><td>Another node stuck dominant, or a short to ground</td></tr>
+<tr><td>Node cycles in and out of bus-off unnoticed</td><td>Automatic recovery hiding a hardware fault — count
+and latch</td></tr>
+<tr><td>CPU saturated by receive interrupts</td><td>Filters too permissive; filter in hardware</td></tr>
+<tr><td>Cannot filter the messages a node needs</td><td>ID allocation not designed for filterability</td></tr>
+<tr><td>One node's errors kill the whole bus</td><td>It is error-active and sending error frames; wait for
+confinement or find it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four segments of a CAN bit and say which two absorb resynchronisation.</li>
+  <li>Explain why the sample point is late rather than centred.</li>
+  <li>Calculate BRP, TSEG1 and TSEG2 for 500 kbit/s from a 42 MHz clock.</li>
+  <li>Say what must match between nodes and what need not.</li>
+  <li>Explain the 8:1 asymmetry between transmit and receive error counters.</li>
+  <li>Name the three error states and the thresholds between them.</li>
+  <li>Explain the difference between active and passive error frames.</li>
+  <li>State what bus-off recovery requires and how long it takes at 500 kbit/s.</li>
+  <li>Interpret an ACK error, a BIT0 error and a BIT1 error as diagnoses.</li>
+  <li>Explain why CAN ID allocation must consider filterability, not just priority.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

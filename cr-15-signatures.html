@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital signatures | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Digital signatures</h1>
+<p class="lead">Anyone can verify; only the key holder can produce. This is what makes secure boot,
+firmware updates and certificates possible — and ECDSA is the primitive with the sharpest edge in all of
+applied cryptography.</p>
+
+<h2 id="model">Signatures versus MACs</h2>
+
+<p>A signature proves both who produced a message and that it has not changed — and unlike a MAC, it does so to anyone, without sharing a secret. That asymmetry is what makes public distribution of trust possible.</p>
+
+<pre class="diagram">   SIGN(private_key, message)  -> signature
+   VERIFY(public_key, message, signature) -> true / false
+
+                     MAC                  SIGNATURE
+   keys              one shared           key PAIR
+   who can verify    only key holders     ANYONE
+   who can produce   any key holder       only the private
+                                          key holder
+   NON-REPUDIATION   NO                   YES
+   size              16-32 bytes          64-512 bytes
+   speed             microseconds         milliseconds
+   key distribution  hard (must be         easy (the public
+                     secret)              key is public)
+
+   THE ASYMMETRY IS THE POINT. A device can ship with a
+   VENDOR PUBLIC KEY in read-only memory and verify every
+   firmware image the vendor ever signs - without the device
+   ever holding a secret that could be extracted to forge
+   one. That is impossible with a MAC.
+
+   THE SECURITY GOAL, same as for MACs:
+     EUF-CMA - existential unforgeability under chosen
+     message attack. Even after seeing signatures on
+     messages of their choosing, an attacker cannot produce
+     a valid signature on a NEW message.
+
+   AND SOMETIMES STRONGER: SUF-CMA, which additionally
+   forbids producing a DIFFERENT valid signature on an
+   ALREADY-SIGNED message. ECDSA is NOT SUF-CMA - see
+   malleability below - and that has caused real bugs.</pre>
+
+<h2 id="ecdsa">ECDSA, and the nonce</h2>
+
+<p>The widely deployed elliptic-curve signature scheme, and one with a famously unforgiving requirement: the per-signature random value must never repeat or be predictable, or the private key is recoverable from two signatures.</p>
+
+<pre><code>/* SIGNING with private key d, on curve with generator G and
+   order n:
+
+    1. e = leftmost n bits of H(message)
+    2. k = A RANDOM NONCE in [1, n-1]        &lt;&lt;&lt; DANGER
+    3. (x1, y1) = k * G
+    4. r = x1 mod n           (if r == 0, restart)
+    5. s = k^-1 * (e + r*d) mod n   (if s == 0, restart)
+    signature = (r, s)
+
+   VERIFYING with public key Q:
+    1. check 1 &lt;= r, s &lt;= n-1
+    2. e = leftmost n bits of H(message)
+    3. u1 = e * s^-1 mod n,   u2 = r * s^-1 mod n
+    4. (x1, y1) = u1*G + u2*Q
+    5. valid iff  r == x1 mod n
+
+/* ======================================================
+   THE NONCE k MUST BE UNIQUE AND SECRET AND UNPREDICTABLE.
+   ANY FAILURE RECOVERS THE PRIVATE KEY FROM SIGNATURES.
+   ====================================================== */
+
+/* --- REUSE: two signatures with the same k --- */
+        s1 = k^-1 (e1 + r*d)
+        s2 = k^-1 (e2 + r*d)      /* same r, because same k */
+
+    subtract:  s1 - s2 = k^-1 (e1 - e2)
+        =&gt;  k = (e1 - e2) / (s1 - s2)   mod n
+        =&gt;  d = (s1*k - e1) / r         mod n
+
+    FOUR LINES OF ARITHMETIC AND THE KEY IS YOURS. And note
+    that reuse is DETECTABLE FROM THE OUTSIDE: identical r
+    values in two signatures are a public giveaway.
+
+    THIS HAPPENED TO:
+      · SONY PLAYSTATION 3 (2010) - a FIXED k in the boot
+        code. The console signing key was published. Full
+        homebrew.
+      · ANDROID BITCOIN WALLETS (2013) - SecureRandom
+        returned repeated values after a fork(). Coins
+        stolen automatically by bots scanning the blockchain
+        for repeated r.
+      · Numerous hardware wallets and IoT devices since.
+
+/* --- BIAS: k not uniform --- */
+    Even a FEW BITS of bias - k always having its top bit
+    clear, or k computed as (random mod n) with a slight
+    modulo skew - lets LATTICE ATTACKS recover d from a few
+    hundred signatures. "Minerva" and "TPM-FAIL" (2019) both
+    exploited a handful of leaked bits from timing.
+
+/* --- PARTIAL LEAK: k's top bits visible via timing --- */
+    Same lattice attack. This is why the scalar multiply must
+    be constant time AND the nonce generation must not depend
+    on k's length (chapter 19).
+
+/* ======================================================
+   THE FIX: RFC 6979 DETERMINISTIC ECDSA
+   ====================================================== */
+        k = HMAC_DRBG(private_key, H(message))
+
+    The nonce is derived deterministically from the key and
+    the message. NO RNG INVOLVED.
+      · unique, because different messages give different k
+      · secret, because it depends on d
+      · unbiased, by construction
+      · REPRODUCIBLE, so signatures are testable
+
+    USE IT ALWAYS. It removes the entire category. mbedTLS:
+    build with MBEDTLS_ECDSA_DETERMINISTIC and call
+    mbedtls_ecdsa_sign_det_ext().
+
+    (One caveat: determinism makes FAULT ATTACKS easier -
+    sign the same message twice, glitch one, and compare. On
+    a physically exposed device, add a small random component
+    - "hedged" signing, as Ed25519ph and some newer specs
+    do.)                                                   */</code></pre>
+
+<div class="danger">
+<b>Never generate an ECDSA nonce from a device RNG you have not audited</b>
+<p>A hardware RNG that has not finished seeding, a PRNG duplicated across a fleet by a firmware image, or
+a counter that resets on reboot will all produce repeated <code>k</code>. And unlike most cryptographic
+failures, this one is <em>publicly detectable</em>: anyone collecting your signatures can grep for a
+repeated <code>r</code>. Use RFC 6979, or Ed25519.</p>
+</div>
+
+<h2 id="ed25519">Ed25519</h2>
+
+<p>A modern scheme designed specifically to remove the footguns of its predecessors — notably by deriving the per-signature value deterministically, so the failure above becomes structurally impossible.</p>
+
+<pre><code>/* EdDSA on the Edwards form of Curve25519 (chapter 14).
+   Designed specifically to remove every foot-gun above. */
+
+    KEY GENERATION:
+        seed  = 32 random bytes
+        h     = SHA-512(seed)
+        a     = clamp(h[0..31])       /* the scalar */
+        prefix= h[32..63]             /* for nonces */
+        A     = a * B                 /* public key,
+                                         32 bytes */
+
+    SIGN(message):
+        r = SHA-512(prefix ‖ message)  mod L   /* NO RNG */
+        R = r * B
+        k = SHA-512(R ‖ A ‖ message)   mod L
+        S = (r + k*a)                  mod L
+        signature = R ‖ S              /* 64 bytes */
+
+    VERIFY:
+        k = SHA-512(R ‖ A ‖ message) mod L
+        check  S*B == R + k*A
+
+/* WHAT IT FIXES, point by point:
+     · THE NONCE IS DETERMINISTIC by construction - not an
+       option you can forget to enable
+     · COMPLETE ADDITION FORMULAS - no exceptional cases, so
+       no branches
+     · CONSTANT TIME by design
+     · the PUBLIC KEY IS HASHED INTO k, preventing
+       key-substitution attacks
+     · COLLISION-RESILIENT: forging needs a SHA-512
+       collision, not just a hash collision on the message
+     · FIXED SIZES: 32-byte keys, 64-byte signatures, no
+       DER parsing at all
+
+/* THE CODE: */
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];  /* 32 */
+    unsigned char sk[crypto_sign_SECRETKEYBYTES];  /* 64 */
+    crypto_sign_keypair(pk, sk);
+
+    unsigned char sig[crypto_sign_BYTES];          /* 64 */
+    crypto_sign_detached(sig, NULL, msg, msg_len, sk);
+
+    if (crypto_sign_verify_detached(sig, msg, msg_len, pk)
+        != 0)
+            return INVALID;
+
+/* THAT IS THE ENTIRE API. No curve parameter, no hash
+   choice, no nonce, no encoding options, no padding mode.
+   Compare with the ECDSA and RSA sections and the appeal is
+   obvious.
+
+/* THE ONE INTEROP WRINKLE: verification strictness varies
+   between implementations - cofactored vs cofactorless
+   equations, and whether non-canonical encodings are
+   rejected. It matters for consensus systems where every
+   node must agree; for a device verifying its own vendor's
+   signatures it does not. RFC 8032 plus the ZIP-215 rules
+   are the strict reference.                             */</code></pre>
+
+<h2 id="compare">Choosing</h2>
+
+<p>Choosing between the schemes is mostly a matter of what your platform supports and what your ecosystem already requires, since all the current ones are sound when correctly implemented.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Scheme</th><th>Sig size</th><th>Pub key</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>Ed25519</strong></td><td>64 B</td><td>32 B</td><td><strong>The default.</strong> Fast, safe, no parameters</td></tr>
+<tr><td>Ed448</td><td>114 B</td><td>57 B</td><td>Higher margin</td></tr>
+<tr><td><strong>ECDSA P-256</strong></td><td>64 B (72 DER)</td><td>33/65 B</td><td>Where FIPS, PKI or hardware demand it. <strong>Use RFC 6979</strong></td></tr>
+<tr><td>RSA-PSS 3072</td><td>384 B</td><td>384 B</td><td>Fast verification — boot ROMs</td></tr>
+<tr><td>RSA v1.5 2048</td><td>256 B</td><td>256 B</td><td>Legacy formats only. Verify the <em>whole</em> block</td></tr>
+<tr><td>ML-DSA-65 (Dilithium)</td><td>3309 B</td><td>1952 B</td><td>Post-quantum (<a href="cr-20-post-quantum.html">ch. 20</a>)</td></tr>
+<tr><td>SLH-DSA (SPHINCS+)</td><td>7856 B+</td><td>32 B</td><td>Hash-based, very conservative, huge signatures</td></tr>
+<tr><td>LMS / XMSS</td><td>~2 KB</td><td>32 B</td><td><strong>Stateful</strong> hash-based. NIST-approved for firmware signing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="pitfalls">The other ways signatures fail</h2>
+
+<p>Signature verification fails in recurring ways, several of which involve accepting something that should have been rejected rather than any weakness in the mathematics.</p>
+
+<pre><code>/* --- 1. MALLEABILITY --- */
+    ECDSA: if (r, s) is valid, so is (r, n - s). An attacker
+    modifies a signature into a different valid one WITHOUT
+    the key.
+
+    Harmless if you only care about the message. FATAL if you
+    use the signature as an identifier - Bitcoin's original
+    transaction IDs included the signature, so an attacker
+    could change a transaction's ID after broadcast. That was
+    "transaction malleability", and it took a protocol change
+    to fix.
+
+    THE RULE: require the canonical low-s form, and NEVER
+    treat a signature as a unique identifier for what it
+    signs.
+
+/* --- 2. NOT VERIFYING WHAT YOU THINK YOU VERIFIED --- */
+    /* WRONG: */
+    if (verify(pubkey, hash, sig) == OK)
+            install(image);       /* is `hash` the hash of
+                                     `image`? */
+    /* The classic bug: hash computed over a header, or over
+       a buffer that is later replaced. TIME-OF-CHECK TO
+       TIME-OF-USE.
+
+    /* RIGHT: hash the exact bytes you are about to use,
+       immediately before using them, from memory the
+       attacker cannot modify in between. */
+
+/* --- 3. NOT CHECKING WHOSE KEY IT IS --- */
+    A valid signature from the WRONG KEY is not an
+    authorisation. The verification must be against a key
+    that is:
+      · pinned (a hash in OTP), or
+      · chained to a pinned root (chapter 16)
+    "It verified" means nothing without "and the key was
+    trusted for this purpose".
+
+/* --- 4. ALGORITHM CONFUSION --- */
+    If the signature format carries its own algorithm
+    identifier and you trust it, an attacker sets it to
+    "none", or to a scheme where they hold a key. JWT's
+    alg:none is the famous instance, and the same shape
+    appears in firmware container formats.
+    THE FIX: THE VERIFIER DECIDES THE ALGORITHM, not the
+    message.
+
+/* --- 5. SIGNING WHAT YOU DID NOT MEAN TO --- */
+    A signing oracle - anything that will sign
+    attacker-supplied bytes - can be tricked into signing
+    something meaningful in another context. USE DOMAIN
+    SEPARATION: sign H("myapp firmware v1" ‖ data), never
+    raw data.
+
+/* --- 6. NO ROLLBACK PROTECTION --- */
+    An OLD, GENUINELY SIGNED image with a known
+    vulnerability verifies perfectly. Signatures give
+    authenticity, not freshness (the same gap as MACs,
+    chapter 08). You need a MONOTONIC VERSION COUNTER in
+    fuses or a replay-protected memory block
+    (chapter 18).
+
+/* --- 7. DER PARSING BUGS --- */
+    ECDSA signatures in X.509 are DER-encoded ASN.1: nested
+    length-prefixed structures, with rules about minimal
+    encoding and leading zero bytes. This is a rich source
+    of parser bugs and signature-forgery CVEs. Ed25519's
+    fixed 64 bytes avoid it entirely - one more reason to
+    prefer it.                                            */</code></pre>
+
+<h2 id="boot">The firmware signing pattern</h2>
+
+<p>Secure boot is the most common place an embedded engineer meets signatures, and it has requirements ordinary message signing does not — including what happens when verification fails.</p>
+
+<pre><code>/* THE SIGNING SIDE, in a facility you control: */
+    private key lives in an HSM. It NEVER exists as a file.
+    the build server calls the HSM to sign; access is
+      logged, multi-party, and revocable
+    a manifest is signed, not just the image:
+
+      struct manifest {
+          uint32_t magic;
+          uint32_t format_version;
+          uint32_t fw_version;        /* ANTI-ROLLBACK */
+          uint32_t image_len;
+          uint8_t  image_hash[32];    /* SHA-256 of the
+                                         image */
+          uint32_t device_class;      /* not the neighbour's
+                                         product */
+          uint64_t not_before;
+      };
+      signature = Ed25519(sk, "vendor-fw-v1" ‖ manifest);
+
+/* THE VERIFYING SIDE, on the device: */
+    1. read the manifest
+    2. check magic and format_version - REJECT UNKNOWN
+    3. verify the signature over the WHOLE manifest, with a
+       key whose HASH IS IN OTP (or a cert chained to it)
+    4. check device_class matches THIS product
+    5. check fw_version &gt;= the fuse counter  -- ROLLBACK
+    6. hash the image and compare to image_hash IN CONSTANT
+       TIME
+    7. only now: erase and write, or jump
+
+/* NOTE THE ORDER. Every check that can reject happens
+   BEFORE anything irreversible. And note that step 6 hashes
+   the image AFTER it is in its final location, so an
+   attacker with DMA access cannot swap it in between
+   (the isolation track).                                     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Private key published after a few signatures</td><td>Repeated ECDSA nonce — identical <code>r</code> values</td></tr>
+<tr><td>Key recovered from a few hundred signatures</td><td>Biased nonce — a lattice attack</td></tr>
+<tr><td>A signature altered but still valid</td><td>ECDSA malleability — require low <code>s</code></td></tr>
+<tr><td>Unsigned firmware installed</td><td>Algorithm confusion — the verifier trusted the message's alg field</td></tr>
+<tr><td>Old vulnerable firmware reinstalled</td><td>No anti-rollback counter</td></tr>
+<tr><td>Verified image differs from the installed one</td><td>TOCTOU between hashing and use</td></tr>
+<tr><td>A valid signature from an untrusted key accepted</td><td>No key pinning or chain check</td></tr>
+<tr><td>Signature forged via a malformed encoding</td><td>DER parser bug</td></tr>
+<tr><td>The neighbouring product's firmware installs</td><td>No device class in the signed manifest</td></tr>
+<tr><td>Key extracted by glitching a repeated signature</td><td>Deterministic signing plus fault injection — hedge it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Contrast MACs and signatures on five axes, and say why a device can ship a public key safely.</li>
+  <li>Write out ECDSA signing and verification.</li>
+  <li>Derive the private key from two signatures sharing a nonce.</li>
+  <li>Explain nonce bias and why a few leaked bits suffice.</li>
+  <li>Explain RFC 6979 and the one situation where pure determinism is a liability.</li>
+  <li>List five design decisions in Ed25519 that remove a class of bug each.</li>
+  <li>Explain malleability and the Bitcoin transaction-ID failure.</li>
+  <li>Explain algorithm confusion and state the fix in one sentence.</li>
+  <li>Explain why "the signature verified" is not an authorisation decision.</li>
+  <li>Write the seven-step firmware verification order and justify the ordering.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

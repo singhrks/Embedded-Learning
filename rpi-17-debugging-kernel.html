@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel debugging: ftrace, dynamic debug, JTAG | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Kernel debugging: ftrace, dynamic debug, JTAG</h1>
+<p class="lead">You cannot attach GDB to a running kernel the way you attach it to a process — the debugger
+would need the thing it is debugging in order to run. So kernel debugging is a different toolkit, and most of
+it is built in and switched off.</p>
+
+<h2 id="order">The order to reach for things</h2>
+
+<pre class="diagram">   CHEAPEST AND MOST USEFUL FIRST. Most people learn these
+   in exactly the wrong order.
+
+   1. dmesg + pr_info          you already have it
+   2. DYNAMIC DEBUG            existing pr_debug, no rebuild
+   3. ftrace                   who called what, and when
+   4. kprobes / bpftrace       inspect any function's args
+                               without touching its source
+   5. /proc, /sys, debugfs     the state the kernel already
+                               exports about itself
+   6. KASAN / lockdep          compile-time, catches the bug
+                               rather than the symptom
+   7. kgdb over serial         source-level, stops the world
+   8. JTAG                     when the CPU itself is stuck
+
+   People reach for 7 and 8 first because they resemble
+   userspace debugging. In practice 2 and 3 solve most
+   problems in minutes, and 6 finds the ones that would
+   otherwise take days.</pre>
+
+<h2 id="dyndebug">Dynamic debug</h2>
+
+<pre><code># The kernel is full of pr_debug() calls that are compiled
+# in but disabled. With CONFIG_DYNAMIC_DEBUG you switch any
+# of them on at runtime, per file, per function, per line.
+
+$ sudo mount -t debugfs none /sys/kernel/debug   # usually mounted
+
+# Everything in one module:
+$ echo 'module pidev +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+
+# One file, one function, one line:
+$ echo 'file i2c-bcm2835.c +p'      | sudo tee .../control
+$ echo 'func bcm2835_i2c_xfer +p'   | sudo tee .../control
+$ echo 'file bme280.c line 100-200 +p' | sudo tee .../control
+
+# Add context - these flags are the useful part:
+#   +p  enable
+#   +f  include function name
+#   +l  include line number
+#   +t  include thread id
+#   +m  include module name
+$ echo 'module i2c_bcm2835 +pflmt' | sudo tee .../control
+
+# Turn back off:
+$ echo 'module pidev -p' | sudo tee .../control
+
+# What is currently enabled:
+$ grep -v '=_' /sys/kernel/debug/dynamic_debug/control
+
+# From boot, before userspace exists - in cmdline.txt:
+dyndbg="module i2c_bcm2835 +p"
+
+# THIS IS THE FIRST THING TO TRY when a kernel driver
+# misbehaves. The driver's author already wrote the
+# diagnostics; you just have to turn them on.
+</code></pre>
+
+<h2 id="ftrace">ftrace</h2>
+
+<pre><code># A function tracer built into the kernel. No rebuild, no
+# instrumentation, no external tool.
+
+$ cd /sys/kernel/tracing        # or /sys/kernel/debug/tracing
+
+# --- WHO CALLS WHAT ---
+$ echo function_graph | sudo tee current_tracer
+$ echo 'bcm2835_i2c_*' | sudo tee set_ftrace_filter
+$ echo 1 | sudo tee tracing_on
+$ i2cget -y 1 0x76 0xD0
+$ echo 0 | sudo tee tracing_on
+$ sudo cat trace | head -40
+
+ 3)               |  bcm2835_i2c_xfer() {
+ 3)   0.520 us    |    bcm2835_i2c_start_transfer();
+ 3) + 89.140 us   |    wait_for_completion_timeout();
+ 3)   1.020 us    |    bcm2835_i2c_finish_transfer();
+ 3) + 94.300 us   |  }
+
+# The DURATIONS are the valuable part: that 89 us is the
+# actual I2C transaction on the wire, and it tells you
+# immediately whether a slow driver is slow in software or
+# waiting on hardware.
+
+# --- TRACE EVENTS: pre-defined tracepoints, cheaper and
+#     more structured than function tracing ---
+$ ls events/                 # hundreds of subsystems
+$ echo 1 | sudo tee events/i2c/enable
+$ echo 1 | sudo tee events/gpio/enable
+$ sudo cat trace_pipe        # live stream
+
+ cat-1893  [002] .... 842.11: i2c_write: i2c-1 #0 a=076 f=0000 l=1
+ cat-1893  [002] .... 842.11: i2c_result: i2c-1 n=2 ret=2
+
+# --- WHY IS LATENCY BAD (chapter 13) ---
+$ echo irqsoff | sudo tee current_tracer     # longest IRQ-off
+$ echo wakeup_rt | sudo tee current_tracer   # RT wakeup delay
+$ cat tracing_max_latency
+
+# --- WHAT HAPPENED BEFORE THE CRASH ---
+# ftrace keeps a ring buffer. After an oops, dump what led
+# up to it:
+$ echo 1 | sudo tee options/func_stack_trace
+# and in cmdline.txt, to dump the buffer on panic:
+ftrace_dump_on_oops
+
+# trace-cmd is a friendlier front end and worth installing:
+$ sudo apt install trace-cmd
+$ sudo trace-cmd record -p function_graph -l 'bcm2835_i2c_*' \
+      -- i2cget -y 1 0x76 0xD0
+$ trace-cmd report
+</code></pre>
+
+<div class="key">
+<b>ftrace answers the question people reach for a debugger to answer</b>
+<p>"Is my driver's probe even being called?" "What order do these callbacks run in?" "Where are those 200
+milliseconds going?" Each is a one-line ftrace filter and takes under a minute, with the system running
+normally at nearly full speed. A kgdb session answers the same questions by stopping the machine, which
+changes the timing you were investigating. Reach for tracing first and breakpoints last — the reverse of
+userspace habits.</p>
+</div>
+
+<h2 id="bpftrace">kprobes and bpftrace</h2>
+
+<pre><code># Attach to ANY kernel function - including static ones and
+# ones with no tracepoint - and inspect arguments.
+
+$ sudo apt install bpftrace
+
+# Every I2C transfer, with the address:
+$ sudo bpftrace -e '
+    kprobe:i2c_transfer {
+      printf("%s: %d msgs\n", comm, arg2);
+    }'
+
+# Time a function and print a histogram - this is how you
+# find out that one call in a thousand takes 50 ms:
+$ sudo bpftrace -e '
+    kprobe:bcm2835_i2c_xfer  { @s[tid] = nsecs; }
+    kretprobe:bcm2835_i2c_xfer /@s[tid]/ {
+      @us = hist((nsecs - @s[tid]) / 1000); delete(@s[tid]);
+    }'
+@us:
+[16, 32)     2 |@                                       |
+[32, 64)    88 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)    3 |@                                       |
+[8K, 16K)    1 |                                        |  &lt;-- !
+
+# That single outlier at ~10 ms is the bug you were looking
+# for, and no amount of printf would have found it.
+
+# Your own module's functions work the same way:
+$ sudo bpftrace -e 'kprobe:pidev_read { printf("read by %s\n", comm); }'
+
+# bpftrace needs kernel support (BTF, BPF, kprobes). If it
+# is unavailable on your kernel, the older perf-probe route
+# works:
+$ sudo perf probe --add 'bcm2835_i2c_xfer'
+$ sudo perf record -e probe:bcm2835_i2c_xfer -a sleep 5
+$ sudo perf script
+</code></pre>
+
+<h2 id="kgdb">kgdb over the serial console</h2>
+
+<pre><code># Source-level kernel debugging, over the same serial cable
+# as chapter 05. The kernel STOPS while you are attached -
+# it is a stop-the-world debugger, which is both its power
+# and its limitation.
+
+# Kernel config (chapter 15):
+CONFIG_KGDB=y
+CONFIG_KGDB_SERIAL_CONSOLE=y
+CONFIG_DEBUG_INFO=y
+CONFIG_MAGIC_SYSRQ=y
+
+# cmdline.txt - note it needs a SECOND uart, because the
+# console and kgdb cannot share one cleanly:
+kgdboc=ttyAMA0,115200 kgdbwait
+#   kgdbwait pauses at boot until a debugger attaches, which
+#   is how you debug early init.
+
+# Break in from a running system:
+$ echo g | sudo tee /proc/sysrq-trigger
+# or send SysRq-g over the serial line (chapter 05).
+
+# --- ON THE HOST ---
+$ aarch64-linux-gnu-gdb ./vmlinux
+(gdb) set serial baud 115200
+(gdb) target remote /dev/ttyUSB0
+(gdb) lx-symbols                 # kernel GDB scripts
+(gdb) bt
+(gdb) break pidev_read
+(gdb) continue
+
+# lx-symbols comes from scripts/gdb in the kernel tree and
+# loads module symbols automatically. Without it, addresses
+# inside your .ko are unresolved.
+(gdb) source /path/to/linux/scripts/gdb/vmlinux-gdb.py
+
+# HONEST ASSESSMENT: kgdb is fiddly on a Pi, needs a second
+# UART, and stopping the kernel breaks anything timing-
+# dependent - including USB and network, so the board is
+# effectively offline while you think. Use it when you need
+# to inspect state at a specific line and tracing genuinely
+# cannot tell you. That is a smaller set of cases than it
+# first appears.
+</code></pre>
+
+<h2 id="jtag">JTAG, and when it is the only option</h2>
+
+<pre><code># JTAG debugs the CPU itself, below the kernel. It works
+# when the kernel is not running at all: early boot, a hard
+# hang, bare metal (chapter 20).
+
+# The Pi exposes JTAG on GPIO alternate functions. In
+# config.txt:
+enable_jtag_gpio=1
+#   This muxes GPIO 22-27 to JTAG on a Pi 4 (TRST, RTCK,
+#   TDO, TCK, TDI, TMS). You lose those pins for anything
+#   else.
+
+# You need an adapter and OpenOCD:
+$ sudo apt install openocd
+$ openocd -f interface/jlink.cfg -f target/rpi4.cfg
+# Then connect GDB to OpenOCD's port 3333.
+
+# Configuration files for the Pi vary in quality and
+# maturity; expect to adapt one. The Raspberry Pi Debug
+# Probe handles SWD for RP2040-family targets, and support
+# for debugging the Pi's own application cores over it
+# depends on the board and firmware - check current
+# documentation rather than assuming.
+
+# WHEN YOU ACTUALLY NEED JTAG:
+#   - bare metal with no console (chapter 20)
+#   - a hang before any console output exists
+#   - debugging the firmware/kernel handoff
+#   - hardware bring-up on a custom board
+#
+# WHEN YOU DO NOT, which is most of the time:
+#   - anything with a working kernel. Use tracing.
+#
+# For this track, JTAG is worth knowing exists. earlycon
+# (chapter 09) plus a serial console solves the great
+# majority of early-boot problems for the cost of a $3
+# adapter.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>pr_debug</code> produces nothing</td><td>Not enabled — use dynamic debug, no rebuild
+needed</td></tr>
+<tr><td><code>/sys/kernel/debug</code> missing</td><td>debugfs not mounted, or
+<code>CONFIG_DEBUG_FS</code> off</td></tr>
+<tr><td>ftrace filter matches nothing</td><td>Function inlined or renamed — check
+<code>available_filter_functions</code></td></tr>
+<tr><td>bpftrace fails to start</td><td>Kernel lacks BTF or BPF support; use perf-probe</td></tr>
+<tr><td>Rare latency spike you cannot catch</td><td>Histogram it with bpftrace rather than
+sampling</td></tr>
+<tr><td>Board goes offline during a kgdb session</td><td>Expected — the kernel is stopped</td></tr>
+<tr><td>kgdb cannot resolve module symbols</td><td><code>lx-symbols</code> not loaded</td></tr>
+<tr><td>Kernel and console fight over one UART</td><td>kgdb needs its own; use a second UART</td></tr>
+<tr><td>Hang with no output at all</td><td>Add <code>earlycon</code> before considering JTAG</td></tr>
+<tr><td>Timing bug vanishes under the debugger</td><td>Stopping the world changed it — trace
+instead</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the eight-step escalation order and say why most people invert it.</li>
+  <li>Enable every <code>pr_debug</code> in one module without rebuilding.</li>
+  <li>Explain what the <code>+pflmt</code> flags add to dynamic debug output.</li>
+  <li>Say what <code>function_graph</code> durations tell you that a call list does not.</li>
+  <li>Give the ftrace tracer for finding the longest interrupts-off region.</li>
+  <li>Explain how to make ftrace dump its buffer on a panic.</li>
+  <li>Describe how to histogram a kernel function's duration and why that finds rare bugs.</li>
+  <li>State kgdb's fundamental limitation and when it is still worth it.</li>
+  <li>Explain what <code>lx-symbols</code> is for.</li>
+  <li>Say when JTAG is genuinely necessary, and the cheaper thing to try first.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

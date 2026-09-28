@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tile-based rendering on mobile GPUs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Tile-based rendering on mobile GPUs</h1>
+<p class="lead">Every phone, tablet and Apple Silicon GPU renders in a fundamentally different order from a
+desktop card. It is not a minor variation — it inverts which operations are cheap, and a renderer tuned for
+one architecture can be several times slower on the other.</p>
+
+<h2 id="why">Bandwidth is the whole reason</h2>
+
+<pre class="diagram">   A desktop GPU has 500-3000 GB/s of dedicated GDDR/HBM and
+   a 300 W power budget.
+
+   A phone has ~50 GB/s of LPDDR, SHARED with the CPU, and
+   about 3 W for the whole SoC.
+
+   THE PHYSICS: moving a byte off-chip costs roughly 100x the
+   energy of an arithmetic operation. On a phone, DRAM traffic
+   IS the power budget, and power is the thermal budget, and
+   thermal is your sustained frame rate.
+
+   IMMEDIATE MODE (desktop) - what it costs
+
+     for each triangle:
+             rasterise
+             for each fragment:
+                     READ depth from DRAM
+                     test, shade
+                     WRITE depth to DRAM
+                     READ colour, blend, WRITE colour
+
+     Every fragment touches off-chip memory several times.
+     Fine at 3 TB/s. Impossible at 50 GB/s.
+
+   TILE-BASED DEFERRED RENDERING (mobile) - the fix
+
+     PHASE 1 - BINNING
+       run ALL vertex shaders for the whole frame.
+       sort the resulting primitives into screen TILES
+       (typically 16x16 or 32x32 pixels).
+       write the per-tile primitive lists to memory.
+
+     PHASE 2 - for each tile, independently:
+       the tile's colour+depth live in ON-CHIP TILE MEMORY -
+       a few tens of KB, single-cycle access
+       rasterise and shade every primitive in that tile
+       ... all depth and blending traffic stays ON CHIP ...
+       finally, WRITE THE FINISHED TILE to DRAM. Once.
+
+   RESULT: the colour buffer is written exactly once per
+   frame, and the depth buffer need never be written at all.
+   Bandwidth drops by an order of magnitude.</pre>
+
+<div class="key">
+<b>The consequence that matters most</b>
+<p>On a tiler, <strong>the entire frame's geometry is processed before any pixel is shaded</strong>. Vertex
+output for the whole frame must be stored to memory and read back — which means vertex data and the number of
+draw calls cost <em>more</em> on mobile, while overdraw, blending and MSAA cost dramatically <em>less</em>.
+Every performance intuition from desktop needs re-examining.</p>
+</div>
+
+<h2 id="differences">What changes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Immediate (desktop)</th><th>Tiled (mobile)</th></tr></thead>
+<tbody>
+<tr><td>Overdraw</td><td>Expensive — DRAM traffic per layer</td><td><strong>Cheap</strong> — it is all in tile
+memory. Some tilers also do hidden-surface removal per tile and shade each pixel once</td></tr>
+<tr><td>MSAA 4×</td><td>4× render-target memory and bandwidth</td><td><strong>Nearly free</strong> — samples
+live in tile memory and resolve on the way out</td></tr>
+<tr><td>Alpha blending</td><td>Read-modify-write to DRAM</td><td><strong>Cheap</strong> — on-chip</td></tr>
+<tr><td>Vertex count</td><td>Cheap</td><td><strong>Expensive</strong> — all vertex output is written to and
+read from DRAM</td></tr>
+<tr><td>Draw calls</td><td>Moderate CPU cost</td><td>Higher — more binning work</td></tr>
+<tr><td>Render-target switches</td><td>Cheap</td><td><strong>Very expensive</strong> — flushes every
+tile</td></tr>
+<tr><td>Reading a target you just wrote</td><td>Normal</td><td><strong>Forces a full flush</strong>, unless
+it is the same tile via a subpass</td></tr>
+<tr><td>Deferred shading (G-buffer)</td><td>The standard technique</td><td>Painful — a fat G-buffer defeats
+the entire point. Use subpasses or forward+</td></tr>
+<tr><td>Depth pre-pass</td><td>Usually a win</td><td>Usually a <strong>loss</strong> — doubles the geometry
+cost to save overdraw that was already cheap</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="loadstore">Load and store actions: the one thing to get right</h2>
+
+<pre><code>/* Because a tile is loaded, worked on, and stored, you must
+   tell the driver what to do at each boundary. Getting this
+   wrong is the single biggest mobile performance mistake. */
+
+  AT TILE LOAD (start of a render pass)
+    CLEAR      cheapest. No read from DRAM at all - the tile
+               is simply initialised on chip.
+    LOAD       read the previous contents from DRAM. Costs
+               full bandwidth.
+    DONT_CARE  cheapest, when you will overwrite everything.
+
+  AT TILE STORE (end of a render pass)
+    STORE      write the tile to DRAM.
+    DONT_CARE  discard it. FREE.
+
+/* THE DEPTH BUFFER should almost always be:
+       load  = CLEAR
+       store = DONT_CARE
+   You need depth during the pass and never afterwards, so
+   there is no reason to spend bandwidth writing it out.
+   Many engines write depth to DRAM every frame for no reason
+   and lose 20-30% of their bandwidth budget to it.        */
+
+/* Vulkan makes it explicit: */
+   VkAttachmentDescription depth = {
+        .loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+   };
+
+/* Metal, the same: */
+   pass.depthAttachment.loadAction  = MTLLoadActionClear;
+   pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+/* GLES, via an extension that is easy to forget: */
+   glInvalidateFramebuffer(GL_FRAMEBUFFER, 1,
+                           (GLenum[]){GL_DEPTH_ATTACHMENT});
+
+/* AND THE ANTI-PATTERN: a partial clear, or a draw that
+   covers only part of the screen, forces a LOAD of the whole
+   render target so the untouched parts survive. Clear the
+   whole thing, or use DONT_CARE and cover it.             */</code></pre>
+
+<h2 id="subpass">Keeping data on chip</h2>
+
+<pre><code>/* Deferred shading writes a G-buffer, then reads it back.
+   On a tiler that is a full round trip to DRAM and back -
+   exactly what tiling exists to avoid.
+
+   THE FIX: tell the API that the second pass reads the same
+   TILE, not the same TEXTURE. Then the data never leaves
+   chip.                                                    */
+
+/* Vulkan SUBPASSES with input attachments: */
+   /* subpass 0: write G-buffer attachments
+      subpass 1: read them as INPUT ATTACHMENTS
+      dependency: BY_REGION                                */
+   VkSubpassDependency dep = {
+        .srcSubpass    = 0,
+        .dstSubpass    = 1,
+        .srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,  /* &lt;-- */
+   };
+   /* BY_REGION is the promise that pixel (x,y) in subpass 1
+      only reads pixel (x,y) from subpass 0. That is what lets
+      the driver keep everything in tile memory.           */
+
+   /* In the shader: */
+   layout(input_attachment_index = 0, set = 0, binding = 0)
+        uniform subpassInput gbufferAlbedo;
+   vec4 albedo = subpassLoad(gbufferAlbedo);
+
+/* Metal: programmable blending - just read the colour
+   attachment directly in the fragment shader: */
+   fragment float4 lighting(GBuffer gbuf [[color(0)]]) { ... }
+
+/* GLES: GL_EXT_shader_framebuffer_fetch */
+   gl_LastFragData[0]
+
+/* This is why "just port the desktop deferred renderer" goes
+   badly on mobile, and why mobile engines favour
+   FORWARD+ / CLUSTERED FORWARD instead: one pass, no
+   G-buffer, lights culled per tile on the CPU or in a
+   compute pass.                                            */</code></pre>
+
+<div class="warn">
+<b>The render-target ping-pong</b>
+<p>Post-processing chains that bounce between two full-screen targets — blur horizontal, blur vertical,
+tonemap, bloom — cost one full flush and reload <em>per pass</em> on a tiler. Four post passes at 1080p RGBA8
+is roughly 66 MB of traffic per frame, at 60 Hz nearly 4 GB/s, on a device with 50 GB/s total. Merge post
+passes aggressively, work at reduced resolution, and prefer compute with groupshared memory over repeated
+full-screen draws.</p>
+</div>
+
+<h2 id="vendors">The landscape, and what "deferred" means here</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>GPU</th><th>Style</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Imagination PowerVR</td><td>TBDR</td><td>Invented it. Full hidden-surface removal per tile — opaque
+overdraw is essentially free</td></tr>
+<tr><td>Apple</td><td>TBDR</td><td>PowerVR lineage; the same on iPhone and on Apple Silicon Macs</td></tr>
+<tr><td>ARM Mali</td><td>TBR</td><td>Tiled, plus "forward pixel kill" rather than full HSR</td></tr>
+<tr><td>Qualcomm Adreno</td><td>Hybrid</td><td>"FlexRender" — chooses tiled or immediate mode per render pass
+based on heuristics</td></tr>
+<tr><td>NVIDIA (Maxwell+)</td><td>Tiled caching</td><td>Immediate-mode API semantics, but bins into tiles
+internally to save bandwidth. Invisible to you</td></tr>
+<tr><td>AMD (Vega+)</td><td>DSBR</td><td>Same idea, also transparent</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Note the vocabulary trap: <em>tile-based <strong>deferred</strong> rendering</em> is a hardware
+architecture — deferring <em>rasterisation</em> until the geometry is binned. <em>Deferred shading</em> is a
+software technique — deferring <em>lighting</em> until after a G-buffer is filled. They are unrelated, and
+deferred shading is the technique that fits TBDR hardware <em>worst</em>.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Desktop renderer runs at a fraction of expected speed on mobile</td><td>Bandwidth — usually depth
+stores, render-target switches, or a G-buffer</td></tr>
+<tr><td>Device gets hot and frame rate halves after a minute</td><td>Thermal throttling driven by DRAM
+traffic</td></tr>
+<tr><td>Adding a depth pre-pass made it slower</td><td>Doubled geometry cost to save overdraw that was already
+free</td></tr>
+<tr><td>MSAA 4× is nearly free</td><td>Correct — enable it, it is the best quality-per-cost on
+mobile</td></tr>
+<tr><td>Frame time jumps when a post-process chain is added</td><td>One flush and reload per pass</td></tr>
+<tr><td>High-poly models much more expensive than on desktop</td><td>All vertex output goes through
+DRAM</td></tr>
+<tr><td>A partial-screen clear is slower than a full one</td><td>It forces a tile load of the whole
+target</td></tr>
+<tr><td>Deferred renderer performs badly</td><td>G-buffer round trip; use subpasses or switch to
+forward+</td></tr>
+<tr><td>Reading the current render target hangs or corrupts</td><td>Needs framebuffer fetch or an input
+attachment, not a texture read</td></tr>
+<tr><td>Profiler shows huge "load/store" cost</td><td><code>storeOp</code> left as STORE on depth</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why mobile GPUs tile, in terms of energy per byte.</li>
+  <li>Describe the two phases of tiled rendering and what memory each touches.</li>
+  <li>Say what becomes cheaper on a tiler and what becomes more expensive, with three of each.</li>
+  <li>Explain why a depth pre-pass is often a loss on mobile.</li>
+  <li>Give the correct load and store actions for a depth buffer, and the cost of getting them
+  wrong.</li>
+  <li>Explain why a partial clear can be slower than a full one.</li>
+  <li>Explain what <code>BY_REGION</code> promises and what it enables.</li>
+  <li>Say why deferred shading fits TBDR hardware badly, and what to use instead.</li>
+  <li>Distinguish tile-based deferred <em>rendering</em> from deferred <em>shading</em>.</li>
+  <li>Estimate the bandwidth cost of a four-pass 1080p post chain at 60 Hz.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

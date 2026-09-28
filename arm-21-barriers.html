@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Barriers: DMB, DSB and ISB | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Barriers: DMB, DSB and ISB</h1>
+<p class="lead">Three instructions that constrain what the hardware may reorder. They look interchangeable and
+are not: each solves a different problem, and choosing the wrong one gives you code that is either incorrect
+or needlessly slow.</p>
+
+<h2 id="three">The three barriers</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>DMB</code></th><th><code>DSB</code></th><th><code>ISB</code></th></tr></thead>
+<tbody>
+<tr><td>Full name</td><td>Data Memory Barrier</td><td>Data Synchronization Barrier</td><td>Instruction Synchronization Barrier</td></tr>
+<tr><td>Guarantees</td><td>Memory accesses before it are <em>observed</em> before those after it</td><td>All prior memory accesses <strong>and maintenance operations</strong> have <em>completed</em></td><td>The pipeline is flushed; later instructions are re-fetched</td></tr>
+<tr><td>Blocks execution?</td><td>No — non-memory instructions continue</td><td><strong>Yes</strong> — execution stalls until everything completes</td><td>Yes</td></tr>
+<tr><td>Cost</td><td>Low</td><td>High</td><td>Moderate</td></tr>
+<tr><td>Use for</td><td>Ordering two data accesses</td><td>After <code>TLBI</code>/<code>DC</code>/<code>IC</code>; before DMA; before <code>WFI</code></td><td>After a system register write; after modifying code</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The distinction in one line each</b>
+<p><strong>DMB</strong> orders. <strong>DSB</strong> waits. <strong>ISB</strong> re-fetches.</p>
+<p>DMB says "these accesses must become visible in this order" but does not stall the pipeline. DSB says
+"nothing proceeds until all of this has actually finished". ISB says "throw away everything already fetched
+and start again", which is what makes a configuration change take effect.</p>
+</div>
+
+<h2 id="suffixes">Domain and direction</h2>
+
+<p>A barrier instruction takes a qualifier saying how far it applies and to which direction of access. Choosing the narrowest one that is still correct is where most of the available performance in this area lives.</p>
+
+<pre class="diagram">   DMB / DSB  &lt;domain&gt;&lt;direction&gt;
+
+   DOMAIN — how far the ordering propagates (chapter 19)
+      sy    full system — widest, includes Device memory and
+            non-coherent masters
+      ish   inner shareable — the SMP default
+      osh   outer shareable
+      nsh   non-shareable — this PE only
+
+   DIRECTION — which accesses are constrained
+      (none)  both loads and stores
+      ld      loads only — orders prior LOADS against later
+              loads and stores
+      st      stores only — orders prior STORES against later
+              stores
+
+   Combined:
+      dmb ishst    prior stores visible before later stores
+                   → the PRODUCER side of a message-passing pattern
+      dmb ishld    prior loads complete before later accesses
+                   → the CONSUMER side
+      dmb ish      full ordering within the inner domain
+      dsb sy       everything, everywhere, completed
+      dsb nshst    local stores completed — boot code
+
+   Narrower is cheaper. `dmb ishst` is materially faster than
+   `dmb sy`, and in a hot path the difference is measurable.</pre>
+
+<h2 id="dmb">DMB in practice</h2>
+
+<p>The most common barrier, and the one to reach for when you need two memory accesses to be observed in a particular order by someone else.</p>
+
+<pre><code>/* The message-passing pattern (chapter 20), fixed with DMB: */
+
+/* producer */                      /* consumer */
+buffer[0] = 42;                     while (flag == 0)
+dmb ishst;   /* stores ordered */           ;
+flag = 1;                           dmb ishld;   /* loads ordered */
+                                    use(buffer[0]);
+
+/* Note both sides need one. Ordering the producer's stores does
+   not stop the consumer's loads being reordered.            */
+
+/* What DMB does NOT do:
+     · it does not FLUSH anything — it constrains ORDER only
+     · it does not wait for completion; a store may still be in
+       a buffer, just guaranteed to leave before the next one
+     · it does not affect instruction fetch
+     · it does nothing for Device-memory-to-DMA handoff, where
+       you need completion — use DSB                        */</code></pre>
+
+<h2 id="acquire-release">Prefer acquire/release</h2>
+
+<p>Rather than placing separate barriers, the architecture lets ordering be attached to the load or store itself. This is both cheaper and harder to get wrong, and it should be your default.</p>
+
+<pre><code>/* Ordering attached to the ACCESS is cheaper than a standalone
+   barrier, because the core can keep other work in flight. */
+
+/* with barriers */                 /* with ordered accesses */
+str  w1, [x0]                       str  w1, [x0]
+dmb  ishst                          stlr w2, [x3]      ← one instruction
+str  w2, [x3]
+
+ldr  w1, [x0]                       ldar w1, [x0]      ← one instruction
+dmb  ishld
+ldr  w2, [x3]                       ldr  w2, [x3]
+
+/* LDAR — load-acquire:  no LATER access may move before it
+   STLR — store-release: no EARLIER access may move after it
+
+   These are what C11's memory_order_acquire/release compile to,
+   and what Linux's smp_load_acquire/smp_store_release emit.
+
+   Rule of thumb: use acquire/release for synchronisation between
+   threads; reserve explicit DMB for cases the ordered accesses
+   cannot express, and DSB for completion.                  */</code></pre>
+
+<h2 id="dsb">DSB: when you need completion, not order</h2>
+
+<p>Where a DMB orders accesses, a DSB waits for them to actually finish. The difference matters whenever the next thing you do depends on the previous operation having completed, not merely being ordered.</p>
+
+<pre><code>/* DSB is required whenever a LATER action depends on a prior
+   operation having actually FINISHED — not merely being ordered. */
+
+/* 1. After cache or TLB maintenance (chapters 15, 18) */
+        dc      cvac, x0
+        dsb     ish              /* the writeback has COMPLETED */
+        /* only now is it safe to start the DMA */
+
+        tlbi    vae1is, x0
+        dsb     ish              /* the invalidate has completed
+                                    on every core */
+        isb
+
+/* 2. Before starting DMA */
+        /* fill the buffer... */
+        dsb     sy               /* the data has reached the point
+                                    the device will read from */
+        writel(START, regs);
+
+/* 3. Before WFI / WFE */
+        dsb     sy               /* outstanding transactions must
+                                    complete before we sleep, or
+                                    they may never do              */
+        wfi
+
+/* 4. Before writing SCTLR to enable the MMU (chapter 12) */
+        dsb     ish              /* the page tables must be visible
+                                    to the table walker */
+        msr     sctlr_el1, x0
+        isb
+
+/* 5. Before a reset or power-down */
+        dsb     sy</code></pre>
+
+<div class="warn">
+<b>DSB is expensive</b>
+<p>It stalls the core until every outstanding memory transaction has completed — which on a large SoC means
+waiting for the far side of the interconnect. Hundreds of cycles is normal. A <code>dsb sy</code> in a hot
+loop is a serious performance bug, and using <code>dsb</code> where <code>dmb</code> would do is the most
+common form of that mistake.</p>
+</div>
+
+<h2 id="isb">ISB: making changes take effect</h2>
+
+<p>Changing how the processor itself behaves — enabling the MMU, switching translation tables — is not visible to instructions already in flight. An ISB is what makes such a change take effect.</p>
+
+<pre><code>/* ISB flushes the pipeline. Instructions after it are re-fetched
+   and re-decoded under the CURRENT context.                  */
+
+/* Required after: */
+
+/* 1. Any system register write affecting fetch, translation or
+      permissions (chapter 06) */
+        msr     sctlr_el1, x0
+        isb
+
+        msr     ttbr0_el1, x0
+        isb
+
+        msr     vbar_el1, x0
+        isb
+
+/* 2. Modifying instructions (chapter 18) */
+        dc      cvau, x0
+        dsb     ish
+        ic      ivau, x0
+        dsb     ish
+        isb                      /* THIS core may have prefetched
+                                    the old bytes */
+
+/* 3. After changing an exception level's configuration and before
+      relying on it */
+
+/* ISB does NOT order memory accesses. It is not a substitute for
+   DMB, and DMB is not a substitute for it. They constrain
+   different machinery: DMB the memory system, ISB the
+   instruction pipeline.                                     */</code></pre>
+
+<h2 id="compiler">The compiler barrier</h2>
+
+<p>Hardware barriers do not stop the compiler reordering your code, and the compiler is perfectly entitled to. Both kinds of barrier are needed, and confusing them produces code that breaks only at higher optimisation levels.</p>
+
+<pre><code>/* Hardware barriers do nothing about COMPILER reordering. A
+   compiler that hoists a load out of a loop has already broken
+   your code before any instruction executes.               */
+
+#define barrier()  asm volatile("" ::: "memory")
+
+/* The "memory" clobber tells GCC: this statement may read or
+   write any memory, so do not cache values in registers across
+   it and do not reorder memory accesses past it. It emits NO
+   instruction.                                              */
+
+/* Linux's READ_ONCE and WRITE_ONCE are built on this idea: */
+#define READ_ONCE(x)      (*(const volatile __typeof__(x) *)&amp;(x))
+#define WRITE_ONCE(x, v)  (*(volatile __typeof__(x) *)&amp;(x) = (v))
+
+/* They prevent the compiler from:
+     · tearing a single access into several
+     · fusing several accesses into one
+     · inventing accesses that were not in the source
+     · caching the value in a register across a loop
+
+   They emit NO hardware barrier. Every shared variable needs at
+   least this, even one you consider "just a flag".         */
+
+/* Every real barrier macro includes the compiler barrier: */
+#define smp_mb()   asm volatile("dmb ish" ::: "memory")
+/*                                          ^^^^^^^^ essential */</code></pre>
+
+<h2 id="linux">The Linux barrier vocabulary</h2>
+
+<p>Linux does not ask driver and kernel code to write raw <code>DMB</code>/<code>DSB</code> instructions with
+a hand-picked domain — it defines a small set of portable macros named after <em>what you are ordering
+against</em>, and each architecture backend picks the cheapest instruction sequence that satisfies it. That
+indirection is why the same driver source compiles correctly on ARM, x86 and RISC-V despite their very
+different native barrier instructions. Reading the table as three groups helps: <code>smp_*</code> macros
+order CPU against CPU and compile to the narrow inner-shareable domain from chapter 19;
+<code>mb()</code>/<code>dma_*</code> macros exist for talking to devices and DMA, and reach further because a
+device is not necessarily inner-shareable; and <code>smp_store_release</code>/<code>smp_load_acquire</code> are
+the publish/consume pairing from chapter 20, spelled the way kernel code actually writes it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Macro</th><th>arm64 expansion</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>barrier()</code></td><td>compiler only</td><td>Stop reordering by the compiler</td></tr>
+<tr><td><code>smp_mb()</code></td><td><code>dmb ish</code></td><td>CPU-to-CPU, both directions</td></tr>
+<tr><td><code>smp_rmb()</code></td><td><code>dmb ishld</code></td><td>CPU-to-CPU, loads</td></tr>
+<tr><td><code>smp_wmb()</code></td><td><code>dmb ishst</code></td><td>CPU-to-CPU, stores</td></tr>
+<tr><td><code>mb()</code></td><td><code>dsb sy</code></td><td>Including MMIO and DMA</td></tr>
+<tr><td><code>dma_wmb()</code></td><td><code>dmb oshst</code></td><td>Before a DMA descriptor is published</td></tr>
+<tr><td><code>dma_rmb()</code></td><td><code>dmb oshld</code></td><td>After reading a DMA completion flag</td></tr>
+<tr><td><code>smp_store_release()</code></td><td><code>stlr</code></td><td>Publish</td></tr>
+<tr><td><code>smp_load_acquire()</code></td><td><code>ldar</code></td><td>Consume</td></tr>
+<tr><td><code>isb()</code></td><td><code>isb</code></td><td>After a system register change</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* On a uniprocessor build the smp_* variants compile to just a
+   compiler barrier — which is why you use smp_mb() for CPU-to-CPU
+   and mb() for device interaction. Using mb() where smp_mb()
+   would do costs a dsb sy on every call.                    */</code></pre>
+
+<h2 id="mmio">MMIO ordering</h2>
+
+<p>Device registers have their own ordering requirements, and driver code has conventions for expressing them. These are the patterns that appear throughout real drivers.</p>
+
+<pre><code>/* Device memory accesses are ordered relative to EACH OTHER
+   (chapter 11), but NOT relative to Normal memory accesses.
+   The DMA handoff is exactly that combination:              */
+
+        memcpy(dma_buf, data, len);     /* Normal memory */
+        dsb     sy                       /* MUST complete first */
+        writel(START, regs + CTRL);      /* Device memory */
+
+/* Linux's accessors handle this for you: */
+        writel(v, addr);          /* includes a barrier before the
+                                     write so prior Normal writes
+                                     are visible                  */
+        readl(addr);              /* includes a barrier after      */
+
+        writel_relaxed(v, addr);  /* NO barrier — use when you have
+                                     already ordered things, e.g.
+                                     several register writes in a
+                                     row where only the last needs
+                                     ordering                      */
+
+/* The common optimisation: use _relaxed for a burst of register
+   writes, then a single full writel() or an explicit barrier at
+   the point where ordering actually matters. This can be a
+   significant win in a hot driver path.                     */
+
+/* And the POSTED WRITE trap: a write to Device-nGnRE may be
+   acknowledged before it reaches the device. To be certain it
+   has landed — before releasing a reset, say — you must READ
+   BACK from the same peripheral:                            */
+        writel(v, regs + CTRL);
+        (void)readl(regs + CTRL);        /* forces completion */</code></pre>
+
+<h2 id="cost">Cost, and choosing</h2>
+
+<p>Barriers are not free, and their cost varies by type and by how busy the system is. This is what makes the difference between choosing correctly and choosing defensively.</p>
+
+<pre class="diagram">Approximate, and highly implementation dependent — but the
+ORDERING is reliable:
+
+   barrier()            0 cycles      (no instruction)
+   ldar / stlr          few cycles    (attached to the access)
+   dmb ishst/ishld      ~5-20         (one direction, narrow)
+   dmb ish              ~10-30
+   dmb sy               ~20-50
+   dsb ish              ~20-100       (waits for completion)
+   dsb sy               ~50-500+      (waits for the whole system)
+   isb                  ~10-30        (pipeline flush)
+
+DECISION PROCEDURE:
+
+   Ordering two data accesses between threads?
+        → acquire/release, or the narrowest DMB
+
+   Need something to have COMPLETED before proceeding?
+        → DSB, narrowest domain that is correct
+
+   Changed a system register or wrote instructions?
+        → ISB
+
+   Only worried about the compiler?
+        → barrier(), READ_ONCE, WRITE_ONCE
+
+   Handing a buffer to a device?
+        → DSB, and use the DMA API which does it for you</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Consumer sees the flag but stale data</td><td>Missing barrier on one or both sides</td></tr>
+<tr><td>System register change has no effect</td><td>Missing <code>ISB</code></td></tr>
+<tr><td>TLB or cache maintenance seems not to happen</td><td>Missing <code>DSB</code> after it</td></tr>
+<tr><td>DMA reads a partially filled buffer</td><td>No <code>DSB</code> before starting the transfer</td></tr>
+<tr><td>Device does not see a register write</td><td>Posted write; read back to force completion</td></tr>
+<tr><td>Hot loop unexpectedly slow</td><td><code>dsb sy</code> where <code>dmb ishst</code> would do</td></tr>
+<tr><td>Adding <code>volatile</code> did not fix a race</td><td><code>volatile</code> is not a barrier</td></tr>
+<tr><td>Works at <code>-O0</code>, fails at <code>-O2</code></td><td>Compiler reordering; missing <code>"memory"</code> clobber</td></tr>
+<tr><td>Core hangs in <code>WFI</code></td><td>No <code>DSB</code> before it; a transaction never completed</td></tr>
+<tr><td>Barrier added, coherency bug persists</td><td>It is a shareability problem, not ordering (<a href="arm-19-shareability.html">ch. 19</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the one-line distinction between DMB, DSB and ISB.</li>
+  <li>Explain the domain and direction suffixes and give three useful combinations.</li>
+  <li>Show a message-passing pattern with barriers, and say why both sides need one.</li>
+  <li>Explain why acquire/release is cheaper than a standalone DMB.</li>
+  <li>Give four situations that specifically require DSB.</li>
+  <li>Give three situations that require ISB.</li>
+  <li>Explain what the <code>"memory"</code> clobber does and why every barrier macro includes it.</li>
+  <li>Explain posted writes and how to force a register write to land.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

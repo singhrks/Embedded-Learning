@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temporal redundancy and motion compensation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Temporal redundancy and motion compensation</h1>
+<p class="lead">The single largest saving in video compression. Consecutive frames are nearly identical, and
+what did change mostly <em>moved</em> — so instead of coding a block, code a vector pointing at where it used
+to be. This one idea is the difference between JPEG-per-frame and real video.</p>
+
+<h2 id="idea">The idea</h2>
+
+<pre class="diagram">   FRAME N-1                    FRAME N
+
+   +----------------+           +----------------+
+   |                |           |                |
+   |    [ball]      |           |       [ball]   |
+   |                |           |                |
+   |  static bg     |           |  static bg     |
+   +----------------+           +----------------+
+
+   CODING FRAME N INDEPENDENTLY  (as JPEG would)
+     every block from scratch. ~50 KB.
+
+   CODING IT AS A DIFFERENCE FROM N-1
+     background blocks: identical -> "SKIP". Zero bits beyond
+                        the flag.
+     ball blocks:       "copy from (x-12, y+3) in frame N-1,
+                        plus this small residual"
+     -> ~2 KB. TWENTY-FIVE TIMES SMALLER.
+
+   THE THREE PIECES
+
+     1. MOTION VECTOR   where to copy from
+     2. REFERENCE INDEX which earlier frame
+     3. RESIDUAL        the error after copying, transformed
+                        and quantised exactly as in chapter 7
+
+   A typical P-frame is 5-20% the size of an I-frame of the
+   same content. On static content it can be 1%.
+
+   AND THE FAILURE MODES FALL OUT OF THIS DIRECTLY:
+     a scene cut          -> nothing matches -> huge frame
+     a fade or flash      -> everything changed slightly ->
+                             every block has a residual
+     new content entering -> occlusion; no source to copy
+     noise / grain        -> genuinely random, cannot be
+                             predicted, and it destroys
+                             compression efficiency</pre>
+
+<div class="key">
+<b>Block matching is not motion estimation</b>
+<p>The encoder is not trying to understand the scene. It searches for the block that <em>minimises cost</em>,
+which is usually but not always the physically correct match. On a repeating texture — a brick wall, a picket
+fence — it will happily pick a neighbouring identical block. That is fine: the decoder reproduces exactly what
+the encoder chose, so the picture is correct even when the "motion" is physically nonsense. Motion vectors are
+a compression tool, not a measurement, and using them for computer vision gives poor results for exactly this
+reason.</p>
+</div>
+
+<h2 id="search">Searching</h2>
+
+<pre><code>/* THE COST FUNCTION. SAD is cheap and standard; SATD
+   (Hadamard-transformed) correlates better with what the
+   transform will actually cost, and is what good encoders use
+   for the final decision.                                  */
+
+static int sad_16x16(const uint8_t *cur, int cs,
+                     const uint8_t *ref, int rs)
+{
+        int sum = 0;
+        for (int y = 0; y &lt; 16; y++)
+                for (int x = 0; x &lt; 16; x++)
+                        sum += abs(cur[y*cs + x] - ref[y*rs + x]);
+        return sum;
+}
+
+/* FULL SEARCH over +/-64 pixels: 129 x 129 = 16,641 positions,
+   each 256 subtractions = 4.3 MILLION operations PER BLOCK.
+   At 8160 blocks per 1080p frame and 30 fps that is 10^12
+   operations per second. Nobody does this.               */
+
+/* WHAT ENCODERS ACTUALLY DO */
+
+  1. PREDICT THE STARTING POINT. Motion is spatially and
+     temporally coherent, so the neighbours' vectors and the
+     co-located block's vector are excellent guesses. Start
+     there, and you are usually within a pixel or two.
+
+  2. DIAMOND / HEXAGON SEARCH. Test a small pattern around the
+     current best, move to the winner, repeat until the centre
+     wins. Typically 20-50 positions instead of 16,641.
+
+  3. HIERARCHICAL / PYRAMID SEARCH. Search a 1/8-scale image
+     first to find large motion cheaply, then refine at each
+     level up. This is how you find fast motion without a
+     huge search window.
+
+  4. EARLY TERMINATION. If the cost is already below a
+     threshold, stop.
+
+/* AND THE PREDICTED VECTOR IS ALSO WHAT GETS CODED: the
+   bitstream carries the DIFFERENCE between the actual vector
+   and the predicted one. Coherent motion therefore costs
+   almost nothing - a pan where every block moves identically
+   codes as a field of zeros.                             */</code></pre>
+
+<h2 id="subpel">Sub-pixel accuracy</h2>
+
+<pre class="diagram">   Real motion is not a whole number of pixels. Restricting
+   vectors to integers leaves a residual that the transform
+   then has to code - expensively.
+
+   H.264 onward: QUARTER-PIXEL precision for luma.
+   AV1 and VVC: EIGHTH-pixel in some modes.
+
+   HOW: interpolate the reference frame.
+
+     half-pixel   a 6-tap filter (1,-5,20,20,-5,1)/32 in
+                  H.264 - not bilinear, because bilinear
+                  blurs and blurring the reference degrades
+                  every future frame that predicts from it
+     quarter-pixel  average of the two nearest half/full
+                  positions
+
+   THE PAYOFF: typically 20-30% bitrate reduction over
+   integer-pixel motion. It is one of the largest single wins
+   in H.264 over MPEG-2.
+
+   THE COST: the interpolation filter runs on EVERY predicted
+   block, in the DECODER. It is one of the most expensive
+   parts of decoding, and the reason motion compensation is
+   always a hand-written SIMD routine.
+
+   AND A SUBTLETY: the filter must be BIT-EXACT and specified
+   by the standard. If the encoder and decoder interpolate
+   even slightly differently, the error feeds into the next
+   frame's reference and DRIFTS - accumulating until the
+   picture visibly diverges. This is why every codec after
+   MPEG-2 specifies integer arithmetic exactly.</pre>
+
+<h2 id="beyond">Beyond one vector per block</h2>
+
+<pre><code>/* Simple block translation cannot express zoom, rotation, or
+   two objects in one block. Codecs added tools for each. */
+
+/* VARIABLE BLOCK SIZE (H.264 onwards)
+     16x16 down to 4x4, chosen per region. Large blocks for
+     flat backgrounds - one vector covers a lot. Small blocks
+     at object boundaries, where two things move differently.
+     HEVC goes to 64x64, AV1 to 128x128 (chapter 11).      */
+
+/* BI-PREDICTION
+     Average two predictions, from a past AND a future frame:
+        pred = (ref0[mv0] + ref1[mv1] + 1) / 2
+     Better on occlusion (something hidden in the past may be
+     visible in the future) and it AVERAGES AWAY NOISE, which
+     often beats either reference alone. Requires B-frames
+     (chapter 10).                                          */
+
+/* WEIGHTED PREDICTION
+     pred = w * ref[mv] + o
+     Handles fades and lighting changes, where every pixel
+     changed by a multiplicative or additive amount. Without
+     it, a one-second fade costs as much as a scene cut.  */
+
+/* GLOBAL / WARPED MOTION (AV1, and VVC's affine mode)
+     One affine or perspective model for the whole frame, or
+     per block:
+        x' = a*x + b*y + c
+        y' = d*x + e*y + f
+     Expresses pan, zoom and rotation in six parameters
+     instead of thousands of vectors. A slow zoom becomes
+     nearly free.                                           */
+
+/* OVERLAPPED BLOCK MC (OBMC)
+     Blend predictions from neighbouring blocks' vectors near
+     the block edges, so the block boundary is not a
+     discontinuity. Reduces blocking at source rather than
+     filtering it afterwards.                               */
+
+/* AND WHAT IS STILL HARD
+     non-rigid motion  - water, fire, cloth, foliage
+     occlusion         - genuinely new pixels must be intra
+                         coded
+     film grain        - random by construction. AV1's answer
+                         is to REMOVE it before encoding and
+                         SYNTHESISE it in the decoder from a
+                         parametric model - which is far
+                         cheaper than coding noise.        */</code></pre>
+
+<div class="warn">
+<b>Grain and noise are the enemy of every codec</b>
+<p>Motion compensation predicts, and noise is by definition unpredictable — so every noisy block gets a large
+residual and consumes bits. A grainy source can cost several times the bitrate of a clean one at the same
+perceptual quality. This is why encoders ship denoisers, why streaming services denoise before encoding, and
+why AV1's film grain synthesis exists: strip the grain, code the clean signal cheaply, and add
+statistically-matched grain back at playback.</p>
+</div>
+
+<h2 id="see">Looking at the vectors</h2>
+
+<pre><code># Visualise motion vectors over the video:
+$ ffplay -flags2 +export_mvs -vf codecview=mv=pf+bf+bb input.mp4
+#   pf = P-frames forward, bf = B forward, bb = B backward
+
+# Or render them to a file:
+$ ffmpeg -flags2 +export_mvs -i input.mp4 \
+    -vf codecview=mv=pf+bf+bb -c:v libx264 -crf 18 mvs.mp4
+
+# WHAT TO LOOK FOR
+#   long vectors in a static area  -> the search found a false
+#                                     match; usually harmless,
+#                                     occasionally a sign of
+#                                     noise
+#   a field of identical vectors   -> a pan. Should be cheap.
+#   chaotic vectors everywhere     -> the encoder is failing to
+#                                     predict; expect a big
+#                                     frame
+#   no vectors at all              -> an I-frame
+
+# Per-frame sizes, which is where prediction success shows:
+$ ffprobe -select_streams v -show_entries \
+    frame=pict_type,pkt_size -of csv input.mp4 | head -20
+frame,I,142883
+frame,P,8214
+frame,B,3102
+frame,B,2894
+frame,P,9017
+
+# The I-frame is 15x the P-frames. That ratio IS temporal
+# redundancy, measured. If your P-frames are nearly as big as
+# your I-frames, prediction is failing - check for noise, a
+# scene cut, or a source that was already heavily compressed.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>P-frames nearly as large as I-frames</td><td>Prediction failing — noise, grain, or a
+constantly-changing scene</td></tr>
+<tr><td>Bitrate spikes at every scene cut</td><td>Expected; nothing to predict from. Rate control must
+absorb it (<a href="vid-13-rate-control.html">chapter 13</a>)</td></tr>
+<tr><td>Fades cost as much as cuts</td><td>Weighted prediction disabled</td></tr>
+<tr><td>Detail smears during fast motion</td><td>Motion search window too small, or the preset too
+fast</td></tr>
+<tr><td>Blocks appear to slide independently</td><td>Block size too large for the motion; sub-block
+partitioning would help</td></tr>
+<tr><td>Grainy source needs 3× the bitrate</td><td>Noise is unpredictable — denoise, or use grain
+synthesis</td></tr>
+<tr><td>Encoder is very slow</td><td>Motion search dominates; a faster preset shrinks the search</td></tr>
+<tr><td>Picture drifts wrong over a long GOP</td><td>Encoder and decoder interpolating differently — a
+conformance bug</td></tr>
+<tr><td>Motion vectors give poor optical flow</td><td>Expected — they minimise bits, not physical
+error</td></tr>
+<tr><td>Slow zoom is expensive on H.264, cheap on AV1</td><td>Warped/global motion expresses it in six
+parameters</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why a P-frame is typically 5–20% the size of an I-frame.</li>
+  <li>Name the three pieces of information an inter-coded block carries.</li>
+  <li>Explain why block matching is not the same as measuring motion.</li>
+  <li>Estimate the cost of a full search and name three techniques that avoid it.</li>
+  <li>Explain why motion vectors are coded as differences from a prediction.</li>
+  <li>Say what quarter-pixel motion buys and what it costs the decoder.</li>
+  <li>Explain drift and why interpolation filters must be bit-exact.</li>
+  <li>Give three tools beyond simple block translation and what each handles.</li>
+  <li>Explain why film grain is expensive and how AV1 addresses it.</li>
+  <li>Read a per-frame size listing and say whether prediction is working.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

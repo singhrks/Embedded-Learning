@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threads, and exactly what they share | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Threads, and exactly what they share</h1>
+<p class="lead">Every concurrency bug is ultimately a disagreement about what is shared. This chapter draws
+the line precisely — what one thread can see of another's state, what it cannot, and the handful of
+per-thread things people assume are private and are not.</p>
+
+<h2 id="picture">The picture</h2>
+
+<p>The defining property of threads is what they share and what they do not. Everything else — every race, every lock, every subtle bug — follows from this one diagram, so it is worth fixing precisely rather than approximately.</p>
+
+<pre class="diagram">   ONE PROCESS, THREE THREADS
+
+   +-------------------------------------------------------+
+   |  SHARED - one copy, every thread sees it               |
+   |                                                        |
+   |   the address space                                    |
+   |     .text   code                                       |
+   |     .data   initialised globals                        |
+   |     .bss    zeroed globals                             |
+   |     heap    everything malloc/new returns              |
+   |                                                        |
+   |   file descriptors      (fd 3 means the same file)     |
+   |   the current directory                                |
+   |   signal handlers, the umask, resource limits          |
+   |   the process id, uid/gid                              |
+   |   memory mappings, and therefore mmap'd files          |
+   +-------------------------------------------------------+
+              |                |                |
+        +-----+----+     +-----+----+     +-----+----+
+        | thread 1 |     | thread 2 |     | thread 3 |
+        +----------+     +----------+     +----------+
+        | PRIVATE  |     | PRIVATE  |     | PRIVATE  |
+        |  stack   |     |  stack   |     |  stack   |
+        |  registers     |  registers     |  registers
+        |  PC, SP  |     |  PC, SP  |     |  PC, SP  |
+        |  errno   |     |  errno   |     |  errno   |
+        |  TLS     |     |  TLS     |     |  TLS     |
+        |  tid     |     |  tid     |     |  tid     |
+        |  signal mask   |  signal mask   |  signal mask
+        |  sched policy  |  sched policy  |  sched policy
+        +----------+     +----------+     +----------+
+
+   THE LINE IS THE STACK. Everything above it is one object
+   shared by all; everything below it exists once per thread.</pre>
+
+<div class="key">
+<b>"Private" means "not shared by default", not "unreachable"</b>
+<p>A thread's stack is ordinary memory in the same address space. Pass a pointer to a local variable to
+another thread and it can read and write it — there is no hardware boundary. Stack-private is a
+<em>convention</em> the compiler relies on, not a protection. Which is why returning a pointer to a local, or
+handing one to a thread that outlives the frame, is a use-after-free with extra steps.</p>
+</div>
+
+<h2 id="surprises">The things people get wrong</h2>
+
+<p>A handful of consequences of that sharing catch nearly everyone at least once, because they contradict reasonable assumptions carried over from single-threaded programming.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Thing</th><th>Shared or private?</th><th>Why it surprises people</th></tr></thead>
+<tbody>
+<tr><td><code>errno</code></td><td><strong>Private</strong></td><td>It looks like a global. It is a macro
+expanding to <code>(*__errno_location())</code>, which is thread-local. This was fixed decades ago and people
+still expect the old behaviour</td></tr>
+<tr><td>File descriptors</td><td><strong>Shared</strong></td><td>Including the <em>file offset</em>. Two
+threads doing <code>read()</code> on the same fd interleave and each gets part of the data. Use
+<code>pread</code>/<code>pwrite</code></td></tr>
+<tr><td>The heap</td><td><strong>Shared</strong></td><td>Which is why <code>malloc</code> must be
+thread-safe, and why it is often a contention point (<a href="mt-16-false-sharing.html">chapter
+16</a>)</td></tr>
+<tr><td>Signal handlers</td><td><strong>Shared</strong> (the disposition)</td><td>But the signal
+<em>mask</em> is per-thread, and which thread receives a process-directed signal is unspecified</td></tr>
+<tr><td>The current working directory</td><td><strong>Shared</strong></td><td>One thread calling
+<code>chdir()</code> changes every other thread's relative paths, mid-operation</td></tr>
+<tr><td>The FPU / SIMD registers</td><td><strong>Private</strong></td><td>Saved and restored per thread — but
+on some embedded targets only if the kernel was built to do so</td></tr>
+<tr><td><code>static</code> locals in a function</td><td><strong>Shared</strong></td><td>The classic
+accidental global. <code>static char buf[256]</code> inside a helper makes that helper unusable
+concurrently</td></tr>
+<tr><td>Anything returning a pointer to internal state</td><td><strong>Shared</strong></td><td><code>strtok</code>,
+<code>asctime</code>, <code>gethostbyname</code>… the <code>_r</code> suffix exists for exactly this
+reason</td></tr>
+<tr><td>C++ function-local <code>static</code> init</td><td>Shared, but <strong>thread-safe since
+C++11</strong></td><td>The compiler emits a guard. It is safe, and it is also a hidden lock in your hot
+path</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The static-buffer bug, which every codebase has once. */
+
+const char *format_id(int id)
+{
+        static char buf[32];              /* SHARED. Disaster. */
+        snprintf(buf, sizeof buf, "id-%d", id);
+        return buf;
+}
+
+/* Two threads:
+     A: format_id(1)  -> writes "id-1"
+     B: format_id(2)  -> overwrites with "id-2"
+     A: prints buf    -> "id-2"
+
+   No crash. No sanitiser hit unless you look for it. Just
+   quietly wrong output, occasionally, under load.
+
+   THREE FIXES, in order of preference:                      */
+
+/* 1. Caller owns the buffer. Boring, obvious, always right. */
+void format_id_r(int id, char *out, size_t n)
+{
+        snprintf(out, n, "id-%d", id);
+}
+
+/* 2. Thread-local storage. Works, but the lifetime rules are
+      now subtle and each thread pays for the buffer.        */
+const char *format_id_tls(int id)
+{
+        static _Thread_local char buf[32];   /* C11          */
+        snprintf(buf, sizeof buf, "id-%d", id);
+        return buf;
+}
+
+/* 3. Allocate and make the caller free it. Correct, and now
+      you have an allocation in a hot path.                  */</code></pre>
+
+<h2 id="tls">Thread-local storage</h2>
+
+<p>Sometimes each thread needs its own copy of something despite sharing the address space. There are several mechanisms for that, differing in cost, in when they are initialised, and in whether they work in a library.</p>
+
+<pre><code>/* One name, one variable per thread, resolved at access. */
+
+  C11         _Thread_local int depth;
+  C++11       thread_local int depth;
+  GCC/Clang   __thread int depth;          /* older, faster,
+                                              no destructors */
+  POSIX       pthread_key_create(&amp;key, dtor);
+              pthread_setspecific(key, p);
+              pthread_getspecific(key);
+  Windows     __declspec(thread) int depth;
+              TlsAlloc/TlsGetValue/TlsSetValue
+
+/* WHAT IT IS FOR
+
+     per-thread scratch buffers
+     per-thread random-number state
+     a "current transaction" or "current request" pointer
+     recursion depth counters, logging context
+     per-thread allocator caches - this is how modern mallocs
+       avoid a global lock
+
+   WHAT IT COSTS
+
+     * access is not free: often a register read plus an
+       offset, sometimes a function call (__tls_get_addr) for
+       dynamically loaded modules
+     * every thread pays the memory, even threads that never
+       touch it
+     * destructors run at thread exit - but NOT if the thread
+       is killed, and not for the main thread on some
+       platforms
+     * it is invisible shared-nothing state, which makes code
+       hard to reason about and impossible to move between
+       threads
+
+   THE TRAP: thread_local in a THREAD POOL is per-WORKER, not
+   per-TASK. Task 1 leaves state behind that task 2 sees, and
+   the two tasks are unrelated. If you use TLS for request
+   context in a pool, you must clear it on every task
+   boundary (chapter 17).                                    */</code></pre>
+
+<div class="warn">
+<b>Stack size is a real constraint, and the default is not what you think</b>
+<p>Linux gives a pthread 8 MB by default (<code>ulimit -s</code>), Windows gives 1 MB reserved, and an RTOS
+gives you whatever you asked for — often 512 bytes. Spawn a thousand threads on Linux and you have reserved
+8 GB of address space; it is virtual and mostly unbacked, but on a 32-bit target it is fatal. Meanwhile a
+deep recursion or a large local array on an embedded target silently runs off the end of a small stack and
+corrupts whatever is next in RAM. Set it deliberately with
+<code>pthread_attr_setstacksize</code>.</p>
+</div>
+
+<h2 id="creation">What "shared" means for the compiler</h2>
+
+<p>Creating a thread is more expensive than it appears — there is a stack to allocate, kernel structures to set up, and scheduling state to initialise. That cost is the entire argument for thread pools later in the track.</p>
+
+<pre><code>/* Sharing is not just about which memory two threads can
+   reach. It is about what the COMPILER is allowed to assume.
+
+   In single-threaded code the compiler may assume nothing
+   else changes memory. That assumption is what makes
+   optimisation possible - and it is exactly wrong under
+   concurrency.                                             */
+
+int flag = 0;
+
+void waiter(void)
+{
+        while (!flag)          /* the compiler sees no writes  */
+                ;              /* to `flag` in this loop, so   */
+        do_work();             /* it may hoist the load OUT:   */
+}
+
+/*     if (!flag) for (;;) ;    <- an infinite loop, legally  */
+
+/* `volatile` stops that hoist, and does NOTHING ELSE:
+     - it does not make the access atomic
+     - it does not order it against other accesses
+     - it does not stop the CPU reordering
+
+   volatile is for memory-mapped registers and for variables
+   changed by a signal handler on the SAME thread. It is not a
+   concurrency tool, and treating it as one is the second most
+   common mistake in this whole track.
+
+   The right answer is an atomic with an ordering:           */
+
+#include &lt;stdatomic.h&gt;
+atomic_int flag = 0;
+
+void waiter(void)
+{
+        while (!atomic_load_explicit(&amp;flag, memory_order_acquire))
+                ;
+        do_work();       /* now guaranteed to see the writes
+                            the setter made before storing    */
+}
+
+/* Chapters 11 and 12 are entirely about that last guarantee. */</code></pre>
+
+<h2 id="kernel">Threads below user space</h2>
+
+<p>What the operating system actually creates when you ask for a thread determines how it is scheduled and what blocking really means. The models differ between systems, and the differences are observable.</p>
+
+<pre class="diagram">   The same word means different things at different levels.
+
+   USER THREAD (pthread, std::thread, HANDLE)
+     scheduled by the kernel, has a kernel task behind it.
+     On Linux, 1:1 - one pthread is one task_struct.
+
+   KERNEL THREAD (kthread)
+     lives entirely in the kernel, no user address space.
+     Workqueues, kswapd, ksoftirqd (Linux chapter 16).
+
+   INTERRUPT CONTEXT
+     not a thread at all. Cannot sleep, cannot take a mutex,
+     borrowed the stack of whatever it interrupted. Everything
+     in this track applies, but only the primitives that do
+     not sleep are legal - spinlocks, atomics.
+
+   HARDWARE THREAD (SMT / hyperthreading)
+     two architectural register sets sharing one core's
+     execution units. To software it is two CPUs; to the cache
+     it is one. Two "parallel" threads on one core's siblings
+     share L1 and can contend invisibly.
+
+   FIBER / COROUTINE / GREEN THREAD
+     scheduled in USER SPACE, no kernel involvement. Cheap to
+     switch, cannot use more than one core by itself, and a
+     blocking syscall stalls every one of them (chapter 18).
+
+   Knowing which of these you have decides which primitives
+   are legal. Taking a sleeping mutex in interrupt context is
+   not slow - it is a kernel bug that panics.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A function returns another thread's data</td><td>A <code>static</code> buffer inside it</td></tr>
+<tr><td>Two threads reading one file each get half the data</td><td>Shared fd, shared offset — use
+<code>pread</code></td></tr>
+<tr><td>Relative paths break intermittently</td><td>Another thread called <code>chdir</code></td></tr>
+<tr><td>A signal is handled by the wrong thread</td><td>Process-directed signals go to any thread that has not
+masked them</td></tr>
+<tr><td>Stack corruption on an embedded target</td><td>Default thread stack far smaller than the locals in
+use</td></tr>
+<tr><td>Address space exhausted with a few thousand threads</td><td>8 MB reserved per thread on a 32-bit
+build</td></tr>
+<tr><td>Request context leaks between unrelated requests</td><td><code>thread_local</code> in a thread pool,
+not cleared per task</td></tr>
+<tr><td>A polling loop never exits in release builds</td><td>Non-atomic flag; the load was hoisted out of the
+loop</td></tr>
+<tr><td><code>volatile</code> "fixed" a race, then it came back</td><td>It never fixed it — it changed the
+timing</td></tr>
+<tr><td>Kernel panic taking a mutex in an interrupt</td><td>Sleeping primitive in non-sleepable
+context</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List what threads in one process share and what is per-thread, from memory.</li>
+  <li>Explain why a thread's stack is "private" but not protected.</li>
+  <li>Say whether <code>errno</code> is shared, and how that is implemented.</li>
+  <li>Explain what goes wrong when two threads <code>read()</code> the same descriptor.</li>
+  <li>Find the <code>static</code> buffer bug in a function and give three fixes, ranked.</li>
+  <li>Give three good uses for thread-local storage and one trap it creates in a thread pool.</li>
+  <li>State the default thread stack size on Linux and on Windows, and why it matters at scale.</li>
+  <li>Explain precisely what <code>volatile</code> does and what it does not.</li>
+  <li>Show why a non-atomic polling loop can become an infinite loop after optimisation.</li>
+  <li>Distinguish a user thread, a kernel thread, interrupt context, an SMT sibling and a coroutine, and say
+  which synchronisation primitives are legal in each.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

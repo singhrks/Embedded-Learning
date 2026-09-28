@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calling conventions and the ABI | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Calling conventions and the ABI</h1>
+<p class="lead">The contract that lets separately compiled code work together: where arguments go, who
+saves what, how the stack is laid out. Violate it and you get corruption that looks like a hardware fault —
+and every language's foreign function interface is built on it.</p>
+
+<h2 id="what">What an ABI covers</h2>
+
+<pre class="diagram">   An API is a source-level contract: function names, types,
+   semantics. An ABI is a BINARY contract:
+
+     · sizes and alignments of every type
+     · struct layout and padding rules
+     · where arguments are passed, and in what order
+     · where return values come back
+     · which registers are preserved across a call
+     · stack frame layout, alignment, and direction
+     · the stack unwinding format, for exceptions
+     · name mangling (C++)
+     · object file format, relocations, symbol visibility
+     · dynamic linking: PLT, GOT, TLS model
+     · system call numbering and convention
+
+   THE RELEVANT DOCUMENT for ARM 64-bit is:
+     "Procedure Call Standard for the Arm 64-bit Architecture"
+     (AAPCS64), plus the ELF ABI supplement.
+
+   TWO OBJECT FILES AGREE ON AN ABI OR THEY DO NOT WORK. This
+   is why you cannot link an armhf library into an aarch64
+   binary, why C++ objects from different compilers may not
+   link, and why the kernel's syscall interface is frozen
+   forever (Linux chapter 02).</pre>
+
+<h2 id="aapcs">AAPCS64: the register map</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>Role</th><th>Preserved?</th></tr></thead>
+<tbody>
+<tr><td><code>x0</code>–<code>x7</code></td><td>Arguments 1–8; <code>x0</code>(–<code>x1</code>) returns the result</td><td>No</td></tr>
+<tr><td><code>x8</code></td><td>Indirect result location (for large returns)</td><td>No</td></tr>
+<tr><td><code>x9</code>–<code>x15</code></td><td>Temporaries</td><td>No</td></tr>
+<tr><td><code>x16</code>, <code>x17</code></td><td>IP0/IP1 — the linker may clobber these in veneers</td><td>No</td></tr>
+<tr><td><code>x18</code></td><td><strong>Platform register</strong> — reserved. TLS on Windows/Darwin, shadow call stack on some Linux configs</td><td>Do not touch</td></tr>
+<tr><td><code>x19</code>–<code>x28</code></td><td>General purpose</td><td><strong>Yes</strong></td></tr>
+<tr><td><code>x29</code></td><td>Frame pointer</td><td><strong>Yes</strong></td></tr>
+<tr><td><code>x30</code></td><td>Link register — the return address</td><td><strong>Yes</strong></td></tr>
+<tr><td><code>sp</code></td><td>Stack pointer, <strong>16-byte aligned</strong></td><td>Yes</td></tr>
+<tr><td><code>v0</code>–<code>v7</code></td><td>FP/SIMD arguments and results</td><td>No</td></tr>
+<tr><td><code>v8</code>–<code>v15</code></td><td>FP/SIMD</td><td><strong>Low 64 bits only</strong></td></tr>
+<tr><td><code>v16</code>–<code>v31</code></td><td>FP/SIMD temporaries</td><td>No</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE v8-v15 RULE IS A REAL TRAP: only the LOW 64 BITS are
+   callee-saved. A function that uses the full 128-bit v8 and
+   restores only the low half has corrupted its caller's
+   upper half. Hand-written SIMD assembly must save the whole
+   register if it uses the whole register.               */
+
+/* AND x18: on Linux it is usually free, but on Windows on
+   ARM and on Darwin it holds the TEB/TLS pointer, and with
+   -fsanitize=shadow-call-stack it holds the shadow stack
+   pointer. Compile with -ffixed-x18 if you are writing code
+   that must be portable across those. Never allocate it in
+   hand-written assembly.                                 */</code></pre>
+
+<h2 id="args">Argument passing</h2>
+
+<pre><code>/* THE ALGORITHM, simplified but accurate for the common
+   cases:
+
+   NGRN = next general register number (starts at 0)
+   NSRN = next SIMD register number (starts at 0)
+   NSAA = next stacked argument address
+
+   For each argument, in order:
+     · integer or pointer, fits in 8 bytes
+           -&gt; x[NGRN++], if NGRN &lt; 8; else stack
+     · 16-byte integer (__int128)
+           -&gt; an even-numbered register PAIR
+     · float, double, or a short vector
+           -&gt; v[NSRN++], if NSRN &lt; 8; else stack
+     · HFA/HVA - a struct of 1-4 identical float/vector
+       members
+           -&gt; consecutive v registers, one per member
+     · other struct, &lt;= 16 bytes
+           -&gt; passed in 1 or 2 general registers, by value
+     · other struct, &gt; 16 bytes
+           -&gt; a COPY is made, and its ADDRESS is passed in a
+              register. The callee may modify the copy.
+     · variadic arguments after the named ones
+           -&gt; on the stack, on most platforms (Darwin differs)
+*/
+
+/* WORKED EXAMPLE: */
+        struct Small { int a, b; };            /* 8 bytes  */
+        struct Big   { int a[10]; };           /* 40 bytes */
+        struct Vec3  { float x, y, z; };       /* an HFA    */
+
+        void f(int a, double b, struct Small c,
+               struct Big d, struct Vec3 e, int f);
+
+/*      a -&gt; w0
+        b -&gt; d0
+        c -&gt; x1              (8 bytes, packed into one reg)
+        d -&gt; x2 = &amp;copy_of_d (too large - by reference)
+        e -&gt; s1, s2, s3      (HFA - one register per member)
+        f -&gt; w3                                            */
+
+/* THE HFA RULE IS WHY a 3-float vector type is efficient on
+   ARM and a 3-int one is not: floats get three registers,
+   ints get packed and spilled. It is also why graphics and
+   DSP code on ARM tends to use float structs.           */
+
+/* VARIADIC FUNCTIONS: the named arguments follow the normal
+   rules, everything after goes on the stack in a defined
+   layout, and va_arg walks it. THIS IS WHY:
+     · printf("%d", someFloat) is UB - the float was passed in
+       a v register or promoted to double on the stack, and
+       %d reads an integer slot
+     · a function must have a prototype in scope: without it,
+       the compiler cannot know whether an argument is named
+       or variadic                                        */</code></pre>
+
+<h2 id="return">Return values</h2>
+
+<pre><code>        int f(void);                    -&gt; w0
+        long f(void);                   -&gt; x0
+        void *f(void);                  -&gt; x0
+        float f(void);                  -&gt; s0
+        double f(void);                 -&gt; d0
+        __int128 f(void);               -&gt; x0, x1
+        struct Small f(void);           -&gt; x0 (and x1 if 9-16
+                                           bytes)
+        struct Vec3 f(void);            -&gt; s0, s1, s2 (HFA)
+
+        struct Big f(void);
+/* THE CALLER allocates space, passes its address in x8, and
+   the callee writes the result there. So:            */
+
+        struct Big result = f();
+   compiles to:
+        add   x8, sp, #16          ; where to put it
+        bl    f
+        ; f writes 40 bytes at [x8]
+
+/* WHICH IS WHY returning a large struct by value is not as
+   expensive as people assume - there is one copy, into a
+   destination the caller chose, not two. And why NAMED RETURN
+   VALUE OPTIMISATION matters in C++ (C++ chapter 05): if the
+   callee builds the result directly at [x8], there is no copy
+   at all.                                                */</code></pre>
+
+<h2 id="frame">The stack frame</h2>
+
+<pre class="diagram">   higher addresses
+   +---------------------------+
+   |  caller's frame           |
+   +---------------------------+  &lt;- sp on entry, 16-aligned
+   |  stacked arguments        |     (arguments 9+)
+   +---------------------------+
+   |  x29 (saved FP)           |  &lt;- x29 points HERE
+   |  x30 (saved LR)           |
+   +---------------------------+
+   |  other callee-saved regs  |
+   |  x19-x28, v8-v15          |
+   +---------------------------+
+   |  local variables          |
+   |  spill slots (chapter 09) |
+   +---------------------------+
+   |  outgoing arguments for   |
+   |  calls this function makes|
+   +---------------------------+  &lt;- sp, always 16-aligned
+   lower addresses
+
+   THE STANDARD PROLOGUE:
+        stp   x29, x30, [sp, #-48]!   ; push FP and LR,
+                                      ; allocate 48 bytes
+        mov   x29, sp                 ; establish the frame
+        stp   x19, x20, [sp, #16]     ; save callee-saved
+        str   x21, [sp, #32]
+
+   THE EPILOGUE, exactly reversed:
+        ldr   x21, [sp, #32]
+        ldp   x19, x20, [sp, #16]
+        ldp   x29, x30, [sp], #48     ; pop and deallocate
+        ret                           ; = br x30
+
+   THE FRAME POINTER CHAIN: each x29 points at the previous
+   x29, forming a linked list. That is how a backtrace works
+   without debug information - walk the chain, read the saved
+   x30 at each level. -fomit-frame-pointer breaks it, which is
+   why profilers and the kernel build with
+   -fno-omit-frame-pointer.
+
+   16-BYTE ALIGNMENT IS MANDATORY at every public interface.
+   Misalign the stack and you get a fault the first time
+   something executes a 128-bit SIMD load/store relative to
+   sp - typically deep inside memcpy, far from the cause.</pre>
+
+<h2 id="layout">Type layout</h2>
+
+<pre><code>/* SIZES AND ALIGNMENTS on AArch64 Linux (LP64): */
+
+        char            1    align 1
+        short           2    align 2
+        int             4    align 4
+        long            8    align 8      &lt;- 4 on Windows!
+        long long       8    align 8
+        pointer         8    align 8
+        float           4    align 4
+        double          8    align 8
+        long double    16    align 16     &lt;- 8 on some ABIs
+        bool            1    align 1
+
+/* THE `long` DIFFERENCE is the classic portability bug:
+     LP64  (Linux, macOS):  long = 8
+     LLP64 (Windows):       long = 4
+   Use int64_t/uint64_t/intptr_t and the question does not
+   arise.                                                  */
+
+/* STRUCT LAYOUT: members in declaration order, each at the
+   next offset satisfying its alignment; the struct's
+   alignment is the maximum of its members'; the size is
+   rounded up to that.                                     */
+
+        struct A {              /* 24 bytes */
+                char  a;        /* offset 0            */
+                                /* 7 bytes PADDING     */
+                long  b;        /* offset 8            */
+                char  c;        /* offset 16           */
+                                /* 7 bytes TAIL PADDING*/
+        };
+
+        struct B {              /* 16 bytes - REORDERED */
+                long  b;        /* offset 0            */
+                char  a;        /* offset 8            */
+                char  c;        /* offset 9            */
+                                /* 6 bytes padding     */
+        };
+
+/* SORTING MEMBERS LARGEST-FIRST is the simplest layout
+   optimisation available, and it costs nothing. On an array
+   of a million elements, 24 versus 16 bytes is 8 MB and a
+   third more cache lines (CA chapter 14).
+
+   SEE THE LAYOUT:
+        pahole -C A prog.o
+        clang -Xclang -fdump-record-layouts -c prog.c        */
+
+/* PACKING, and why it is dangerous: */
+        struct __attribute__((packed)) Wire {
+                uint8_t  type;
+                uint32_t value;         /* offset 1 -
+                                           MISALIGNED */
+        };
+/* On ARM, an unaligned access to Normal memory works but may
+   be slower; to DEVICE memory it FAULTS (ARM chapter 11).
+   And taking a POINTER to a packed member and dereferencing
+   it is undefined behaviour - the compiler warns with
+   -Waddress-of-packed-member for exactly this reason.
+
+   FOR WIRE FORMATS, prefer explicit serialisation:      */
+        static void encode(uint8_t *buf, const struct Msg *m)
+        {
+                buf[0] = m-&gt;type;
+                put_le32(buf + 1, m-&gt;value);
+        }
+/* Slower to write, correct everywhere, and endian-explicit. */</code></pre>
+
+<div class="key">
+<b>The C++ additions</b>
+<p>C++ layers name mangling (so overloads and templates get distinct symbols), vtable layout, RTTI
+representation, exception unwinding tables, and the rules for empty base optimisation on top of the C ABI.
+The Itanium C++ ABI is what GCC and Clang both implement on Linux and ARM, which is why their objects
+interoperate — and MSVC's differs entirely, which is why they do not on Windows.</p>
+</div>
+
+<h2 id="asm">Inline assembly and the ABI</h2>
+
+<pre><code>/* Writing assembly means obeying the ABI yourself. */
+
+static inline uint64_t read_cntvct(void)
+{
+        uint64_t val;
+
+        __asm__ volatile("mrs %0, cntvct_el0"
+                         : "=r" (val)     /* output */
+                         :                /* no inputs */
+                         : "memory");     /* clobbers */
+        return val;
+}
+
+/* THE CONSTRAINT LETTERS you need on AArch64:
+     "r"    a general register
+     "w"    a SIMD/FP register
+     "m"    a memory operand
+     "i"    an immediate constant
+     "I"    a 12-bit immediate valid for add/sub
+     "0"    same as operand 0 (tied)
+     "+r"   read AND written
+     "=r"   write only
+
+/* THE CLOBBER LIST is where mistakes happen:
+     · list EVERY register you modify that is not an output
+     · "memory" means "this may read or write memory the
+       compiler does not know about" - it prevents the
+       compiler from caching loads across the asm and from
+       reordering memory operations around it
+     · "cc" means the condition flags are modified
+
+/* FORGETTING A CLOBBER produces the worst class of bug: the
+   compiler keeps a value in a register you overwrote, and the
+   corruption appears somewhere unrelated, only at -O2, only
+   sometimes.
+
+/* AND `volatile` on the asm means "do not delete this even if
+   its outputs are unused, and do not move it". Required for
+   anything with a side effect - an MMIO access, a barrier, a
+   system register write.                                 */
+
+/* A COMPLETE EXAMPLE with input, output and clobbers: */
+static inline void write_ttbr0(uint64_t val)
+{
+        __asm__ volatile("msr ttbr0_el1, %0\n"
+                         "isb"
+                         :
+                         : "r" (val)
+                         : "memory");
+}
+
+/* FOR A WHOLE FUNCTION IN ASSEMBLY, the ABI is entirely
+   yours: save x19-x28 if you use them, keep sp 16-aligned,
+   return through x30, put the result in x0. Get any of it
+   wrong and the failure appears in the CALLER.          */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Corruption in the caller after a call</td><td>Callee-saved register not restored — often hand-written assembly</td></tr>
+<tr><td>Corruption only in SIMD code</td><td>Only the low 64 bits of <code>v8</code>–<code>v15</code> are preserved</td></tr>
+<tr><td>Fault inside <code>memcpy</code> with a sane pointer</td><td>Stack not 16-byte aligned</td></tr>
+<tr><td>Works at <code>-O0</code>, corrupts at <code>-O2</code></td><td>Missing clobber in inline assembly</td></tr>
+<tr><td>Wrong value from <code>printf</code></td><td>Argument type does not match the format — variadic slots</td></tr>
+<tr><td>Struct different size on two platforms</td><td><code>long</code>, or different alignment rules</td></tr>
+<tr><td>Struct larger than the sum of its members</td><td>Padding — reorder largest first</td></tr>
+<tr><td>Unaligned access fault</td><td>A packed struct member, or a cast to a wider type</td></tr>
+<tr><td>Backtrace stops after one frame</td><td><code>-fomit-frame-pointer</code>, or hand-written assembly with no frame</td></tr>
+<tr><td>C++ objects will not link across compilers</td><td>Different C++ ABI</td></tr>
+<tr><td>Crash only on Windows/Darwin ARM</td><td>Used <code>x18</code></td></tr>
+<tr><td>Passing a 3-float struct is fast, 3-int is not</td><td>The HFA rule</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List what an ABI specifies beyond an API.</li>
+  <li>State AArch64's register roles from memory, including <code>x8</code> and <code>x18</code>.</li>
+  <li>Explain the <code>v8</code>–<code>v15</code> partial-preservation rule and the bug it causes.</li>
+  <li>Work out where each argument of a mixed-type function is passed.</li>
+  <li>Explain HFAs and why they favour float structs on ARM.</li>
+  <li>Explain how a large struct is returned and why NRVO matters.</li>
+  <li>Draw a stack frame and write a correct prologue and epilogue.</li>
+  <li>Explain the frame pointer chain and what breaks it.</li>
+  <li>Lay out a struct by hand and reorder it to save space.</li>
+  <li>Explain why packed structs are dangerous on ARM.</li>
+  <li>Write inline assembly with correct constraints and clobbers, and say what <code>"memory"</code>
+  prevents.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

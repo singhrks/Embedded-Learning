@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The kernel address space | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The kernel address space</h1>
+<p class="lead">Where the kernel lives in virtual memory on arm64, which addresses can be translated to
+physical ones and which cannot, and why <code>virt_to_phys()</code> is right about half the pointers you
+will hand it.</p>
+
+<h2 id="split">The split</h2>
+
+<p>Every process on a 64-bit ARM machine sees a vast address space, but it is not all its own. The range is cut in two: the lower half belongs to the running program and changes every time the kernel switches to a different process, while the upper half is the kernel and is identical no matter who is running.</p>
+
+<pre class="diagram">arm64 uses TTBR0 for user and TTBR1 for kernel (ARM ch. 12) -
+so the split is architectural, not a software convention.
+
+  With a 48-bit VA (CONFIG_ARM64_VA_BITS=48), the default:
+
+  0x0000_0000_0000_0000  +-------------------------+
+                         |  USER SPACE             |  TTBR0_EL1
+                         |  256 TB                 |  per-process
+  0x0000_ffff_ffff_ffff  +-------------------------+
+                         |                         |
+                         |   NON-CANONICAL          |  faults
+                         |   (the "hole")          |
+                         |                         |
+  0xffff_0000_0000_0000  +-------------------------+  TTBR1_EL1
+                         |  KERNEL SPACE           |  shared by
+                         |  256 TB                 |  all tasks
+  0xffff_ffff_ffff_ffff  +-------------------------+
+
+  The top bits select the table, so the "hole" is addresses
+  that are neither - and touching one is an immediate
+  translation fault, which is a useful property: a corrupted
+  pointer usually lands there rather than somewhere plausible.
+
+  INSIDE THE KERNEL HALF (layout varies by version; this is
+  the shape, check Documentation/arch/arm64/memory.rst for
+  yours):
+
+   +-------------------------------+
+   |  KASAN shadow                 |  if enabled - a quarter
+   |                               |  of the space
+   +-------------------------------+
+   |  modules            128 MB    |  must be within branch
+   |                               |  range of the kernel text
+   +-------------------------------+
+   |  vmalloc / ioremap            |  large. vmalloc(), and
+   |                               |  every ioremap() mapping
+   +-------------------------------+
+   |  fixmap, PCI I/O              |
+   +-------------------------------+
+   |  vmemmap                      |  the struct page array
+   +-------------------------------+
+   |  LINEAR MAP                   |  &lt;-- ALL of physical
+   |  (the "direct map")           |      memory, mapped
+   |                               |      contiguously
+   +-------------------------------+</pre>
+
+<h2 id="linear">The linear map is the key idea</h2>
+
+<p>This next idea is the one that makes kernel memory code comprehensible. The kernel keeps a single, permanent mapping of <em>all</em> physical RAM at a fixed place in its address space — so for most memory, converting between a physical address and a kernel virtual address is simple arithmetic rather than a lookup.</p>
+
+<pre><code>/* Every byte of physical RAM appears at a fixed virtual
+   address, in order, at a constant offset. So:            */
+
+        virt = phys + PAGE_OFFSET_ADJUSTMENT
+
+/* which makes translation ARITHMETIC, not a page-table walk: */
+
+        phys_addr_t p = virt_to_phys(v);    /* subtract */
+        void       *v = phys_to_virt(p);    /* add      */
+
+        struct page *pg   = virt_to_page(v);
+        void        *v2   = page_address(pg);
+        unsigned long pfn = page_to_pfn(pg);
+
+/* WHY IT EXISTS: the kernel constantly needs to convert
+   between "a page I am tracking" and "a pointer I can
+   dereference". Doing that with a page-table walk every time
+   would be intolerable.
+
+/* AND THE CRITICAL LIMITATION:
+
+   These functions are ONLY valid for LINEAR MAP addresses -
+   memory from kmalloc(), alloc_pages(), or the kernel image
+   itself.
+
+   THEY ARE WRONG, silently, for:
+        vmalloc() addresses     - scattered physical pages
+        ioremap() addresses     - device memory, not RAM
+        user-space pointers     - a different address space
+        stack addresses on a VMAP_STACK kernel - the kernel
+                                  stack is vmalloc'd!
+
+   "Silently wrong" is the problem. virt_to_phys() on a
+   vmalloc address does not fault - it returns a number, which
+   points at some unrelated physical memory. Hand that to a
+   DMA engine and you have a device writing into whatever
+   happens to live there.                                   */
+
+/* THE CORRECT TOOLS for the non-linear cases: */
+        vmalloc_to_page(addr)         /* vmalloc -> page     */
+        virt_to_page(addr)            /* linear only         */
+        dma_map_single(dev, ...)      /* the ONLY right way
+                                         to get a device
+                                         address (ch. 30)    */</code></pre>
+
+<div class="danger">
+<b>Four kinds of pointer, one C type</b>
+<p>A <code>void *</code> in the kernel may be a linear-map address, a vmalloc address, an <code>__iomem</code>
+cookie, or a <code>__user</code> address. They look identical to the compiler and behave completely
+differently. The annotations exist to make <code>sparse</code> tell them apart — which is the entire
+argument for running <code>make C=1</code> on your driver.</p>
+</div>
+
+<h2 id="ioremap">ioremap: reaching device registers</h2>
+
+<p>Device registers are not RAM. They live at physical addresses too, but they are deliberately left out of the mapping above, because reading them has side effects and caching them would be catastrophic. To reach them at all you have to ask for a mapping explicitly.</p>
+
+<pre><code>/* Device registers are NOT in the linear map. RAM is; MMIO is
+   not. To touch a peripheral you must create a mapping.    */
+
+        void __iomem *base;
+
+        base = ioremap(0x1c000000, 0x1000);
+        if (!base)
+                return -ENOMEM;
+        ...
+        iounmap(base);
+
+/* IN A DRIVER, do not do that. Use the managed, DT-driven
+   form, which also RESERVES the region so two drivers cannot
+   claim it:                                                */
+
+        base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(base))
+                return PTR_ERR(base);
+
+/* WHAT ioremap GIVES YOU:
+     · a mapping with Device memory attributes (ARM ch. 11):
+       nGnRE - no gathering, no reordering, no early write
+       acknowledgement. So accesses reach the device in
+       program order and are not merged.
+     · a __iomem pointer, which sparse will police
+
+   THE VARIANTS:
+     ioremap()        Device nGnRE. The default. Use this.
+     ioremap_wc()     write-combining - for framebuffers,
+                      where merging writes is a huge win
+     ioremap_np()     non-posted, strictly ordered
+     ioremap_cache()  Normal cacheable - for RAM-like regions
+                      such as a firmware image in a carve-out
+
+   NEVER dereference an __iomem pointer directly:
+        val = *base;                    /* WRONG            */
+        val = readl(base);              /* right (ch. 26)   */
+
+   On arm64 a direct dereference often appears to work, which
+   makes it worse - it compiles to a load with the wrong
+   assumptions about reordering and merging, and fails on a
+   different core or compiler version.                      */</code></pre>
+
+<h2 id="pagetables">The page tables themselves</h2>
+
+<p>Underneath every virtual address is a set of tables the hardware walks to find the physical page. You will rarely touch them directly, but knowing their shape explains why a page is 4 KB, why large mappings are cheaper, and what a page-table dump in an oops is telling you.</p>
+
+<pre><code>/* arm64, 4 KB granule, 48-bit VA -> four levels (ARM ch. 13): */
+
+    PGD -> PUD -> PMD -> PTE -> page
+    (level 0)(1)   (2)    (3)
+
+/* Kernel types:
+        pgd_t, p4d_t, pud_t, pmd_t, pte_t
+   and the walk, which you will see in mm/ code:            */
+
+static int walk_one(struct mm_struct *mm, unsigned long addr)
+{
+        pgd_t *pgd;  p4d_t *p4d;  pud_t *pud;
+        pmd_t *pmd;  pte_t *pte;
+
+        pgd = pgd_offset(mm, addr);
+        if (pgd_none(*pgd) || pgd_bad(*pgd))  return -EFAULT;
+
+        p4d = p4d_offset(pgd, addr);
+        if (p4d_none(*p4d) || p4d_bad(*p4d))  return -EFAULT;
+
+        pud = pud_offset(p4d, addr);
+        if (pud_none(*pud) || pud_bad(*pud))  return -EFAULT;
+        if (pud_huge(*pud))  { /* 1 GB block */ }
+
+        pmd = pmd_offset(pud, addr);
+        if (pmd_none(*pmd) || pmd_bad(*pmd))  return -EFAULT;
+        if (pmd_huge(*pmd))  { /* 2 MB block */ }
+
+        pte = pte_offset_map(pmd, addr);
+        ...
+        pte_unmap(pte);
+        return 0;
+}
+
+/* You will rarely write this. You WILL read it, in mm/, in
+   the DMA code, and in any driver doing something unusual
+   with mappings.
+
+   BLOCK MAPPINGS matter for performance: the kernel maps its
+   own linear map with 2 MB or 1 GB blocks where it can, which
+   collapses four TLB entries into one (ARM ch. 15). That is
+   also why CONFIG_RODATA_FULL_DEFAULT_ENABLED, which splits
+   blocks to apply finer permissions, costs a measurable
+   amount of performance.                                   */</code></pre>
+
+<h2 id="inspect">Looking at it</h2>
+
+<p>All of this is inspectable on a running system. Being able to print the actual layout — and confirm where a given address falls — turns a confusing pointer in a crash report into a definite answer about what kind of memory it was.</p>
+
+<pre><code># The full kernel page tables, level by level:
+    CONFIG_PTDUMP_DEBUGFS=y
+    sudo cat /sys/kernel/debug/kernel_page_tables
+
+  ---[ Linear Mapping start ]---
+  0xffff000000000000-0xffff000040000000  1G PMD  RW NX SHD AF ...
+  0xffff000040000000-0xffff000040200000  2M PTE  ro x  SHD AF ...
+                                                 ^^^^ kernel text
+  ---[ vmalloc() Area ]---
+  0xffff800000000000-0xffff800000001000  4K PTE  RW NX ...
+
+# Read the permissions: kernel TEXT should be `ro x`, RODATA
+# `ro NX`, everything else `RW NX`. Anything both writable and
+# executable is a finding.
+
+# Physical memory layout:
+    cat /proc/iomem
+
+# vmalloc allocations, with the caller:
+    sudo cat /proc/vmallocinfo
+    0xffff800008000000-0xffff800008002000 8192 my_probe+0x40/0x200 ...
+
+# The kernel's own summary at boot:
+    dmesg | grep -A20 "Virtual kernel memory layout"
+
+# Where a symbol lives:
+    sudo grep my_symbol /proc/kallsyms</code></pre>
+
+<div class="tip">
+<b><code>/proc/vmallocinfo</code> attributes every mapping to a caller</b>
+<p>It shows the size and the function that allocated it, including <code>ioremap</code> mappings. If vmalloc
+space is filling up, or you suspect a driver is leaking mappings across bind/unbind cycles, this file names
+the culprit directly.</p>
+</div>
+
+<h2 id="kaslr">KASLR and pointer hiding</h2>
+
+<p>If an attacker knows exactly where kernel code and data sit, an information leak becomes a working exploit. So the kernel deliberately moves itself to a different address on every boot, and hides raw pointers from anything that prints them.</p>
+
+<pre><code>/* Two things that surprise people reading addresses: */
+
+/* 1. KASLR randomises the kernel's base address each boot.
+      So an address from one boot means nothing in another,
+      and a crash dump must be decoded against that boot's
+      offset. Disable it while debugging:                  */
+        nokaslr        # on the command line
+
+/* 2. %p HASHES pointers for unprivileged readers, to avoid
+      leaking kernel layout: */
+        pr_info("ptr=%p\n", p);
+                -&gt; ptr=00000000e2f4a1b7      /* hashed */
+
+        /* Real values, for debugging only: */
+        pr_info("ptr=%px\n", p);          /* raw - NEVER ship */
+        pr_info("ptr=%pK\n", p);          /* hashed unless
+                                             privileged */
+        no_hash_pointers                  /* cmdline: make all
+                                             %p raw. Prints a
+                                             warning banner. */
+
+/* If two %p values print identically, they are the same
+   pointer - hashing is stable within a boot. That is often
+   enough to debug without unhashing at all.               */</code></pre>
+
+<h2 id="highmem">A note on highmem</h2>
+
+<p>You will meet this term constantly in older kernel code and documentation, and it is worth knowing precisely because it does <em>not</em> apply to the systems this track targets — carrying the assumption over from 32-bit material is a common source of confusion.</p>
+
+<pre><code>/* On 32-bit systems, the linear map could only cover ~896 MB,
+   so memory above that ("highmem") needed temporary mappings:
+
+        void *v = kmap(page);           /* map it        */
+        ... use v ...
+        kunmap(page);
+
+   You will see kmap/kmap_atomic/kmap_local_page all over
+   older mm code and in generic drivers.
+
+   ON ARM64 THIS DOES NOT APPLY. The 48-bit address space maps
+   all physical memory linearly; there is no highmem.
+   kmap_local_page() is still the portable idiom and is
+   essentially free on arm64 - so generic code uses it and
+   arm64-only code need not.
+
+   MENTION IT ONLY because you will read the calls and wonder
+   why they exist.                                          */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>DMA writes land in unrelated memory</td><td><code>virt_to_phys()</code> on a vmalloc or stack address</td></tr>
+<tr><td><code>Unable to handle kernel paging request at 0x0000...</code></td><td>NULL or small-offset pointer dereference</td></tr>
+<tr><td>Fault at an address in the non-canonical hole</td><td>Corrupted pointer, or uninitialised memory used as one</td></tr>
+<tr><td>Reading a register returns garbage</td><td>Direct dereference of an <code>__iomem</code> pointer instead of <code>readl()</code></td></tr>
+<tr><td><code>ioremap</code> returns NULL</td><td>vmalloc space exhausted, or the region overlaps an existing mapping</td></tr>
+<tr><td>Two drivers fight over a peripheral</td><td>Used bare <code>ioremap</code> instead of the resource-requesting form</td></tr>
+<tr><td>Framebuffer writes are very slow</td><td>Mapped Device instead of write-combining — use <code>ioremap_wc()</code></td></tr>
+<tr><td>Addresses differ every boot</td><td>KASLR — use <code>nokaslr</code> while debugging</td></tr>
+<tr><td><code>%p</code> prints meaningless values</td><td>Pointer hashing; use <code>%px</code> in a debug build only</td></tr>
+<tr><td>vmalloc space exhausted over time</td><td>Leaked <code>ioremap</code>/<code>vmalloc</code> — check <code>/proc/vmallocinfo</code></td></tr>
+<tr><td>Writable and executable kernel mapping</td><td>A real hardening bug — check the ptdump output</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the TTBR0/TTBR1 split and what the non-canonical hole gives you.</li>
+  <li>Name the major regions of the kernel half.</li>
+  <li>Explain the linear map and why <code>virt_to_phys()</code> can be arithmetic.</li>
+  <li>List four kinds of address for which <code>virt_to_phys()</code> is silently wrong.</li>
+  <li>Explain what <code>ioremap</code> does and why direct dereference is wrong.</li>
+  <li>Choose between <code>ioremap</code>, <code>ioremap_wc</code> and <code>ioremap_cache</code>.</li>
+  <li>Walk a four-level page table in kernel types.</li>
+  <li>Read <code>/sys/kernel/debug/kernel_page_tables</code> and spot a bad permission.</li>
+  <li>Use <code>/proc/vmallocinfo</code> to attribute a mapping to a driver.</li>
+  <li>Explain <code>%p</code> hashing and how to debug around it safely.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

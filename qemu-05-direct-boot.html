@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Booting a kernel directly | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Booting a kernel directly</h1>
+<p class="lead"><code>-kernel</code> lets you skip the bootloader entirely: QEMU loads your image, synthesises
+the handoff a bootloader would have performed, and jumps to it. It turns a five-minute build-flash-boot cycle
+into a two-second one, and it is how you should develop everything until the boot chain itself is the thing
+you are testing.</p>
+
+<h2 id="what">What <code>-kernel</code> actually does</h2>
+
+<pre class="diagram">   Normally, on real hardware:
+
+     ROM -> BL1 -> BL2 -> BL31 (EL3) -> U-Boot (EL2/EL1)
+                                          |
+                                          | reads a device tree
+                                          | loads Image + initrd
+                                          | sets x0 = DTB address
+                                          | jumps to the kernel
+                                          v
+                                        Linux
+
+   With -kernel, QEMU IS the bootloader:
+
+     1. Parse the image. An arm64 "Image" has a 64-byte header:
+            0x00  code0, code1        (branch instructions)
+            0x08  text_offset         (where to load, relative
+                                       to the start of RAM)
+            0x10  image_size
+            0x18  flags
+            0x38  magic "ARM\x64"
+        QEMU reads text_offset and image_size and places the
+        image accordingly - usually 0x4008_0000.
+
+     2. Load the initrd, if given, somewhere above the kernel,
+        and record its address and size.
+
+     3. GENERATE the device tree (chapter 4), then PATCH it:
+            /chosen/bootargs        = your -append string
+            /chosen/linux,initrd-start
+            /chosen/linux,initrd-end
+        and write it into guest RAM.
+
+     4. Write a tiny boot stub at the start of RAM that:
+            sets x0 = DTB address
+            x1 = x2 = x3 = 0
+            branches to the kernel entry point
+        For -smp N, secondary CPUs park in a PSCI-compatible
+        wait loop.
+
+     5. Release the CPU at the stub.
+
+   The kernel cannot tell the difference, which is the point.</pre>
+
+<h2 id="minimal">The smallest thing that boots</h2>
+
+<pre><code># You need three things: a kernel, a console, and a root
+# filesystem. Start with only the first two.
+
+$ qemu-system-aarch64 \
+    -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image \
+    -append "console=ttyAMA0 earlycon"
+
+# It boots, prints, and panics with "No working init found",
+# because there is no root filesystem. That panic is SUCCESS:
+# it means the kernel ran to the end of its own initialisation.
+
+# Now add an initramfs and you have a usable system:
+$ qemu-system-aarch64 \
+    -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image -initrd initramfs.cpio.gz \
+    -append "console=ttyAMA0 earlycon rdinit=/bin/sh"
+
+# Exit with Ctrl-A x.  (Ctrl-A c switches to the monitor.)
+
+# The four arguments that matter, and why:
+#
+#   console=ttyAMA0   the PL011 at 0x09000000. WITHOUT THIS you
+#                     see nothing after the kernel takes over
+#                     its own console. It is the single most
+#                     common "it hangs" cause.
+#
+#   earlycon          console output BEFORE the driver probes.
+#                     On virt, the kernel finds the address in
+#                     /chosen/stdout-path, so plain "earlycon"
+#                     works with no arguments.
+#
+#   rdinit=/bin/sh    run a shell from the initramfs instead of
+#                     looking for /sbin/init.
+#
+#   -nographic        no window; serial to your terminal.
+#                     Implies -serial mon:stdio.</code></pre>
+
+<div class="tip">
+<b>Always add <code>earlycon</code> while bringing something up</b>
+<p>Without it, the window between "kernel entered" and "console driver probed" is silent — and that window
+contains the MMU setup, the memory-map parse and the device-tree parse, which is exactly where early boot
+failures live. With it, you see <code>Booting Linux on physical CPU 0x0</code> almost immediately, and a hang
+after that is a much smaller problem than a hang before it.</p>
+</div>
+
+<h2 id="build">Building a kernel worth booting</h2>
+
+<pre><code>$ git clone --depth=1 -b v6.8 \
+    https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+$ cd linux
+
+$ export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+$ make defconfig
+
+# defconfig already includes virtio, PL011 and the GIC. Add the
+# things you will want for this site's tracks:
+$ scripts/config --enable  DEBUG_INFO_DWARF5 \
+                 --enable  GDB_SCRIPTS \
+                 --enable  DEBUG_KERNEL \
+                 --enable  DYNAMIC_DEBUG \
+                 --enable  MAGIC_SYSRQ \
+                 --enable  KGDB \
+                 --enable  FTRACE \
+                 --enable  FUNCTION_TRACER \
+                 --enable  KPROBES \
+                 --enable  TEE \
+                 --enable  OPTEE \
+                 --enable  BLK_DEV_INITRD \
+                 --set-val CONFIG_RANDOMIZE_BASE n
+$ make olddefconfig
+$ make -j$(nproc) Image modules
+
+# Result: arch/arm64/boot/Image   (uncompressed - what -kernel
+#                                  wants)
+#         arch/arm64/boot/Image.gz (what a real board uses)
+#         vmlinux                  (with symbols - what GDB
+#                                   wants, chapter 11)
+
+# RANDOMIZE_BASE off is deliberate: KASLR moves the kernel
+# every boot, and then your GDB symbols are at the wrong
+# addresses. Turn it off for debugging, on for realism.
+# Alternatively pass "nokaslr" in -append.</code></pre>
+
+<h2 id="initramfs">A root filesystem in thirty seconds</h2>
+
+<pre><code># Option 1: busybox, statically linked. Smallest and fastest.
+
+$ wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+$ tar xf busybox-1.36.1.tar.bz2 &amp;&amp; cd busybox-1.36.1
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+$ sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+       CONFIG_PREFIX=../rootfs install
+
+$ cd ../rootfs
+$ mkdir -p proc sys dev etc/init.d
+$ cat &gt; init &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc  none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+echo "=== up ==="
+exec /bin/sh
+EOF
+$ chmod +x init
+$ find . | cpio -o -H newc | gzip &gt; ../initramfs.cpio.gz
+
+# Boot it:
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image -initrd initramfs.cpio.gz \
+    -append "console=ttyAMA0 earlycon"
+
+# Option 2: use the host's own aarch64 container image
+$ docker create --platform linux/arm64 --name x arm64v8/alpine
+$ docker export x | (mkdir -p rootfs &amp;&amp; cd rootfs &amp;&amp; tar xf -)
+$ docker rm x
+# ...then cpio it as above, or make it a disk image (chapter 6).</code></pre>
+
+<h2 id="dtb-custom">Supplying your own device tree</h2>
+
+<pre><code># Sometimes you want to modify what QEMU generated - to add a
+# node for a device model you are writing, or to change a
+# property. The workflow is: dump, edit, feed back.
+
+$ qemu-system-aarch64 -M virt,dumpdtb=virt.dtb -m 1G -smp 2
+$ dtc -I dtb -O dts virt.dtb -o virt.dts
+
+# Edit virt.dts - add your node:
+#     my-device@c000000 {
+#         compatible = "acme,widget";
+#         reg = &lt;0x0 0x0c000000 0x0 0x1000&gt;;
+#         interrupts = &lt;0x0 0x30 0x4&gt;;
+#     };
+
+$ dtc -I dts -O dtb virt.dts -o virt-mod.dtb
+$ qemu-system-aarch64 -M virt -m 1G -smp 2 -nographic \
+    -kernel Image -dtb virt-mod.dtb -append "console=ttyAMA0"
+
+# CAUTION: -dtb REPLACES the generated tree entirely. If you
+# then change -m or -smp, the tree no longer matches the
+# machine and the guest will see the OLD memory size. Regenerate
+# after any machine change. This causes hours of confusion, so
+# script it:
+
+$ cat > boot.sh &lt;&lt;'EOF'
+#!/bin/sh
+set -e
+MEM=${MEM:-1G}; SMP=${SMP:-2}
+qemu-system-aarch64 -M virt,dumpdtb=/tmp/base.dtb -m $MEM -smp $SMP
+dtc -I dtb -O dts /tmp/base.dtb -o /tmp/base.dts 2>/dev/null
+python3 add_my_node.py /tmp/base.dts /tmp/final.dts
+dtc -I dts -O dtb /tmp/final.dts -o /tmp/final.dtb 2>/dev/null
+exec qemu-system-aarch64 -M virt -m $MEM -smp $SMP -nographic \
+    -kernel Image -dtb /tmp/final.dtb -append "console=ttyAMA0 earlycon"
+EOF
+$ chmod +x boot.sh</code></pre>
+
+<h2 id="el">Choosing the exception level you land at</h2>
+
+<pre><code># -kernel normally enters at EL1 (or EL2 with virtualization=on).
+# For bare-metal work you often want something else.
+
+# Land at EL2, so you can write a hypervisor:
+$ qemu-system-aarch64 -M virt,virtualization=on -cpu max \
+    -kernel my-el2-payload.bin -nographic
+# Confirm from inside: mrs x0, CurrentEL  -> 0x8 means EL2
+
+# Land at EL3, for firmware work:
+$ qemu-system-aarch64 -M virt,secure=on -cpu max \
+    -bios my-el3-firmware.bin -nographic
+# NOTE: -bios, not -kernel. -bios loads at address 0 and starts
+# there with no stub, no device tree patching and no PSCI - you
+# are the firmware now.
+
+# Load a raw ELF anywhere, with full control:
+$ qemu-system-aarch64 -M virt -cpu max -nographic \
+    -device loader,file=payload.elf \
+    -device loader,addr=0x40100000,cpu-num=0
+# The second loader sets the PC of CPU 0.
+
+# Load several blobs at chosen addresses - the pattern the
+# OP-TEE track uses for TF-A + OP-TEE + U-Boot:
+$ qemu-system-aarch64 -M virt,secure=on -cpu max -nographic \
+    -bios bl1.bin \
+    -device loader,file=fip.bin,addr=0x40100000 \
+    -semihosting-config enable=on,target=native</code></pre>
+
+<div class="warn">
+<b><code>-kernel</code> versus <code>-bios</code></b>
+<p><code>-kernel</code> means "you are an OS; I will act as your bootloader". <code>-bios</code> means "you
+are the firmware; here is a bare machine". With <code>-bios</code> you get no device tree, no
+<code>-append</code>, no initrd loading and no PSCI implementation — QEMU stops helping. Mixing them up
+produces a payload that runs but finds <code>x0</code> pointing at nothing.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Completely silent, no output ever</td><td>Missing <code>console=ttyAMA0</code>, or
+<code>-nographic</code> omitted so output went to a window</td></tr>
+<tr><td>Prints "Booting Linux" then stops</td><td>Console handed over from earlycon to the real driver and the
+real console is wrong</td></tr>
+<tr><td>Hangs before any output at all</td><td>Add <code>earlycon</code>; if still silent, the image is loaded
+at the wrong address or is the wrong format</td></tr>
+<tr><td><code>No working init found</code></td><td>No initrd, or no <code>/init</code> in it, or it is not
+executable, or it is dynamically linked with no libraries</td></tr>
+<tr><td>Guest sees the wrong memory size</td><td>A stale <code>-dtb</code> from a different
+<code>-m</code></td></tr>
+<tr><td>Secondary CPUs never come up</td><td>PSCI conduit mismatch, or <code>-bios</code> used so there is no
+PSCI at all</td></tr>
+<tr><td>GDB symbols are all wrong</td><td>KASLR — add <code>nokaslr</code> or disable
+<code>RANDOMIZE_BASE</code></td></tr>
+<tr><td><code>Image</code> rejected or garbage executed</td><td>Passed <code>Image.gz</code> or
+<code>vmlinux</code> to <code>-kernel</code> instead of <code>Image</code></td></tr>
+<tr><td>Works with <code>-kernel</code>, fails with <code>-bios</code></td><td>Expected — no boot stub, no DTB,
+no PSCI</td></tr>
+<tr><td>initramfs unpacks but binaries fail with "not found"</td><td>Dynamically linked busybox without its
+loader; build static</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the five things QEMU does on your behalf when you pass <code>-kernel</code>.</li>
+  <li>Name the arm64 <code>Image</code> header fields QEMU reads and what it does with them.</li>
+  <li>Explain what the kernel finds in <code>x0</code> at entry and who put it there.</li>
+  <li>Give the four <code>-append</code> arguments needed for a first boot and what each does.</li>
+  <li>Explain why <code>earlycon</code> is worth adding during bring-up.</li>
+  <li>Build a static busybox initramfs and boot it.</li>
+  <li>Describe the dump-edit-feed-back workflow for a custom device tree, and its main hazard.</li>
+  <li>State the difference between <code>-kernel</code> and <code>-bios</code> in terms of what QEMU
+  provides.</li>
+  <li>Show how to land a payload at EL2 and at EL3.</li>
+  <li>Diagnose a completely silent boot in three steps.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

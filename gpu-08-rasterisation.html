@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rasterisation, depth and blending | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Rasterisation, depth and blending</h1>
+<p class="lead">The fixed-function stages nobody writes and everybody has to configure. Getting the rules
+wrong here produces cracks between triangles, z-fighting, transparency in the wrong order, and shadow acne —
+a catalogue of artefacts that all look like bugs in your shader and are not.</p>
+
+<h2 id="rules">Rasterisation is a coverage test</h2>
+
+<pre class="diagram">   For each pixel, is its CENTRE inside the triangle?
+
+        +-------+-------+-------+
+        |       |   *   |       |    * = pixel centre
+        |   *   |  / \  |   *   |
+        +-------+-/---\-+-------+
+        |     */|      \|       |
+        |     / |   *   |\  *   |
+        +----/--+-------+-\-----+
+
+   Not "does the triangle overlap the pixel". The CENTRE.
+   That single rule gives you everything below.
+
+   THE TOP-LEFT RULE
+     A pixel centre exactly on an edge belongs to exactly one
+     triangle: the one for which that edge is a top or left
+     edge. Without a tie-break rule, two triangles sharing an
+     edge would either both draw that pixel (double-blending
+     -> a visible seam in transparent geometry) or neither
+     (a crack -> a one-pixel gap you can see through).
+
+     This is why watertight meshes rasterise watertight. It is
+     also why "gaps between adjacent triangles" is almost
+     never a rasterisation bug and almost always your vertices
+     not being bit-for-bit identical: compute a shared vertex
+     ONCE and reuse it, do not recompute it per triangle.
+
+   SUB-PIXEL PRECISION
+     Vertices snap to a fixed-point grid, typically 1/256 of a
+     pixel (8 sub-pixel bits). Very large coordinates lose
+     precision and wobble; this is one reason to keep world
+     coordinates near the origin, or to use camera-relative
+     rendering for large worlds.</pre>
+
+<h2 id="msaa">Multisampling</h2>
+
+<pre><code>/* The trick: decouple COVERAGE from SHADING.
+
+   Supersampling  = shade every sample.  4x SSAA = 4x cost.
+   Multisampling  = shade ONCE per pixel, test coverage and
+                    depth per SAMPLE, resolve at the end.
+                    4x MSAA costs ~1.2x shading and 4x memory
+                    bandwidth on the render target.          */
+
+  1 sample                4 samples (4x MSAA)
+   +-------+               +-------+
+   |       |               |  x  x |    each sample gets its
+   |   *   |               |   *   |    own coverage bit and
+   |       |               |  x  x |    depth value; all four
+   +-------+               +-------+    share ONE shaded colour
+
+/* WHY IT ONLY FIXES GEOMETRIC ALIASING
+
+   MSAA antialiases EDGES, because that is where coverage
+   varies. It does nothing for:
+     * shader aliasing - a specular highlight that flickers,
+       a high-frequency normal map. The shader ran once.
+     * alpha-tested foliage - coverage is decided inside the
+       shader by `discard`, after MSAA has done its work.
+       ALPHA-TO-COVERAGE converts alpha into a coverage mask
+       and restores MSAA's usefulness there.
+
+   THIS IS WHY MSAA FELL OUT OF FASHION with deferred
+   rendering: a G-buffer stores per-sample data, so MSAA
+   multiplies its already-large memory cost, and the lighting
+   pass has to run per sample to benefit. Post-process
+   antialiasing (FXAA, SMAA) and temporal methods (TAA, DLSS,
+   FSR) took over - they are cheaper and they also catch
+   shader aliasing, at the cost of blur and ghosting.       */
+
+/* Per-sample shading, when you do want it: */
+        float4 PSMain(VSOut i, uint sample : SV_SampleIndex)
+        /* declaring SV_SampleIndex forces the shader to run
+           PER SAMPLE - i.e. supersampling. Know that you are
+           asking for 4x the shading.                        */</code></pre>
+
+<h2 id="depth">Depth: precision, and where the artefacts come from</h2>
+
+<pre class="diagram">   Z-FIGHTING: two surfaces at nearly the same depth flicker
+   between each other as the camera moves. It is a precision
+   failure, and the cause is almost always the near plane.
+
+   THE PROBLEM: the perspective divide makes depth
+   NON-LINEAR. With a 24-bit depth buffer, near=0.1,
+   far=1000:
+
+        distance     depth values available
+        0.1 - 0.2    ~8,000,000     (half the buffer!)
+        1   - 2      ~800,000
+        10  - 20     ~80,000
+        100 - 200    ~8,000
+        900 - 1000   ~200            &lt;-- z-fighting lives here
+
+   PRECISION IS PROPORTIONAL TO near/far. Moving the near
+   plane from 0.1 to 1.0 gains you TEN TIMES the precision
+   everywhere else. Pushing the far plane out costs you almost
+   nothing by comparison.
+
+   THE FIXES, in order of effectiveness:
+
+   1. RAISE THE NEAR PLANE. Free, and usually enough.
+
+   2. REVERSED-Z. Map near->1.0, far->0.0, clear to 0, and
+      use GREATER_EQUAL. Floating-point has most of its
+      precision near 0, and the perspective divide puts most
+      depth range near 1 - so reversing them CANCELS OUT.
+      With a 32-bit float depth buffer this is close to
+      uniform precision across the whole range, for free.
+      It is the modern default and there is no reason not to
+      use it.
+
+   3. A 32-bit float depth buffer instead of 24-bit unorm.
+
+   4. Depth bias / polygon offset, for coplanar geometry like
+      decals - but this is a patch, not a fix.</pre>
+
+<pre><code>/* Reversed-Z, in DX12. Three changes, no shader edits. */
+
+  /* 1. Build the projection with near and far swapped. */
+     XMMatrixPerspectiveFovLH(fov, aspect, farZ, nearZ);
+
+  /* 2. Clear depth to 0 instead of 1. */
+     cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH,
+                                0.0f, 0, 0, nullptr);
+
+  /* 3. Reverse the comparison. */
+     dsDesc.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+
+/* Use a DXGI_FORMAT_D32_FLOAT buffer to get the full benefit.
+   Note hierarchical-Z may need a depth-buffer "resummarise"
+   if you change the comparison direction mid-frame - so pick
+   one direction and stay with it (chapter 6).             */
+
+/* SHADOW ACNE is the same family of problem: a shadow map
+   samples depth at a different resolution than the receiving
+   surface, so a surface shadows itself.
+     depth bias        - shift the comparison; causes PETER
+                         PANNING (shadows detach) if too large
+     slope-scaled bias - scale the bias by the surface angle;
+                         much better, and what you want
+     normal offset     - move the sample position along the
+                         normal instead of the depth; best
+     front-face culling when rendering the shadow map - cheap
+                         and effective for closed meshes    */</code></pre>
+
+<div class="key">
+<b>Raise the near plane before anything else</b>
+<p>Depth precision is dominated by the ratio near:far, and the relationship is roughly linear in
+<code>near</code>. A team fighting z-fighting with bias tweaks and 32-bit buffers can often fix it entirely by
+changing <code>0.01f</code> to <code>0.5f</code> in one line — assuming nothing legitimately gets that close
+to the camera. Check that number first, every time.</p>
+</div>
+
+<h2 id="blend">Blending, and why order matters</h2>
+
+<pre><code>/* Blending is fixed function because it must be atomic per
+   pixel and applied in DRAW ORDER. The general form:      */
+
+        result = src * SrcBlend  BlendOp  dst * DestBlend
+
+/* The ones you actually use: */
+
+  OPAQUE            src=ONE  dst=ZERO
+                    (or just disable blending)
+
+  ALPHA BLEND       src=SRC_ALPHA  dst=INV_SRC_ALPHA  op=ADD
+                    result = s.rgb*s.a + d.rgb*(1-s.a)
+                    ORDER DEPENDENT. Must sort back to front.
+
+  PREMULTIPLIED     src=ONE  dst=INV_SRC_ALPHA
+                    the colour already has alpha baked in.
+                    Better: it composites correctly, filters
+                    correctly, and makes "additive" and
+                    "alpha" the same blend state with
+                    different data. Prefer it.
+
+  ADDITIVE          src=ONE  dst=ONE
+                    ORDER INDEPENDENT - addition commutes.
+                    Fire, sparks, glow. No sorting needed.
+
+  MULTIPLY          src=DEST_COLOR  dst=ZERO
+
+/* THE TRANSPARENCY PROBLEM
+
+   Alpha blending needs back-to-front order. But:
+     * sorting per object fails when objects intersect
+     * sorting per triangle is expensive and still fails for
+       a single self-intersecting mesh
+     * you cannot use early-Z, so overdraw is fully paid
+
+   MITIGATIONS
+     depth PRE-PASS then depth-write-off for transparents:
+       stops transparent surfaces occluding each other wrongly
+     alpha test instead of blend where the edges allow it:
+       restores Z, at the cost of hard edges
+     WEIGHTED BLENDED OIT: an order-independent approximation
+       that is cheap and looks acceptable for particles
+     per-pixel linked lists / ROVs: exact, expensive, rarely
+       worth it outside CAD
+
+   Transparency remains genuinely unsolved in real-time
+   graphics. Every game ships with a compromise.           */</code></pre>
+
+<div class="warn">
+<b>Alpha-blended geometry must not write depth</b>
+<p>If a transparent surface writes to the depth buffer, later transparent surfaces behind it fail the depth
+test and vanish — a very common "my particles disappear behind glass" bug. The standard setup is: depth
+<em>test</em> on, depth <em>write</em> off, sorted back to front. Opaque geometry writes depth; transparent
+geometry only reads it.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>One-pixel cracks between adjacent triangles</td><td>Shared vertices computed twice and not
+bit-identical</td></tr>
+<tr><td>Dark seams in transparent geometry</td><td>Double-blending along a shared edge — usually a duplicated
+vertex</td></tr>
+<tr><td>Surfaces flicker between each other</td><td>Z-fighting — raise the near plane, or use
+reversed-Z</td></tr>
+<tr><td>Geometry wobbles far from the origin</td><td>Sub-pixel precision loss; use camera-relative
+coordinates</td></tr>
+<tr><td>Shadows have stripes on lit surfaces</td><td>Shadow acne — use slope-scaled bias or normal
+offset</td></tr>
+<tr><td>Shadows detached from their casters</td><td>Depth bias too large — peter panning</td></tr>
+<tr><td>MSAA does nothing for foliage</td><td>Alpha test decides coverage after MSAA — use
+alpha-to-coverage</td></tr>
+<tr><td>MSAA does nothing for shimmering highlights</td><td>Shader aliasing; MSAA only fixes edges</td></tr>
+<tr><td>Particles vanish behind glass</td><td>Transparent geometry writing depth</td></tr>
+<tr><td>Transparent objects pop as the camera moves</td><td>Per-object sorting with intersecting
+geometry</td></tr>
+<tr><td>Everything is dark after switching to premultiplied</td><td>Textures not converted — the colour must
+be multiplied by alpha</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the coverage rule and explain what the top-left rule prevents.</li>
+  <li>Explain why cracks between triangles are usually a vertex problem, not a rasteriser one.</li>
+  <li>Distinguish supersampling from multisampling and give the cost of each.</li>
+  <li>Name two kinds of aliasing MSAA does not fix, and what does.</li>
+  <li>Explain why depth precision is concentrated near the camera.</li>
+  <li>Explain reversed-Z and why it works, and list the three changes it needs.</li>
+  <li>Say which single parameter most affects z-fighting.</li>
+  <li>Name three shadow-acne mitigations and rank them.</li>
+  <li>Give the blend factors for alpha, premultiplied and additive, and say which is order-independent.</li>
+  <li>Explain why transparent geometry must not write depth.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

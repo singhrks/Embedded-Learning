@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DMA in WDF | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DMA in WDF</h1>
+<p class="lead">Giving a Windows device direct memory access: the DMA enabler, transactions, common buffers
+and scatter-gather. The same problem as <a href="lx-24-dma-api.html">Linux chapter 30</a>, with a framework
+that manages the state machine for you.</p>
+
+<h2 id="model">The model</h2>
+
+<p>DMA lets a device read and write memory without the processor copying anything, and the price is that the device sees a different address space than your code does. Everything in this chapter follows from that one fact.</p>
+
+<pre class="diagram">   WDFDMAENABLER          created once, in PrepareHardware.
+        |                 describes the device's DMA
+        |                 capabilities: direction, maximum
+        |                 transfer length, alignment,
+        |                 address width
+        |
+        +-- WDFDMATRANSACTION   one per logical transfer
+        |        |              May be split into several
+        |        |              hardware transfers if the
+        |        |              buffer exceeds what the device
+        |        |              can do in one go.
+        |        |
+        |        +-- SCATTER/GATHER LIST
+        |               the physical fragments, ready to
+        |               program into the device
+        |
+        +-- WDFCOMMONBUFFER    memory the CPU and device both
+                               access continuously - rings,
+                               descriptors, status blocks
+
+   THE THREE ADDRESS SPACES are the same as Linux's
+   (ch. 26): virtual, physical, and LOGICAL (Windows' name
+   for the device-visible address). The DMA enabler is what
+   knows the mapping, including any IOMMU translation - so you
+   program the device with the LOGICAL address the framework
+   gives you, never a physical one you computed.</pre>
+
+<h2 id="enabler">Creating the enabler</h2>
+
+<p>The enabler is where you declare your device's DMA capabilities — how much it can address, whether it can scatter-gather, its maximum transfer size — so the framework can hand you buffers the hardware can actually reach.</p>
+
+<pre><code>NTSTATUS
+MyPrepareHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesRaw,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        WDF_DMA_ENABLER_CONFIG dmaConfig;
+        NTSTATUS status;
+
+        ... map registers (chapter 18) ...
+
+        /* 1. DECLARE THE ADDRESS WIDTH. This is the single
+              most consequential call: get it wrong and the
+              hardware silently drops the high address bits.
+              Same failure as a wrong dma_set_mask on Linux -
+              works on a small-memory machine, corrupts
+              random memory on a large one.               */
+        status = WdfDeviceSetAlignmentRequirement(Device,
+                        FILE_LONG_ALIGNMENT);   /* 4-byte */
+        if (!NT_SUCCESS(status))
+                return status;
+
+        WDF_DMA_ENABLER_CONFIG_INIT(&amp;dmaConfig,
+                        WdfDmaProfileScatterGather64,
+                        MY_MAX_TRANSFER_LENGTH);
+
+        dmaConfig.WdmDmaVersionOverride = 3;
+
+        status = WdfDmaEnablerCreate(Device, &amp;dmaConfig,
+                        WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;ctx-&gt;DmaEnabler);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        return STATUS_SUCCESS;
+}
+
+/* THE PROFILES:
+
+   WdfDmaProfilePacket           single contiguous buffer,
+                                 32-bit addresses
+   WdfDmaProfileScatterGather    scattered, 32-bit
+   WdfDmaProfilePacket64         contiguous, 64-bit
+   WdfDmaProfileScatterGather64  scattered, 64-bit   &lt;-- the
+                                 usual modern choice
+   WdfDmaProfileSystem           uses a system DMA controller
+                                 rather than bus mastering
+   WdfDmaProfileSystemDuplex
+
+   PICK 64-BIT ONLY IF THE DEVICE REALLY IS. Declaring 64 on a
+   32-bit device is the classic silent corruption; declaring
+   32 on a 64-bit device merely costs you bounce buffering,
+   which is safe but slow.
+
+/* AND THE MAXIMUM LENGTH: if a request exceeds it, the
+   framework splits the transaction into several transfers
+   automatically - which is why you must handle
+   EvtProgramDma being called more than once per
+   transaction.                                            */</code></pre>
+
+<h2 id="transaction">A transaction</h2>
+
+<p>A transaction is one logical transfer, which the framework may split into several hardware operations if the device's limits require it. Your job is to program one fragment at a time and say when each is done.</p>
+
+<pre><code>/* The common flow: an IOCTL or write arrives with a buffer,
+   and you DMA it to the device.                            */
+
+VOID
+MyEvtIoWrite(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
+             _In_ size_t Length)
+{
+        WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+        PMY_CONTEXT ctx = MyGetContext(device);
+        WDFDMATRANSACTION transaction;
+        NTSTATUS status;
+
+        if (Length == 0 || Length &gt; MY_MAX_TRANSFER_LENGTH) {
+                WdfRequestComplete(Request,
+                                   STATUS_INVALID_PARAMETER);
+                return;
+        }
+
+        /* 1. create a transaction */
+        status = WdfDmaTransactionCreate(ctx-&gt;DmaEnabler,
+                        WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;transaction);
+        if (!NT_SUCCESS(status)) {
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        /* 2. bind it to the request's buffer. The framework
+              gets the MDL, ensures the pages are locked, and
+              builds the scatter-gather list.             */
+        status = WdfDmaTransactionInitializeUsingRequest(
+                        transaction, Request,
+                        MyEvtProgramDma,
+                        WdfDmaDirectionWriteToDevice);
+        if (!NT_SUCCESS(status)) {
+                WdfObjectDelete(transaction);
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        /* remember it so the DPC can finish it */
+        ctx-&gt;CurrentTransaction = transaction;
+
+        /* 3. GO. This calls MyEvtProgramDma. */
+        status = WdfDmaTransactionExecute(transaction,
+                                          WDF_NO_CONTEXT);
+        if (!NT_SUCCESS(status)) {
+                WdfObjectDelete(transaction);
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        /* the request completes later, in the DPC */
+}
+
+/* 4. PROGRAM THE HARDWARE - called once per hardware
+      transfer, possibly SEVERAL times per transaction.  */
+BOOLEAN
+MyEvtProgramDma(_In_ WDFDMATRANSACTION Transaction,
+                _In_ WDFDEVICE Device,
+                _In_ WDFCONTEXT Context,
+                _In_ WDF_DMA_DIRECTION Direction,
+                _In_ PSCATTER_GATHER_LIST SgList)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        ULONG i;
+
+        UNREFERENCED_PARAMETER(Context);
+        UNREFERENCED_PARAMETER(Direction);
+
+        /* Runs at DISPATCH_LEVEL. Program the descriptors and
+           start the device. Do NOT block.                */
+
+        for (i = 0; i &lt; SgList-&gt;NumberOfElements; i++) {
+                /* THE LOGICAL ADDRESS - what the device must
+                   be programmed with.                     */
+                MyWr(ctx, REG_DESC_LO(i),
+                     SgList-&gt;Elements[i].Address.LowPart);
+                MyWr(ctx, REG_DESC_HI(i),
+                     SgList-&gt;Elements[i].Address.HighPart);
+                MyWr(ctx, REG_DESC_LEN(i),
+                     SgList-&gt;Elements[i].Length);
+        }
+
+        KeMemoryBarrier();      /* descriptors visible before
+                                   the doorbell (chapter 18) */
+        MyWr(ctx, REG_DMA_COUNT, SgList-&gt;NumberOfElements);
+        MyWr(ctx, REG_DMA_START, 1);
+
+        return TRUE;    /* FALSE aborts the transaction */
+}
+
+/* 5. IN THE DPC, when the hardware signals completion: */
+VOID
+MyEvtInterruptDpc(_In_ WDFINTERRUPT Interrupt,
+                  _In_ WDFOBJECT AssociatedObject)
+{
+        PMY_CONTEXT ctx = MyGetContext(
+                        WdfInterruptGetDevice(Interrupt));
+        WDFDMATRANSACTION transaction = ctx-&gt;CurrentTransaction;
+        WDFREQUEST request;
+        NTSTATUS status;
+        size_t transferred;
+        BOOLEAN more;
+
+        UNREFERENCED_PARAMETER(AssociatedObject);
+
+        if (transaction == NULL)
+                return;
+
+        /* IS THERE MORE? A long buffer is split into several
+           hardware transfers. DmaCompleted returns TRUE if
+           the whole transaction is finished, FALSE if it
+           queued the next transfer - in which case
+           EvtProgramDma is called again and we must NOT
+           complete the request.                          */
+        more = !WdfDmaTransactionDmaCompleted(transaction,
+                                              &amp;status);
+        if (more)
+                return;
+
+        transferred = WdfDmaTransactionGetBytesTransferred(
+                                transaction);
+
+        request = WdfDmaTransactionGetRequest(transaction);
+
+        ctx-&gt;CurrentTransaction = NULL;
+        WdfObjectDelete(transaction);   /* releases the SG list
+                                           and unmaps        */
+
+        if (request)
+                WdfRequestCompleteWithInformation(request,
+                                status, transferred);
+}
+
+/* THE MULTI-TRANSFER RULE IS THE ONE PEOPLE MISS. A driver
+   that completes the request on the first DPC works
+   perfectly for small buffers and truncates large ones -
+   exactly the Linux scatter-gather coalescing trap
+   (ch. 26), in a different form.                        */</code></pre>
+
+<div class="key">
+<b>Deleting the transaction is not optional</b>
+<p><code>WdfObjectDelete</code> on the transaction is what releases the scatter-gather list, unmaps the
+buffer and returns the map registers to the system pool. Map registers are a finite, shared resource; leaking
+them degrades DMA for every device on the machine and eventually makes
+<code>WdfDmaTransactionExecute</code> fail with <code>STATUS_INSUFFICIENT_RESOURCES</code> — for someone
+else's driver.</p>
+</div>
+
+<h2 id="common">Common buffers</h2>
+
+<p>For descriptor rings and control structures — memory both the driver and the device touch continuously — you want a long-lived buffer visible to both, with no per-transfer setup. That is a common buffer.</p>
+
+<pre><code>/* For memory the CPU and device both touch continuously:
+   descriptor rings, command queues, status blocks. The
+   Windows equivalent of dma_alloc_coherent (Linux ch. 30). */
+
+        WDFCOMMONBUFFER commonBuffer;
+        PVOID va;
+        PHYSICAL_ADDRESS la;
+
+        status = WdfCommonBufferCreate(ctx-&gt;DmaEnabler,
+                        MY_RING_SIZE,
+                        WDF_NO_OBJECT_ATTRIBUTES,
+                        &amp;commonBuffer);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        va = WdfCommonBufferGetAlignedVirtualAddress(
+                        commonBuffer);
+        la = WdfCommonBufferGetAlignedLogicalAddress(
+                        commonBuffer);
+
+        RtlZeroMemory(va, MY_RING_SIZE);
+
+        /* program the device with the LOGICAL address */
+        MyWr(ctx, REG_RING_BASE_LO, la.LowPart);
+        MyWr(ctx, REG_RING_BASE_HI, la.HighPart);
+
+        /* the CPU uses `va` normally, at any IRQL */
+        ring = (PMY_DESCRIPTOR)va;
+        ring[0].Address = dataLa.QuadPart;
+        ring[0].Length  = len;
+        ring[0].Flags   = DESC_OWN;
+
+        KeMemoryBarrier();
+        MyWr(ctx, REG_DOORBELL, 0);
+
+/* WITH SPECIFIC ALIGNMENT: */
+        status = WdfCommonBufferCreateWithConfig(
+                        ctx-&gt;DmaEnabler, size, &amp;config,
+                        &amp;attributes, &amp;commonBuffer);
+        /* config.AlignmentRequirement = 4096 - 1; */
+
+/* PROPERTIES:
+     · physically contiguous
+     · cache-coherent with the device, or mapped uncached if
+       the platform is not coherent - so no explicit flushing
+     · allocated at PrepareHardware time, so no runtime
+       fragmentation risk
+     · freed automatically when its parent dies
+
+   USE IT FOR SMALL CONTROL STRUCTURES. On a non-coherent
+   platform it is uncached, so CPU access is slow - bulk data
+   belongs in a transaction, not a common buffer. Exactly the
+   Linux coherent-versus-streaming trade (ch. 26).       */</code></pre>
+
+<h2 id="direct">Direct-programmed DMA</h2>
+
+<p>Some devices do not fit the transaction model at all. Direct-programmed DMA hands you the scatter-gather list and gets out of the way, which is more control and correspondingly more responsibility.</p>
+
+<pre><code>/* Some devices need the driver to manage the buffer
+   lifecycle itself - a continuous capture ring, for example,
+   where there is no per-request transaction.             */
+
+        /* build a transaction from an MDL you own */
+        status = WdfDmaTransactionInitialize(transaction,
+                        MyEvtProgramDma,
+                        WdfDmaDirectionReadFromDevice,
+                        mdl,
+                        virtualAddress,
+                        length);
+
+        /* or, for a buffer you will reuse indefinitely,
+           allocate a common buffer and manage it yourself */
+
+/* AND FOR "I just need the logical address of this buffer": */
+        status = WdfDmaTransactionGetTransferInfo(transaction,
+                        &amp;mapRegisters, &amp;sgElements);
+
+/* THE HONEST ADVICE: if the framework's transaction model
+   fits your device, use it - it handles splitting, map
+   register allocation, cache flushing and cleanup. Reach for
+   direct programming only when the device's model genuinely
+   does not match request-oriented DMA, which in practice
+   means continuous streaming devices: audio, video capture,
+   and network receive rings.                            */</code></pre>
+
+<h2 id="iommu">The IOMMU</h2>
+
+<p>On modern systems the addresses a device issues are themselves translated by hardware sitting in front of it. Most of the time this is invisible to your driver — and knowing it is there explains several otherwise baffling failures.</p>
+
+<pre><code>/* Modern Windows enables DMA remapping (VT-d / SMMU) for
+   kernel DMA protection. The consequences for your driver are
+   the same as the Linux ones (isolation ch. 03-07):
+
+   · the LOGICAL address the framework gives you is an IOVA,
+     not a physical address. Programming a physical address
+     you computed yourself will FAULT.
+
+   · a transfer longer than what you mapped faults, rather
+     than reading a neighbour's memory. That is a feature: it
+     turns silent corruption into an attributable error.
+
+   · using a logical address after deleting the transaction
+     faults, because the mapping is gone.
+
+   · the device must be correctly identified to the IOMMU by
+     firmware. On a machine where it is not, DMA either
+     bypasses protection entirely or fails outright.
+
+/* SEEING IT: */
+        WinDbg:  !iommu                (on supported builds)
+        Event Viewer -&gt; Microsoft-Windows-Kernel-IoTrace
+        System event log: DMA remapping faults are logged
+
+/* KERNEL DMA PROTECTION also affects HOT-PLUGGABLE buses
+   (Thunderbolt): a device may be blocked from DMA entirely
+   until the user authorises it. A driver must handle
+   STATUS_DEVICE_NOT_READY gracefully rather than assuming
+   DMA will always be permitted.                          */</code></pre>
+
+<h2 id="debug">Debugging DMA</h2>
+
+<p>DMA bugs corrupt memory belonging to something else entirely, so the crash rarely points at the responsible driver. These tools catch the mistake when it happens rather than leaving you to work backwards.</p>
+
+<pre><code># DRIVER VERIFIER's DMA checking (chapter 22) is the primary
+# tool - the Windows counterpart of CONFIG_DMA_API_DEBUG:
+    verifier /flags 0x10 /driver mydriver.sys
+# It validates:
+#   · map register accounting
+#   · buffer alignment against the declared requirement
+#   · transfers exceeding the declared maximum
+#   · use after completion
+#   · flushing rules
+#   · adapter object misuse
+# and bugchecks with 0xE6 DRIVER_VERIFIER_DMA_VIOLATION,
+# naming the rule.
+
+# --- WinDbg ---
+    !wdfkd.wdfdriverinfo mydriver 0x20    DMA enabler state
+    !dma                                  adapter objects and
+                                          map register usage
+    dt nt!_SCATTER_GATHER_LIST &lt;address&gt;
+
+# --- The classic symptoms ---
+#   data lands in the wrong place  -&gt; you programmed a
+#                                     physical rather than a
+#                                     logical address
+#   large transfers truncated      -&gt; completed the request on
+#                                     the first DPC
+#   works on 4 GB, fails on 32 GB  -&gt; declared 64-bit DMA on a
+#                                     32-bit device
+#   intermittent under load        -&gt; missing memory barrier
+#                                     before the doorbell
+#   DMA fails for other drivers    -&gt; you are leaking map
+#                                     registers</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Data written to the wrong memory</td><td>Programmed a physical address instead of the logical one</td></tr>
+<tr><td>IOMMU fault logged</td><td>Same — the physical address is not a valid IOVA</td></tr>
+<tr><td>Works with 4 GB RAM, corrupts with more</td><td>Declared a 64-bit profile on a 32-bit device</td></tr>
+<tr><td>Large transfers truncated</td><td>Request completed on the first DPC — check <code>DmaCompleted</code></td></tr>
+<tr><td>Device reads stale descriptors</td><td>Missing <code>KeMemoryBarrier()</code> before the doorbell</td></tr>
+<tr><td>Bugcheck 0xE6</td><td>Verifier caught a DMA rule violation</td></tr>
+<tr><td><code>WdfDmaTransactionExecute</code> fails with insufficient resources</td><td>Map registers exhausted — usually your own leak</td></tr>
+<tr><td>Other drivers' DMA starts failing</td><td>Leaked transactions — delete them</td></tr>
+<tr><td>Alignment fault or corruption at buffer start</td><td>Alignment requirement not declared or not honoured</td></tr>
+<tr><td>Common buffer access is very slow</td><td>Non-coherent platform maps it uncached — use it only for control structures</td></tr>
+<tr><td>DMA blocked on a Thunderbolt device</td><td>Kernel DMA protection pending user authorisation</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the WDF DMA objects and what each is for.</li>
+  <li>Choose a DMA profile and explain the consequence of declaring the wrong address width.</li>
+  <li>Write the full transaction flow: create, initialise, execute, program, complete.</li>
+  <li>Explain why <code>EvtProgramDma</code> may be called several times per transaction.</li>
+  <li>Explain what <code>WdfDmaTransactionDmaCompleted</code> returns and why it matters.</li>
+  <li>Say what deleting the transaction releases, and what leaking it costs the system.</li>
+  <li>Use a common buffer and say when it is the right choice.</li>
+  <li>Explain what the IOMMU changes and why a computed physical address now faults.</li>
+  <li>Enable Verifier's DMA checking and name five rules it enforces.</li>
+  <li>Map each concept onto its Linux counterpart.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

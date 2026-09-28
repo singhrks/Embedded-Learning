@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The system call path: from userspace to kernel and back | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The system call path: from userspace to kernel and back</h1>
+<p class="lead"><a href="lx-02-kernel-vs-user.html">Chapter 02</a> listed everything that differs between
+user-space and kernel code; this chapter is the actual mechanism a program uses to cross that boundary —
+what <code>read()</code> really does underneath the libc wrapper, and why some calls never trap into the
+kernel at all.</p>
+
+<h2 id="anatomy">A system call is a deliberate, controlled trap</h2>
+
+<p>A system call is the only way a program can ask the kernel to do anything. It is not a function call — it is a deliberate, controlled trap that changes the processor's privilege level, and the fact that the destination is fixed by the kernel rather than chosen by the caller is what makes the whole boundary safe.</p>
+
+<pre class="diagram">   USER PROGRAM CALLS  read(fd, buf, count)
+        |
+        v
+   GLIBC WRAPPER  - not a direct syscall itself. It:
+        |            - loads the syscall NUMBER into a register
+        |            - loads the arguments into the registers
+        |              the ABI specifies
+        |            - executes ONE INSTRUCTION that traps into
+        |              the kernel: svc #0 on ARM64, syscall on
+        |              x86-64
+        v
+   THE CPU switches from EL0 (user) to EL1 (kernel) - or
+   ring 3 to ring 0 on x86 - and jumps to a FIXED, KERNEL-
+   CHOSEN entry point. The user program cannot choose where
+   execution resumes; that address was set up once, at boot,
+   by the kernel itself.
+        |
+        v
+   KERNEL ENTRY CODE (arch/arm64/kernel/entry.S, roughly)
+        - saves every user register to the kernel stack (so
+          the syscall's C code can safely use registers, and
+          so the process's user-mode state is fully restored
+          on return)
+        - reads the syscall NUMBER out of the saved registers
+        - looks it up in THE SYSCALL TABLE
+        v
+   sys_call_table[nr]  -&gt;  the actual C implementation,
+                            e.g. ksys_read() / vfs_read()
+        |
+        v
+   ... does the work, using the kernel's OWN memory, OWN
+   privilege level - not the calling process's user-mode
+   privileges ...
+        |
+        v
+   RETURN: registers restored, EL1 -&gt; EL0, execution resumes
+   in glibc's wrapper exactly where it left off, with the
+   return value (or a negative errno) in the return register.</pre>
+
+<div class="key">
+<b>The trap instruction is the ENTIRE security boundary</b>
+<p>A user process cannot call kernel code directly — there is no ordinary function-call instruction that
+crosses from EL0 to EL1. The only door is the trap instruction, and the CPU guarantees it always lands at the
+one address the kernel configured at boot, never anywhere a user program could redirect it to. This is why a
+buffer overflow in user-space code, however severe, cannot by itself execute arbitrary kernel code: the
+attacker's corrupted return address still lives entirely inside EL0, and reaching EL1 still requires going
+through this same fixed, kernel-controlled entry point.</p>
+</div>
+
+<h2 id="table">The syscall table: a plain array of function pointers</h2>
+
+<p>Once inside, the kernel has to work out which of several hundred services you asked for. It does this the simplest way possible: a plain array of function pointers, indexed by the number you passed in.</p>
+
+<pre><code>/* Conceptually - the real table is generated from
+   arch/arm64/include/asm/unistd.h and a script, but the
+   result is exactly this: an array indexed by syscall
+   number.                                                  */
+
+const syscall_fn_t sys_call_table[__NR_syscalls] = {
+        [__NR_read]  = sys_read,
+        [__NR_write] = sys_write,
+        [__NR_open]  = sys_open,
+        [__NR_close] = sys_close,
+        ...
+};
+
+/* WHY THE NUMBER MATTERS: __NR_read is a fixed constant
+   (63 on arm64, 0 on x86-64 - THE TWO ARCHITECTURES DO NOT
+   AGREE, which is exactly why a static binary compiled for
+   one architecture cannot run on another, quite apart from
+   instruction-set differences: even if the CPU could somehow
+   execute both instruction sets, syscall number 0 means
+   read() on arm64 and something entirely different on
+   x86-64.
+
+   THIS IS ALSO WHY REMOVING OR RENUMBERING A SYSCALL IS
+   FORBIDDEN once released: any existing binary has the OLD
+   number baked into its machine code, permanently. New
+   syscalls are only ever ADDED at the end - the same
+   "we do not break user space" rule chapter 02 named for the
+   ABI in general applies here in its strictest form.        */
+
+/* SEE THE TABLE YOURSELF: */
+        cat /proc/kallsyms | grep sys_call_table
+        strace -c ls                 /* count every syscall a
+                                         program makes        */
+        ausyscall --dump             /* number -&gt; name map,
+                                         where available       */</code></pre>
+
+<h2 id="vdso">The vDSO: some calls never trap at all</h2>
+
+<p>Trapping into the kernel costs real time, and for a few very frequent calls that cost dominates the work being done. So the kernel plays a trick: it maps a small piece of its own code into every process, letting some calls be answered without entering the kernel at all.</p>
+
+<pre class="diagram">   TRAPPING IS NOT FREE. Every EL0-&gt;EL1-&gt;EL0 round trip costs
+   hundreds of cycles even before the syscall does any real
+   work - saving and restoring registers, the CPU's own
+   pipeline effects, and on some hardware explicit mitigations
+   for speculative-execution vulnerabilities that make the
+   trap itself considerably more expensive than it looks.
+
+   FOR A CALL LIKE gettimeofday() or clock_gettime(), WHICH
+   JUST READS A COUNTER, paying that cost on every call is
+   wasteful - so the kernel maps a small, READ-ONLY page of
+   its OWN CODE directly into every process's address space:
+   the vDSO (virtual Dynamic Shared Object).
+
+   glibc's gettimeofday() wrapper checks for the vDSO first
+   and, if present, CALLS INTO IT DIRECTLY - an ordinary
+   function call, no trap, no privilege switch - and the vDSO
+   code reads the current time from a memory page the kernel
+   updates periodically, entirely in user mode.
+
+        ldd /bin/true
+                linux-vdso.so.1 (0x0000...)   &lt;- this line
+        cat /proc/self/maps | grep vdso
+
+   THE PRACTICAL CONSEQUENCE: a tight loop calling
+   clock_gettime() millions of times per second is not,
+   despite appearances, making millions of kernel entries -
+   it is almost certainly hitting the vDSO, which is exactly
+   why it is fast enough to use for latency measurement in
+   the first place.</pre>
+
+<h2 id="restart">Interrupted syscalls: -EINTR and automatic restart</h2>
+
+<p>A blocked system call can be interrupted by a signal, which raises a question with no obvious answer: should the call fail, or resume? Linux supports both, and knowing which you get is essential for any program that handles signals.</p>
+
+<pre><code>/* A BLOCKING SYSCALL - read() waiting on an empty pipe,
+   for instance - can be interrupted by a signal arriving
+   mid-wait. What happens next depends on how the signal
+   handler was installed:                                   */
+
+        ssize_t n = read(fd, buf, count);
+        if (n &lt; 0 &amp;&amp; errno == EINTR) {
+                /* A signal handler ran and returned. The
+                   syscall did NOT complete - you must decide
+                   whether to retry it yourself.             */
+        }
+
+/* SA_RESTART changes this: */
+struct sigaction sa = { .sa_handler = my_handler,
+                         .sa_flags  = SA_RESTART };
+sigaction(SIGUSR1, &amp;sa, NULL);
+/* Now the KERNEL retries certain interrupted syscalls
+   automatically after the handler returns, and the caller
+   never sees EINTR for them at all. NOT ALL SYSCALLS HONOUR
+   THIS - a few, like poll() and select() with a timeout
+   already partially elapsed, deliberately still return
+   EINTR, because "restart" would be ambiguous for them (how
+   much of the timeout is left?).
+
+   THE PRACTICAL RULE: any program that installs a signal
+   handler and also makes blocking syscalls must handle
+   EINTR explicitly somewhere, whether by checking for it
+   after every blocking call or by relying on SA_RESTART and
+   knowing which calls it does not cover.                    */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A statically linked binary built for the wrong architecture fails immediately</td><td>Syscall numbers
+differ per architecture — number 0 means something different on each</td></tr>
+<tr><td><code>strace</code> shows far fewer calls than expected for time-related functions</td><td>The vDSO is
+serving them directly, with no kernel entry to trace</td></tr>
+<tr><td>A blocking call returns early with <code>EINTR</code></td><td>A signal arrived during the wait — check
+whether the handler used <code>SA_RESTART</code></td></tr>
+<tr><td>A read/write loop occasionally reads less than requested with no error</td><td>Expected for many
+syscalls — always check the return value and loop, do not assume a full transfer</td></tr>
+<tr><td>Old and new syscall numbers coexist for what looks like one feature</td><td>Normal — a syscall's number
+and behaviour cannot be changed once released, so a revised version is added as a new number</td></tr>
+<tr><td>A tight timing loop is far faster than the "syscall cost" intuition predicts</td><td>It is very likely
+hitting the vDSO, not making real kernel entries</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the full path from a libc call to kernel code and back, naming each step.</li>
+  <li>Explain why the trap instruction is the entire security boundary between user and kernel mode.</li>
+  <li>Explain why syscall numbers can never be renumbered or removed once released.</li>
+  <li>Explain what the vDSO is, why it exists, and name a call it typically serves.</li>
+  <li>Explain the difference between a syscall returning <code>EINTR</code> and one that transparently
+  restarts.</li>
+  <li>Use <code>strace</code> to observe a program's syscalls, and explain why some expected calls do not
+  appear.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

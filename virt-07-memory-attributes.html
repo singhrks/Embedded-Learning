@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory attributes and cacheability under virtualisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Memory attributes and cacheability under virtualisation</h1>
+<p class="lead">Two independent pieces of software now describe the same byte of memory, and the hardware
+combines their opinions with a rule neither of them chose. Most "impossible" virtualisation bugs — a guest
+that boots but corrupts data, a device that reads zeroes, an exclusive that never succeeds — live here.</p>
+
+<h2 id="rule">The combining rule</h2>
+
+<p>When two stages each specify a memory type, the hardware combines them by a fixed rule that always favours the more restrictive. A guest therefore cannot demand cacheability the hypervisor did not grant.</p>
+
+<pre class="diagram">   For every access, the CPU has TWO opinions about the memory:
+
+     stage 1 attribute   (guest's MAIR_EL1 + descriptor AttrIndx)
+     stage 2 attribute   (hypervisor's descriptor MemAttr[3:0])
+
+   and it must produce ONE. The rule is "most restrictive wins":
+
+     TYPE           Device beats Normal
+     CACHEABILITY   Non-cacheable beats Write-Through
+                    Write-Through   beats Write-Back
+     SHAREABILITY   Outer beats Inner beats Non-shareable
+     DEVICE STRENGTH nGnRnE beats nGnRE beats nGRE beats GRE
+
+   Worked cases:
+
+     s1 Normal WB, s2 Normal WB      -> Normal WB       (good)
+     s1 Normal WB, s2 Normal NC      -> Normal NC       (slow)
+     s1 Normal WB, s2 Device-nGnRE   -> Device-nGnRE    (broken)
+     s1 Device,    s2 Normal WB      -> Device          (fine)
+     s1 Normal WB, s2 Device-nGnRnE  -> Device-nGnRnE   (very broken)
+
+   The GUEST cannot escape upward. It can only make things
+   stricter than the hypervisor allowed - never looser.
+
+   Which means: if the hypervisor gets stage 2 wrong, the guest
+   has NO WAY to compensate, and its own page tables will look
+   completely correct while it misbehaves.</pre>
+
+<div class="key">
+<b>The asymmetry that matters</b>
+<p>Isolation only requires stage 2 to restrict <em>permissions</em>. Restricting <em>memory type</em> is a
+side effect of the same mechanism, and it is almost never what you want for ordinary RAM. Map guest RAM as
+Normal, Inner-Shareable, Write-Back at stage 2 and let the guest decide. Anything else is a bug waiting for
+a workload.</p>
+</div>
+
+<h2 id="consequences">What Device memory actually costs a guest</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>Normal memory</th><th>Device memory</th></tr></thead>
+<tbody>
+<tr><td>Unaligned access</td><td>Allowed</td><td><strong>Alignment fault</strong></td></tr>
+<tr><td><code>LDXR</code>/<code>STXR</code> exclusives</td><td>Work</td><td><strong>Constrained
+unpredictable</strong> — in practice, never succeed</td></tr>
+<tr><td>Speculative reads</td><td>Allowed</td><td>Forbidden</td></tr>
+<tr><td>Access merging / reordering</td><td>Allowed</td><td>Restricted per nGnRE flavour</td></tr>
+<tr><td>Caching</td><td>Yes</td><td>Never</td></tr>
+<tr><td>Throughput for a bulk copy</td><td>GB/s</td><td>Tens of MB/s</td></tr>
+<tr><td><code>DC ZVA</code></td><td>Works</td><td>Faults</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>An arm64 Linux guest whose RAM is Device at stage 2 will typically boot — early boot code is careful and
+aligned — and then die the moment the C library uses an optimised <code>memcpy</code>, or the moment
+<code>futex</code> takes an exclusive. The symptom looks like memory corruption or a scheduler hang, and
+nothing in the guest points at the real cause.</p>
+
+<h2 id="fwb">FWB: making the guest's opinion irrelevant</h2>
+
+<p>ARMv8.4-S2FWB ("stage-2 force write-back") changes the rule from <em>combine</em> to <em>override</em>. It
+exists because the combining rule made a whole class of hypervisor bugs unavoidable.</p>
+
+<pre><code>/* Without FWB, the hypervisor has a problem it cannot solve:
+
+   The guest boots with its MMU OFF. All its accesses are
+   therefore Device-nGnRnE (that is the architectural default
+   when stage 1 is disabled). The hypervisor, meanwhile, has
+   the page mapped Normal cacheable and has written the kernel
+   image into it THROUGH THE CACHE.
+
+   Guest reads with MMU off  -> Device -> bypasses the cache
+                             -> reads STALE DRAM
+                             -> reads garbage instead of the
+                                kernel it was given.
+
+   Historic fixes, both unpleasant:
+     a) HCR_EL2.DC = 1: force the guest's stage-1-disabled
+        accesses to be treated as Normal cacheable. Works, but
+        it lies to a guest that genuinely wanted Device access
+        to a real device before enabling its MMU.
+     b) The hypervisor cleans the entire guest image to the
+        point of coherency before every VM entry where the
+        guest MMU is off. Correct and very slow.              */
+
+/* With HCR_EL2.FWB = 1:
+
+     stage 2 MemAttr is no longer combined - it WINS.
+
+     s2 MemAttr = 0b0110  ->  Normal, Write-Back, whatever
+                              stage 1 says. Including when
+                              stage 1 is disabled.
+     s2 MemAttr = 0b0101  ->  Normal, Non-Cacheable, forced
+     s2 MemAttr = 0b0001  ->  Device-nGnRE, forced
+
+   The hypervisor now states the truth once, in one place, and
+   the guest's stage-1 attributes only affect ordering and
+   sharing - not cacheability. KVM enables FWB whenever the
+   silicon has it, and a large amount of cache-maintenance code
+   becomes dead.                                              */</code></pre>
+
+<h2 id="coherency">Who cleans the cache, and when</h2>
+
+<p>Cache maintenance under virtualisation is a question of division of labour, and the answer changes depending on who mapped the memory and how.</p>
+
+<pre class="diagram">   Three participants, three different views of memory:
+
+     the GUEST      writes through its cache
+     the HYPERVISOR writes through its cache (a different
+                    virtual mapping of the same physical page!)
+     a DEVICE doing DMA  may or may not be coherent
+
+   ALIASING: the hypervisor maps guest RAM into its own address
+   space to load a kernel image, to emulate a device, or to
+   migrate the VM. That is a SECOND virtual mapping of the same
+   physical memory, potentially with different attributes. On
+   ARM, mismatched attributes for the same physical address are
+   architecturally UNPREDICTABLE - not merely slow.
+
+   The rules that keep you safe:
+
+   1. Hypervisor and guest should both use Normal WB Inner-
+      Shareable for RAM. Then the coherent interconnect handles
+      it and NO maintenance is needed.
+
+   2. If the hypervisor writes guest memory while the guest's
+      MMU is off (loading a kernel), it must either
+        - clean to the Point of Coherency afterwards, or
+        - rely on HCR_EL2.DC / FWB.
+
+   3. If a NON-COHERENT device will read that memory, someone
+      must clean it. Under passthrough this is the GUEST'S
+      driver, and it works - the guest's DC CVAC operates on
+      the right physical lines because stage 2 translated the
+      address.
+
+   4. Never map the same page as Device in one place and Normal
+      in another. This is the mismatched-attribute rule, and
+      the failure is silent and rare enough to reach
+      production.</pre>
+
+<div class="warn">
+<b>The mismatched-alias bug</b>
+<p>A hypervisor maps a guest's framebuffer as Device (because it came from a PCI BAR) while the guest maps
+it Normal Non-Cacheable (because that is what framebuffers want). Both mappings are "reasonable"; together
+they are architecturally unpredictable. Symptoms: tearing, occasional wrong pixels, and behaviour that
+changes with CPU model. Fix the hypervisor mapping, not the guest.</p>
+</div>
+
+<h2 id="dc">HCR_EL2.DC and the boot window</h2>
+
+<p>One bit exists almost entirely for the window between reset and the guest enabling its MMU, and it causes confusing behaviour if you do not know it is there.</p>
+
+<pre><code>/* The window: from "hypervisor ERETs into the guest" to
+   "guest sets SCTLR_EL1.M = 1". Perhaps a few thousand
+   instructions, and every one of them is dangerous.        */
+
+  HCR_EL2.DC = 1   effect while the guest's stage-1 MMU is OFF:
+
+     the guest's accesses are treated as
+         Normal, Inner-Shareable, Write-Back Read/Write-Allocate
+     instead of
+         Device-nGnRnE
+
+     and stage 1 is forced to behave as if disabled anyway.
+
+  WHY YOU WANT IT:
+     the hypervisor wrote the kernel image through its cache;
+     the guest can now read it coherently without anyone
+     performing cache maintenance.
+
+  WHY IT IS NOT FREE:
+     a guest that legitimately wants to touch a real device
+     before enabling its MMU now does so through the cache.
+     For most guests this never happens. For a bare-metal
+     payload that pokes a UART before MMU setup, it does -
+     and the character never appears.
+
+  KVM's actual policy (simplified):
+     if FWB is available          -> use FWB, leave DC clear
+     else if guest MMU is off     -> set DC
+     else                         -> clear DC
+   and it re-evaluates on every trap that could have changed
+   SCTLR_EL1.M. That is one reason KVM traps SCTLR_EL1 writes
+   on hardware without FWB, and does not on hardware with it. */</code></pre>
+
+<h2 id="check-real">Checking what a guest really got</h2>
+
+<p>What a guest asked for and what it got can differ, and there are direct ways to find out which — worth doing before blaming a driver.</p>
+
+<pre><code># From the HOST, dump KVM's stage-2 view. (Requires
+# CONFIG_PTDUMP_DEBUGFS and a debug kernel; not all builds.)
+$ sudo ls /sys/kernel/debug/kvm/
+  1234-5/    # one directory per VM
+
+# From the GUEST, look at what stage 1 asked for:
+$ sudo cat /sys/kernel/debug/kernel_page_tables | head -20
+
+# The practical test, from inside the guest - does it BEHAVE
+# like Normal memory?
+
+$ cat > attrtest.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+int main(void) {
+        static _Alignas(64) uint8_t buf[128];
+        /* 1. unaligned access - faults on Device memory */
+        volatile uint32_t *p = (uint32_t *)(buf + 1);
+        *p = 0xdeadbeef;
+        printf("unaligned ok: %08x\n", *p);
+
+        /* 2. exclusives - never succeed on Device memory */
+        uint32_t v = 0;
+        int ok = __atomic_compare_exchange_n(&amp;v, &amp;(uint32_t){0}, 1,
+                        0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        printf("cas ok: %d\n", ok);
+        return 0;
+}
+EOF
+$ gcc attrtest.c -o attrtest &amp;&amp; ./attrtest
+unaligned ok: deadbeef
+cas ok: 1
+
+# A SIGBUS on test 1, or cas ok: 0 forever, means your RAM is
+# not Normal memory. That is a stage-2 problem, in the host.
+
+# Throughput is the blunt instrument that finds it fastest:
+$ dd if=/dev/zero of=/dev/null bs=1M count=2000
+# GB/s = Normal.  Tens of MB/s = Device. There is no middle.</code></pre>
+
+<h2 id="passthrough">Attributes for passed-through devices</h2>
+
+<p>A real device imposes attribute requirements of its own, and getting these wrong produces corruption rather than a fault.</p>
+
+<pre><code>/* When you assign a real device to a guest (chapter 17), its
+   MMIO region must be Device at BOTH stages.               */
+
+   stage 2: MemAttr = 0b0001  Device-nGnRE
+            S2AP    = 0b11    read/write
+            XN      = 1       never execute a device register
+
+/* Getting this wrong in the permissive direction is the
+   dangerous one: mapping a device region as Normal cacheable
+   at stage 2 means
+
+     - writes sit in the cache and reach the device late,
+       out of order, or merged
+     - the CPU may SPECULATIVELY READ device registers, which
+       for many devices has side effects (clear-on-read status,
+       FIFO pop). A speculative read can dequeue data nobody
+       asked for.
+
+   That last one is not theoretical. Speculatively reading a
+   UART's RX FIFO loses characters that were never delivered to
+   anyone. Always XN and always Device for MMIO.             */
+
+/* And the reverse for the DMA buffers that device will use:
+   they are ordinary RAM and must be Normal. A common bring-up
+   mistake is to map an entire "device" range - registers AND
+   the shared descriptor ring - as Device, then wonder why
+   throughput is dreadful.                                   */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest boots, then SIGBUS on unaligned access in libc</td><td>Guest RAM is Device at stage 2</td></tr>
+<tr><td>Guest hangs in <code>futex</code> or spinlocks; exclusives never succeed</td><td>Same — exclusives
+require Normal memory</td></tr>
+<tr><td>Guest memory bandwidth is 10–50x below the host's</td><td>Stage 2 forced Non-Cacheable or
+Device</td></tr>
+<tr><td>Guest reads garbage instead of its own kernel image at boot</td><td>Hypervisor wrote through the cache;
+guest read with MMU off as Device. Needs <code>DC</code> or FWB or a clean</td></tr>
+<tr><td>Bare-metal guest's early UART output is missing</td><td><code>HCR_EL2.DC</code> set, so the pre-MMU
+device write went into the cache</td></tr>
+<tr><td>Framebuffer tears or shows stale pixels</td><td>Mismatched aliases: Device in one mapping, Normal in
+another</td></tr>
+<tr><td>Passed-through UART loses received characters</td><td>MMIO mapped Normal at stage 2; speculative reads
+popped the FIFO</td></tr>
+<tr><td>Passed-through device DMA reads stale data</td><td>Descriptor ring mapped Device, or non-coherent
+device with no cache maintenance</td></tr>
+<tr><td>Behaviour differs between two CPU models on the same code</td><td>Mismatched-attribute aliasing —
+architecturally unpredictable, so implementations differ</td></tr>
+<tr><td>Everything above disappears on a newer SoC</td><td>That SoC has S2FWB and KVM stopped combining</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the combining rule for type, cacheability and shareability, and apply it to four stage-1/stage-2
+  pairs.</li>
+  <li>Explain why a guest cannot compensate for a stage-2 attribute mistake.</li>
+  <li>List five things that break when RAM is Device instead of Normal.</li>
+  <li>Explain the boot-window problem and the two historic fixes for it.</li>
+  <li>Say what <code>HCR_EL2.DC</code> does, and give a case where setting it is wrong.</li>
+  <li>Explain what S2FWB changes and why it deletes hypervisor code.</li>
+  <li>Define the mismatched-alias rule and give a realistic example.</li>
+  <li>Give the correct stage-2 attributes for a passed-through device's registers and for its DMA
+  buffers.</li>
+  <li>Describe two tests you can run inside a guest to prove its RAM is Normal memory.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

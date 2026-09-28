@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging through QEMU with GDB | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging through QEMU with GDB</h1>
+<p class="lead">QEMU has a built-in GDB stub, which means you can stop a machine before its first instruction,
+single-step through a bootloader, set a watchpoint on a hardware register, and inspect an EL3 exception
+handler — with no JTAG probe, no cost, and none of the ways a real debug port can interfere with the system
+it is debugging.</p>
+
+<h2 id="start">The two flags</h2>
+
+<pre><code>  -s        shorthand for -gdb tcp::1234
+  -S        do NOT start the CPU; wait for the debugger
+
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 1G -nographic \
+    -kernel Image -append "console=ttyAMA0 nokaslr" \
+    -s -S
+
+# In another terminal:
+$ gdb-multiarch vmlinux
+(gdb) target remote :1234
+Remote debugging using :1234
+0x0000000040000000 in ?? ()
+
+# You are now stopped at the very first instruction the machine
+# will execute, before any firmware, before the kernel header,
+# before anything. No real debug hardware gives you this.
+
+(gdb) break start_kernel
+(gdb) continue
+Breakpoint 1, start_kernel () at init/main.c:936
+
+# Other ports/transports:
+-gdb tcp::4321                   # different port
+-gdb unix:/tmp/gdb.sock,server=on
+-gdb stdio                       # pipe it
+
+# The right GDB:
+#   gdb-multiarch                 (Debian/Ubuntu)
+#   aarch64-linux-gnu-gdb         (from the cross toolchain)
+#   aarch64-none-elf-gdb          (bare metal)
+#   lldb also speaks the protocol: (lldb) gdb-remote 1234
+#
+# Plain x86 gdb will connect and then produce nonsense, because
+# it does not know the target architecture. If registers look
+# absurd, this is why. Force it:
+(gdb) set architecture aarch64</code></pre>
+
+<h2 id="kernel">Debugging a Linux kernel</h2>
+
+<pre><code># Build with symbols and without KASLR (chapter 5), then:
+
+$ gdb-multiarch vmlinux
+(gdb) target remote :1234
+
+# Linux ships GDB scripts. They are excellent and nobody uses
+# them.
+(gdb) source /path/to/linux/vmlinux-gdb.py
+(gdb) lx-symbols               # load module symbols too
+(gdb) lx-dmesg                 # the kernel ring buffer, even
+                               # if the console is broken
+(gdb) lx-ps                    # every task
+(gdb) lx-lsmod
+(gdb) lx-device-tree
+(gdb) lx-mounts
+
+# You may need:
+$ echo "add-auto-load-safe-path /path/to/linux" &gt;&gt; ~/.gdbinit
+
+# Breakpoints in a MODULE. The module is not loaded yet when
+# you connect, so:
+(gdb) lx-symbols /path/to/module/build/dir
+# after insmod in the guest, run lx-symbols again - it finds
+# the load address from the kernel's module list and relocates.
+
+(gdb) break my_driver_probe
+(gdb) continue
+# in the guest: insmod mydriver.ko
+Breakpoint 2, my_driver_probe (pdev=0xffff0000c1234000) ...
+(gdb) bt
+(gdb) p *pdev
+(gdb) p pdev-&gt;dev.of_node-&gt;name
+
+# Per-CPU variables and the current task:
+(gdb) p $lx_current().comm
+(gdb) p $lx_per_cpu("runqueues", 1)
+
+# Physical memory, when the MMU is off or you do not trust it:
+(gdb) monitor xp/16xg 0x40000000
+# "monitor" passes the command to QEMU's HMP - so every command
+# from chapter 10 is available from inside GDB.</code></pre>
+
+<div class="key">
+<b><code>monitor</code> is the bridge</b>
+<p>Anything you can do in the QEMU monitor, you can do from the GDB prompt by prefixing it with
+<code>monitor</code>. <code>monitor info registers</code>, <code>monitor info mtree</code>,
+<code>monitor savevm x</code>. That combination — a source-level debugger plus full machine
+introspection — is strictly more than a JTAG probe offers.</p>
+</div>
+
+<h2 id="el">Exception levels and the multi-image problem</h2>
+
+<pre class="diagram">   A full arm64 boot has four separate binaries at three
+   exception levels, and GDB only knows about symbols you have
+   told it about.
+
+     bl1.bin / bl2 / bl31.elf     EL3   TF-A
+     tee.elf / tee-pager.elf      S-EL1 OP-TEE
+     u-boot                       EL2/1 bootloader
+     vmlinux                      EL1   Linux
+
+   Load them all, at their link addresses:
+
+     (gdb) file bl31.elf
+     (gdb) add-symbol-file tee.elf   0x0e100000
+     (gdb) add-symbol-file u-boot    0x60000000
+     (gdb) add-symbol-file vmlinux
+
+   Now a backtrace resolves whichever image the PC is in.
+
+   Which EL are we in right now?
+
+     (gdb) p $cpsr
+     (gdb) monitor info registers | grep PSTATE
+     PSTATE=204003c9 --C- EL3h
+                          ^^^^ there it is
+
+   Breakpoints across an EL switch: QEMU's stub uses SOFTWARE
+   breakpoints by default, which need writable memory. Code in
+   ROM or in a region the current stage cannot write needs a
+   HARDWARE breakpoint:
+
+     (gdb) hbreak *0x0e100000
+     (gdb) watch *(int *)0x09000000       # software watchpoint
+     (gdb) rwatch *(int *)0x09000018      # break on READ of a
+                                          # device register -
+                                          # this is the killer
+                                          # feature for driver
+                                          # work</pre>
+
+<h2 id="baremetal">Bare-metal and early boot</h2>
+
+<pre><code># A payload with no OS. This is the OP-TEE and TF-A workflow.
+
+$ aarch64-none-elf-gcc -g -O0 -nostdlib -Wl,-Ttext=0x40100000 \
+      -o payload.elf start.S main.c
+
+$ qemu-system-aarch64 -M virt -cpu max -nographic \
+    -kernel payload.elf -s -S
+
+$ aarch64-none-elf-gdb payload.elf
+(gdb) target remote :1234
+(gdb) break _start
+(gdb) continue
+(gdb) layout asm            # a disassembly window
+(gdb) layout regs           # registers alongside
+(gdb) si                    # step one instruction
+(gdb) info registers sctlr_el1 ttbr0_el1 vbar_el1
+
+# System registers ARE exposed by QEMU's stub on aarch64:
+(gdb) p $sctlr_el1
+(gdb) p/x $esr_el1
+(gdb) p $currentel
+
+# Stepping through MMU enable - the moment that breaks most
+# bare-metal code:
+(gdb) break *enable_mmu
+(gdb) si
+(gdb) p/x $sctlr_el1        # watch bit 0 flip
+(gdb) x/4i $pc              # are we still executing sane code?
+
+# If the CPU vanishes after enabling the MMU, the identity
+# mapping for the code itself is missing. GDB shows you exactly
+# which instruction it died on, which a hardware debugger often
+# cannot because it loses the connection at the same moment.</code></pre>
+
+<h2 id="smp">Multiple CPUs</h2>
+
+<pre><code># Each vCPU is a GDB "thread".
+
+(gdb) info threads
+  Id   Target Id      Frame
+* 1    Thread 1 (CPU#0 [running])  cpu_do_idle () at ...
+  2    Thread 2 (CPU#1 [halted ])  0x0000000000000000 in ?? ()
+
+(gdb) thread 2
+(gdb) bt
+
+# By default GDB stops ALL CPUs when one hits a breakpoint,
+# which is what you want. Non-stop mode lets the others run:
+(gdb) set non-stop on          # before connecting
+
+# Break only on a specific CPU:
+(gdb) break my_func if $_thread == 2
+
+# A race between two CPUs is best caught with -icount (chapter
+# 2), which makes the interleaving deterministic and therefore
+# repeatable:
+$ qemu-system-aarch64 ... -icount shift=5,align=off,sleep=off -s -S</code></pre>
+
+<h2 id="tricks">Techniques worth stealing</h2>
+
+<pre><code># 1. Script the whole session. Stop retyping.
+$ cat &gt; debug.gdb &lt;&lt;'EOF'
+target remote :1234
+source /work/linux/vmlinux-gdb.py
+lx-symbols
+break panic
+break die
+break my_driver_probe
+commands 3
+  bt
+  p *pdev
+  continue
+end
+continue
+EOF
+$ gdb-multiarch vmlinux -x debug.gdb
+
+# 2. Catch a fault before it becomes an oops:
+(gdb) break do_mem_abort
+(gdb) break __do_kernel_fault
+
+# 3. Watch a hardware register be touched, and by whom:
+(gdb) awatch *(volatile unsigned int *)0x09000018
+Hardware access (read/write) watchpoint 1
+Value = 0x90
+0xffff800008a41234 in pl011_console_write ()
+# THIS is how you find the code that is banging on a register
+# it should not.
+
+# 4. Change guest state to test an error path you cannot
+#    otherwise reach:
+(gdb) p $x0 = -12            # make an allocation "fail"
+(gdb) return -ENOMEM
+(gdb) set var some_flag = 1
+
+# 5. Combine with savevm: snapshot at the interesting point,
+#    then loadvm and try a different intervention each time.
+(gdb) monitor savevm probe-entry
+(gdb) monitor loadvm probe-entry
+
+# 6. Reverse debugging, with record/replay:
+$ qemu-system-aarch64 ... -icount shift=auto,rr=record,rrfile=rr.bin -s -S
+$ qemu-system-aarch64 ... -icount shift=auto,rr=replay,rrfile=rr.bin -s -S
+(gdb) reverse-continue
+(gdb) reverse-step
+# Stepping BACKWARDS from a crash to its cause. It has
+# limitations (no external input during replay) but when it
+# works it is unmatched.</code></pre>
+
+<div class="warn">
+<b>KASLR will waste your afternoon</b>
+<p>If breakpoints do not hit and symbols point at nonsense, the kernel relocated itself. Add
+<code>nokaslr</code> to <code>-append</code> or turn off <code>CONFIG_RANDOMIZE_BASE</code>. The same applies
+to modules — always re-run <code>lx-symbols</code> after <code>insmod</code>, because until then GDB has no
+idea where the module landed.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>GDB connects, registers are nonsense</td><td>Wrong GDB architecture — use
+<code>gdb-multiarch</code> or <code>set architecture aarch64</code></td></tr>
+<tr><td>Breakpoints never hit</td><td>KASLR, or symbols from a different build than the running
+image</td></tr>
+<tr><td>Breakpoint in a module never hits</td><td><code>lx-symbols</code> not re-run after
+<code>insmod</code></td></tr>
+<tr><td><code>Cannot insert breakpoint</code></td><td>Target memory is read-only (ROM, or another EL's
+region) — use <code>hbreak</code></td></tr>
+<tr><td>Guest runs away immediately</td><td>Forgot <code>-S</code></td></tr>
+<tr><td>Connection refused</td><td>QEMU not started, wrong port, or <code>-s</code> missing</td></tr>
+<tr><td>Everything freezes when you step</td><td>Normal — the whole machine is stopped, including its
+timers</td></tr>
+<tr><td>Guest network connections time out while debugging</td><td>Also normal; the guest's clock stopped but
+the world's did not</td></tr>
+<tr><td>Symbols resolve for the kernel but not for firmware</td><td>Need <code>add-symbol-file</code> at the
+firmware's link address</td></tr>
+<tr><td>Race disappears under GDB</td><td>Use <code>-icount</code> for determinism, or you are observing a
+genuine timing dependency</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>-s</code> and <code>-S</code> do, separately.</li>
+  <li>Name the correct GDB binary for an aarch64 target and what happens if you use the wrong one.</li>
+  <li>Load the Linux GDB scripts and name four <code>lx-</code> commands.</li>
+  <li>Explain how to get a breakpoint into a kernel module.</li>
+  <li>Explain what <code>monitor</code> does at the GDB prompt and give two uses.</li>
+  <li>Load symbols for four images at three exception levels and determine the current EL.</li>
+  <li>Say when you need <code>hbreak</code> instead of <code>break</code>.</li>
+  <li>Set a watchpoint that fires when a device register is <em>read</em>.</li>
+  <li>Describe how vCPUs appear to GDB and how to inspect a specific one.</li>
+  <li>Explain how to make a race reproducible under the debugger.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

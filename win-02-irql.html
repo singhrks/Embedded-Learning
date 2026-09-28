@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IRQL | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>IRQL</h1>
+<p class="lead">Interrupt Request Level is the single most important concept in Windows kernel programming.
+It is a per-CPU number that determines what your code is allowed to do, and violating its rules is the
+cause of most driver bugchecks.</p>
+
+<h2 id="levels">The levels</h2>
+
+<p>IRQL is the single most important concept in Windows driver development and has no direct Linux equivalent. It is a per-processor priority level that determines what the processor is currently allowed to be interrupted by — and, as a direct consequence, what your code is allowed to do.</p>
+
+<pre class="diagram">   HIGH_LEVEL        (15)  bugcheck, everything masked
+   ...
+   CLOCK_LEVEL       (13)  the clock interrupt
+   IPI_LEVEL         (14)  inter-processor interrupts
+   ...
+   DIRQL             (3-12) DEVICE interrupt levels - your ISR
+                            runs here
+   DISPATCH_LEVEL     (2)  the scheduler and DPCs
+   APC_LEVEL          (1)  asynchronous procedure calls
+   PASSIVE_LEVEL      (0)  normal thread execution
+                                     ^ lowest
+
+  THE RULE THAT DEFINES EVERYTHING:
+
+     Code running at IRQL N can only be interrupted by code at
+     IRQL > N, on the same CPU. Code at IRQL N cannot be
+     preempted by anything at or below N.
+
+  So raising IRQL MASKS everything at or below it. At
+  DISPATCH_LEVEL the scheduler itself cannot run - which is
+  why you cannot block, wait, or page fault there.
+
+  THE CRITICAL BOUNDARY IS BETWEEN 1 AND 2:
+
+     &lt;= APC_LEVEL       the scheduler still works.
+                        You may block, wait, and touch
+                        paged memory.
+
+     &gt;= DISPATCH_LEVEL  the scheduler is masked.
+                        NO blocking. NO waiting. NO paged
+                        memory. NO page faults.
+
+  Everything else in this chapter follows from that line.</pre>
+
+<div class="key">
+<b>The Linux comparison</b>
+<p>IRQL does the job that "context" does in Linux (<a href="lx-02-kernel-vs-user.html">chapter 02</a>), but
+as an explicit, readable, <em>settable</em> number rather than an implicit property of how you were called.
+Roughly: <code>PASSIVE_LEVEL</code> is process context; <code>DISPATCH_LEVEL</code> is softirq context or
+holding a spinlock; <code>DIRQL</code> is hardirq context. The difference is that Windows lets you
+<em>query</em> it (<code>KeGetCurrentIrql()</code>) and <em>raise</em> it deliberately, and every API's
+documentation states the IRQL it requires.</p>
+</div>
+
+<h2 id="rules">What you may do at each level</h2>
+
+<p>Every "No" in this table traces back to the same root cause: at <code>DISPATCH_LEVEL</code> and above, the
+scheduler is masked, and every one of these operations secretly depends on the scheduler being able to run.
+Blocking or waiting means suspending the current thread and running a different one — impossible with no
+scheduler. Touching paged memory means accepting the possibility of a page fault, and servicing a page fault
+means reading from disk, which means blocking, which loops back to the same problem. A fast mutex and an
+ERESOURCE are built on the same waiting primitive as an ordinary wait, so they inherit the restriction too. The
+one row that is "Yes" everywhere — non-paged pool and queuing a DPC — is the tell: those are the only
+operations the kernel guarantees never need the scheduler, which is exactly why they are the tools you are left
+with once you are running at an elevated IRQL.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>PASSIVE (0)</th><th>APC (1)</th><th>DISPATCH (2)</th><th>DIRQL (3+)</th></tr></thead>
+<tbody>
+<tr><td>Block / wait with a timeout</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Touch paged memory</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Allocate paged pool</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Allocate non-paged pool</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Acquire a fast mutex</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Acquire a spinlock</td><td>Yes (raises to DISPATCH)</td><td>Yes</td><td>Yes</td><td>Only at that DIRQL</td></tr>
+<tr><td>Access user memory</td><td>Yes, in the right process</td><td>Careful</td><td><strong>No</strong></td><td><strong>No</strong></td></tr>
+<tr><td>Call most Zw* / Io* APIs</td><td>Yes</td><td>Some</td><td>Few</td><td>Almost none</td></tr>
+<tr><td>Queue a DPC</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><code>DbgPrint</code></td><td>Yes</td><td>Yes</td><td>Yes</td><td>Careful</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE PAGED MEMORY RULE IS THE SUBTLE ONE.
+
+   Touching paged-out memory takes a page fault. Servicing a
+   page fault requires disk I/O, which requires the scheduler
+   to block the thread. At DISPATCH_LEVEL the scheduler cannot
+   run.
+
+   RESULT: bugcheck 0xA, IRQL_NOT_LESS_OR_EQUAL.
+
+   And it is a LATENT bug: the memory is usually resident, so
+   the code works for weeks. Then the machine is under memory
+   pressure, the page is evicted, and the driver crashes -
+   apparently at random.
+
+   THIS IS WHY Driver Verifier has a "force IRQL checking"
+   option that makes every pageable page non-resident, turning
+   the latent bug into a reliable one (chapter 22). Use it.  */</code></pre>
+
+<h2 id="query">Querying and changing IRQL</h2>
+
+<p>Most of the time you know your IRQL from context, because the documentation states it for every callback. When you genuinely cannot tell, the system will tell you, and raising or lowering it yourself is occasionally necessary — with one rule that must never be broken.</p>
+
+<pre><code>        KIRQL irql = KeGetCurrentIrql();
+
+        if (irql &gt; DISPATCH_LEVEL)
+                return STATUS_INVALID_DEVICE_STATE;
+
+/* RAISING and LOWERING - always paired, always LIFO: */
+        KIRQL oldIrql;
+
+        KeRaiseIrql(DISPATCH_LEVEL, &amp;oldIrql);
+        /* ... the scheduler cannot run here ... */
+        KeLowerIrql(oldIrql);
+
+/* You rarely do this explicitly. Acquiring a spinlock does it
+   for you: */
+        KIRQL oldIrql;
+
+        KeAcquireSpinLock(&amp;lock, &amp;oldIrql);   /* raises to
+                                                 DISPATCH     */
+        /* ... critical section ... */
+        KeReleaseSpinLock(&amp;lock, oldIrql);    /* restores */
+
+/* Or, when you KNOW you are already at DISPATCH_LEVEL: */
+        KeAcquireSpinLockAtDpcLevel(&amp;lock);
+        ...
+        KeReleaseSpinLockFromDpcLevel(&amp;lock);
+/* Cheaper - no IRQL change. Calling it below DISPATCH_LEVEL
+   is a bug that Driver Verifier catches.                   */
+
+/* ASSERT IT, in every function whose IRQL matters: */
+        NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+        NT_ASSERT(KeGetCurrentIrql() &lt;= DISPATCH_LEVEL);
+
+/* And DOCUMENT it in the function header, the way Microsoft's
+   own headers do:
+
+     IRQL_requires_max_(DISPATCH_LEVEL)
+     NTSTATUS MyFunction(...);
+
+   Those SAL annotations are checked by static analysis
+   (chapter 22) - so an annotated codebase catches IRQL
+   violations at BUILD time rather than at run time. That is
+   the highest-value habit in this chapter.               */</code></pre>
+
+<h2 id="annotations">SAL annotations</h2>
+
+<p>The compiler can check much of this for you, if you tell it what your functions expect. These annotations look like noise at first and are in fact the cheapest bug-prevention available in Windows driver work — static analysis uses them to find IRQL violations before the code ever runs.</p>
+
+<pre><code>/* Windows drivers are annotated with SAL - Microsoft's source
+   annotation language. Code Analysis reads them and finds
+   real bugs statically.                                    */
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_                    /* on an out KIRQL parameter */
+_IRQL_restores_
+
+_Must_inspect_result_
+_Check_return_
+
+_In_            /* input, must be valid */
+_Out_           /* output, written by the callee */
+_Inout_
+_In_opt_        /* may be NULL */
+_In_reads_bytes_(n)
+_Out_writes_bytes_(n)
+
+_Requires_lock_held_(lock)
+_Acquires_lock_(lock)
+_Releases_lock_(lock)
+
+/* A realistic annotated declaration: */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+MyQueueRequest(
+        _In_ PMY_DEVICE Device,
+        _In_reads_bytes_(Length) PVOID Buffer,
+        _In_ SIZE_T Length
+        );
+
+/* WHY BOTHER: Code Analysis will then tell you, at compile
+   time, that you called this from a DIRQL ISR, or ignored its
+   return value, or passed a buffer shorter than Length. Those
+   are exactly the bugs that otherwise become bugchecks on a
+   customer machine.
+
+   ANNOTATE AS YOU WRITE. Retrofitting SAL to an existing
+   driver is tedious; adding it to a new function costs
+   seconds.                                                */</code></pre>
+
+<h2 id="bugcheck">The bugchecks IRQL causes</h2>
+
+<p>Getting IRQL wrong does not produce a subtle misbehaviour; it produces one of a small set of very recognisable blue screens. Learning to read these three by name means you often know the cause before opening the dump.</p>
+
+<pre><code>/* --- 0x0A  IRQL_NOT_LESS_OR_EQUAL --------------------------
+   The most common driver bugcheck by a wide margin.
+
+   MEANS: memory was touched at too high an IRQL. Either the
+   memory is paged out, or the address is garbage.
+
+   Parameters:
+     1  the address referenced
+     2  the IRQL at the time
+     3  0 = read, 1 = write, 8 = execute
+     4  the instruction address
+
+   PARAMETER 2 IS THE DIAGNOSIS. If it is 2 or higher and the
+   address looks plausible, you touched paged memory at
+   DISPATCH_LEVEL. If the address is near zero, it is a NULL
+   dereference that happens to have occurred at high IRQL. */
+
+/* --- 0xD1  DRIVER_IRQL_NOT_LESS_OR_EQUAL ------------------
+   The same thing, but the faulting code was identified as a
+   driver. Same parameters. Parameter 4 names YOUR function.
+
+/* --- 0xC4  DRIVER_VERIFIER_DETECTED_VIOLATION -------------
+   Verifier caught an IRQL rule violation before it became a
+   crash. The subcode says which rule (chapter 22).
+
+/* --- 0x1E  KMODE_EXCEPTION_NOT_HANDLED --------------------
+   An unhandled exception - often an access violation at high
+   IRQL.
+
+/* --- 0x7E  SYSTEM_THREAD_EXCEPTION_NOT_HANDLED ------------
+   Same, in a system thread.
+
+/* --- 0x133 DPC_WATCHDOG_VIOLATION -------------------------
+   A DPC ran for more than ~20 microseconds too long, or the
+   system stayed at DISPATCH_LEVEL for more than ~10 seconds.
+   MEANS: your DPC is doing far too much work
+   (chapter 11).                                          */
+
+/* READING ONE in WinDbg (chapter 23): */
+        !analyze -v
+        .bugcheck
+        kb                    /* the stack */
+        !irql                 /* the IRQL at crash time */</code></pre>
+
+<h2 id="patterns">Patterns that keep you correct</h2>
+
+<p>Rather than reasoning about IRQL afresh on every function, experienced driver authors follow a handful of habits that make violations structurally difficult. These are those habits.</p>
+
+<pre><code>/* 1. KNOW WHICH IRQL YOUR CALLBACK RUNS AT. Every framework
+      callback documents it. Memorise the common ones:      */
+
+        DriverEntry                      PASSIVE_LEVEL
+        EvtDriverDeviceAdd               PASSIVE_LEVEL
+        EvtDevicePrepareHardware         PASSIVE_LEVEL
+        EvtDeviceD0Entry                 PASSIVE_LEVEL
+        EvtIoRead / EvtIoWrite           &lt;= DISPATCH_LEVEL
+        EvtIoDeviceControl               &lt;= DISPATCH_LEVEL
+        EvtInterruptIsr                  DIRQL
+        EvtInterruptDpc                  DISPATCH_LEVEL
+        EvtWorkItem                      PASSIVE_LEVEL
+        EvtTimerFunc                     DISPATCH_LEVEL
+        EvtCleanupCallback               &lt;= DISPATCH_LEVEL
+
+/* 2. IF YOU NEED PASSIVE_LEVEL FROM A HIGHER ONE, queue a
+      WORK ITEM (chapter 11). You cannot simply lower IRQL to
+      escape - lowering below where you were called is a
+      serious bug.
+
+/* 3. MARK CODE PAGEABLE ONLY IF IT RUNS AT PASSIVE_LEVEL: */
+
+        #pragma alloc_text(INIT,  DriverEntry)
+        #pragma alloc_text(PAGE,  MyDeviceAdd)
+        #pragma alloc_text(PAGE,  MyPrepareHardware)
+
+        NTSTATUS MyDeviceAdd(...)
+        {
+                PAGED_CODE();     /* ASSERTS PASSIVE_LEVEL -
+                                     put this at the top of
+                                     every PAGE function     */
+                ...
+        }
+
+   INIT   discarded after boot (like Linux's __init)
+   PAGE   pageable
+   .text  always resident - the default
+
+/* PAGED_CODE() costs nothing in a release build and catches
+   the mistake immediately in a checked one. Use it in every
+   pageable function without exception.
+
+/* 4. NON-PAGED DATA for anything touched above PASSIVE: */
+        ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'GATd');
+   and never a global marked with #pragma data_seg("PAGE").
+
+/* 5. THE ONE-LINE HABIT that prevents most of this: before
+      writing any line that touches memory or calls an API,
+      ask "what IRQL am I at?" If you cannot answer instantly,
+      look at the callback that got you here.             */</code></pre>
+
+<h2 id="spinlocks">IRQL and spinlocks</h2>
+
+<p>Spinlocks and IRQL are two aspects of one mechanism, which is why they are easy to confuse. Acquiring a spinlock <em>raises</em> your IRQL, so a lock is not only mutual exclusion — it silently changes what the code inside it may do.</p>
+
+<pre><code>/* A spinlock protects data; raising IRQL protects against
+   PREEMPTION. Windows combines them because you almost always
+   need both.                                               */
+
+/* Data shared between PASSIVE code and a DPC: */
+        KeAcquireSpinLock(&amp;d-&gt;Lock, &amp;oldIrql);
+        /* now at DISPATCH_LEVEL: the DPC cannot run on this
+           CPU, and the spinlock excludes other CPUs        */
+        ...
+        KeReleaseSpinLock(&amp;d-&gt;Lock, oldIrql);
+
+/* Data shared with an ISR - the spinlock must be acquired at
+   the DEVICE's IRQL, or the ISR can interrupt you while you
+   hold it and deadlock (exactly the Linux spinlock
+   self-deadlock, chapter 12):                             */
+        KeAcquireInterruptSpinLock(interrupt, &amp;oldIrql);
+        ...
+        KeReleaseInterruptSpinLock(interrupt, oldIrql);
+
+/* In WDF this is: */
+        WdfInterruptAcquireLock(interrupt);
+        ...
+        WdfInterruptReleaseLock(interrupt);
+
+/* THE RULES:
+     · a spinlock section runs at DISPATCH_LEVEL or higher, so
+       everything forbidden at DISPATCH_LEVEL is forbidden
+       inside it - no paged memory, no blocking, no
+       paged-pool allocation
+     · keep it SHORT. Other CPUs spin.
+     · never acquire a lower-IRQL lock while holding a
+       higher-IRQL one
+     · the `oldIrql` variable must be LOCAL. Sharing one
+       between CPUs corrupts the IRQL restore.            */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0xA or 0xD1, parameter 2 &gt;= 2</td><td>Paged memory touched at DISPATCH_LEVEL or above</td></tr>
+<tr><td>Works for days, then crashes under memory pressure</td><td>The same bug, latent — Verifier's IRQL checking exposes it</td></tr>
+<tr><td>Bugcheck 0x133 DPC_WATCHDOG</td><td>A DPC doing far too much work</td></tr>
+<tr><td>Hang with one CPU spinning</td><td>Spinlock acquired at the wrong IRQL, then interrupted by the ISR</td></tr>
+<tr><td>Random corruption after a spinlock release</td><td><code>oldIrql</code> shared instead of local</td></tr>
+<tr><td>Verifier reports an IRQL violation on a working driver</td><td>A latent bug it made deterministic</td></tr>
+<tr><td>Crash only on a multi-processor machine</td><td>Missing spinlock; IRQL alone does not exclude other CPUs</td></tr>
+<tr><td><code>ExAllocatePool2</code> fails or crashes in a DPC</td><td>Requested paged pool above PASSIVE_LEVEL</td></tr>
+<tr><td>Code Analysis warns about IRQL</td><td>A real bug found at build time — fix it, do not suppress</td></tr>
+<tr><td>Crash in a pageable function</td><td>Called above PASSIVE_LEVEL — <code>PAGED_CODE()</code> would have asserted</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the IRQL levels in order and say what runs at each.</li>
+  <li>State the masking rule and why DISPATCH_LEVEL is the critical boundary.</li>
+  <li>Map IRQL onto Linux's execution contexts.</li>
+  <li>Explain the paged-memory rule and why the resulting bug is latent.</li>
+  <li>Raise and lower IRQL correctly, and say why you rarely should.</li>
+  <li>Annotate a function with SAL and say what Code Analysis will then check.</li>
+  <li>Decode bugcheck 0xD1 from its four parameters.</li>
+  <li>State the IRQL of eight common framework callbacks.</li>
+  <li>Use <code>#pragma alloc_text</code> and <code>PAGED_CODE()</code> correctly.</li>
+  <li>Explain why data shared with an ISR needs an interrupt spinlock.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

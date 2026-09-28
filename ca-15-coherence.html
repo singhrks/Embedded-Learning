@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache coherence and memory consistency | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Cache coherence and memory consistency</h1>
+<p class="lead">Two words that sound like synonyms and are not. Coherence is about one location seen by many
+caches; consistency is about the order of operations across different locations. Confusing them is the root
+of most multi-core bugs.</p>
+
+<h2 id="problem">The problem</h2>
+
+<p>Give each core its own cache (<a href="ca-13-memory-hierarchy.html">chapter 13</a>) and you have created a
+correctness problem: the same location now exists in several places at once, with different values.</p>
+
+<pre class="diagram">   Core 0                      Core 1
+   +-----------+               +-----------+
+   | L1: x = 5 |               | L1: x = 5 |
+   +-----------+               +-----------+
+         |                            |
+         +------------+---------------+
+                 +----------+
+                 | DRAM x=5 |
+                 +----------+
+
+   Core 0 executes:  x = 7
+
+   +-----------+               +-----------+
+   | L1: x = 7 |  dirty        | L1: x = 5 |  &lt;-- STALE
+   +-----------+               +-----------+
+
+   Core 1 reads x and gets 5. The program is wrong, and nothing in
+   the source code hinted that it could be.</pre>
+
+<h2 id="coherence">Coherence: one location, many caches</h2>
+
+<div class="key">
+<b>The coherence guarantee</b>
+<p>A memory system is coherent if, for any <em>single</em> location:</p>
+<ol>
+<li>A read returns the value of the most recent write to that location.</li>
+<li>All observers agree on the <em>order</em> of writes to it (write serialisation).</li>
+</ol>
+<p>Note what this does not say: nothing about the relative ordering of accesses to <em>different</em>
+locations. That is consistency, and it is a separate guarantee that hardware does <em>not</em> give you
+by default.</p>
+</div>
+
+<h3>MESI</h3>
+
+<p>Each cache line carries a state. Cores watch — "snoop" — each other's transactions and change state
+accordingly.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>State</th><th>Meaning</th><th>Others may hold it?</th><th>Memory current?</th></tr></thead>
+<tbody>
+<tr><td><strong>M</strong> — Modified</td><td>I have it and I changed it</td><td>No</td><td>No — I must write back</td></tr>
+<tr><td><strong>E</strong> — Exclusive</td><td>I have it, unmodified, and only I have it</td><td>No</td><td>Yes</td></tr>
+<tr><td><strong>S</strong> — Shared</td><td>I have it, unmodified, others may too</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><strong>I</strong> — Invalid</td><td>No usable copy</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">The transitions that matter
+
+  Core 0 reads x, nobody else has it   ->  I -> E
+  Core 1 then reads x                  ->  Core 0: E -> S,  Core 1: I -> S
+  Core 0 writes x                      ->  broadcast INVALIDATE
+                                           Core 1: S -> I
+                                           Core 0: S -> M
+  Core 1 reads x again                 ->  Core 0 must SUPPLY the data
+                                           (or write it back first)
+                                           Core 0: M -> S,  Core 1: I -> S
+
+The E state exists purely as an optimisation: if only you hold a clean
+line, you may write it without broadcasting anything. Without E, every
+first write to a private variable would need a bus transaction.
+
+MOESI adds O (Owned): a dirty line may be shared, with one owner
+responsible for eventual write-back. Saves memory traffic.</pre>
+
+<p>On ARM this rides the interconnect protocols from <a href="ca-17-io-buses.html">chapter 17</a> — ACE
+for smaller systems, CHI for large ones. Broadcast snooping does not scale past a modest core count, so
+large designs use a <strong>directory</strong>: a structure recording which caches hold which lines, so
+invalidations go point-to-point instead of to everyone.</p>
+
+<h2 id="false-sharing">False sharing</h2>
+
+<p>Coherence operates on <em>lines</em>, not variables. Two unrelated variables in the same 64-byte line are
+indistinguishable to the protocol.</p>
+
+<pre><code>/* looks perfectly parallel. It is not. */
+struct counters {
+        uint64_t a;    /* thread 0 increments this */
+        uint64_t b;    /* thread 1 increments this */
+};                     /* both in ONE cache line   */
+
+/* Thread 0 writes a  -> invalidates the line in thread 1's cache
+   Thread 1 writes b  -> invalidates the line in thread 0's cache
+   ...forever. The line ping-pongs between cores every iteration.
+
+   Measured effect: often 10-100x SLOWER than one thread doing both
+   increments. You added a core and went backwards.               */
+
+/* the fix: give each its own line */
+struct counters {
+        alignas(64) uint64_t a;
+        alignas(64) uint64_t b;
+};
+
+/* portable spellings */
+_Alignas(64)                                         /* C11           */
+alignas(std::hardware_destructive_interference_size) /* C++17         */
+____cacheline_aligned                                /* Linux kernel  */
+__attribute__((aligned(64)))                         /* GCC / Clang   */</code></pre>
+
+<div class="warn">
+<b>The signature of false sharing</b>
+<p>Unmistakable once you know it: <strong>throughput gets worse as you add threads</strong>, and the working
+set is tiny. Confirm with <code>perf c2c record</code> / <code>perf c2c report</code>, which names the exact
+cache lines suffering cross-core contention and the source lines touching them. Usual victims: per-thread
+statistics arrays, adjacent lock structures, and the head and tail pointers of a ring buffer.</p>
+</div>
+
+<h2 id="consistency">Consistency: many locations, what order?</h2>
+
+<p>Coherence is not enough. Consider two <em>different</em> variables:</p>
+
+<pre><code>/* both start at 0 */
+
+/* Core 0 */                    /* Core 1 */
+data = 42;                      while (flag == 0)
+flag = 1;                               ;
+                                use(data);      /* may read 0! */</code></pre>
+
+<p>Every location is coherent. Yet core 1 can observe <code>flag == 1</code> while still reading
+<code>data == 0</code>. Coherence never promised anything about ordering <em>between</em> addresses.</p>
+
+<h3>Why the reordering happens</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Source</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>Compiler</td><td>Reorders or eliminates accesses it can prove safe <em>single-threaded</em></td></tr>
+<tr><td>Store buffer</td><td>A write retires into a buffer; other cores cannot see it yet. The store to <code>data</code> can still be sitting there when <code>flag</code>'s store drains.</td></tr>
+<tr><td>Out-of-order execution</td><td>Loads issue as soon as their address is known, possibly before earlier loads</td></tr>
+<tr><td>Cache hierarchy</td><td>Invalidations reach different cores at different times</td></tr>
+<tr><td>Interconnect</td><td>Messages take different routes and arrive out of order</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Memory models, strong to weak</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Guarantee</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td><strong>Sequential consistency</strong></td><td>One global order consistent with each program's order</td><td>No real hardware — too slow. It is the model beginners assume.</td></tr>
+<tr><td><strong>TSO</strong> (total store order)</td><td>Only store&rarr;load may be reordered; the store buffer is the sole relaxation</td><td>x86-64, SPARC</td></tr>
+<tr><td><strong>Weak / relaxed</strong></td><td>Almost anything may be reordered unless you say otherwise</td><td><strong>ARM</strong>, RISC-V, PowerPC</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="danger">
+<b>Why this bites when porting from x86</b>
+<p>Lock-free code that ran correctly on x86 for years can fail on ARM. x86's TSO happens to forbid the
+reorderings naive code depends on; ARM's weak model does not. <em>The code was always wrong</em> — x86 merely
+hid it. It will not reproduce reliably either: it depends on timing, core count and load, so it surfaces in
+production rather than in test. This is the most common serious porting bug from x86 to ARM.</p>
+</div>
+
+<h2 id="barriers">Restoring order</h2>
+
+<p>Coherence keeps caches consistent, but it does not stop the processor or compiler reordering your accesses. That is a separate problem with a separate fix, and conflating the two is the source of a great deal of broken lock-free code.</p>
+
+<pre class="diagram">Fixed with barriers
+
+  /* Core 0 */                     /* Core 1 */
+  data = 42;                       while (flag == 0)
+  DMB ISHST;   &lt;- prior stores             ;
+  flag = 1;       visible before    DMB ISHLD;  &lt;- no later load may
+                  later stores                    float above this
+                                    use(data);
+
+Fixed with acquire / release - cheaper, and the modern idiom
+
+  /* Core 0 */                     /* Core 1 */
+  data = 42;                       while (LDAR(flag) == 0)   &lt;- acquire
+  STLR(flag, 1);   &lt;- release              ;
+                                   use(data);
+
+  STLR: no EARLIER access may be reordered after it
+  LDAR: no LATER   access may be reordered before it
+
+Together they form a RELEASE-ACQUIRE PAIR: everything core 0 did
+before the release is visible to core 1 after the acquire. This is
+the fundamental synchronisation building block, and every mutex,
+every channel and every lock-free queue is built out of it.</pre>
+
+<pre><code>/* portable C11 / C++11 - compiles to LDAR/STLR on ARM, and to plain
+   loads and stores on x86, where TSO already provides the ordering  */
+#include &lt;stdatomic.h&gt;
+
+_Atomic int flag = 0;
+int data = 0;
+
+/* producer */
+data = 42;
+atomic_store_explicit(&amp;flag, 1, memory_order_release);
+
+/* consumer */
+while (atomic_load_explicit(&amp;flag, memory_order_acquire) == 0)
+        ;
+use(data);                      /* guaranteed to see 42 */
+
+/* Linux kernel spellings of the same idea */
+smp_store_release(&amp;flag, 1);
+if (smp_load_acquire(&amp;flag)) use(data);
+smp_mb();  smp_rmb();  smp_wmb();      /* full / read / write barrier  */
+READ_ONCE(x);  WRITE_ONCE(x, v);       /* stop the COMPILER only       */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>memory_order</code></th><th>Guarantee</th><th>Cost on ARM</th></tr></thead>
+<tbody>
+<tr><td><code>relaxed</code></td><td>Atomicity only, no ordering</td><td>Free — a plain atomic op</td></tr>
+<tr><td><code>acquire</code></td><td>Later accesses cannot move before it</td><td><code>LDAR</code></td></tr>
+<tr><td><code>release</code></td><td>Earlier accesses cannot move after it</td><td><code>STLR</code></td></tr>
+<tr><td><code>acq_rel</code></td><td>Both, for read-modify-write</td><td><code>LDAXR</code>/<code>STLXR</code> or <code>CAS</code></td></tr>
+<tr><td><code>seq_cst</code></td><td>Plus a single global total order</td><td>Most expensive — and the default if you omit the argument</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="dma">Coherence with devices</h2>
+
+<p>Cores are kept coherent by hardware. Devices may not be — and whether they are is a property of the SoC,
+not something you may assume.</p>
+
+<pre class="diagram">Non-coherent DMA: the two failure modes
+
+  CPU writes a buffer, then starts a device READ
+    · the data is dirty in L1; DRAM still holds the old bytes
+    · the device reads DRAM -> gets garbage
+    -> software must CLEAN (flush) the cache first
+
+  Device WRITES a buffer, then the CPU reads it
+    · the CPU may still hold a stale clean copy in L1
+    · the CPU reads its cache -> gets old data
+    -> software must INVALIDATE the cache first
+
+  On ARM:  DC CVAC (clean), DC IVAC (invalidate), DC CIVAC (both)
+
+Coherent DMA: the device participates in the coherency protocol
+(ACE-Lite or CHI; marked `dma-coherent` in the device tree). No
+maintenance needed - but never assume it, check.</pre>
+
+<pre><code>/* Which is exactly why you NEVER hand a device a raw kmalloc pointer.
+   The DMA API knows whether this device is coherent and emits the
+   right maintenance - or correctly emits none.                      */
+
+dma_addr_t d = dma_map_single(dev, buf, len, DMA_TO_DEVICE);
+/* ... the device owns the buffer here; the CPU must not touch it ... */
+dma_unmap_single(dev, d, len, DMA_TO_DEVICE);
+
+/* peek mid-transfer, correctly */
+dma_sync_single_for_cpu(dev, d, len, DMA_FROM_DEVICE);
+inspect(buf);
+dma_sync_single_for_device(dev, d, len, DMA_FROM_DEVICE);</code></pre>
+
+<h2 id="measure">Measuring coherence traffic</h2>
+
+<p>Coherence traffic is invisible in source code and very visible in performance. These counters show you when cores are fighting over the same cache lines, which is usually the explanation for a parallel program that gets slower as you add threads.</p>
+
+<pre><code># find false sharing and cross-core line contention
+perf c2c record ./program
+perf c2c report --stdio
+#   reports HITM (hit-modified) events: a load that hit a line
+#   modified in ANOTHER core's cache - the fingerprint of sharing
+
+# ARM PMU events worth watching
+perf stat -e mem_access,l2d_cache_wb,bus_access_shared ./program
+
+# quick triage: if throughput DROPS as you add threads and the working
+# set is tiny, it is almost certainly false sharing</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Adding threads makes a parallel program slower</td><td>False sharing; pad to cache-line boundaries</td></tr>
+<tr><td>Lock-free code works on x86, fails on ARM</td><td>Missing barriers, previously hidden by TSO</td></tr>
+<tr><td>A bug appears only under load on many cores</td><td>The reordering window widened; the ordering was never guaranteed</td></tr>
+<tr><td>A flag is set but the data it guards is stale</td><td>Missing release/acquire pairing</td></tr>
+<tr><td>DMA reads zeros or old data</td><td>Cache not cleaned before the device read</td></tr>
+<tr><td>DMA results never become visible to the CPU</td><td>Cache not invalidated after the device write</td></tr>
+<tr><td>Adding a <code>printf</code> makes the bug vanish</td><td>Timing changed; the race is still there</td></tr>
+<tr><td><code>volatile</code> did not fix a multi-threaded bug</td><td><code>volatile</code> constrains the compiler, not the hardware. It is not a barrier and never was.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the difference between coherence and consistency in one sentence each.</li>
+  <li>Walk two cores through the MESI states for read, read, write, read.</li>
+  <li>Explain why the E state exists.</li>
+  <li>Construct a false-sharing example, fix it, and say how you would detect it.</li>
+  <li>Explain why the flag/data example can fail even with perfect coherence.</li>
+  <li>Give the release-acquire pairing and state exactly what it guarantees.</li>
+  <li>Say why lock-free code tested on x86 may fail on ARM.</li>
+  <li>Name the two cache-maintenance operations non-coherent DMA needs, and when each applies.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

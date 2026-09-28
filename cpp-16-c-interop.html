@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interoperating with C | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Interoperating with C</h1>
+<p class="lead">Every embedded C++ project sits on top of C: a vendor HAL, an RTOS, a driver, libc.
+Mixing them safely is a small set of rules about linkage, layout and lifetimes — and getting them wrong
+produces link errors at best and silent corruption at worst.</p>
+
+<h2 id="linkage">extern "C"</h2>
+
+<p>C++ encodes argument types into symbol names so that overloading can work, which means a C++ function is invisible to a C linker unless you say otherwise. That one declaration is the foundation of all interoperability.</p>
+
+<pre><code>/* C++ MANGLES function names to encode types, so overloads
+   get distinct symbols. C does not. `extern "C"` says "use C
+   linkage for this".                                       */
+
+        void foo(int);          /* C++: _Z3fooi */
+        extern "C" void foo(int);   /* C: foo */
+
+        nm prog.o
+          0000000000000000 T _Z3fooi
+          0000000000000000 T foo
+        c++filt _Z3fooi
+          foo(int)
+
+/* THE HEADER PATTERN, so one header works for both
+   languages: */
+
+        /* driver.h */
+        #ifndef DRIVER_H
+        #define DRIVER_H
+
+        #include &lt;stdint.h&gt;
+
+        #ifdef __cplusplus
+        extern "C" {
+        #endif
+
+        int  driver_init(uintptr_t base);
+        int  driver_read(uint8_t *buf, size_t n);
+        void driver_close(void);
+
+        #ifdef __cplusplus
+        }
+        #endif
+
+        #endif
+
+/* WHAT extern "C" DOES:
+     · disables name mangling
+     · uses the C calling convention (identical on AArch64,
+       but not on every platform)
+   WHAT IT DOES NOT DO:
+     · it does NOT change the language rules inside the
+       function - you may still use C++ features
+     · it does NOT allow OVERLOADING, because there is only
+       one symbol name available:                          */
+        extern "C" void f(int);
+        extern "C" void f(double);      /* ERROR */
+
+/* CALLING C++ FROM C: expose a C-linkage wrapper. */
+        /* wrapper.hpp */
+        class Driver { ... };
+
+        /* wrapper.cpp */
+        extern "C" void *driver_create(uintptr_t base)
+        {
+                return new (std::nothrow) Driver{base};
+        }
+        extern "C" int driver_read(void *h, uint8_t *b, size_t n)
+        {
+                return static_cast&lt;Driver *&gt;(h)-&gt;read(b, n);
+        }
+        extern "C" void driver_destroy(void *h)
+        {
+                delete static_cast&lt;Driver *&gt;(h);
+        }
+/* An OPAQUE HANDLE plus C-linkage functions is the standard
+   shape, and it is exactly what a C library with a struct
+   pointer looks like from the outside.                   */</code></pre>
+
+<h2 id="layout">Layout compatibility</h2>
+
+<p>For a struct to be shared between C and C++ it must have a layout both languages agree on. The rules for that are precise, and adding an innocent-looking member can silently break the agreement.</p>
+
+<pre><code>/* For C and C++ to agree on a struct, it must be STANDARD
+   LAYOUT: no virtual functions, no virtual bases, all
+   non-static data members with the same access control, no
+   base class with data members.                          */
+
+        struct Message {                /* shareable */
+                uint32_t id;
+                uint16_t length;
+                uint8_t  payload[64];
+        };
+        static_assert(std::is_standard_layout_v&lt;Message&gt;);
+        static_assert(std::is_trivially_copyable_v&lt;Message&gt;);
+        static_assert(sizeof(Message) == 72);
+        static_assert(offsetof(Message, payload) == 8);
+
+/* THOSE FOUR ASSERTIONS are what makes it safe to pass this
+   struct to C, memcpy it, or DMA it. Put them next to every
+   type that crosses the boundary.
+
+/* WHAT BREAKS LAYOUT COMPATIBILITY: */
+        struct Bad {
+                uint32_t id;
+                virtual void f();       /* adds a VPTR at
+                                           offset 0        */
+        };
+        struct Bad2 {
+        public:  uint32_t a;
+        private: uint32_t b;            /* mixed access -
+                                           order is
+                                           unspecified     */
+        };
+
+/* WHAT IS SAFE to add to a standard-layout struct:
+     · member FUNCTIONS (non-virtual) - they are not stored
+     · static members
+     · constructors and destructors - though adding them
+       makes it non-TRIVIAL, so it can no longer be memcpy'd
+       or DMA'd
+
+        struct Message {
+                uint32_t id;
+                uint16_t length;
+                uint8_t  payload[64];
+
+                /* these cost NOTHING and change no layout: */
+                std::span&lt;const uint8_t&gt; data() const
+                        { return {payload, length}; }
+                bool valid() const { return length &lt;= 64; }
+        };
+/* SAME BYTES, better interface. This is a genuinely
+   underused technique: take the C struct exactly as it is
+   and add methods.                                        */
+
+/* AND THE ENUM QUESTION: */
+        enum class Mode : uint8_t { Idle, Run };
+/* An enum class with an explicit underlying type has exactly
+   that representation, so it is safe in a shared struct - C
+   sees a uint8_t.                                        */</code></pre>
+
+<div class="key">
+<b>Standard layout versus trivially copyable</b>
+<p>Two different guarantees. <strong>Standard layout</strong> means C and C++ agree on where the members
+are, so the struct can cross the boundary. <strong>Trivially copyable</strong> means it can be
+<code>memcpy</code>'d, DMA'd or stored in a union — no user-provided copy, move or destructor. A struct with
+a constructor is standard layout but not trivially copyable, and DMA into it is undefined. Assert both
+where both matter.</p>
+</div>
+
+<h2 id="callbacks">Callbacks</h2>
+
+<p>Registering a C++ function as a callback with a C API is the most common interop task and the one with the most traps — chiefly that a non-static member function cannot be used directly.</p>
+
+<pre><code>/* C libraries take function pointers, usually with a `void
+   *context`. C++ has three ways to supply one.           */
+
+        typedef void (*event_cb)(void *ctx, int event);
+        void register_handler(event_cb cb, void *ctx);
+
+/* --- 1. A CAPTURELESS LAMBDA converts to a function
+       pointer --- */
+        register_handler([](void *ctx, int ev) {
+                static_cast&lt;Handler *&gt;(ctx)-&gt;on_event(ev);
+        }, &amp;my_handler);
+/* Clean, and the lambda has C++ linkage - which is
+   technically not the same as `extern "C"` and is accepted
+   by every real compiler. For strict correctness on unusual
+   platforms, use form 2.
+
+/* --- 2. A STATIC MEMBER, or a free extern "C" function --- */
+        class Handler {
+                void on_event(int ev);
+        public:
+                static void trampoline(void *ctx, int ev)
+                {
+                        static_cast&lt;Handler *&gt;(ctx)-&gt;on_event(ev);
+                }
+                void install() { register_handler(trampoline,
+                                                  this); }
+        };
+
+/* --- 3. A TEMPLATE TRAMPOLINE, generated per type --- */
+        template&lt;typename T, void (T::*M)(int)&gt;
+        void trampoline(void *ctx, int ev)
+        {
+                (static_cast&lt;T *&gt;(ctx)-&gt;*M)(ev);
+        }
+        register_handler(trampoline&lt;Handler,
+                                    &amp;Handler::on_event&gt;,
+                         &amp;h);
+/* Fully inlined, no runtime indirection beyond the C call
+   itself.
+
+/* --- THE THREE RULES for every C callback --- */
+
+/* (a) NO EXCEPTIONS MAY ESCAPE (chapter 12): */
+        extern "C" void cb(void *ctx, int ev) noexcept
+        {
+                try   { handler(ctx, ev); }
+                catch (...) { log("callback threw"); }
+        }
+
+/* (b) THE CONTEXT MUST OUTLIVE THE REGISTRATION. A callback
+       registered with `this` and never unregistered before
+       the object is destroyed is a dangling pointer waiting
+       for an event. Unregister in the destructor:        */
+        ~Handler() { unregister_handler(trampoline, this); }
+
+/* (c) A NON-CAPTURELESS LAMBDA CANNOT CONVERT. */
+        int x = 5;
+        register_handler([x](void*, int){ use(x); }, nullptr);
+        /* ERROR - it has state, so it is not a plain
+           function. Put the state in the context pointer,
+           which is what the context pointer is FOR.     */</code></pre>
+
+<h2 id="rtos">Wrapping an RTOS or HAL</h2>
+
+<p>Using C++ on top of an RTOS written in C brings specific concerns around task entry points, static initialisation and stack usage that do not arise in a hosted environment.</p>
+
+<pre><code>/* The most valuable thing C++ does to a C API: wrap it in
+   RAII once, and every user gets correct cleanup.        */
+
+/* --- a FreeRTOS mutex --- */
+class Mutex {
+        SemaphoreHandle_t h_;
+public:
+        Mutex() : h_(xSemaphoreCreateMutex()) {
+                configASSERT(h_ != nullptr);
+        }
+        ~Mutex() { vSemaphoreDelete(h_); }
+
+        Mutex(const Mutex&amp;) = delete;
+        Mutex&amp; operator=(const Mutex&amp;) = delete;
+
+        void lock()   { xSemaphoreTake(h_, portMAX_DELAY); }
+        void unlock() { xSemaphoreGive(h_); }
+        bool try_lock_for(TickType_t t)
+                { return xSemaphoreTake(h_, t) == pdTRUE; }
+};
+/* NOW std::lock_guard WORKS ON IT - the standard library's
+   locking types only require lock() and unlock():       */
+        Mutex m;
+        {
+                std::lock_guard lk{m};
+                shared++;
+        }
+        std::scoped_lock lk{m1, m2};    /* deadlock-free
+                                           ordering, free   */
+
+/* --- a task --- */
+class Task {
+        TaskHandle_t h_ = nullptr;
+
+        template&lt;typename F&gt;
+        static void entry(void *p)
+        {
+                (*static_cast&lt;F *&gt;(p))();
+                vTaskDelete(nullptr);
+        }
+public:
+        template&lt;typename F&gt;
+        Task(F&amp;&amp; f, const char *name, uint16_t stack,
+             UBaseType_t prio)
+        {
+                /* the functor must outlive the task - store
+                   it, or require a captureless lambda    */
+                xTaskCreate(entry&lt;std::decay_t&lt;F&gt;&gt;, name,
+                            stack, &amp;f, prio, &amp;h_);
+        }
+        ~Task() { if (h_) vTaskDelete(h_); }
+};
+
+/* --- a vendor HAL handle --- */
+class SpiBus {
+        SPI_HandleTypeDef h_{};
+public:
+        explicit SpiBus(SPI_TypeDef *inst)
+        {
+                h_.Instance = inst;
+                h_.Init = { ... };
+                if (HAL_SPI_Init(&amp;h_) != HAL_OK)
+                        panic("SPI init failed");
+        }
+        ~SpiBus() { HAL_SPI_DeInit(&amp;h_); }
+
+        SpiBus(const SpiBus&amp;) = delete;
+
+        [[nodiscard]] std::expected&lt;void, HAL_StatusTypeDef&gt;
+        transfer(std::span&lt;const uint8_t&gt; tx,
+                 std::span&lt;uint8_t&gt; rx)
+        {
+                auto st = HAL_SPI_TransmitReceive(&amp;h_,
+                        const_cast&lt;uint8_t *&gt;(tx.data()),
+                        rx.data(),
+                        static_cast&lt;uint16_t&gt;(tx.size()),
+                        HAL_MAX_DELAY);
+                if (st != HAL_OK) return std::unexpected(st);
+                return {};
+        }
+};
+
+/* THE PATTERN IN ONE SENTENCE: keep the C API exactly as it
+   is, and add a thin class that gives it a destructor, a
+   span-based interface, and an error type that cannot be
+   ignored. The generated code is the same; the failure
+   modes are gone.                                        */</code></pre>
+
+<h2 id="pitfalls">The pitfalls</h2>
+
+<p>Mixing the two languages fails in a small number of recognisable ways, several of which produce link errors that name a symbol you never wrote.</p>
+
+<pre><code>/* --- 1. C++ IS NOT A SUPERSET OF C. These differ: --- */
+        void *p = malloc(n);            /* C: fine.
+                                           C++: ERROR, needs a
+                                           cast              */
+        int f();                        /* C: unspecified
+                                           args. C++: no args */
+        char c[] = "x";  sizeof('a');   /* C: 4. C++: 1 */
+        enum E { A }; int x = A;        /* both fine, but
+                                           enum class differs */
+        struct S { };                   /* C: size may be 0.
+                                           C++: size 1      */
+        /* and C++ has more keywords: class, new, delete,
+           template, typename, this, operator, ...          */
+
+/* --- 2. INITIALISATION ORDER ACROSS THE BOUNDARY --- */
+/* A C++ static constructor may run before the C library it
+   depends on is initialised (chapter 01). Use constinit,
+   lazy initialisation, or explicit init functions.
+
+/* --- 3. `restrict` IS NOT IN C++ --- */
+        void f(int * restrict p);       /* C only */
+        void f(int * __restrict p);     /* the compiler
+                                           extension both
+                                           accept           */
+
+/* --- 4. VARIABLE-LENGTH ARRAYS ARE NOT IN C++ --- */
+        void f(int n) { int a[n]; }     /* C99; a GNU
+                                           extension in C++ */
+/* Use std::array with a fixed bound, or alloca, or a static
+   buffer.
+
+/* --- 5. COMPOUND LITERALS DIFFER --- */
+        f((struct S){1, 2});            /* C99. In C++ use a
+                                           temporary:      */
+        f(S{1, 2});
+
+/* --- 6. DESIGNATED INITIALISERS --- */
+        struct S s = { .b = 2, .a = 1 };  /* C: ANY order.
+                                             C++20: must
+                                             match
+                                             DECLARATION
+                                             order         */
+
+/* --- 7. const AT FILE SCOPE --- */
+        const int x = 1;        /* C: EXTERNAL linkage.
+                                   C++: INTERNAL linkage    */
+/* So a `const int` in a header is one object per translation
+   unit in C++ and a duplicate-definition error in C. Use
+   `inline constexpr` in C++17.
+
+/* --- 8. STRICTER TYPE RULES generally --- */
+        int *p = (void *)q;             /* needs a cast */
+        enum E e = 1;                   /* needs a cast */
+        char *s = "literal";            /* C++: ERROR, use
+                                           const char *     */
+/* Every one of these is C++ catching something C permitted,
+   which is why step 1 of a migration (chapter 15) is
+   valuable on its own.                                    */</code></pre>
+
+<h2 id="build">Building mixed projects</h2>
+
+<p>Getting a mixed-language project to build and link correctly is mostly a matter of which compiler drives the link and which runtime gets pulled in.</p>
+
+<pre><code># --- CMake ---
+    project(firmware C CXX ASM)
+
+    set(CMAKE_C_STANDARD 11)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+
+    add_executable(fw
+        main.cpp driver.cpp        # C++
+        vendor_hal.c startup.c     # C
+        vectors.S)                 # assembly
+
+    target_compile_options(fw PRIVATE
+        $&lt;$&lt;COMPILE_LANGUAGE:CXX&gt;:-fno-exceptions -fno-rtti&gt;
+        $&lt;$&lt;COMPILE_LANGUAGE:C&gt;:-std=c11&gt;
+        -Wall -Wextra -Os)
+
+# --- THE LINKER MUST BE THE C++ ONE ---
+#   g++, not gcc - it links libstdc++ and, crucially, the
+#   static-constructor machinery. Linking with gcc gives
+#   undefined references to __cxa_* and silently skips
+#   .init_array.
+#   CMake does this automatically when any source is C++.
+
+# --- CHECK WHAT LANGUAGE A SYMBOL HAS ---
+    nm -C prog.o | grep myfunc
+    #   `myfunc`           C linkage
+    #   `myfunc(int)`      C++ linkage (demangled)
+
+# --- AND THE COMMONEST LINK ERROR ---
+#   "undefined reference to `driver_init'"
+#   where driver_init is defined in a .c file
+#   -&gt; the C++ caller saw a declaration WITHOUT extern "C",
+#      so it looked for the mangled name. Add the
+#      #ifdef __cplusplus guard to the header.
+#
+#   THE REVERSE: a C file calling a C++ function that was not
+#   declared extern "C" - same error, same cause.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"undefined reference" to a function that clearly exists</td><td>Missing <code>extern "C"</code> — check with <code>nm -C</code></td></tr>
+<tr><td>Link error only when the caller is C++</td><td>Same, in the header</td></tr>
+<tr><td>Undefined <code>__cxa_*</code> symbols</td><td>Linked with <code>gcc</code> instead of <code>g++</code></td></tr>
+<tr><td>Static constructors never run</td><td>Same, or <code>.init_array</code> not walked in startup code</td></tr>
+<tr><td>Struct fields wrong across the boundary</td><td>Not standard layout — assert it</td></tr>
+<tr><td>DMA into a struct corrupts it</td><td>Not trivially copyable — it has a constructor</td></tr>
+<tr><td>Terminate inside a C library</td><td>An exception escaped a callback</td></tr>
+<tr><td>Crash in a callback after an object was destroyed</td><td>Not unregistered in the destructor</td></tr>
+<tr><td>A capturing lambda will not convert to a function pointer</td><td>By design — use the context pointer</td></tr>
+<tr><td>Duplicate symbol for a <code>const</code> in a header</td><td>Different linkage rules — use <code>inline constexpr</code></td></tr>
+<tr><td>C code compiles, the same code as C++ does not</td><td>Stricter rules — each one is finding something</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>extern "C"</code> does and does not do.</li>
+  <li>Write a header usable from both languages.</li>
+  <li>Expose a C++ class through an opaque-handle C API.</li>
+  <li>Distinguish standard layout from trivially copyable and say when each matters.</li>
+  <li>Add methods to a C struct without changing its layout.</li>
+  <li>Give three ways to supply a C callback from C++, and the three rules for all of them.</li>
+  <li>Wrap an RTOS mutex so <code>std::lock_guard</code> works with it.</li>
+  <li>Name eight ways C++ differs from C in existing code.</li>
+  <li>Explain why the linker must be <code>g++</code>.</li>
+  <li>Diagnose an <code>extern "C"</code> link error using <code>nm</code>.</li>
+</ul>
+
+<div class="tip">
+<b>End of the C++ track</b>
+<p>Sixteen chapters: what C++ buys, what it costs, how to verify both, and a subset you can defend in
+review. Next: <a href="track.html?t=rs">Rust</a>, which takes the same goal — zero-cost abstraction over
+hardware — and reaches it by making the compiler prove memory safety rather than trusting discipline.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access control: XPU concepts | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Access control: XPU concepts</h1>
+<p class="lead">The MMU protects a CPU from itself. The SMMU protects memory from devices that have one.
+XPUs are the last layer: a firewall in the interconnect that decides, per transaction, whether
+<em>this master</em> may touch <em>this address</em> — and it is the one nobody teaches.</p>
+
+<h2 id="gap">The gap XPUs fill</h2>
+
+<p>The SMMU protects memory from devices and TrustZone splits the system in two. Neither stops one non-secure master from reaching a peripheral it has no business touching — which is the gap this last mechanism fills.</p>
+
+<pre class="diagram">Three protection mechanisms, three different questions:
+
+  MMU     "may this VIRTUAL ADDRESS be accessed by the code
+           currently running, at its privilege level?"
+          Per-CPU. Translates AND checks.
+
+  SMMU    "may this DEVICE's virtual/IO address be translated,
+           and to what?"
+          Per-StreamID. Translates AND checks.
+          Requires the device to be behind an SMMU.
+
+  XPU     "may THIS MASTER touch THIS PHYSICAL ADDRESS, in
+           THIS security state, for READ or WRITE?"
+          No translation at all. Pure permission check,
+          on physical addresses, in the interconnect.
+
+  WHY THE THIRD ONE IS NECESSARY:
+
+  1. Not every master is behind an SMMU. Small DMA engines,
+     sensor hubs, audio DSPs, power-management microcontrollers,
+     debug blocks, display pipelines - many are wired straight
+     to the interconnect.
+
+  2. The SMMU protects DRAM well. It does nothing about
+     PERIPHERAL registers. Which master may write the clock
+     controller? The fuse controller? Another CPU's mailbox?
+
+  3. TZASC and TZPC (chapter 10) are two-valued: secure or
+     non-secure. Real SoCs have more than two principals - a
+     modem, an application processor, a video DSP, a sensor
+     hub, all mutually distrusting and all NON-SECURE.
+
+  4. Some masters must be constrained BEFORE the SMMU is
+     configured - during boot, when a firmware core is running
+     and Linux is not.</pre>
+
+<div class="key">
+<b>The name</b>
+<p>"XPU" is a family, not a standard. Qualcomm calls them XPUs (with variants MPU, PPU, VMIDMT). NXP i.MX
+has the RDC (Resource Domain Controller), the CSU, and TrustZone-aware AIPSTZ. TI has firewalls. Renesas
+has the Access Window. Xilinx/AMD has XMPU and XPPU. Arm's own is the TZC family. The <em>mechanism</em> is
+the same everywhere; only the register names and the marketing differ, so learn the model rather than one
+vendor's manual.</p>
+</div>
+
+<h2 id="model">The model</h2>
+
+<p>Access control units check transactions at the target rather than at the source, asking whether this particular master may reach this particular resource. That placement is what makes them independent of anything the master itself does.</p>
+
+<pre class="diagram">   MASTER                            SLAVE
+   ------                            -----
+   CPU cluster    ---+
+   GPU            ---+
+   display        ---+          +--&gt; DRAM
+   video codec    ---+---&gt; XPU -+--&gt; SRAM
+   modem DSP      ---+          +--&gt; peripheral registers
+   audio DSP      ---+          +--&gt; fuses, crypto, PMU
+   sensor hub     ---+
+   DMA engine     ---+
+
+  Each transaction on the bus carries:
+
+     ADDRESS        where
+     MASTER ID      who   (AxID / AxUSER / a dedicated sideband)
+     NS             which world (AxPROT[1])
+     PRIVILEGED     AxPROT[0]
+     READ / WRITE   direction
+     sometimes: a VMID, so one master can be split by which
+                virtual machine issued the access
+
+  The XPU holds a table of REGIONS:
+
+     +-------------------------------------------------------+
+     | region 3                                              |
+     |   base   0x8000_0000   size 64 MB                     |
+     |   masters allowed: CPU(rw) GPU(r--) DISPLAY(r--)       |
+     |   security: non-secure only                           |
+     |   locked: yes                                         |
+     +-------------------------------------------------------+
+
+  Transaction arrives -&gt; find the matching region -&gt; look up
+  this master's permission -&gt; ALLOW or DENY.
+
+  And critically: what happens when NOTHING matches. That is
+  the DEFAULT, and it should be DENY.</pre>
+
+<h2 id="place">Where they sit</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Placement</th><th>Protects</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>At the master</strong> (a "master-side" or ingress firewall)</td><td>Constrains one specific device wherever it goes</td><td>One instance per master; a master with several ports needs several</td></tr>
+<tr><td><strong>At the slave</strong> (memory controller, peripheral bridge)</td><td>Everything reaching that slave, from every master</td><td>Fewer instances; but the master ID must survive the whole path to get there</td></tr>
+<tr><td><strong>In the interconnect fabric</strong></td><td>Whole subsystems from one another</td><td>Coarse granularity, but catches paths you did not think of</td></tr>
+<tr><td><strong>Inside a peripheral</strong> (per-register or per-channel)</td><td>Fine-grained sharing of one device</td><td>Only where the vendor implemented it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The master ID is only as trustworthy as the wiring</b>
+<p>An XPU's entire decision rests on the master ID arriving intact and unforgeable. Real integration
+problems: IDs remapped by a bridge so the XPU sees the bridge's ID and not the originator's; several
+masters sharing one ID because the sideband was too narrow; an ID that a master can <em>program</em>. Any of
+these collapses the policy to "some device did this", which is not a policy. It is exactly the StreamID
+integrity question from <a href="sec-03-smmu-streamid.html">chapter 03</a>, and it has the same answer:
+verify it empirically, per SoC.</p>
+</div>
+
+<h2 id="granularity">Granularity and its limits</h2>
+
+<p>How finely a policy can be expressed — per register, per region, per master, per group — is fixed by the hardware and varies enormously between SoCs. It constrains what policies are expressible at all.</p>
+
+<pre><code>/* Every XPU has hard limits, and they shape your design more
+   than any principle does.                                  */
+
+   NUMBER OF REGIONS      typically 8, 16, or 32. Rarely more.
+   MINIMUM REGION SIZE    4 KB, 64 KB, or 1 MB depending on
+                          the block. Sometimes power-of-two
+                          and naturally aligned, sometimes an
+                          arbitrary base/limit pair.
+   NUMBER OF MASTERS      a bitmap of 8-32 entries, or a list
+                          of ID + mask pairs.
+   PERMISSION GRANULARITY read/write, sometimes execute,
+                          sometimes secure/non-secure
+                          independently.
+
+/* CONSEQUENCES you will hit:
+
+   · you cannot give every master a private region - there are
+     not enough regions. You will group masters into DOMAINS.
+
+   · buffers must be laid out to MATCH the alignment the XPU
+     can express. A 1 MB minimum region means a 4 KB secure
+     buffer wastes 1 MB, or worse, cannot be isolated at all
+     without moving everything around it.
+
+   · this is a MEMORY MAP DESIGN constraint, decided very early
+     in a project. Retrofitting it after the address map is
+     frozen is painful and is usually done by giving up on
+     some isolation.
+
+   · ID masking lets one entry cover a group:
+          match: id & 0xF0 == 0x20
+     which is efficient, and also means an accidental grouping
+     if the masks are chosen carelessly.                    */</code></pre>
+
+<h2 id="denial">What happens on a denial</h2>
+
+<p>Blocking an access is not the end of the decision: what the hardware does next — abort, return zero, or stall — has consequences for whether a fault is diagnosable or merely mysterious.</p>
+
+<pre class="diagram">Three possible behaviours, and which one you get changes how
+hard debugging is by an order of magnitude:
+
+  1. ERROR RESPONSE
+        the bus returns SLVERR or DECERR.
+        the master sees an abort. For a CPU that is a
+        synchronous or asynchronous external abort
+        (ARM ch. 29). For a DMA engine, a channel error.
+        BEST: something visibly fails, close to the cause.
+
+  2. RAZ/WI - read as zero, write ignored
+        the transaction "succeeds" and does nothing.
+        WORST: no error anywhere. A driver reads 0x00000000
+        from its ID register and reports "device not present".
+        Days are lost to this (chapter 20).
+
+  3. INTERRUPT + LOG, transaction dropped or errored
+        the XPU records address, master ID, security state and
+        direction in fault registers and raises an interrupt to
+        a monitor.
+        BEST FOR DEBUGGING, if someone wired the interrupt up
+        and someone else wrote the handler.
+
+  ALWAYS configure error responses and the fault interrupt in
+  development builds, even if production chooses to be quiet.
+  A silent policy is an untestable policy.</pre>
+
+<h2 id="vsmmu">XPU versus SMMU: choosing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>SMMU</th><th>XPU</th></tr></thead>
+<tbody>
+<tr><td>Translates addresses</td><td>Yes — scatter-gather, virtual DMA</td><td>No</td></tr>
+<tr><td>Per-context (per-process, per-VM)</td><td>Yes — thousands of contexts</td><td>No — a handful of static regions</td></tr>
+<tr><td>Dynamic remapping</td><td>Yes, per DMA mapping</td><td>Rarely, and expensively</td></tr>
+<tr><td>Protects peripheral registers</td><td>Not usually</td><td>Yes</td></tr>
+<tr><td>Works before the OS boots</td><td>Needs setup and tables</td><td>Yes — a few register writes</td></tr>
+<tr><td>Cost in silicon</td><td>Large: TLBs, page walkers, queues</td><td>Small: comparators</td></tr>
+<tr><td>Latency</td><td>TLB hit is fast; a walk is not</td><td>Fixed, small</td></tr>
+<tr><td>Fault reporting</td><td>Rich — event queue with full context</td><td>Basic — often one fault register</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>They are complements, not alternatives. A well-built SoC uses the SMMU for masters that need scatter-gather
+DMA into user or guest memory, and XPUs for the static, coarse questions: which subsystem owns which DRAM
+carve-out, and who may write the clock and fuse controllers. Where both cover a path, <strong>both</strong>
+must allow the transaction — and that intersection is itself a defence, since a mistake in one is caught by
+the other.</p>
+
+<h2 id="domains">Domains: the usable abstraction</h2>
+
+<p>Masters are usually grouped into domains rather than listed individually, because a policy with one entry per master does not scale and does not survive a chip revision.</p>
+
+<pre><code>/* With 16 regions and 20 masters you cannot enumerate pairs.
+   So group masters into DOMAINS and write the policy in terms
+   of domains.                                               */
+
+   DOMAIN_SECURE     EL3 firmware, the trusted OS, the crypto
+                     engine when claimed
+   DOMAIN_AP         the application processor and everything
+                     Linux drives directly
+   DOMAIN_MODEM      the cellular subsystem: its DSP, its own
+                     DMA, its dedicated peripherals
+   DOMAIN_MEDIA      GPU, display, video codec, camera
+   DOMAIN_SENSOR     the always-on sensor hub
+   DOMAIN_DEBUG      CoreSight, the debug access port
+
+/* Then the policy is a MATRIX - domains against resources: */
+
+                  secure  AP     modem  media  sensor
+   secure DRAM      rw     -      -      -      -
+   AP DRAM          rw     rw     -      r      -
+   modem DRAM       rw     -      rw     -      -
+   shared AP/modem  rw     rw     rw     -      -
+   framebuffer      rw     rw     -      rw     -
+   fuses            r      -      -      -      -
+   clock controller rw     rw     -      -      -
+   sensor SRAM      rw     r      -      -      rw
+
+/* This matrix IS the security architecture of the SoC. It
+   belongs in a design document, reviewed by people who did not
+   write it, and it should be MECHANICALLY DERIVED into the
+   register settings rather than hand-written twice
+   (chapter 19).
+
+   Note what the matrix makes obvious that prose does not: the
+   modem cannot see the framebuffer; the sensor hub cannot see
+   AP memory; nothing but secure code reads the fuses. Those
+   are decisions. Write them down and they can be argued with. */</code></pre>
+
+<h2 id="why">Why this matters beyond security</h2>
+
+<div class="note">
+<b>The best argument for XPUs is not security — it is debugging</b>
+<p>A rogue DMA write into another subsystem's memory produces a crash <em>somewhere else, much later</em>,
+in code that is entirely innocent. It is the hardest class of bug on an SoC: no stack trace points at the
+culprit, and the symptom moves whenever anything is recompiled.</p>
+<p>An XPU converts that into an immediate fault at the moment of the bad access, with the offending master's
+ID in a register. That turns a two-week bug into a two-hour one, and it is why teams that adopt XPU policies
+for security keep them enabled for reasons that have nothing to do with attackers.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Driver reads all-zero registers, reports "no device"</td><td>XPU denying with RAZ/WI</td></tr>
+<tr><td>External abort on an MMIO access that used to work</td><td>Firmware tightened the policy; this master is no longer allowed</td></tr>
+<tr><td>DMA completes but the buffer is unchanged</td><td>Writes ignored by the XPU</td></tr>
+<tr><td>Works when firmware is old, fails with new firmware</td><td>Policy changed — the two must be versioned together</td></tr>
+<tr><td>One master works, an identical one does not</td><td>Different master IDs; the policy covers only one</td></tr>
+<tr><td>Fails only for large transfers</td><td>The buffer crosses a region boundary</td></tr>
+<tr><td>Fails only sometimes</td><td>Buffer address varies; a boundary is crossed only for some allocations</td></tr>
+<tr><td>Everything is allowed</td><td>Default region permissive, or the XPU never enabled</td></tr>
+<tr><td>A subsystem can reach memory it should not</td><td>Master ID remapped by a bridge, or shared with another master</td></tr>
+<tr><td>Random corruption with no attribution</td><td>The exact bug an XPU exists to catch — turn one on</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the different question each of the MMU, SMMU and XPU answers.</li>
+  <li>Give four reasons an SoC needs XPUs even though it has an SMMU.</li>
+  <li>List the fields of a bus transaction an XPU decides on.</li>
+  <li>Explain why the master ID's integrity is the foundation of the whole mechanism.</li>
+  <li>Describe how region count and alignment constrain the memory map.</li>
+  <li>Name the three denial behaviours and rank them for debuggability.</li>
+  <li>Say when to use an SMMU, when an XPU, and why overlap is good.</li>
+  <li>Draw a domain-versus-resource matrix for a device you know.</li>
+  <li>Explain the debugging argument for enabling XPUs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

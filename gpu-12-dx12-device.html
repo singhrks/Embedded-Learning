@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DX12: adapters, devices and the debug layer | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DX12: adapters, devices and the debug layer</h1>
+<p class="lead">Everything starts with picking a GPU and creating a device. It is thirty lines, and every
+one of them is a decision that will bite you later if you copy it from a tutorial without reading it —
+starting with which adapter you got and whether validation is on.</p>
+
+<h2 id="objects">The object graph</h2>
+
+<pre class="diagram">   IDXGIFactory                 enumerates adapters, creates
+        |                       swap chains
+        +-- IDXGIAdapter        one GPU (or the software one)
+             |
+             +-- ID3D12Device   THE ROOT. Everything is created
+                  |             from it. Not tied to a window.
+                  |
+                  +-- ID3D12CommandQueue      where work is
+                  |    |                      submitted
+                  |    +-- IDXGISwapChain     presentation
+                  |
+                  +-- ID3D12CommandAllocator  backing memory
+                  |    +-- ID3D12GraphicsCommandList
+                  |
+                  +-- ID3D12DescriptorHeap    (chapter 14)
+                  +-- ID3D12Resource          buffers, textures
+                  +-- ID3D12RootSignature     (chapter 15)
+                  +-- ID3D12PipelineState     (chapter 15)
+                  +-- ID3D12Fence             (chapter 16)
+
+   NOTE what the device is NOT: it has no state. There is no
+   "current shader" or "current texture" on it. All state
+   lives in a command list, and is reset every time you reset
+   the list. That statelessness is what makes multi-threaded
+   recording possible.</pre>
+
+<h2 id="adapter">Choosing an adapter</h2>
+
+<pre><code>#include &lt;d3d12.h&gt;
+#include &lt;dxgi1_6.h&gt;
+#include &lt;wrl/client.h&gt;
+using Microsoft::WRL::ComPtr;
+
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+
+static void ThrowIfFailed(HRESULT hr, const char *what)
+{
+    if (FAILED(hr))
+        throw std::runtime_error(std::string(what) + " failed: 0x"
+                                 + std::to_string((unsigned)hr));
+}
+
+ComPtr&lt;IDXGIAdapter1&gt; PickAdapter(IDXGIFactory6 *factory)
+{
+    ComPtr&lt;IDXGIAdapter1&gt; adapter;
+
+    /* EnumAdapterByGpuPreference sorts for you. Without it you
+       get adapter 0, which on a laptop is very often the
+       INTEGRATED GPU - and then you spend an afternoon
+       wondering why performance is a third of expected. */
+    for (UINT i = 0;
+         factory-&gt;EnumAdapterByGpuPreference(
+             i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+             IID_PPV_ARGS(&amp;adapter)) != DXGI_ERROR_NOT_FOUND;
+         i++)
+    {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter-&gt;GetDesc1(&amp;desc);
+
+        if (desc.Flags &amp; DXGI_ADAPTER_FLAG_SOFTWARE)
+            continue;              /* WARP - useful, but not
+                                      what you want by default */
+
+        /* Probe WITHOUT creating: pass nullptr for the device
+           and it just tells you whether it would succeed. */
+        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(),
+                                        D3D_FEATURE_LEVEL_12_0,
+                                        _uuidof(ID3D12Device),
+                                        nullptr)))
+        {
+            wprintf(L"using %s (%zu MB)\n", desc.Description,
+                    desc.DedicatedVideoMemory / (1024 * 1024));
+            return adapter;
+        }
+    }
+    throw std::runtime_error("no D3D12-capable adapter");
+}</code></pre>
+
+<div class="key">
+<b>Feature levels are not the whole story</b>
+<p><code>D3D_FEATURE_LEVEL_12_0</code> is a coarse baseline. The things you actually care about — resource
+binding tier, shader model, raytracing, mesh shaders, wave intrinsics — are queried separately with
+<code>CheckFeatureSupport</code>. A device can report feature level 12_1 and still not support the shader
+model your HLSL was compiled for, which fails at PSO creation with a message that does not mention shader
+models.</p>
+</div>
+
+<pre><code>/* The capabilities worth checking at startup, before you
+   depend on them. */
+
+D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+device-&gt;CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
+                            &amp;opts, sizeof opts);
+/* opts.ResourceBindingTier decides how many descriptors you
+   may use per table - Tier 1 is genuinely restrictive, Tier 3
+   is effectively unlimited (chapter 14). */
+
+D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_6 };
+if (FAILED(device-&gt;CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,
+                                       &amp;sm, sizeof sm)))
+        sm.HighestShaderModel = D3D_SHADER_MODEL_5_1;
+/* NOTE the in/out convention: you pass the HIGHEST you want,
+   and it writes back the highest supported. */
+
+D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+device-&gt;CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,
+                            &amp;o5, sizeof o5);
+bool raytracing = o5.RaytracingTier &gt;=
+                  D3D12_RAYTRACING_TIER_1_0;
+
+D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
+device-&gt;CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7,
+                            &amp;o7, sizeof o7);
+bool meshShaders = o7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+
+/* Descriptor sizes are DEVICE-DEPENDENT and must be queried.
+   Hardcoding 32 works on your machine and corrupts on
+   someone else's (chapter 14). */
+UINT rtvSize = device-&gt;GetDescriptorHandleIncrementSize(
+                   D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+UINT cbvSize = device-&gt;GetDescriptorHandleIncrementSize(
+                   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);</code></pre>
+
+<h2 id="debug">The debug layer, properly configured</h2>
+
+<pre><code>/* MUST be enabled BEFORE the device is created. Enabling it
+   afterwards silently does nothing, which is a common and
+   frustrating waste of an afternoon. */
+
+void EnableDebugLayer()
+{
+#if defined(_DEBUG)
+    ComPtr&lt;ID3D12Debug1&gt; debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&amp;debug))))
+    {
+        debug-&gt;EnableDebugLayer();
+
+        /* GPU-based validation instruments your SHADERS to
+           check descriptor and resource-state correctness at
+           execution time. It is 10-100x slower and it finds
+           an entire class of bug the CPU-side layer cannot -
+           notably reading a descriptor that was never
+           written. Run it periodically, not always. */
+        debug-&gt;SetEnableGPUBasedValidation(TRUE);
+    }
+#endif
+}
+
+/* After device creation: break in the debugger AT the error,
+   rather than discovering it later. */
+void ConfigureInfoQueue(ID3D12Device *device)
+{
+#if defined(_DEBUG)
+    ComPtr&lt;ID3D12InfoQueue&gt; iq;
+    if (FAILED(device-&gt;QueryInterface(IID_PPV_ARGS(&amp;iq))))
+        return;
+
+    iq-&gt;SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+    iq-&gt;SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR,      TRUE);
+    iq-&gt;SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING,    TRUE);
+
+    /* Silence the handful of warnings that are genuinely
+       noise, and NOTHING ELSE. Every suppression you add is a
+       bug you have chosen not to see. */
+    D3D12_MESSAGE_ID deny[] = {
+        D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
+        D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE,
+    };
+    D3D12_INFO_QUEUE_FILTER filter = {};
+    filter.DenyList.NumIDs  = _countof(deny);
+    filter.DenyList.pIDList = deny;
+    iq-&gt;PushStorageFilter(&amp;filter);
+#endif
+}</code></pre>
+
+<div class="warn">
+<b>Device removal, and how to find out why</b>
+<p><code>DXGI_ERROR_DEVICE_REMOVED</code> is DX12's segfault: the GPU hit something it could not recover from
+— a page fault, a timeout, a bad command. By itself it tells you nothing. <strong>Enable
+<code>ID3D12DeviceRemovedExtendedData</code> (DRED) before device creation</strong> and you get the last
+executed command and the auto-breadcrumbs leading to it. Without DRED you are guessing; with it you usually
+know within a minute.</p>
+</div>
+
+<pre><code>/* DRED - set this up at startup, always, including in
+   release builds. It costs almost nothing and it is the
+   difference between a diagnosable crash and a mystery. */
+
+ComPtr&lt;ID3D12DeviceRemovedExtendedDataSettings&gt; dred;
+if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&amp;dred)))) {
+    dred-&gt;SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred-&gt;SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+}
+
+/* Then, when Present or a fence wait returns DEVICE_REMOVED: */
+void ReportDeviceRemoval(ID3D12Device *device)
+{
+    HRESULT reason = device-&gt;GetDeviceRemovedReason();
+    /* DXGI_ERROR_DEVICE_HUNG    - your commands hung the GPU
+       DXGI_ERROR_DEVICE_RESET   - TDR: took longer than ~2 s
+       DXGI_ERROR_DRIVER_INTERNAL_ERROR - driver bug, or yours
+       DXGI_ERROR_INVALID_CALL   - you did something illegal */
+
+    ComPtr&lt;ID3D12DeviceRemovedExtendedData&gt; data;
+    if (FAILED(device-&gt;QueryInterface(IID_PPV_ARGS(&amp;data))))
+        return;
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs = {};
+    if (SUCCEEDED(data-&gt;GetAutoBreadcrumbsOutput(&amp;crumbs)))
+        for (auto *n = crumbs.pHeadAutoBreadcrumbNode; n;
+             n = n-&gt;pNext)
+            wprintf(L"cmdlist %s: %u of %u ops completed\n",
+                    n-&gt;pCommandListDebugNameW,
+                    *n-&gt;pLastBreadcrumbValue,
+                    n-&gt;BreadcrumbCount);
+            /* The op AFTER the last completed one is the one
+               that killed you. */
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    if (SUCCEEDED(data-&gt;GetPageFaultAllocationOutput(&amp;pf)))
+        wprintf(L"page fault at GPU VA 0x%llx\n",
+                pf.PageFaultVA);
+        /* and the existing/freed allocation lists tell you
+           WHICH resource - usually one you freed too early */
+}</code></pre>
+
+<h2 id="names">Name everything</h2>
+
+<pre><code>/* Every D3D12 object takes a debug name. Without them, PIX,
+   RenderDoc, the debug layer and DRED all report
+   "ID3D12Resource" and you have no idea which one. */
+
+resource-&gt;SetName(L"GBuffer.Albedo");
+pso-&gt;SetName(L"PSO.OpaqueLit");
+cmdList-&gt;SetName(L"CmdList.Shadow.Thread2");
+
+/* A macro so it is never skipped: */
+#if defined(_DEBUG)
+  #define NAME_OBJ(obj) (obj)-&gt;SetName(L#obj)
+#else
+  #define NAME_OBJ(obj) ((void)0)
+#endif
+
+/* And mark up your command lists so a capture is readable: */
+PIXBeginEvent(cmdList, PIX_COLOR(0,255,0), "Shadow Pass");
+    /* ... draws ... */
+PIXEndEvent(cmdList);
+
+/* This takes ten minutes to add and saves hours on every
+   single debugging session afterwards. Do it on day one, not
+   when you first need it.                                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Performance a third of expected on a laptop</td><td>Got the integrated GPU — use
+<code>EnumAdapterByGpuPreference</code></td></tr>
+<tr><td>Debug layer produces no output</td><td>Enabled after device creation</td></tr>
+<tr><td>PSO creation fails with an unhelpful message</td><td>Shader model higher than the device
+supports</td></tr>
+<tr><td>Corruption on another machine only</td><td>Hardcoded descriptor increment size</td></tr>
+<tr><td><code>DEVICE_REMOVED</code> with no information</td><td>DRED not enabled</td></tr>
+<tr><td><code>DEVICE_RESET</code> after a heavy frame</td><td>TDR — a single submission took over ~2
+seconds</td></tr>
+<tr><td>Page fault at a GPU address</td><td>A resource freed while still referenced by in-flight
+work</td></tr>
+<tr><td>Everything is named <code>ID3D12Resource</code> in PIX</td><td>No <code>SetName</code>
+calls</td></tr>
+<tr><td>Runs in debug, corrupts in release</td><td>GPU-based validation was masking a descriptor
+error</td></tr>
+<tr><td>Feature works on your GPU, missing on another</td><td>Capability assumed rather than
+queried</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the DX12 object graph from the factory down to a pipeline state.</li>
+  <li>Explain why the device has no state, and what that enables.</li>
+  <li>Say why adapter 0 is often the wrong choice and how to avoid it.</li>
+  <li>Explain what a feature level does and does not tell you.</li>
+  <li>Name four capabilities you must query separately.</li>
+  <li>Say why descriptor increment sizes must be queried.</li>
+  <li>Explain when the debug layer must be enabled and what happens otherwise.</li>
+  <li>Say what GPU-based validation adds and what it costs.</li>
+  <li>Explain what DRED gives you after a device removal.</li>
+  <li>Give four causes of <code>DEVICE_REMOVED</code> and how to distinguish them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

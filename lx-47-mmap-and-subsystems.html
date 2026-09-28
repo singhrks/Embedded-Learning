@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exposing a driver properly: mmap and subsystem registration | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Exposing a driver properly: mmap and subsystem registration</h1>
+<p class="lead">Two things this track has told you to do without ever showing you how.
+<a href="lx-21-ioctl.html">Chapter 23</a> argued that you should use an existing subsystem instead of
+inventing an interface — this chapter registers with one. And <a href="lx-20-char-devices.html">chapter 22</a>
+covered every file operation except the one that matters most for moving real data:
+<code>mmap</code>.</p>
+
+<h2 id="whymmap">Part 1 — mmap: letting userspace touch the buffer directly</h2>
+
+<p>Everything so far has moved data by copying it between the kernel and user space. For small transfers that is exactly right; for large ones the copying becomes the dominant cost, and there is a way to avoid it entirely.</p>
+
+<pre class="diagram">   WITH read()/write(), EVERY BYTE IS COPIED:
+
+     device buffer (kernel)  --copy_to_user-->  user buffer
+                                   ^
+                          one full copy of the data,
+                          every single transfer
+
+   For a temperature sensor sending 2 bytes a second, that
+   copy costs nothing and read() is the right answer.
+
+   For a camera sending 60 frames a second at 8 MB a frame -
+   480 MB/s - that copy is roughly half your memory bandwidth
+   spent achieving nothing.
+
+   WITH mmap(), THERE IS NO COPY AT ALL:
+
+     the SAME physical pages appear in the process's address
+     space. Userspace reads the buffer the device DMA'd into,
+     directly.
+
+     user virtual address ----+
+                              |  page tables point at
+     kernel virtual address --+--> THE SAME PHYSICAL PAGES
+                              |
+     device DMA writes here --+
+
+   THIS IS WHY EVERY HIGH-BANDWIDTH SUBSYSTEM USES IT: V4L2
+   for video, ALSA for audio, DRM for graphics. They all
+   expose buffers by mmap and pass around buffer INDICES,
+   never the data itself.</pre>
+
+<pre><code>/* THE TWO CASES, and using the wrong one is the classic bug. */
+
+/* CASE 1: mapping a DMA buffer (the common one).
+   dma_alloc_coherent gave you memory; dma_mmap_coherent maps
+   THAT SAME memory to userspace, and it knows about the
+   architecture's cache and attribute requirements - which
+   you would otherwise have to get right by hand.          */
+
+static int my_mmap(struct file *file, struct vm_area_struct *vma)
+{
+        struct my_dev *d = file-&gt;private_data;
+        size_t size = vma-&gt;vm_end - vma-&gt;vm_start;
+
+        /* VALIDATE. vm_pgoff and the length come straight from
+           userspace and are entirely under its control - this
+           check is the whole security boundary of mmap.     */
+        if (size &gt; d-&gt;dma_size)
+                return -EINVAL;
+        if (vma-&gt;vm_pgoff != 0)          /* we only offer the
+                                            one buffer, at 0  */
+                return -EINVAL;
+
+        return dma_mmap_coherent(d-&gt;dev, vma,
+                                 d-&gt;dma_virt,   /* kernel addr */
+                                 d-&gt;dma_handle, /* dma addr    */
+                                 size);
+}
+
+/* CASE 2: mapping device REGISTERS or a physical region.
+   remap_pfn_range installs page-table entries pointing at a
+   physical page frame number directly.                     */
+
+static int my_mmio_mmap(struct file *file,
+                        struct vm_area_struct *vma)
+{
+        struct my_dev *d = file-&gt;private_data;
+        size_t size = vma-&gt;vm_end - vma-&gt;vm_start;
+
+        if (size &gt; d-&gt;reg_size || vma-&gt;vm_pgoff != 0)
+                return -EINVAL;
+
+        /* Registers are NOT normal memory: they must not be
+           cached, and the CPU must not reorder or combine
+           accesses to them.                                 */
+        vma-&gt;vm_page_prot = pgprot_noncached(vma-&gt;vm_page_prot);
+
+        return remap_pfn_range(vma,
+                               vma-&gt;vm_start,
+                               d-&gt;reg_phys &gt;&gt; PAGE_SHIFT,
+                               size,
+                               vma-&gt;vm_page_prot);
+}
+
+static const struct file_operations my_fops = {
+        .owner   = THIS_MODULE,
+        .open    = my_open,
+        .release = my_release,
+        .mmap    = my_mmap,
+};</code></pre>
+
+<div class="danger">
+<b>An unvalidated <code>mmap</code> hands the whole machine to any process that can open your device</b>
+<p><code>vma-&gt;vm_pgoff</code> and the mapping length are supplied entirely by userspace. If you pass them to
+<code>remap_pfn_range()</code> without bounds-checking, a caller chooses <em>any</em> physical address and your
+driver maps it into their process — kernel memory, another device's registers, another process's pages. This is
+not a theoretical concern; it is a recurring class of real CVEs in vendor drivers. Check the length against
+your buffer's actual size, and either reject a non-zero <code>vm_pgoff</code> or validate it against a range
+you own. There is no framework doing this for you.</p>
+</div>
+
+<pre><code>/* THE USERSPACE SIDE, so you can test it: */
+
+        int fd = open("/dev/mydev", O_RDWR);
+        size_t len = 4096;
+
+        void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                       MAP_SHARED,      /* SHARED, not PRIVATE -
+                                           PRIVATE would give a
+                                           copy-on-write copy and
+                                           the device would never
+                                           see your writes      */
+                       fd, 0);
+        if (p == MAP_FAILED) { perror("mmap"); return 1; }
+
+        /* p now points at the device's buffer. No copies. */
+        printf("first word: 0x%08x\n", ((uint32_t *)p)[0]);
+
+        munmap(p, len);
+        close(fd);</code></pre>
+
+<h2 id="subsystems">Part 2 — registering with a subsystem instead of inventing an interface</h2>
+
+<p><a href="lx-41-example-i2c-driver.html">Chapter 27</a>'s temperature sensor exposed a file called
+<code>temp</code> containing a number. It works, but it invented a private interface: no existing tool knows
+that file exists, nobody knows what unit the number is in, and every program wanting the reading must be taught
+about your specific driver. Registering with <strong>hwmon</strong> instead takes about the same amount of code
+and produces an interface that <code>sensors</code>, Prometheus exporters and every monitoring agent already
+understand.</p>
+
+<pre><code>/* The same sensor from chapter 27, done properly. */
+
+#include &lt;linux/hwmon.h&gt;
+
+/* 1. Declare WHAT you have: one temperature channel, which
+      can be read, and which has a label.                   */
+static const struct hwmon_channel_info *tmp102_info[] = {
+        HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
+        HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
+        NULL
+};
+
+/* 2. Say which of those are actually accessible, and how. */
+static umode_t tmp102_is_visible(const void *data,
+                                 enum hwmon_sensor_types type,
+                                 u32 attr, int channel)
+{
+        return 0444;            /* read-only, to everyone */
+}
+
+/* 3. One read function for every channel. The core has
+      already told you WHICH value it wants.               */
+static int tmp102_read(struct device *dev,
+                       enum hwmon_sensor_types type,
+                       u32 attr, int channel, long *val)
+{
+        struct tmp102 *t = dev_get_drvdata(dev);
+        int milli, ret;
+
+        if (type != hwmon_temp || attr != hwmon_temp_input)
+                return -EOPNOTSUPP;
+
+        ret = tmp102_read_millicelsius(t, &amp;milli);
+        if (ret)
+                return ret;
+
+        *val = milli;    /* hwmon's UNIT IS FIXED: temperatures
+                            are millidegrees Celsius, always.
+                            That fixed convention is the whole
+                            point - no tool has to ask.       */
+        return 0;
+}
+
+static const struct hwmon_ops tmp102_hwmon_ops = {
+        .is_visible = tmp102_is_visible,
+        .read       = tmp102_read,
+};
+
+static const struct hwmon_chip_info tmp102_chip_info = {
+        .ops  = &amp;tmp102_hwmon_ops,
+        .info = tmp102_info,
+};
+
+/* 4. Register, in probe(). One call replaces the whole
+      attribute-group machinery of chapter 27.             */
+        hwmon = devm_hwmon_device_register_with_info(dev,
+                        "tmp102", t, &amp;tmp102_chip_info, NULL);
+        if (IS_ERR(hwmon))
+                return PTR_ERR(hwmon);</code></pre>
+
+<pre><code># WHAT YOU GET, WITHOUT WRITING ANY OF IT:
+
+$ sensors
+tmp102-i2c-1-48
+Adapter: i2c-1
+temp1:        +23.5 C
+
+$ cat /sys/class/hwmon/hwmon2/temp1_input
+23500
+$ cat /sys/class/hwmon/hwmon2/name
+tmp102
+
+# The sensor also appears to the thermal framework, so it can
+# drive fan control and thermal throttling policies - all
+# because it registered as a standard temperature source
+# instead of as a file called "temp".</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Your device is a…</th><th>Register with</th><th>Userspace gets</th></tr></thead>
+<tbody>
+<tr><td>Temperature, voltage, current, fan sensor</td><td><strong>hwmon</strong></td><td><code>sensors</code>,
+thermal framework, every monitoring agent</td></tr>
+<tr><td>ADC, accelerometer, gyro, light sensor — anything sampled</td><td><strong>IIO</strong></td><td>Buffered,
+timestamped sampling, triggers, <code>libiio</code></td></tr>
+<tr><td>Button, keyboard, touchscreen, joystick</td><td><strong>input</strong></td><td><code>evdev</code>, and
+every GUI stack already handles it</td></tr>
+<tr><td>LED or backlight</td><td><strong>leds</strong></td><td><code>/sys/class/leds</code>, triggers, standard
+brightness control</td></tr>
+<tr><td>Camera or video capture</td><td><strong>V4L2</strong></td><td>GStreamer, ffmpeg, every capture
+application</td></tr>
+<tr><td>Real-time clock</td><td><strong>rtc</strong></td><td><code>hwclock</code>, and the kernel sets system
+time from it</td></tr>
+<tr><td>Watchdog</td><td><strong>watchdog</strong></td><td><code>/dev/watchdog</code>, systemd integration</td></tr>
+<tr><td>Genuinely none of the above</td><td>A char device (<a href="lx-40-example-char-driver.html">ch. 24</a>)</td><td>Whatever you
+document — and you now own that ABI forever</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The rule, stated plainly</b>
+<p>Search <code>drivers/</code> for a subsystem matching your device class <em>before</em> you write a line of
+interface code. A subsystem gives you a documented ABI, working tools on day one, less code to maintain, and a
+far easier path upstream — <a href="lx-30-upstreaming.html">chapter 45</a> lists "a new custom char device
+where a subsystem exists" as the single most common reason a driver is asked to be rewritten. The char device
+is the right answer only when nothing fits, and then the burden of documenting and supporting that interface
+forever is yours (<a href="lx-02-kernel-vs-user.html">chapter 02</a>'s ABI rule).</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Userspace writes to the mapping but the device never sees it</td><td><code>MAP_PRIVATE</code> was used
+— it gives a copy-on-write copy; <code>MAP_SHARED</code> is required</td></tr>
+<tr><td>Mapped registers behave erratically or return stale values</td><td>The mapping was left cacheable — use
+<code>pgprot_noncached()</code></td></tr>
+<tr><td>A process can map arbitrary physical memory</td><td>Unvalidated <code>vm_pgoff</code> or length — a
+serious security bug</td></tr>
+<tr><td><code>mmap</code> returns <code>-EINVAL</code> for a valid-looking request</td><td>Length is not
+page-aligned, or exceeds the buffer your bounds check allows</td></tr>
+<tr><td>Data is correct via <code>read()</code> but garbled via <code>mmap</code></td><td>A DMA buffer mapped
+with <code>remap_pfn_range</code> instead of <code>dma_mmap_coherent</code>, losing the correct attributes</td></tr>
+<tr><td><code>sensors</code> does not show your device</td><td>It exposes a private sysfs file rather than
+registering with hwmon</td></tr>
+<tr><td>Reviewers ask you to rewrite against a subsystem</td><td>Expected — the subsystem existed and the
+driver invented an interface instead</td></tr>
+<tr><td>hwmon values are off by 1000×</td><td>hwmon units are fixed — millidegrees, millivolts — and the driver
+reported the wrong scale</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>mmap</code> avoids that <code>read()</code> cannot, and when that matters.</li>
+  <li>Name the two mapping functions and say which is for a DMA buffer and which for registers.</li>
+  <li>Explain exactly what an unvalidated <code>vm_pgoff</code> allows an attacker to do.</li>
+  <li>Explain why register mappings must be non-cached.</li>
+  <li>Explain the difference between <code>MAP_SHARED</code> and <code>MAP_PRIVATE</code> for a driver
+  mapping.</li>
+  <li>Convert chapter 27's sensor to hwmon and verify it with <code>sensors</code>.</li>
+  <li>Given six device types, name the subsystem each should register with.</li>
+  <li>Explain what you take on by choosing a custom char device when a subsystem exists.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

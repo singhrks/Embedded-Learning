@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DX12: command lists, allocators and queues | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DX12: command lists, allocators and queues</h1>
+<p class="lead">Nothing you call executes immediately. You record commands into a list, submit the list to a
+queue, and the GPU gets to it whenever it gets to it. The gap between "I recorded it" and "it ran" is where
+every DX12 lifetime bug lives.</p>
+
+<h2 id="three">Three objects, three jobs</h2>
+
+<pre class="diagram">   COMMAND ALLOCATOR
+     the MEMORY the commands are written into. Grows as you
+     record; never shrinks. You can only RESET it - which frees
+     everything at once - and only when the GPU has finished
+     executing every list ever recorded from it.
+
+   COMMAND LIST
+     the RECORDER. Cheap. Reset it to begin recording, Close
+     it when done. A list may be reset and reused as soon as
+     it is submitted - it does not own the memory.
+
+   COMMAND QUEUE
+     the SUBMISSION POINT. Lists execute in submission order
+     within a queue. Different queues run CONCURRENTLY.
+
+   THE LIFETIME RULE, and it is the whole chapter:
+
+     allocator: reset only after the GPU is DONE with it
+     list:      reset any time after Close + submit
+
+   So you need ONE ALLOCATOR PER FRAME IN FLIGHT, and a fence
+   to know when it is safe to reuse.
+
+     frame 0 -> allocator A -> submit -> fence value 1
+     frame 1 -> allocator B -> submit -> fence value 2
+     frame 2 -> wait for fence >= 1, then reuse allocator A
+
+   Reset an allocator the GPU is still reading and you get
+   corruption or a device removal, usually several frames
+   later and nowhere near the cause.</pre>
+
+<pre><code>/* Creating the three. */
+
+D3D12_COMMAND_QUEUE_DESC qd = {};
+qd.Type  = D3D12_COMMAND_LIST_TYPE_DIRECT;
+qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+ComPtr&lt;ID3D12CommandQueue&gt; queue;
+device-&gt;CreateCommandQueue(&amp;qd, IID_PPV_ARGS(&amp;queue));
+
+/* One allocator per frame in flight. */
+static const UINT kFrames = 3;
+ComPtr&lt;ID3D12CommandAllocator&gt; alloc[kFrames];
+for (UINT i = 0; i &lt; kFrames; i++)
+    device-&gt;CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&amp;alloc[i]));
+
+/* One list is enough if you record single-threaded. */
+ComPtr&lt;ID3D12GraphicsCommandList&gt; cmd;
+device-&gt;CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                          alloc[0].Get(), nullptr,
+                          IID_PPV_ARGS(&amp;cmd));
+cmd-&gt;Close();     /* lists are created OPEN. Close it so the
+                     frame loop's Reset is symmetrical. */</code></pre>
+
+<h2 id="loop">The frame loop</h2>
+
+<pre><code>UINT64 fenceValue[kFrames] = {};
+UINT64 nextFence = 1;
+UINT   frame = 0;
+
+void RenderFrame()
+{
+    /* 1. WAIT until the GPU has finished the frame that last
+          used this allocator. THIS is what makes reuse safe. */
+    if (fence-&gt;GetCompletedValue() &lt; fenceValue[frame]) {
+        fence-&gt;SetEventOnCompletion(fenceValue[frame], fenceEvent);
+        WaitForSingleObject(fenceEvent, INFINITE);
+    }
+
+    /* 2. Reset the allocator (frees its memory), then the list
+          (begins recording). Order matters: allocator first. */
+    alloc[frame]-&gt;Reset();
+    cmd-&gt;Reset(alloc[frame].Get(), initialPSO.Get());
+
+    /* 3. Record. A freshly reset list has NO STATE - no
+          descriptor heaps, no root signature, no viewport, no
+          render targets. You set all of it, every frame. That
+          is not overhead; it is what makes lists independent
+          and recordable in parallel. */
+    cmd-&gt;SetGraphicsRootSignature(rootSig.Get());
+    ID3D12DescriptorHeap *heaps[] = { srvHeap.Get() };
+    cmd-&gt;SetDescriptorHeaps(1, heaps);
+    cmd-&gt;RSSetViewports(1, &amp;viewport);
+    cmd-&gt;RSSetScissorRects(1, &amp;scissor);
+
+    Transition(cmd.Get(), backBuffer[frame].Get(),
+               D3D12_RESOURCE_STATE_PRESENT,
+               D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    cmd-&gt;OMSetRenderTargets(1, &amp;rtv[frame], FALSE, &amp;dsv);
+    cmd-&gt;ClearRenderTargetView(rtv[frame], clearColour, 0, nullptr);
+    /* ... draws ... */
+
+    Transition(cmd.Get(), backBuffer[frame].Get(),
+               D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_PRESENT);
+
+    /* 4. Close, then submit. A list must be Closed before
+          ExecuteCommandLists or the runtime rejects it. */
+    cmd-&gt;Close();
+    ID3D12CommandList *lists[] = { cmd.Get() };
+    queue-&gt;ExecuteCommandLists(1, lists);
+
+    swapChain-&gt;Present(1, 0);
+
+    /* 5. Signal a fence AFTER the submission, so we can later
+          tell when this frame's work is done. */
+    fenceValue[frame] = nextFence;
+    queue-&gt;Signal(fence.Get(), nextFence++);
+
+    frame = (frame + 1) % kFrames;
+}</code></pre>
+
+<div class="key">
+<b>Frames in flight is a latency-versus-throughput dial</b>
+<p>Two frames buffered keeps the GPU fed while the CPU records the next one. Three smooths hitches further
+but adds a frame of input latency. One means the CPU and GPU alternate, each idle half the time. Two or three
+is the normal range, and it must match your number of allocators and your swap-chain buffer count — mismatch
+them and you either stall or corrupt.</p>
+</div>
+
+<h2 id="queues">Queue types, and why they run concurrently</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Can do</th><th>Hardware</th></tr></thead>
+<tbody>
+<tr><td><code>DIRECT</code></td><td>Everything — draw, dispatch, copy</td><td>The main graphics
+engine</td></tr>
+<tr><td><code>COMPUTE</code></td><td>Dispatch and copy, no draws</td><td>A separate async compute engine on
+most GPUs</td></tr>
+<tr><td><code>COPY</code></td><td>Copy only</td><td>A dedicated DMA engine — runs while the GPU renders, and
+is the right way to stream data</td></tr>
+<tr><td><code>BUNDLE</code></td><td>A small pre-recorded set of draws, replayed into a direct
+list</td><td>Not a queue. Rarely worth it on modern drivers</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* ASYNC COMPUTE: overlap work that uses different units.
+
+   A shadow pass is geometry- and depth-bound; SSAO is
+   ALU-bound. Run them on separate queues and they fill each
+   other's gaps - typically 5-15% of frame time on a GPU that
+   supports it well.                                        */
+
+  graphics queue:  [ shadow maps ][ gbuffer ][ lighting ]
+  compute queue:        [ SSAO ][ particle sim ]
+                        ^                     ^
+                        |                     |
+                   both running at once, on different units
+
+/* SYNCHRONISING BETWEEN QUEUES is done with fences, on the
+   GPU - no CPU involvement: */
+
+  computeQueue-&gt;ExecuteCommandLists(1, &amp;ssaoList);
+  computeQueue-&gt;Signal(sharedFence.Get(), 42);
+
+  /* graphics queue WAITS for that, without stalling the CPU */
+  graphicsQueue-&gt;Wait(sharedFence.Get(), 42);
+  graphicsQueue-&gt;ExecuteCommandLists(1, &amp;lightingList);
+
+/* THE COPY QUEUE is the one everybody should use and few do.
+   Uploading a texture on the direct queue serialises against
+   your rendering. On the copy queue it happens in parallel,
+   on a DMA engine that is otherwise idle:                  */
+
+  copyQueue-&gt;ExecuteCommandLists(1, &amp;uploadList);
+  copyQueue-&gt;Signal(uploadFence.Get(), n);
+  graphicsQueue-&gt;Wait(uploadFence.Get(), n);   /* use it after */
+
+/* THE CAVEAT: resources have state (chapter 16), and the copy
+   and compute queues support only a SUBSET of states. A
+   resource used on a copy queue must be in COMMON state at
+   the boundary. Getting this wrong is a classic multi-queue
+   bug, and the debug layer catches it.                     */</code></pre>
+
+<h2 id="threads">Recording in parallel</h2>
+
+<pre><code>/* The rules:
+     - one ALLOCATOR per thread per frame in flight
+     - one LIST per thread (lists are cheap to create)
+     - lists EXECUTE in submission order, whatever order they
+       were recorded in                                     */
+
+struct ThreadCtx {
+    ComPtr&lt;ID3D12CommandAllocator&gt;    alloc[kFrames];
+    ComPtr&lt;ID3D12GraphicsCommandList&gt; list;
+};
+ThreadCtx ctx[kThreads];
+
+void RecordChunk(int t, int frame, int first, int count)
+{
+    auto *c = &amp;ctx[t];
+    c-&gt;alloc[frame]-&gt;Reset();
+    c-&gt;list-&gt;Reset(c-&gt;alloc[frame].Get(), pso.Get());
+
+    /* every list sets up its own state - nothing is inherited */
+    c-&gt;list-&gt;SetGraphicsRootSignature(rootSig.Get());
+    c-&gt;list-&gt;SetDescriptorHeaps(1, heaps);
+    c-&gt;list-&gt;RSSetViewports(1, &amp;viewport);
+    c-&gt;list-&gt;RSSetScissorRects(1, &amp;scissor);
+    c-&gt;list-&gt;OMSetRenderTargets(1, &amp;rtv[frame], FALSE, &amp;dsv);
+
+    for (int i = first; i &lt; first + count; i++)
+        DrawObject(c-&gt;list.Get(), i);
+
+    c-&gt;list-&gt;Close();
+}
+
+/* Then, on the main thread: */
+  parallel_for(0, kThreads, [&amp;](int t) {
+      RecordChunk(t, frame, t * per, per);
+  });
+
+  ID3D12CommandList *all[kThreads];
+  for (int t = 0; t &lt; kThreads; t++) all[t] = ctx[t].list.Get();
+  queue-&gt;ExecuteCommandLists(kThreads, all);   /* ONE submit   */
+
+/* SUBMIT IN ONE CALL where you can: each
+   ExecuteCommandLists has real driver overhead, so twenty
+   calls of one list is measurably worse than one call of
+   twenty.
+
+   AND NOTE the barriers: resource transitions must be
+   consistent across list boundaries. If list A leaves a
+   resource in RENDER_TARGET and list B expects PIXEL_SHADER
+   _RESOURCE, one of them must do the transition - and the
+   runtime cannot check across lists at record time, only at
+   execute time.                                            */</code></pre>
+
+<div class="warn">
+<b>The two mistakes that produce delayed, confusing corruption</b>
+<p><strong>Resetting an allocator the GPU is still using.</strong> Symptoms appear frames later, in unrelated
+draws. <strong>Freeing or overwriting a resource that an in-flight command list still references.</strong>
+Same delay, same confusion. Both are solved the same way: a fence value per frame, and nothing is reused or
+released until the fence says that frame completed. Build that discipline into your allocator and upload
+helpers on day one rather than retrofitting it.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Corruption appearing a few frames after a change</td><td>Allocator reset while the GPU was still
+reading it</td></tr>
+<tr><td><code>DEVICE_REMOVED</code> with a page fault</td><td>A resource released while in-flight work
+referenced it</td></tr>
+<tr><td><code>ExecuteCommandLists</code> rejects a list</td><td>It was not <code>Close</code>d</td></tr>
+<tr><td>Nothing renders after adding a second list</td><td>The new list did not set its own render targets or
+root signature — no state is inherited</td></tr>
+<tr><td>CPU and GPU each idle half the time</td><td>Only one frame in flight</td></tr>
+<tr><td>Input latency high but frame rate fine</td><td>Too many frames buffered</td></tr>
+<tr><td>Async compute gives no speed-up</td><td>Over-synchronised, or the two passes use the same
+units</td></tr>
+<tr><td>Debug layer error about resource state on the copy queue</td><td>Copy queues support only a subset of
+states — return to COMMON at the boundary</td></tr>
+<tr><td>Parallel recording is slower than single-threaded</td><td>Too many <code>ExecuteCommandLists</code>
+calls, or lists too small to amortise setup</td></tr>
+<tr><td>Random hangs under load</td><td>A fence waited on a value that is never signalled</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what each of allocator, list and queue owns.</li>
+  <li>State the reset rule for allocators and for lists, and why they differ.</li>
+  <li>Explain why you need one allocator per frame in flight.</li>
+  <li>Walk through the five steps of the frame loop and say what each guards against.</li>
+  <li>Explain why a freshly reset command list has no state, and why that is a feature.</li>
+  <li>Name the queue types and what each can do.</li>
+  <li>Explain what async compute overlaps and give a realistic gain.</li>
+  <li>Show how two queues synchronise without involving the CPU.</li>
+  <li>Give the rules for multi-threaded recording, including the allocator rule.</li>
+  <li>Explain why submitting twenty lists in one call beats twenty calls.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

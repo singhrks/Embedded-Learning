@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PWM, clocks and precise timing | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>PWM, clocks and precise timing</h1>
+<p class="lead">Anything that must happen at an exact moment has to come out of hardware, because Linux cannot
+promise you a moment. This chapter covers what timing hardware a Pi actually has, how to reach it, and the
+honest limits of every software alternative.</p>
+
+<h2 id="why">Why software timing fails</h2>
+
+<pre class="diagram">   A userspace loop toggling a GPIO on a Pi:
+
+     typical   ~0.3 us per toggle    (a few MHz)
+     often     jitter of tens of microseconds
+     sometimes A 10 MILLISECOND GAP
+
+   The gap is not a bug in your code. It is:
+     - the scheduler preempting you
+     - a page fault
+     - an interrupt handler running
+     - CPU frequency scaling changing your loop's speed
+     - a thermal event moving the clock (chapter 18)
+
+   FOR A SERVO expecting a 1.5 ms pulse every 20 ms, a
+   10 ms stall is a violent twitch. For WS2812 LEDs with a
+   400 ns bit period, software timing is hopeless from the
+   start.
+
+   THE HIERARCHY, best to worst:
+
+   1. HARDWARE PERIPHERAL   exact, zero CPU, no jitter
+      PWM block, SPI, I2S, RP1's PIO
+   2. DMA-DRIVEN GPIO       exact enough, some setup
+      a DMA engine writing GPIO registers on a clock
+   3. KERNEL DRIVER         microseconds of jitter
+      hrtimer in kernel space
+   4. USERSPACE + RT        tens of microseconds, mostly
+      SCHED_FIFO, mlockall, isolated core
+   5. PLAIN USERSPACE       milliseconds, unpredictable
+
+   Reach for 1. Everything below it is a compromise you
+   should be able to justify.</pre>
+
+<h2 id="pwm">Hardware PWM</h2>
+
+<pre><code># The Pi has hardware PWM channels, but only on specific
+# pins - the SoC's mux decides, not you.
+
+# Pi 4: 2 channels
+#   PWM0: GPIO12 (alt0) or GPIO18 (alt5)
+#   PWM1: GPIO13 (alt0) or GPIO19 (alt5)
+# Pi 5: more channels, on RP1 (chapter 14)
+
+# NOTE GPIO18 IS ALSO I2S. Enabling PWM there kills audio,
+# and enabling audio kills your PWM - a classic pin conflict
+# (chapter 10).
+
+# Enable in config.txt:
+dtoverlay=pwm,pin=18,func=2            # one channel
+dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+
+# The sysfs interface. Note this one is NOT deprecated -
+# unlike GPIO sysfs, the PWM sysfs API is current:
+$ ls /sys/class/pwm/
+pwmchip0
+$ cd /sys/class/pwm/pwmchip0
+$ echo 0 | sudo tee export              # channel 0
+$ cd pwm0
+
+# Everything is in NANOSECONDS.
+# A servo: 50 Hz frame, 1.5 ms pulse = centre.
+$ echo 20000000 | sudo tee period       # 20 ms  = 50 Hz
+$ echo 1500000  | sudo tee duty_cycle   # 1.5 ms
+$ echo 1        | sudo tee enable
+
+# Sweep it - and note the pulse stays exact throughout,
+# because a comparator in silicon is generating it and the
+# CPU is asleep (mcu chapter 11 explains the mechanism):
+$ for us in 1000 1500 2000; do
+    echo $((us * 1000)) | sudo tee duty_cycle
+    sleep 1
+  done
+
+$ echo 0 | sudo tee enable
+$ echo 0 | sudo tee ../unexport
+
+# RESOLUTION: duty cycle granularity is period divided by
+# the PWM clock's ticks in that period. At 50 Hz you have
+# enormous resolution; at 1 MHz you have very little. If
+# you need both high frequency AND fine steps, check the
+# arithmetic before designing around it.
+</code></pre>
+
+<div class="key">
+<b>Software PWM is fine for an LED and wrong for a servo</b>
+<p>Dimming an LED at 1 kHz from a userspace thread looks perfectly smooth, because your eye integrates and a
+missed edge is invisible. A servo, an ESC or an addressable LED strip decodes pulse <em>widths</em>, so a
+single late edge is a physical movement or a wrong colour. The test is simple: does the receiving device care
+about an individual edge, or only about the average? Average is forgiving; individual edges need hardware.</p>
+</div>
+
+<h2 id="dma">DMA-driven waveforms</h2>
+
+<pre><code># For more channels than the hardware has, or for protocols
+# the PWM block cannot express, the classic Pi trick is a
+# DMA engine copying a prepared buffer into the GPIO
+# registers, paced by a hardware clock. No CPU involvement,
+# so no jitter.
+
+# THIS IS WHAT pigpio DOES, and why it gives you
+# software PWM on any pin with far better timing than a
+# plain userspace loop:
+$ sudo apt install pigpio python3-pigpio
+$ sudo systemctl enable --now pigpiod
+
+import pigpio
+pi = pigpio.pi()
+pi.set_mode(17, pigpio.OUTPUT)
+pi.hardware_PWM(18, 1000, 500000)   # true hardware: 1 kHz, 50%
+pi.set_servo_pulsewidth(17, 1500)   # DMA-timed, any pin
+pi.wave_add_generic([...])          # arbitrary waveforms
+pi.stop()
+
+# WHAT TO KNOW:
+#   - hardware_PWM only works on the real PWM pins
+#   - everything else is DMA-timed: much better than
+#     userspace, not as exact as the PWM block
+#   - pigpio uses direct register access, so PI 5 SUPPORT
+#     IS NOT THE SAME (chapter 14). Check current status
+#     before building a Pi 5 project on it.
+
+# THE SPI TRICK for WS2812 / NeoPixel strips: encode each
+# LED bit as a pattern of SPI bits and clock the whole
+# frame out of the SPI peripheral. The SPI block generates
+# exact timing, and you get a protocol it was never
+# designed for:
+#   WS2812 '0' = 0.4us high, 0.85us low
+#   WS2812 '1' = 0.8us high, 0.45us low
+#   at 2.4 MHz SPI, one WS2812 bit = 3 SPI bits:
+#     '0' -> 0b100
+#     '1' -> 0b110
+# Three bytes of SPI per colour byte, one DMA transfer per
+# frame, perfect timing. This kind of repurposing is worth
+# recognising as a technique.
+</code></pre>
+
+<h2 id="rt">Making userspace as good as it can be</h2>
+
+<pre><code>/* When the work genuinely must be in userspace, this is the
+   preamble that buys you the last order of magnitude. It is
+   the same list as the concurrency track's real-time
+   chapter, applied here.                                   */
+
+#include &lt;sched.h&gt;
+#include &lt;sys/mman.h&gt;
+
+void make_realtime(void)
+{
+    /* 1. Real-time priority. Now only a higher-priority RT
+          thread or an interrupt can preempt you.           */
+    struct sched_param sp = { .sched_priority = 80 };
+    if (sched_setscheduler(0, SCHED_FIFO, &amp;sp) &lt; 0)
+        perror("sched_setscheduler");   /* needs privilege  */
+
+    /* 2. Lock memory. A page fault is a millisecond, and
+          it can happen on a page you touched yesterday.    */
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) &lt; 0)
+        perror("mlockall");
+
+    /* 3. Pre-fault the stack, so the first deep call does
+          not fault at the worst moment.                    */
+    volatile char stack[64 * 1024];
+    for (size_t i = 0; i &lt; sizeof(stack); i += 4096)
+        stack[i] = 0;
+
+    /* 4. Pin to a core, ideally one the scheduler has been
+          told to leave alone (isolcpus=3 in cmdline.txt,
+          chapter 09).                                      */
+    cpu_set_t set;
+    CPU_ZERO(&amp;set); CPU_SET(3, &amp;set);
+    sched_setaffinity(0, sizeof(set), &amp;set);
+}
+
+/* AND STILL: no malloc in the loop, no file I/O, no
+   printf, no lock shared with a non-RT thread (priority
+   inversion, concurrency chapter 15).
+
+   MEASURE what you got. Do not assume:                     */
+$ sudo apt install rt-tests
+$ sudo cyclictest -t1 -p80 -n -i1000 -l100000
+# T: 0 ( 1234) P:80 I:1000 C: 100000 Min: 8 Act: 12 Avg: 14 Max: 96
+#                                          ^^^^^^        ^^^^^^^^
+#              typical latency, microseconds        THE WORST CASE
+
+/* Max is the number that matters. On a stock Pi kernel
+   expect tens to hundreds of microseconds; with PREEMPT_RT
+   and tuning, tens. Never the sub-microsecond determinism
+   of the Cortex-M in the mcu track - which is the whole
+   reason products pair a Pi with an MCU.                   */
+</code></pre>
+
+<h2 id="clocks">Reading time correctly</h2>
+
+<pre><code>/* Three clocks, and picking the wrong one is a real bug. */
+
+struct timespec ts;
+
+/* CLOCK_MONOTONIC - never jumps, never goes backwards, not
+   affected by NTP steps or someone setting the date. THE
+   ONLY correct choice for measuring an interval.          */
+clock_gettime(CLOCK_MONOTONIC, &amp;ts);
+
+/* CLOCK_MONOTONIC_RAW - also ignores NTP's gradual rate
+   adjustment. Use when you want the raw hardware counter's
+   view.                                                    */
+
+/* CLOCK_REALTIME - wall-clock time. Jumps when NTP corrects
+   it. Use for timestamps a human will read, NEVER for
+   measuring durations - the classic bug is a negative
+   elapsed time when NTP steps backwards mid-measurement.  */
+
+/* SLEEPING ACCURATELY: nanosleep sleeps AT LEAST the
+   requested time, and returns late by the scheduler's
+   whim. For a periodic loop, always compute the next
+   absolute deadline rather than sleeping for a delta -
+   otherwise the error accumulates forever.                */
+struct timespec next;
+clock_gettime(CLOCK_MONOTONIC, &amp;next);
+for (;;) {
+    next.tv_nsec += 10 * 1000 * 1000;      /* 10 ms period */
+    while (next.tv_nsec &gt;= 1000000000L) {
+        next.tv_nsec -= 1000000000L; next.tv_sec++;
+    }
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &amp;next, NULL);
+    do_work();                  /* jitters, but never drifts */
+}
+
+/* The Pi's ARM generic timer (ARM track, chapter 32) backs
+   CLOCK_MONOTONIC and is a constant-rate counter unaffected
+   by CPU frequency scaling: */
+$ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+arch_sys_counter
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Servo twitches occasionally</td><td>Software-timed pulses — use hardware PWM</td></tr>
+<tr><td>LED strip shows wrong colours randomly</td><td>Bit timing missed; use the SPI or DMA
+technique</td></tr>
+<tr><td>PWM works, audio stops</td><td>GPIO18 shared between PWM and I2S</td></tr>
+<tr><td>Duty cycle steps are coarse</td><td>Period too short for the PWM clock's resolution</td></tr>
+<tr><td>Periodic loop drifts over hours</td><td>Sleeping for a delta instead of to an absolute
+deadline</td></tr>
+<tr><td>Negative elapsed time measured</td><td><code>CLOCK_REALTIME</code> stepped by NTP — use
+<code>CLOCK_MONOTONIC</code></td></tr>
+<tr><td>Latency fine on the bench, poor in the product</td><td>Other load; measure with
+<code>cyclictest</code>, not by feel</td></tr>
+<tr><td><code>sched_setscheduler</code> fails</td><td>Needs <code>CAP_SYS_NICE</code> or a limits.conf
+entry</td></tr>
+<tr><td>RT thread still gets long stalls</td><td>A page fault, a <code>malloc</code>, or a lock shared with a
+normal thread</td></tr>
+<tr><td>pigpio does nothing on a Pi 5</td><td>Direct register access; check its Pi 5 status (chapter
+14)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the five-level timing hierarchy and the accuracy of each.</li>
+  <li>Explain why a userspace loop can stall for ten milliseconds.</li>
+  <li>State the test for whether software timing is acceptable for a given device.</li>
+  <li>Compute period and duty-cycle values in nanoseconds for a 50 Hz servo at centre.</li>
+  <li>Name the pin conflict that PWM commonly causes on a Pi.</li>
+  <li>Explain how a DMA engine produces jitter-free GPIO waveforms.</li>
+  <li>Describe the SPI trick for WS2812 timing and why it works.</li>
+  <li>List the four steps of a real-time thread preamble and what each prevents.</li>
+  <li>Say which <code>cyclictest</code> number matters and why.</li>
+  <li>Explain why a periodic loop must sleep to an absolute deadline.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

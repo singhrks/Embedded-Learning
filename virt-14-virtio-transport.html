@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>virtio: the transport and the virtqueue | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>virtio: the transport and the virtqueue</h1>
+<p class="lead">virtio is what you design when you accept that the guest knows it is a guest. Instead of
+pretending to be an IDE controller, you build the interface you would have wanted all along: a shared-memory
+ring where the expensive operation — telling the other side there is work — happens once per batch instead of
+once per register.</p>
+
+<h2 id="shape">The shape of the thing</h2>
+
+<p>virtio exists because trapping every register access is too expensive. Its answer is to move the data plane into shared memory and keep the hypervisor out of the common path entirely.</p>
+
+<pre class="diagram">   GUEST                                    HOST
+
+   virtio driver                            virtio device
+   (net, blk, console, ...)                 (QEMU, vhost, or a
+        |                                    separate process)
+        |                                          |
+   +----+------------------------------------------+----+
+   |             ONE OR MORE VIRTQUEUES                 |
+   |    living in GUEST MEMORY, which the host can      |
+   |    read and write directly - no copying, no        |
+   |    per-register traps                              |
+   +----------------------------------------------------+
+        |                                          |
+        | NOTIFY: guest -> device                  |
+        |   one MMIO write. This is the ONLY       |
+        |   trap in the whole data path.           |
+        |                                          |
+        | INTERRUPT: device -> guest               |
+        |   one virtual interrupt when work is done|
+
+   Plus a CONFIGURATION space for the slow path: feature
+   negotiation, queue setup, device-specific config (MAC
+   address, disk size, screen resolution). Touched at probe
+   time and then essentially never.
+
+   Split the design in your head:
+     CONTROL PLANE  = MMIO registers, traps, rare
+     DATA PLANE     = shared memory rings, no traps, constant</pre>
+
+<div class="key">
+<b>One idea, three transports</b>
+<p>The virtqueue is the same everywhere. Only the way you find it and kick it changes:
+<strong>virtio-mmio</strong> (a flat register block, used on embedded and by QEMU's <code>virt</code>
+machine), <strong>virtio-pci</strong> (BARs and capabilities, used in clouds), and
+<strong>virtio-ccw</strong> (s390). Learn the queue once; the transports are packaging.</p>
+</div>
+
+<h2 id="split">The split virtqueue</h2>
+
+<p>The split virtqueue is three rings with a deliberate ownership discipline, and once you see who writes what, the memory barriers stop looking arbitrary.</p>
+
+<pre class="diagram">   Three arrays, all in guest memory, all agreed in advance.
+
+   DESCRIPTOR TABLE - the buffers themselves
+   +----+----------------+--------+-------+-------+
+   | id |     addr       |  len   | flags |  next |
+   +----+----------------+--------+-------+-------+
+   |  0 | 0x4123_0000    |   16   | NEXT  |   1   |  request header
+   |  1 | 0x4123_1000    | 4096   | NEXT  |   2   |  data
+   |  2 | 0x4123_2000    |    1   | WRITE |   -   |  status byte
+   +----+----------------+--------+-------+-------+
+        flags: NEXT (chained)  WRITE (device writes it)
+               INDIRECT (this descriptor points at a whole
+                         table of descriptors)
+
+   AVAILABLE RING - guest -> device.  "please process these"
+   +-------+-------+---------------------------+
+   | flags | idx=7 | ring[0..N]: 0, 5, 9, ...  |
+   +-------+-------+---------------------------+
+                ^         each entry is the HEAD descriptor
+                |         of a chain
+                idx only ever increases, and wraps naturally
+                at 16 bits
+
+   USED RING - device -> guest.  "these are done"
+   +-------+-------+-------------------------------+
+   | flags | idx=5 | ring[0..N]: {id=0,len=4096},  |
+   +-------+-------+-------------------------------+
+                        each entry says which chain completed
+                        and how many bytes were written
+
+   THE PROTOCOL:
+
+     guest:  fill descriptors
+             write avail.ring[avail.idx % N] = head
+             memory barrier
+             avail.idx++
+             memory barrier
+             NOTIFY (one MMIO write)   &lt;-- the only trap
+
+     device: sees avail.idx moved
+             reads the chain, does the work
+             writes used.ring[used.idx % N] = {head, len}
+             memory barrier
+             used.idx++
+             raises an interrupt (maybe - see suppression)
+
+     guest:  interrupt handler sees used.idx moved
+             reclaims all completed chains in one pass</pre>
+
+<h2 id="barriers">The barriers are not optional</h2>
+
+<p>This is the part that is genuinely easy to get wrong, because an implementation missing a barrier works on your development machine and corrupts data on a weakly ordered core under load.</p>
+
+<pre><code>/* Both sides are ordinary code on weakly-ordered CPUs, writing
+   to shared memory with no lock. Every publication needs a
+   barrier, and getting one wrong produces corruption that
+   appears once an hour under load.                          */
+
+/* GUEST, adding a buffer (linux/drivers/virtio/virtio_ring.c) */
+
+        vq-&gt;split.vring.desc[head] = ...;      /* fill descriptors */
+
+        /* The descriptor contents must be visible BEFORE the
+           index that publishes them.                          */
+        virtio_wmb(vq-&gt;weak_barriers);        /* DMB ISHST      */
+
+        vq-&gt;split.vring.avail-&gt;idx = cpu_to_virtio16(vdev, new);
+
+        /* And the index must be visible before the notify.    */
+        virtio_mb(vq-&gt;weak_barriers);         /* DMB ISH        */
+
+        if (vring_need_event(...))
+                vq-&gt;notify(vq);
+
+/* DEVICE, completing a buffer */
+
+        used-&gt;ring[i] = (struct vring_used_elem){ head, len };
+        smp_wmb();                            /* entry before idx */
+        used-&gt;idx = new_idx;
+        smp_mb();                             /* idx before irq   */
+        raise_interrupt();
+
+/* GUEST, reaping */
+
+        if (vq-&gt;last_used_idx == virtio16_to_cpu(vdev, used-&gt;idx))
+                return NULL;                  /* nothing new      */
+        virtio_rmb(vq-&gt;weak_barriers);        /* idx before entry */
+        elem = &amp;used-&gt;ring[vq-&gt;last_used_idx % vq-&gt;num];
+
+/* The "weak_barriers" flag: when the device is a HOST THREAD
+   sharing coherent memory, SMP barriers (DMB ISH) suffice.
+   When it is a real PCIe device doing DMA, you need full DMA
+   barriers. VIRTIO_F_ORDER_PLATFORM tells the driver which.  */</code></pre>
+
+<h2 id="suppress">Notification suppression: doing nothing, faster</h2>
+
+<p>The most valuable optimisation in virtio is not doing the notification at all, and both sides participate in deciding when it can be skipped.</p>
+
+<pre><code>/* An interrupt per completed request is as bad as a trap per
+   register. Both sides can say "do not bother me".         */
+
+/* Basic form, in the ring flags:
+
+     avail-&gt;flags |= VRING_AVAIL_F_NO_INTERRUPT
+         the GUEST is saying: I am polling, do not interrupt me.
+         Used while NAPI is active.
+
+     used-&gt;flags |= VRING_USED_F_NO_NOTIFY
+         the DEVICE is saying: I am already processing, do not
+         trap on notify. This is what removes the exit
+         entirely while a batch is in flight.                */
+
+/* Better form: VIRTIO_F_EVENT_IDX. Instead of on/off, each
+   side publishes the index at which it WANTS to be told.  */
+
+     used_event  = the avail.idx value at which the device
+                   should notify the guest
+     avail_event = the used.idx value at which the guest
+                   should notify the device
+
+/* So a busy device processing a stream of requests sets
+   avail_event far ahead, and the guest submits hundreds of
+   buffers with ZERO exits. When the device drains the queue it
+   moves avail_event to "next one", and the following submit
+   traps once to wake it.
+
+   Result on a saturated virtio-net link: the exit rate is
+   roughly the number of BATCHES per second, not packets. That
+   is the difference between 50k and 3M packets per second.  */
+
+/* This is the same fast-path/doorbell pattern as GICv4 direct
+   injection (chapter 12). It recurs because it is the only way
+   to make an expensive notification cheap: make it
+   conditional on the receiver actually being asleep.        */</code></pre>
+
+<h2 id="packed">The packed virtqueue</h2>
+
+<p>The newer layout trades descriptor indirection for cache locality, which matters more than it sounds on a device doing millions of operations a second.</p>
+
+<pre class="diagram">   virtio 1.1 replaces three arrays with ONE.
+
+   Split ring: descriptor table + avail ring + used ring
+               -> three cache lines touched per request,
+                  in three separate places
+
+   Packed ring: a single descriptor ring, where ownership is
+                encoded in two flag bits and a wrap counter.
+
+   +---------------------------------------------------+
+   |  addr  |  len  |  id  |  flags: AVAIL | USED       |
+   +---------------------------------------------------+
+
+     driver writes a descriptor with AVAIL == wrap_counter
+     device sees it, processes, writes back with
+            USED == wrap_counter
+
+   Each side keeps its own index and wrap counter, and flips
+   the counter each time it goes round.
+
+   Why it is faster:
+     * one cache line per descriptor instead of three
+     * the device prefetches sequentially - the ring is read in
+       order
+     * far friendlier to a hardware implementation, which is
+       the real motivation: virtio-net offloaded onto a SmartNIC
+       or DPU wants a ring a state machine can walk.
+
+   Negotiated with VIRTIO_F_RING_PACKED. Both sides must
+   support it; the split ring remains the universal fallback.</pre>
+
+<h2 id="mmio">virtio-mmio, concretely</h2>
+
+<p>On embedded platforms without PCI, virtio appears as a plain memory-mapped device, and the register layout is small enough to read in full.</p>
+
+<pre><code>/* The register block QEMU's virt machine puts at 0x0a000000,
+   0x0a000200, 0x0a000400, ... one per device slot.         */
+
+  0x000  MagicValue        0x74726976  ("virt")
+  0x004  Version           2 (modern) or 1 (legacy)
+  0x008  DeviceID          1=net 2=blk 3=console 4=entropy
+                           16=gpu 18=input 19=vsock 25=fs
+                           0 = EMPTY SLOT
+  0x00c  VendorID
+  0x010  DeviceFeatures    read, 32 bits at a time
+  0x014  DeviceFeaturesSel which 32-bit word
+  0x020  DriverFeatures
+  0x024  DriverFeaturesSel
+  0x030  QueueSel          which queue the following apply to
+  0x034  QueueNumMax       device's maximum ring size
+  0x038  QueueNum          driver's chosen size
+  0x044  QueueReady
+  0x050  QueueNotify       &lt;-- THE DOORBELL. ioeventfd this.
+  0x060  InterruptStatus
+  0x064  InterruptACK
+  0x070  Status            the handshake state machine
+  0x080  QueueDescLow      guest-physical address of the
+  0x084  QueueDescHigh     descriptor table
+  0x090  QueueDriverLow    ... of the avail ring
+  0x094  QueueDriverHigh
+  0x0a0  QueueDeviceLow    ... of the used ring
+  0x0a4  QueueDeviceHigh
+  0x100+ Config            device-specific
+
+/* The Status handshake - every virtio driver does exactly
+   this, and a device model must enforce the order:        */
+
+    0                          reset
+    |= ACKNOWLEDGE   (1)       "I see a virtio device"
+    |= DRIVER        (2)       "I have a driver for it"
+    ... read DeviceFeatures, write DriverFeatures ...
+    |= FEATURES_OK   (8)       "I accept this feature set"
+    ... re-read Status: if FEATURES_OK cleared, the device
+        rejected the negotiation and the driver must give up
+    ... set up queues, write addresses, QueueReady = 1 ...
+    |= DRIVER_OK     (4)       "I am live, you may use the
+                                queues"
+
+    FAILED           (128)     something went wrong
+    DEVICE_NEEDS_RESET (64)    the device gave up
+
+/* A device that starts processing queues before DRIVER_OK, or
+   a driver that touches a queue before QueueReady, produces
+   the classic "works most of the time" virtio bug.        */</code></pre>
+
+<div class="warn">
+<b>Legacy versus modern</b>
+<p>Version 1 (legacy) virtio-mmio uses guest page numbers rather than addresses, has a different endianness
+rule, and lacks the <code>QueueReady</code> handshake. Mixing a modern driver with a legacy device model
+gives you a device that probes and then silently transfers nothing. Check register <code>0x004</code>
+first — it is two instructions and saves an afternoon.</p>
+</div>
+
+<h2 id="see">Watching it work</h2>
+
+<p>All of this is observable on a running system, and watching a real queue is the fastest way to make the ring discipline concrete.</p>
+
+<pre><code># Guest: which virtio devices exist and what negotiated?
+$ ls /sys/bus/virtio/devices/
+virtio0  virtio1  virtio2
+$ cat /sys/bus/virtio/devices/virtio1/device       # 0x0002 = blk
+$ cat /sys/bus/virtio/devices/virtio1/features
+1000000000000000000000110000100000000000000000000000000000000000
+
+$ cat /proc/interrupts | grep virtio
+ 25:      88104          0     GICv3  34 Level     virtio1
+
+# Host: how many exits is the data path costing?
+$ sudo perf stat -e kvm:kvm_mmio -a sleep 5
+# Then run a big dd inside the guest and compare. With
+# ioeventfd + EVENT_IDX the count should barely move.
+
+# Is vhost carrying the datapath, or QEMU?
+$ ps -T -p $(pgrep qemu) -o comm | grep vhost
+vhost-4211            # kernel thread -> vhost is in use
+
+# QEMU command line for an mmio virtio-blk on the virt machine:
+$ qemu-system-aarch64 -M virt -m 1G \
+    -drive file=rootfs.ext4,format=raw,if=none,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev user,id=n0 -device virtio-net-device,netdev=n0
+# "-device virtio-*-device" = mmio transport
+# "-device virtio-*-pci"    = PCI transport (needs a PCIe host
+#                             bridge, which -M virt provides)</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device probes, then no data ever moves</td><td>Legacy/modern mismatch, or queue addresses programmed
+before <code>QueueReady</code></td></tr>
+<tr><td>Rare data corruption under load</td><td>A missing barrier between descriptor contents and
+<code>avail.idx</code>, or between <code>used.idx</code> and the interrupt</td></tr>
+<tr><td>Guest hangs waiting for completions</td><td>Notification suppression bug: device slept and the guest's
+notify was suppressed, so nobody woke</td></tr>
+<tr><td>Throughput fine, latency terrible</td><td><code>EVENT_IDX</code> thresholds too far ahead — batching
+at the cost of responsiveness</td></tr>
+<tr><td>Enormous MMIO exit count on a busy queue</td><td>No <code>ioeventfd</code> on
+<code>QueueNotify</code></td></tr>
+<tr><td>Guest driver refuses to attach</td><td>Feature negotiation failed — <code>FEATURES_OK</code> cleared by
+the device</td></tr>
+<tr><td>Works with QEMU, breaks with vhost</td><td>Device model and vhost disagree about which features were
+negotiated</td></tr>
+<tr><td>Works on x86, fails on arm64</td><td>Barriers that were free on a strongly-ordered CPU and are not
+here</td></tr>
+<tr><td>Ring wedges after ~65536 requests</td><td>Index wrap handled with a comparison instead of modular
+arithmetic</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the control-plane/data-plane split and say which one costs exits.</li>
+  <li>Name the three arrays of a split virtqueue and say which direction each carries.</li>
+  <li>Walk a request from descriptor allocation to completion reaping, naming every barrier.</li>
+  <li>Explain why the descriptor contents must be published before <code>avail.idx</code>.</li>
+  <li>Describe both forms of notification suppression and what <code>EVENT_IDX</code> adds.</li>
+  <li>Explain what the packed ring changes and why hardware implementers wanted it.</li>
+  <li>List the virtio status handshake states in order and say what each asserts.</li>
+  <li>Name the doorbell register in virtio-mmio and the optimisation that should be attached to it.</li>
+  <li>Give two symptoms of a legacy/modern transport mismatch.</li>
+  <li>Determine, from inside a guest, which virtio devices exist and what features they negotiated.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

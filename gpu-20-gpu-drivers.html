@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What a GPU driver actually does | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>What a GPU driver actually does</h1>
+<p class="lead">Between your <code>Draw</code> call and the silicon sits several hundred thousand lines of
+someone else's code, split across a user-mode library and a kernel driver. Knowing what each half does closes
+the loop between this track and the <a href="track.html?t=lx">Linux</a> and
+<a href="track.html?t=win">Windows</a> driver tracks — and explains most of the odd behaviour you have met
+along the way.</p>
+
+<h2 id="split">The two halves</h2>
+
+<pre class="diagram">   YOUR APPLICATION
+        |  d3d12.dll / libvulkan.so
+        v
+   +--------------------------------------------------------+
+   |  USER-MODE DRIVER  (UMD)                               |
+   |    runs IN YOUR PROCESS, at your privilege             |
+   |                                                        |
+   |    * compiles DXIL/SPIR-V -> the GPU's real ISA        |
+   |    * translates API calls into hardware COMMAND        |
+   |      PACKETS, written into a buffer                    |
+   |    * manages descriptors and their hardware layout     |
+   |    * per-application workarounds and shader            |
+   |      replacements, keyed on the executable name        |
+   |                                                        |
+   |    A CRASH HERE CRASHES YOUR APP, and nothing else.    |
+   |    This is why most of the driver lives here.          |
+   +--------------------------------------------------------+
+        |  ioctl / DeviceIoControl  - the ONLY kernel entry
+        v
+   +--------------------------------------------------------+
+   |  KERNEL-MODE DRIVER  (KMD)                             |
+   |    ring 0. Shared by every process on the machine.     |
+   |                                                        |
+   |    * SUBMITS command buffers to the hardware rings     |
+   |    * SCHEDULES between processes - your game and the   |
+   |      compositor and the browser all want the GPU       |
+   |    * manages GPU VIRTUAL MEMORY and page tables        |
+   |    * handles interrupts and fence completion           |
+   |    * power and clock management                        |
+   |    * RESETS the GPU when something hangs (TDR)         |
+   |                                                        |
+   |    A CRASH HERE IS A BUGCHECK / KERNEL PANIC.          |
+   +--------------------------------------------------------+
+        |  MMIO, doorbells, DMA
+        v
+   THE GPU
+
+   THE SPLIT IS DELIBERATE: everything that can be done at
+   application privilege is, so that the enormous, fast-moving,
+   game-specific part of the driver cannot take down the
+   machine. Only the parts that genuinely need ring 0 -
+   submission, memory mapping, interrupts, arbitration between
+   processes - live in the kernel.</pre>
+
+<div class="key">
+<b>This is exactly the split you learned in the driver tracks</b>
+<p>A GPU driver is the largest example of the same architecture: a user-mode component doing the complex,
+untrusted work, and a small kernel component owning the hardware, the address space and the arbitration.
+Compare <a href="win-12-driver-models.html">Windows' WDM/KMDF/UMDF split</a> and the Linux DRM/KMS design —
+the reasoning is identical, and GPU drivers are simply where it is pushed hardest.</p>
+</div>
+
+<h2 id="submit">How a draw actually reaches the GPU</h2>
+
+<pre><code>/* Follow one Draw all the way down. */
+
+  1. YOUR CODE
+        cmd->DrawInstanced(3, 1, 0, 0);
+
+  2. UMD, in your process
+        appends a hardware command packet to the command
+        allocator's memory. On AMD that is a PM4 packet; on
+        NVIDIA a method write. Perhaps 20-100 bytes.
+        NO SYSCALL. This is why DX12 draw calls are ~0.1 us.
+
+  3. ExecuteCommandLists
+        UMD builds a submission descriptor and calls into the
+        KMD. ONE ioctl for the whole list - not one per draw.
+
+  4. KMD
+        * validates the buffer belongs to you
+        * ensures every referenced resource is RESIDENT and
+          mapped in this process's GPU page tables
+        * places the submission in a hardware RING BUFFER
+        * writes a DOORBELL register - an MMIO write that
+          tells the GPU "there is work"
+
+  5. GPU COMMAND PROCESSOR
+        fetches from the ring, decodes packets, and feeds the
+        front end. The GPU is now executing.
+
+  6. COMPLETION
+        the GPU writes a fence value to memory and raises an
+        INTERRUPT. The KMD's ISR runs, signals the OS
+        synchronisation object, and your WaitForSingleObject
+        returns.
+
+  NOTE how few kernel transitions there are: one per SUBMIT,
+  not one per draw. That is the single biggest structural
+  reason DX12 and Vulkan are faster than DX11 and OpenGL -
+  the batching is explicit and under your control.        */</code></pre>
+
+<h2 id="memory">GPU virtual memory</h2>
+
+<pre class="diagram">   Modern GPUs have an MMU and per-process page tables, for
+   the same reasons a CPU does.
+
+     GPU virtual address
+          |  GPU page tables, per process
+          v
+     physical: VRAM, or system RAM over PCIe, or migrated
+               between them by the driver
+
+   WHAT THIS BUYS
+     * isolation: one process cannot read another's textures.
+       Before per-process GPU page tables this was genuinely
+       not true, and it was a real vulnerability class.
+     * OVERSUBSCRIPTION: allocate more than VRAM and let the
+       driver page. Slow, but it works instead of failing.
+     * a stable address for a resource across residency
+       changes - GetGPUVirtualAddress() stays valid even if
+       the pages move.
+
+   WHAT IT COSTS
+     * a GPU page fault is enormously expensive - the whole
+       wave stalls, and on older hardware the whole GPU
+     * this is what a DRED page-fault report is telling you
+       (chapter 12): a shader dereferenced a GPU VA that is
+       not mapped, almost always a freed resource or a
+       descriptor pointing at nothing
+
+   IOMMU / SMMU applies here too: on a system with an IOMMU
+   the GPU's DMA is itself translated, which is what makes
+   GPU passthrough to a VM safe (virtualisation chapter 17).</pre>
+
+<h2 id="tdr">Scheduling, preemption and TDR</h2>
+
+<pre><code>/* THE GPU IS SHARED. Your game, the compositor, the browser
+   playing video and Windows' own UI all submit work. The KMD
+   arbitrates.                                              */
+
+  PREEMPTION GRANULARITY - how quickly a running job can be
+  interrupted:
+
+    DRAW-LEVEL     between draw calls. Old hardware.
+    PRIMITIVE      between triangles.
+    PIXEL / WAVE   mid-draw. Modern hardware.
+    INSTRUCTION    fully preemptible. Newest.
+
+  Coarse preemption is why a single enormous draw or dispatch
+  can make the whole desktop stutter: nothing else can run
+  until it finishes.
+
+/* TDR - TIMEOUT DETECTION AND RECOVERY
+
+   If a submission does not complete within ~2 seconds,
+   Windows assumes the GPU is hung:
+     1. the KMD is asked to reset the GPU
+     2. every application's device is marked REMOVED
+     3. your app gets DXGI_ERROR_DEVICE_REMOVED with
+        DXGI_ERROR_DEVICE_RESET (chapter 12)
+
+   CAUSES, in order of likelihood:
+     * an infinite loop in a shader
+     * a compute dispatch that is genuinely too large - split
+       it, or it will TDR on slower GPUs even though it works
+       on yours
+     * a barrier a group never reaches (chapter 18)
+     * an actual driver or hardware fault
+
+   THE REGISTRY KEY people reach for:
+     HKLM\System\CurrentControlSet\Control\GraphicsDrivers
+        TdrDelay = 60
+   Raise it FOR DEBUGGING ONLY. Shipping software that needs
+   it has a bug, and users will not have set it.
+
+   Linux equivalents: amdgpu.lockup_timeout, and the
+   GPU reset paths in i915/amdgpu. Same idea, same causes. */</code></pre>
+
+<div class="warn">
+<b>Application profiles are real, and they explain a lot</b>
+<p>Drivers ship per-executable profiles that change defaults, force settings, and in some cases
+<em>substitute entire shaders</em> with hand-optimised replacements. This is why renaming your executable can
+change performance, why a driver update can alter behaviour with no change on your side, and why benchmarking
+against a shipped game tells you about the profile as much as the hardware. When something behaves
+differently on one vendor for no reason you can find, this is a real candidate.</p>
+</div>
+
+<h2 id="stacks">The open-source stacks</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Layer</th><th>Linux</th><th>Windows</th></tr></thead>
+<tbody>
+<tr><td>Kernel driver</td><td><code>drivers/gpu/drm/</code> — amdgpu, i915/xe, nouveau, panfrost, msm</td><td>WDDM
+miniport (vendor, closed)</td></tr>
+<tr><td>Kernel framework</td><td>DRM/KMS — mode setting, GEM/TTM memory, <code>dma-fence</code>,
+scheduler</td><td>DXGkrnl</td></tr>
+<tr><td>User-mode driver</td><td>Mesa: RADV, ANV, NVK, turnip, panvk</td><td>Vendor UMD (closed)</td></tr>
+<tr><td>Shader compiler</td><td>NIR + ACO or LLVM</td><td>Vendor back end</td></tr>
+<tr><td>Interface</td><td>libdrm ioctls</td><td>D3DKMT ioctls</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Mesa is the best code to read if you want to see this for real: <code>src/amd/vulkan</code> (RADV) is a
+complete, readable Vulkan driver, and <code>drivers/gpu/drm/amdgpu</code> is a complete kernel driver for the
+same hardware. Between them they contain every idea in this chapter, in code you can build and instrument —
+which is a rare thing for hardware this complex.</p>
+
+<pre><code># Look at what the driver is doing on a Linux box.
+
+$ lsmod | grep -E 'amdgpu|i915|nouveau'
+$ dmesg | grep -i drm
+[drm] amdgpu kernel modesetting enabled.
+[drm] Initialized amdgpu 3.57.0 for 0000:03:00.0 on minor 0
+
+# Every GPU client, and what it is using:
+$ sudo cat /sys/kernel/debug/dri/0/clients
+$ sudo cat /sys/kernel/debug/dri/0/amdgpu_gem_info
+$ sudo cat /sys/kernel/debug/dri/0/amdgpu_vm_info    # page tables
+
+# The ring buffers - the actual submission queues:
+$ sudo cat /sys/kernel/debug/dri/0/amdgpu_ring_gfx | head
+
+# A GPU hang, after the fact:
+$ sudo cat /sys/kernel/debug/dri/0/amdgpu_gpu_recover
+$ dmesg | grep -i 'ring gfx timeout\|GPU reset'
+
+# Trace submissions as they happen:
+$ sudo perf trace -e 'amdgpu:*' -a
+$ sudo cat /sys/kernel/debug/tracing/events/amdgpu/available_filters
+
+# And the disassembly of what your shader really became:
+$ RADV_DEBUG=shaders ./app 2>shaders.txt
+$ head -50 shaders.txt        # actual GCN/RDNA assembly</code></pre>
+
+<h2 id="closing">Where this track sits</h2>
+
+<p>You have gone from "a GPU hides latency instead of reducing it" to reading the assembly a driver generated
+for your shader. The natural continuations are
+<a href="track.html?t=lx">Linux kernel and drivers</a> if you want to work on the KMD side,
+<a href="track.html?t=cmp">compilers</a> if the shader back end is the interesting part,
+<a href="track.html?t=mt">concurrency</a> because a GPU is the most parallel machine you will program, and
+<a href="track.html?t=ai">AI and large language models</a> for the workload that now drives most GPU design
+decisions.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>DEVICE_REMOVED</code> after a heavy dispatch</td><td>TDR — split the work; it will fail on
+slower GPUs too</td></tr>
+<tr><td>Whole desktop stutters during your frame</td><td>Coarse preemption and a very long draw or
+dispatch</td></tr>
+<tr><td>DRED reports a page fault</td><td>A shader dereferenced an unmapped GPU VA — usually a freed resource
+or a stale descriptor</td></tr>
+<tr><td>Performance changes after renaming the executable</td><td>Driver application profile</td></tr>
+<tr><td>Behaviour changes after a driver update, no code change</td><td>UMD shader compiler or profile
+change</td></tr>
+<tr><td>Works on one vendor, hangs on another</td><td>Almost always a missing barrier one driver
+tolerated</td></tr>
+<tr><td>Allocation succeeds but everything is slow</td><td>Oversubscribed VRAM; the driver is paging</td></tr>
+<tr><td>A GPU crash takes down the whole machine</td><td>A KMD bug — rare, and reportable</td></tr>
+<tr><td>Raising <code>TdrDelay</code> "fixed" it</td><td>It did not; you have a shader or dispatch that is too
+long</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the UMD/KMD split and say what each half does.</li>
+  <li>Explain why most of a GPU driver lives in user mode.</li>
+  <li>Trace one <code>Draw</code> from your call to the GPU executing it, naming each layer.</li>
+  <li>Say how many kernel transitions a thousand draws cost, and why that matters.</li>
+  <li>Give three things GPU virtual memory buys and one it costs.</li>
+  <li>Explain what a DRED page-fault report is telling you.</li>
+  <li>Define preemption granularity and say what coarse granularity causes.</li>
+  <li>Explain TDR, its usual causes, and why raising <code>TdrDelay</code> is not a fix.</li>
+  <li>Say what an application profile is and three symptoms of one.</li>
+  <li>Name the Linux equivalents of the UMD and the KMD, and where to read them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

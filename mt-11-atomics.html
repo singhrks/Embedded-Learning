@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atomic operations and the CAS loop | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Atomic operations and the CAS loop</h1>
+<p class="lead">An atomic operation is one that no other thread can observe half-finished. That is a smaller
+guarantee than people assume — it says nothing about <em>ordering</em>, and it does not compose. Both of those
+gaps are where the bugs live.</p>
+
+<h2 id="what">What atomic buys, and what it does not</h2>
+
+<p>An atomic operation is one that cannot be observed half-finished. That is a weaker guarantee than it sounds — it says nothing about ordering relative to other operations, which is the subject of the next chapter.</p>
+
+<pre class="diagram">   ATOMIC GIVES YOU
+
+     indivisibility   no thread sees a half-written value.
+                      No torn reads, no lost read-modify-write.
+
+     a defined value  the result is one of the values some
+                      thread actually wrote - never a mixture.
+
+   ATOMIC DOES NOT GIVE YOU
+
+     ordering         unless you ask. atomic_fetch_add with
+                      memory_order_relaxed orders NOTHING
+                      around it (chapter 12).
+
+     composition      two atomic operations are not one atomic
+                      operation:
+
+                          if (atomic_load(&amp;a) == 0)     // 1
+                                  atomic_store(&amp;b, 1);  // 2
+
+                      anything can happen between 1 and 2.
+                      This is the check-then-act race with
+                      extra syntax.
+
+     atomicity of the SURROUNDING LOGIC. An atomic counter
+     that is correct tells you nothing about the invariant it
+     was counting.
+
+   THE ONE OPERATION THAT COMPOSES is compare-and-swap, because
+   it folds the check and the act into a single indivisible
+   step. Everything lock-free is built out of it.</pre>
+
+<h2 id="ops">The operation set</h2>
+
+<p>The available operations are a small set, and knowing which are provided natively by the hardware matters: anything not provided is emulated with a retry loop, which performs very differently under contention.</p>
+
+<pre><code>#include &lt;stdatomic.h&gt;                 /* C11                   */
+
+atomic_int   counter = 0;
+atomic_bool  flag    = false;
+_Atomic(struct point) pt;              /* may be lock-free or
+                                          not - see below      */
+
+/* LOAD / STORE - indivisible, but nothing more by default. */
+        int v = atomic_load(&amp;counter);
+        atomic_store(&amp;counter, 42);
+
+/* READ-MODIFY-WRITE - the useful ones. Each returns the OLD
+   value, which is what makes them composable into algorithms. */
+        old = atomic_fetch_add(&amp;counter,  1);
+        old = atomic_fetch_sub(&amp;counter,  1);
+        old = atomic_fetch_or (&amp;flags, MASK);
+        old = atomic_fetch_and(&amp;flags, ~MASK);
+        old = atomic_fetch_xor(&amp;flags, MASK);
+        old = atomic_exchange (&amp;ptr, newptr);
+
+/* COMPARE-AND-SWAP - the universal primitive. */
+        bool ok = atomic_compare_exchange_strong(&amp;p, &amp;expected, desired);
+        /* if (*p == expected) { *p = desired; return true; }
+           else                { expected = *p; return false; }
+
+           NOTE: `expected` is updated on failure. That is not
+           a wart - it saves you a reload in the retry loop.  */
+
+/* C++ is the same set, spelled as methods: */
+        std::atomic&lt;int&gt; c{0};
+        c.fetch_add(1, std::memory_order_relaxed);
+        c.compare_exchange_weak(exp, des);
+
+/* Rust: */
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let c = AtomicUsize::new(0);
+        c.fetch_add(1, Ordering::Relaxed);
+        c.compare_exchange_weak(exp, des, Ordering::AcqRel,
+                                Ordering::Relaxed)</code></pre>
+
+<div class="key">
+<b><code>strong</code> versus <code>weak</code></b>
+<p><code>compare_exchange_weak</code> may fail <em>spuriously</em> — return false even when the value
+matched. That sounds useless until you remember ARM's LL/SC (<a href="mt-06-mutual-exclusion.html">chapter
+6</a>): the store-exclusive fails if anything touched the cache line, including an unrelated access. The weak
+form maps to one LL/SC attempt; the strong form has to add a retry loop inside. <strong>Use
+<code>weak</code> inside a loop you were writing anyway; use <code>strong</code> when a single attempt must be
+conclusive.</strong> On x86 they compile identically.</p>
+</div>
+
+<h2 id="cas">The CAS loop</h2>
+
+<p>Compare-and-swap is the universal primitive — every other atomic operation can be built from it, and every lock-free algorithm uses it. It also brings one notorious failure mode that its interface cannot detect.</p>
+
+<pre><code>/* The shape of every lock-free update. Learn it once. */
+
+        T old = atomic_load_explicit(&amp;obj, memory_order_relaxed);
+        T new;
+        do {
+                new = compute_new_from(old);     /* pure! */
+        } while (!atomic_compare_exchange_weak_explicit(
+                        &amp;obj, &amp;old, new,
+                        memory_order_acq_rel,    /* on success */
+                        memory_order_relaxed));  /* on failure */
+
+/* WHY IT IS CORRECT: the CAS only succeeds if `obj` is still
+   `old` - i.e. nobody changed it while you were computing.
+   If someone did, `old` is refreshed with the current value
+   and you recompute. Progress is guaranteed for the system
+   (someone always wins) but not for any given thread.
+
+   THREE RULES FOR THE BODY:
+
+   1. compute_new_from() MUST be pure and cheap. It runs again
+      on every failure. Anything with a side effect - logging,
+      allocating, incrementing another counter - happens
+      multiple times.
+
+   2. It must not be able to loop for ever. Under heavy
+      contention a thread can lose repeatedly; if that matters,
+      add back-off, or use a lock.
+
+   3. Do NOT reload `old` yourself at the top of the loop.
+      compare_exchange already wrote the current value into it.
+      Reloading opens a window and is a common source of
+      subtle livelock.                                        */
+
+/* A worked example: atomically clamp-and-add. */
+int add_clamped(atomic_int *c, int delta, int max)
+{
+        int old = atomic_load_explicit(c, memory_order_relaxed);
+        int new;
+        do {
+                if (old &gt;= max)
+                        return -1;               /* full        */
+                new = old + delta;
+                if (new &gt; max) new = max;
+        } while (!atomic_compare_exchange_weak_explicit(
+                        c, &amp;old, new,
+                        memory_order_acq_rel, memory_order_relaxed));
+        return new;
+}
+/* You cannot write that with fetch_add. This is exactly the
+   class of problem CAS exists for: a read-modify-write whose
+   "modify" involves a decision.                              */</code></pre>
+
+<h2 id="lockfree">Is it actually lock-free?</h2>
+
+<p>Whether a type is genuinely lock-free is a property of the platform, not of the language. Assuming rather than checking produces code that silently takes a lock on the one target where that matters most.</p>
+
+<pre><code>/* An "atomic" type is not necessarily implemented in hardware.
+   If the type is too big, the compiler emits a hidden LOCK. */
+
+        _Atomic(struct { long a, b, c; }) big;   /* 24 bytes    */
+
+        printf("%d\n", atomic_is_lock_free(&amp;big));   /* 0       */
+
+/* C++ has the compile-time version, which is what you want in
+   a static_assert: */
+        static_assert(std::atomic&lt;MyType&gt;::is_always_lock_free,
+                      "this type needs a hidden mutex");
+
+/* WHAT IS LOCK-FREE, TYPICALLY
+
+     1, 2, 4, 8 bytes         yes, everywhere
+     16 bytes                 x86-64: yes, via CMPXCHG16B
+                              ARM64:  yes, via LDXP/STXP or
+                                      CASP (LSE)
+                              but often only if you compile
+                              with -mcx16 / -march=armv8.1-a
+     anything larger          NO - a lock table, keyed by
+                              address, inside libatomic
+
+   WHY IT MATTERS
+
+     * a hidden lock is not async-signal-safe, so your
+       "atomic" is illegal in a signal handler
+     * it is not usable across processes in shared memory:
+       the lock table is per-process, so two processes
+       "atomically" updating the same shared struct do not
+       exclude each other AT ALL
+     * performance falls off a cliff you cannot see in the
+       source
+
+   Check it. Once, in a static_assert, and never worry again. */</code></pre>
+
+<div class="warn">
+<b><code>volatile</code> is still not atomic</b>
+<p>Worth repeating from <a href="mt-02-threads-and-sharing.html">chapter 2</a> because it is the most durable
+misconception in this field. <code>volatile</code> stops the compiler caching a value in a register. It does
+not make the access indivisible, does not stop the CPU reordering, and does not give any ordering guarantee.
+On MSVC with <code>/volatile:ms</code> it happens to add acquire/release semantics — which is why code written
+for Windows breaks when ported, and why <code>/volatile:iso</code> exists.</p>
+</div>
+
+<h2 id="uses">What atomics are actually for</h2>
+
+<p>Atomics are reached for far more often than they are needed, and used for far fewer things than they could be. These are the cases where they are genuinely the right tool rather than a premature optimisation.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Use</th><th>Operation</th><th>Ordering usually needed</th></tr></thead>
+<tbody>
+<tr><td>Statistics counters</td><td><code>fetch_add</code></td><td><code>relaxed</code> — nobody makes a
+decision on the value</td></tr>
+<tr><td>Reference counts, increment</td><td><code>fetch_add</code></td><td><code>relaxed</code> — you already
+hold a reference</td></tr>
+<tr><td>Reference counts, decrement</td><td><code>fetch_sub</code></td><td><code>acq_rel</code>, or release
+plus an acquire fence before destroying</td></tr>
+<tr><td>A "stop" flag</td><td><code>store</code> / <code>load</code></td><td><code>relaxed</code> is usually
+fine; <code>release</code>/<code>acquire</code> if data goes with it</td></tr>
+<tr><td>Publishing a pointer</td><td><code>store</code></td><td><strong><code>release</code></strong>, always
+(<a href="mt-12-memory-ordering.html">chapter 12</a>)</td></tr>
+<tr><td>Sequence numbers, ID allocation</td><td><code>fetch_add</code></td><td><code>relaxed</code></td></tr>
+<tr><td>Spinlock acquire / release</td><td><code>exchange</code> /
+<code>store</code></td><td><code>acquire</code> / <code>release</code></td></tr>
+<tr><td>Lock-free stack, queue</td><td><code>compare_exchange</code></td><td><code>acq_rel</code></td></tr>
+<tr><td>One-time initialisation</td><td><code>compare_exchange</code></td><td><code>acq_rel</code>, or just use
+<code>call_once</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The reference-count idiom, written correctly. It is the
+   most common real use of non-trivial ordering.            */
+
+void ref_get(struct obj *o)
+{
+        /* relaxed: we already hold a reference, so the object
+           cannot die under us, and no data is being published */
+        atomic_fetch_add_explicit(&amp;o-&gt;refs, 1, memory_order_relaxed);
+}
+
+void ref_put(struct obj *o)
+{
+        if (atomic_fetch_sub_explicit(&amp;o-&gt;refs, 1,
+                                      memory_order_release) == 1) {
+                /* We dropped the last reference. The release
+                   above published OUR writes. Now we must
+                   ACQUIRE everyone else's before we destroy,
+                   or we may free memory whose last write we
+                   never saw.                                 */
+                atomic_thread_fence(memory_order_acquire);
+                destroy(o);
+        }
+}
+/* This exact pattern is in the C++ standard's shared_ptr
+   discussion, in Boost, and in the Linux kernel's kref. If you
+   find yourself writing a refcount by hand, copy it exactly. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Counter is correct but the logic around it is not</td><td>Two atomic operations treated as one — use
+CAS</td></tr>
+<tr><td>CAS loop performs a side effect several times</td><td>An impure body; it re-runs on every
+failure</td></tr>
+<tr><td>CAS loop spins for ever under load</td><td>No back-off; a thread keeps losing. Livelock</td></tr>
+<tr><td>CAS never succeeds</td><td><code>expected</code> reloaded manually at the top of the loop, or
+<code>weak</code> used where a single conclusive attempt was needed</td></tr>
+<tr><td>"Atomic" struct is slow and not signal-safe</td><td>Too large — <code>libatomic</code> is using a
+hidden lock</td></tr>
+<tr><td>Two processes corrupt a shared atomic struct</td><td>Same cause: the hidden lock table is
+per-process</td></tr>
+<tr><td>Works on x86, breaks on ARM</td><td>Relaxed ordering that x86's strong model was hiding</td></tr>
+<tr><td>Use-after-free on the last <code>put</code></td><td>Missing acquire fence before destroy in the
+refcount</td></tr>
+<tr><td>Works with MSVC, breaks with GCC</td><td>Relied on <code>/volatile:ms</code> giving acquire/release
+semantics</td></tr>
+<tr><td>Link error on <code>__atomic_load_16</code></td><td>16-byte atomics without
+<code>-mcx16</code>/<code>-latomic</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State exactly what atomicity guarantees and the two things it does not.</li>
+  <li>Show why two atomic operations are not one, with a concrete race.</li>
+  <li>Explain why compare-and-swap is the primitive everything lock-free is built from.</li>
+  <li>Write the CAS loop from memory and give the three rules for its body.</li>
+  <li>Explain why <code>expected</code> is updated on failure and why reloading it manually is a bug.</li>
+  <li>Distinguish <code>compare_exchange_weak</code> from <code>strong</code>, and relate it to
+  LL/SC.</li>
+  <li>Explain how an "atomic" type can contain a hidden lock and give two consequences.</li>
+  <li>Say why <code>volatile</code> is not a substitute, including the MSVC caveat.</li>
+  <li>Write the reference-count get/put pair with correct orderings and justify each.</li>
+  <li>Give the right memory order for a statistics counter and for publishing a pointer, with
+  reasons.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

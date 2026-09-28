@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Static analysis and Driver Verifier | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Static analysis and Driver Verifier</h1>
+<p class="lead">Windows ships the best driver verification tooling of any operating system, and most of it
+is free and automatic. Static analysis finds bugs at build time; Driver Verifier turns latent runtime bugs
+into immediate, attributable bugchecks. Use both, from day one.</p>
+
+<h2 id="why">Why these matter more here</h2>
+
+<p>Windows ships an unusually strong set of verification tools, and the reason is structural: because the driver ABI is stable and drivers ship as closed binaries, Microsoft cannot fix your bugs during a refactor the way Linux maintainers can. The tools exist to catch them before release instead.</p>
+
+<pre class="diagram">A driver bug on Linux is found by the community, because the
+source is in the tree and everyone builds it (Linux ch. 45).
+
+A Windows driver ships as a signed binary that Microsoft never
+sees the source of. So the verification burden moves to
+TOOLING, and Microsoft has invested accordingly:
+
+   BUILD TIME              Code Analysis (PREfast)
+                           Static Driver Verifier (SDV)
+                           SAL annotations (chapter 03)
+                           InfVerif (chapter 20)
+
+   RUN TIME                Driver Verifier
+                           WDF Verifier (chapter 14)
+                           Application Verifier (user mode)
+                           Special pool (chapter 07)
+
+   CERTIFICATION           HLK Device Fundamentals
+                           Static Tools Logo test
+
+  THE PAYOFF: these tools find, mechanically, most of the bug
+  classes this entire track has described - IRQL violations,
+  leaked resources, unvalidated input, incorrect IRP handling,
+  DMA misuse, lock ordering. A driver that passes all of them
+  clean is in far better shape than one that merely works.</pre>
+
+<h2 id="ca">Code Analysis</h2>
+
+<p>The compiler can find a surprising number of driver bugs before the code ever runs, provided you annotate your functions so it knows what to check. This is the cheapest of all the tools here and the one most often left switched off.</p>
+
+<pre><code># PREfast for Drivers - runs during the build, understands
+# SAL annotations (chapter 03) and driver-specific rules.
+
+    msbuild mydriver.sln /p:RunCodeAnalysis=true
+    ; or: Visual Studio -&gt; Analyze -&gt; Run Code Analysis
+
+# In the project: use the "Recommended driver rules" ruleset,
+# which adds the driver-specific checks to the general C/C++
+# ones.
+
+# WHAT IT CATCHES:
+#   · calling a function at the wrong IRQL, per its
+#     _IRQL_requires_max_ annotation
+#   · ignoring a _Must_inspect_result_ return
+#   · buffer sizes inconsistent with _In_reads_bytes_
+#   · using an uninitialised variable
+#   · leaking a resource on an error path
+#   · dereferencing a possibly-NULL pointer
+#   · a lock acquired and not released on some path
+#   · incorrect WDF object usage
+
+# A TYPICAL FINDING:
+    warning C28118: The current IRQL was too high. Prior
+    function calls indicate IRQL was DISPATCH_LEVEL, but the
+    function MmMapIoSpaceEx requires PASSIVE_LEVEL.
+
+# FIX IT. Do not suppress it. If a warning is genuinely a
+# false positive, suppress it NARROWLY and with a comment:
+    #pragma warning(suppress: 28118)  // IRQL is checked by
+                                      // the caller; see the
+                                      // header contract
+
+# THE HIGHEST-VALUE HABIT in Windows driver development is
+# annotating your own functions with SAL as you write them.
+# The analyser then checks your CALLERS against your
+# contract - which is the difference between finding an IRQL
+# bug at build time and finding it in a customer's crash
+# dump.</code></pre>
+
+<h2 id="sdv">Static Driver Verifier</h2>
+
+<p>Static Driver Verifier goes considerably further, symbolically exploring the paths through your driver against a model of the rules it must obey. It is slow and it finds things no amount of testing would.</p>
+
+<pre><code># SDV is different from Code Analysis: it does symbolic model
+# checking against a set of RULES that describe how the driver
+# framework must be used. It explores paths, not just
+# expressions.
+
+    msbuild /p:Configuration="Win8.1 Release" \
+            /p:Platform=x64 /t:sdv /p:Inputs="/check:*"
+    ; or: Visual Studio -&gt; Driver -&gt; Launch Static Driver
+    ;     Verifier
+
+# THE PROCESS:
+#   1. scan - identify entry points and roles
+#   2. verify - run each rule against the model
+#   3. produce a report, with a COUNTEREXAMPLE TRACE for each
+#      violation
+
+# EXAMPLE RULES:
+    IrqlKeApcLte1        KeXxx APC functions at the right IRQL
+    IrqlIoPassive1       Io functions requiring PASSIVE_LEVEL
+    SpinLockRelease      every acquire has a release
+    LowerDriverReturn    completion routines return correctly
+    PnpIrpCompletion     PnP IRPs completed per the rules
+    RequestCompleted     every WDF request is completed exactly
+                         once
+    MarkIrpPending2      IoMarkIrpPending used correctly
+    WdfSpinlock          WDF spinlock usage
+    DoubleCompletion     no IRP completed twice
+
+# READING A DEFECT: SDV shows the exact path through your code
+# that violates the rule, step by step. It is a proof, not a
+# heuristic - so a reported defect on a reachable path is a
+# real bug.
+
+# CAVEATS, stated honestly:
+#   · SDV can time out on complex drivers. Increase the limit,
+#     or simplify the function it struggles with.
+#   · it can report defects on paths that cannot actually
+#     occur, because it does not know a hardware invariant you
+#     rely on. Those need review, not blind fixing.
+#   · it must be run on the whole driver, not one file.
+
+# BUT: the Static Tools Logo certification test REQUIRES a
+# clean SDV run and a clean Code Analysis run. So this is not
+# optional if you intend to certify - run it early, when the
+# fixes are cheap.</code></pre>
+
+<div class="key">
+<b>Run both before you ever load the driver</b>
+<p>A bug caught by Code Analysis costs a minute. The same bug caught by Driver Verifier costs an hour of
+crash-dump analysis. The same bug found by a customer costs a support case, a hotfix, and a re-certification.
+The ordering of these tools is also the ordering of their cost.</p>
+</div>
+
+<h2 id="verifier">Driver Verifier</h2>
+
+<p>Driver Verifier is the runtime counterpart and the single most valuable tool in this chapter. Rather than waiting for bad behaviour, it forces rare paths to execute and checks the rules on every call — turning intermittent bugs into deterministic ones.</p>
+
+<pre><code># The runtime tool. It instruments your driver's interaction
+# with the kernel and BUGCHECKS at the moment a rule is
+# violated, rather than letting the consequence appear later
+# somewhere else.
+
+# --- Enable it ---
+    verifier /standard /driver mydriver.sys
+    ; or a specific flag set:
+    verifier /flags 0x209BB /driver mydriver.sys
+    ; then reboot
+
+    verifier /querysettings        ; what is enabled
+    verifier /volatile /flags 0x1 /adddriver mydriver.sys
+                                   ; some flags, no reboot
+    verifier /reset                ; turn it all off
+    ; or the GUI: verifier.exe
+
+# --- THE FLAGS, and what each finds ---
+
+    0x00001  Special pool
+             each allocation on its own page with a guard
+             page. Catches overruns AT THE MOMENT they happen.
+             The equivalent of Linux's KASAN (ch. 34).
+
+    0x00002  Force IRQL checking
+             makes pageable code and data non-resident, so
+             touching it at DISPATCH_LEVEL faults IMMEDIATELY
+             instead of weeks later (chapter 03). THE most
+             valuable flag.
+
+    0x00004  Low resources simulation
+             randomly fails allocations, so untested error
+             paths execute. Linux's fault injection (ch. 33).
+
+    0x00008  Pool tracking
+             detects allocations still outstanding at unload,
+             with the stack that made them (chapter 07).
+
+    0x00010  I/O verification
+             IRP rule checking: double completion, use after
+             completion, wrong IRQL, missing PendingReturned
+             (chapter 05).
+
+    0x00020  Deadlock detection
+             builds a lock-order graph and reports
+             inconsistent acquisition. Linux's lockdep
+             (ch. 10).
+
+    0x00080  DMA verification
+             map register accounting, alignment, overruns
+             (chapter 19).
+
+    0x00100  Security checks
+             insecure object creation, missing access checks
+
+    0x00800  Miscellaneous checks
+             freeing an object with references, incorrect
+             string usage
+
+    0x02000  Invariant MDL checking (stack)
+    0x04000  Invariant MDL checking (driver)
+
+    0x20000  DDI compliance checking
+             the KMDF framework rules
+
+# --- START HERE ---
+    verifier /flags 0x209BB /driver mydriver.sys
+# = special pool, IRQL checking, pool tracking, I/O
+# verification, deadlock detection, DMA, security, misc, DDI
+# compliance. This is the standard development set.
+
+# --- AND FOR A HARDER PASS, add low resources ---
+    verifier /flags 0x209BF /driver mydriver.sys
+# Expect to find unchecked allocations. That is the point.</code></pre>
+
+<h2 id="cost">The cost, and when to enable what</h2>
+
+<p>Driver Verifier works by making a class of bug that is normally rare and timing-dependent happen on the
+very first triggering access, and it does that by spending resources — memory, CPU time, or literally injecting
+failures — that you would never accept in a shipping build. The checks marked "Always" cost little enough that
+there is no reason not to run them on every development build. Special pool is the expensive one: it puts each
+allocation on its own page with an inaccessible guard page beside it, which turns a one-byte buffer overflow
+from silent, distant corruption into an immediate access-violation bugcheck at the exact instruction that wrote
+past the end — worth the memory cost the moment you suspect a corruption bug, and worth leaving off otherwise
+because it multiplies memory usage substantially. Low resources simulation is different in kind: it does not
+find bugs by making memory access stricter, it finds them by deliberately failing allocations your driver
+almost certainly assumes will succeed — which is the only reliable way to test an error path that real hardware
+conditions essentially never trigger.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Cost</th><th>When</th></tr></thead>
+<tbody>
+<tr><td>Special pool</td><td>High memory, moderate speed</td><td>Development, and any corruption hunt</td></tr>
+<tr><td>Force IRQL checking</td><td>Moderate</td><td><strong>Always</strong> during development</td></tr>
+<tr><td>Low resources</td><td>Causes failures by design</td><td>A dedicated error-path testing pass</td></tr>
+<tr><td>Pool tracking</td><td>Low</td><td>Always</td></tr>
+<tr><td>I/O verification</td><td>Moderate</td><td>Always</td></tr>
+<tr><td>Deadlock detection</td><td>Moderate</td><td>Always</td></tr>
+<tr><td>DMA verification</td><td>Low</td><td>Any driver doing DMA</td></tr>
+<tr><td>DDI compliance</td><td>Low</td><td>Always, for WDF drivers</td></tr>
+<tr><td>Everything at once</td><td>Very slow</td><td>An overnight soak run</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* THE PRACTICAL SCHEDULE:
+
+   EVERY DEVELOPMENT BUILD
+        the standard set, always on. You will catch bugs the
+        day you write them.
+
+   BEFORE EACH MILESTONE
+        add low resources simulation and run the full
+        functional test suite. Every crash is an unchecked
+        allocation.
+
+   BEFORE SUBMISSION
+        the full flag set, plus the HLK Device Fundamentals
+        tests (chapter 21), running overnight.
+
+   ON A TEST MACHINE, NOT YOUR DEVELOPMENT BOX. Verifier
+   bugchecks, by design.                                   */</code></pre>
+
+<h2 id="reading">Reading a Verifier bugcheck</h2>
+
+<p>When Verifier catches something it bugchecks deliberately, with a code that names exactly which rule was broken. Reading those is a distinct skill from reading an ordinary crash, and a much easier one.</p>
+
+<pre><code>DRIVER_VERIFIER_DETECTED_VIOLATION (c4)
+A device driver attempting to corrupt the system has been
+caught.
+Arguments:
+Arg1: 0000000000000062, A driver has forgotten to free its
+                        pool allocations prior to unloading.
+Arg2: ffff8a0c11223344, name of the driver having the issue
+Arg3: 0000000000000004, number of allocations leaked
+Arg4: 0000000000000000
+
+/* THE FIRST ARGUMENT IS THE RULE. Common ones:
+
+     0x62  pool allocations not freed at unload
+     0x81  freeing memory that contains active timers
+     0xE6  DMA violation (also bugcheck 0xE6 itself)
+     0xF6  a driver referenced a freed object
+     0x91  a thread holding a spinlock at exit
+     0x1000-series  deadlock detection
+
+/* AND THE INVESTIGATION, in WinDbg (chapter 23): */
+
+        !analyze -v
+        !verifier 3 mydriver.sys
+          /* every outstanding allocation, WITH THE STACK that
+             made it - which names the leak directly */
+        !verifier 0x80 mydriver.sys
+          /* IRP log */
+        !verifier 1
+          /* the enabled flags */
+
+/* THE OTHER VERIFIER BUGCHECKS:
+     0xC4  DRIVER_VERIFIER_DETECTED_VIOLATION
+     0xC6  DRIVER_CAUGHT_MODIFYING_FREED_POOL
+     0xC9  DRIVER_VERIFIER_IOMANAGER_VIOLATION
+     0xE6  DRIVER_VERIFIER_DMA_VIOLATION
+     0xC1  SPECIAL_POOL_DETECTED_MEMORY_CORRUPTION
+
+/* EACH ONE NAMES YOUR DRIVER AND THE RULE. That is the whole
+   value: the crash is at the point of the mistake, attributed
+   to the code that made it, rather than a random later
+   consequence in someone else's driver.                  */</code></pre>
+
+<h2 id="wdfverifier">WDF Verifier</h2>
+
+<p>The framework has its own verifier on top of the system one, checking WDF-specific rules — object lifetimes, handle validity, request ownership — that the kernel knows nothing about.</p>
+
+<pre><code># Separate from Driver Verifier, and it checks a different
+# thing: framework contract violations.
+
+# Enable via the WDK's tool:
+    wdfverifier.exe
+# or in the registry, under the driver's Parameters\Wdf key:
+    VerifierOn        = 1
+    VerboseOn         = 1
+    DbgBreakOnError   = 1
+    TrackHandles      = 1     ; find handle leaks
+    VerifyDownLevel   = 1
+
+# WHAT IT CATCHES:
+#   · using a WDF handle after deletion
+#   · completing a request twice
+#   · completing a request you forwarded
+#   · calling a WDF API at the wrong IRQL
+#   · object hierarchy violations (chapter 14)
+#   · lock misuse
+#   · queue state violations (chapter 16)
+
+# WHEN IT FIRES, with DbgBreakOnError it breaks into the
+# debugger with a message naming the rule:
+    *** WDFVERIFIER: WdfRequestComplete called on a request
+        that is not owned by the driver.
+
+# THEN:
+    !wdflogdump mydriver
+# gives the framework's own trace of what led there.
+
+# TURN BOTH VERIFIERS ON. They overlap very little.</code></pre>
+
+<h2 id="workflow">The workflow</h2>
+
+<p>Knowing the tools matters less than having a habit that uses them. This is the order that catches the most, earliest, for the least effort.</p>
+
+<pre><code># A realistic development cycle:
+
+# EVERY BUILD
+    msbuild /p:RunCodeAnalysis=true
+    ; zero warnings, or a documented suppression
+
+# EVERY TEST RUN, on the test machine
+    verifier /flags 0x209BB /driver mydriver.sys
+    wdfverifier: VerifierOn=1
+    ; both enabled, always
+
+# WEEKLY
+    SDV full run
+    low resources simulation pass
+    100 install/uninstall cycles
+    100 disable/enable cycles
+    sleep/resume cycles with I/O in flight
+
+# BEFORE SUBMISSION
+    full verifier flags, overnight soak
+    HLK Device Fundamentals (chapter 21)
+    HLK Static Tools Logo (Code Analysis + SDV, clean)
+    IoAttack fuzzing of the IOCTL interface (chapter 17)
+
+# THE THINGS THAT MOST OFTEN FIND REAL BUGS, in order:
+#   1. Force IRQL checking - the paged-memory-at-DISPATCH bug
+#   2. Low resources simulation - unchecked allocations
+#   3. PNP Surprise Remove - unhandled removal
+#   4. Deadlock detection - latent lock ordering
+#   5. IoAttack - unvalidated IOCTL input
+#
+# All five are free, automated, and take an afternoon to set
+# up once.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0xC4 Arg1 = 0x62</td><td>Pool leaked at unload — <code>!verifier 3</code> names the site</td></tr>
+<tr><td>Bugcheck 0xC1</td><td>Special pool caught an overrun at the moment it happened</td></tr>
+<tr><td>Bugcheck 0xC6</td><td>Wrote to freed pool</td></tr>
+<tr><td>Bugcheck 0xC9</td><td>I/O manager rule — usually double completion</td></tr>
+<tr><td>Bugcheck 0xE6</td><td>DMA rule (<a href="win-18-wdf-dma.html">ch. 19</a>)</td></tr>
+<tr><td>Driver crashes only with Verifier on</td><td>A real latent bug Verifier made deterministic — not a false alarm</td></tr>
+<tr><td>Crashes with low resources simulation</td><td>Unchecked allocation return</td></tr>
+<tr><td>WDFVERIFIER message about request ownership</td><td>Completed a forwarded request (<a href="win-15-wdf-queues.html">ch. 16</a>)</td></tr>
+<tr><td>SDV reports an unreachable defect</td><td>A path it cannot rule out — review, annotate, or accept</td></tr>
+<tr><td>SDV times out</td><td>Function too complex; simplify or raise the limit</td></tr>
+<tr><td>Static Tools Logo fails</td><td>Code Analysis or SDV not clean — required for certification</td></tr>
+<tr><td>Everything is very slow</td><td>Too many Verifier flags for routine use — trim to the standard set</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why Windows invests more in tooling than Linux does, and what that follows from.</li>
+  <li>Run Code Analysis and fix a finding rather than suppressing it.</li>
+  <li>Explain what SAL annotations let the analyser check about your callers.</li>
+  <li>Explain how SDV differs from Code Analysis and what a counterexample trace is.</li>
+  <li>Name eight Driver Verifier flags and the bug class each finds.</li>
+  <li>Map five of them onto their Linux equivalents.</li>
+  <li>Choose a flag set for daily use and one for a milestone pass.</li>
+  <li>Read a 0xC4 bugcheck and use <code>!verifier 3</code> to locate the leak.</li>
+  <li>Enable WDF Verifier and say what it catches that Driver Verifier does not.</li>
+  <li>Write the weekly and pre-submission verification schedule.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

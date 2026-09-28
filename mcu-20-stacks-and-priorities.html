@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack sizing, priority assignment and inversion | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Stack sizing, priority assignment and inversion</h1>
+<p class="lead">Two numbers per task decide whether a system is reliable: how much stack it gets and what
+priority it runs at. Both are usually guessed. This chapter replaces the guessing with measurement for one and
+a theorem for the other.</p>
+
+<h2 id="whyhard">Why stack sizing is hard here</h2>
+
+<pre class="diagram">   ON LINUX                      ON AN MCU
+
+   8 MB default stack            512 bytes to 4 kB
+   Guard page: overflow          Nothing. The stack grows
+   traps immediately             into the next task's data
+   Grows on demand               Fixed at creation
+   One bad recursion = crash     One bad recursion = a
+                                 variable changes somewhere
+                                 else, hours later
+
+   WHAT CONSUMES A TASK'S STACK:
+
+     local variables in every frame of the deepest call path
+   + saved registers at each call (up to 32 bytes)
+   + compiler temporaries and spills
+   + ONE EXCEPTION FRAME if an interrupt lands while this
+     task runs (32 bytes, or 104 with FP state)
+   + the nesting depth of interrupts, IF they run on the
+     task stack
+
+   That last point is why PSP matters (chapter 03): with
+   tasks on PSP and interrupts on MSP, interrupt nesting is
+   charged to ONE main stack you size once, rather than to
+   every task stack separately. Without the split, every
+   task stack must carry the worst-case interrupt depth.</pre>
+
+<h2 id="measuring">Measuring, three ways</h2>
+
+<pre><code>/* 1. WATERMARKING - the standard technique. Fill the stack
+      with a pattern at creation; later, count how much is
+      still intact.                                        */
+
+void stack_fill(uint32_t *base, size_t words)
+{
+    for (size_t i = 0; i &lt; words; i++) {
+        base[i] = 0xA5A5A5A5u;
+    }
+}
+
+size_t stack_unused_words(const uint32_t *base, size_t words)
+{
+    size_t i = 0;
+    while (i &lt; words &amp;&amp; base[i] == 0xA5A5A5A5u) {
+        i++;
+    }
+    return i;      /* words never touched */
+}
+
+/* FreeRTOS does this for you:
+     uxTaskGetStackHighWaterMark(handle)
+   returns the minimum free WORDS ever observed. Print it
+   for every task after a long soak test under peak load.
+
+   THE TRAP: this reports the worst case SEEN, not the
+   worst case POSSIBLE. If the error path that calls
+   snprintf never ran during your test, its 200 bytes are
+   not in the number. Exercise error paths deliberately
+   before trusting a watermark.                            */
+
+/* 2. STATIC ANALYSIS - the only way to bound the worst
+      case rather than sample it.                          */
+
+/*   $ arm-none-eabi-gcc -fstack-usage ...
+     produces a .su file per translation unit:
+
+       i2c.c:142:5:i2c_read    48   static
+       parse.c:88:1:parse_msg  120  dynamic,bounded
+
+     Combine with the call graph and you get a true maximum.
+     Tools: puncover, StackAnalyzer, or a script over the
+     .su files plus objdump's call graph.
+
+     "dynamic" entries - alloca, VLAs, recursion - cannot be
+     bounded. That is the real reason those constructs are
+     banned in embedded coding standards, MISRA included.  */
+
+/* 3. THE MPU GUARD - not a measurement, a safety net.
+      A no-access region below each stack (chapter 14)
+      converts overflow into an immediate, attributable
+      fault. Use it alongside watermarking, not instead:
+      watermarking tells you how close you are, the guard
+      catches the day you are wrong.                       */
+</code></pre>
+
+<div class="key">
+<b>A practical procedure</b>
+<p>Start every task at 1 kB. Run the system under peak load, including every error path you can provoke, for
+long enough to see the rare cases. Read the high-water marks. Set each stack to the observed maximum plus 50%,
+rounded up to a sensible boundary. Add an MPU guard region. Re-check the watermarks in every release. This is
+not elegant, but it is what reliable products actually do, and it beats both guessing and the false confidence
+of a single short test run.</p>
+</div>
+
+<h2 id="priorities">Assigning priorities: rate-monotonic</h2>
+
+<pre><code>/* There IS a right answer for periodic tasks, and it is a
+   theorem rather than an opinion.
+
+   RATE-MONOTONIC: the shorter the period, the higher the
+   priority. Not "the more important" - the more FREQUENT.
+
+   Liu and Layland proved this is OPTIMAL among fixed-
+   priority schemes: if any fixed-priority assignment can
+   meet all deadlines, rate-monotonic can.
+
+   SCHEDULABILITY TEST:
+
+     U = sum(Ci / Ti)          C = worst-case compute time
+                               T = period
+
+     Schedulable if U &lt;= n(2^(1/n) - 1)
+
+       n=1  100%      n=4  75.7%
+       n=2  82.8%     n=5  74.3%
+       n=3  78.0%     n-&gt;inf  69.3%   (ln 2)
+
+   WORKED EXAMPLE:
+
+     control loop   T=10 ms   C=2 ms   ->  0.200
+     sensor read    T=50 ms   C=5 ms   ->  0.100
+     comms          T=100 ms  C=20 ms  ->  0.200
+     display        T=200 ms  C=30 ms  ->  0.150
+                                            -----
+                                     U =    0.650
+
+     n=4 bound is 0.757, and 0.650 &lt;= 0.757, so ALL
+     deadlines are met with priorities in period order:
+     control &gt; sensor &gt; comms &gt; display.
+
+   The bound is SUFFICIENT, not necessary: above it a system
+   may still be schedulable, but you must then do exact
+   response-time analysis rather than the simple test.
+
+   THIS IS WHY 69% IS A FAMOUS NUMBER. A fixed-priority
+   real-time system that must always meet deadlines cannot
+   safely be planned above roughly 70% CPU utilisation.
+   Designing for 95% is designing for missed deadlines.   */
+</code></pre>
+
+<h2 id="inversion">Priority inversion, in miniature</h2>
+
+<pre class="diagram">   The concurrency track covers this fully (chapter 15).
+   The MCU-specific points:
+
+   1. USE A MUTEX, NOT A SEMAPHORE, for mutual exclusion.
+      Only a mutex has an owner, so only a mutex can
+      implement priority inheritance (chapter 19).
+
+   2. CHECK IT IS ENABLED.
+        configUSE_MUTEXES = 1
+      Without it xSemaphoreCreateMutex is compiled out and
+      you silently get a binary semaphore.
+
+   3. THE ISR IS ALWAYS HIGHEST.
+      Any interrupt outranks every task, always. A long ISR
+      delays your most urgent task no matter what priority
+      you gave it. Interrupt duration is therefore part of
+      your schedulability arithmetic, not separate from it:
+
+        U = sum(Ci/Ti) for tasks
+          + sum(Ei/Pi) for INTERRUPTS
+
+      A 20 us ISR at 10 kHz is 20% utilisation before any
+      task runs. This is routinely forgotten, and it is
+      why a system that analyses as 65% utilised misses
+      deadlines at 85%.
+
+   4. MEASURE C, DO NOT ESTIMATE IT.
+      Use the DWT cycle counter (chapter 16) and record the
+      MAXIMUM, not the average. A deadline cares only about
+      the worst case, and the worst case is often 5-10x the
+      typical one because of a cache miss, a flash wait
+      state, or an error path.</pre>
+
+<h2 id="rules">Rules that survive contact with real systems</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Rule</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Fewer tasks is better</td><td>Each costs a stack, a TCB and a synchronisation surface. Two tasks that
+always run together should be one</td></tr>
+<tr><td>Never <code>portMAX_DELAY</code> without a recovery path</td><td>A lost signal becomes a permanently
+blocked task and a silent partial failure</td></tr>
+<tr><td>The idle task must actually run</td><td>If it never does, you are at 100% CPU and have no margin —
+and cannot sleep</td></tr>
+<tr><td>Keep ISRs to tens of microseconds</td><td>They preempt every task; their duration is everyone's
+jitter</td></tr>
+<tr><td>Do not use priority to express importance</td><td>Priority expresses urgency. An important but slow
+task belongs low</td></tr>
+<tr><td>Avoid dynamic creation after startup</td><td>Fragmentation and unbounded failure modes; create
+everything up front</td></tr>
+<tr><td>One priority per task, no two equal</td><td>Equal priorities mean round-robin, which makes response
+times depend on arrival order</td></tr>
+<tr><td>Budget for 70%, not 95%</td><td>The rate-monotonic bound — above it, deadlines are not
+guaranteed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A variable in another task changes spontaneously</td><td>Stack overflow — add MPU guards and check
+watermarks</td></tr>
+<tr><td>Crash only when an error path runs</td><td>That path's stack usage was never in the watermark</td></tr>
+<tr><td>Stack usage cannot be bounded statically</td><td>Recursion, <code>alloca</code> or a VLA — remove
+them</td></tr>
+<tr><td>Deadlines missed at 85% CPU despite analysis</td><td>Interrupt time not included in the utilisation
+sum</td></tr>
+<tr><td>System analyses fine but misses deadlines rarely</td><td>Worst-case compute times estimated rather than
+measured</td></tr>
+<tr><td>High-priority task blocked by a low one</td><td>Priority inversion — use a mutex and enable
+inheritance</td></tr>
+<tr><td>Mutex behaves like a semaphore</td><td><code>configUSE_MUTEXES</code> is 0</td></tr>
+<tr><td>A task never runs again</td><td>Blocked on <code>portMAX_DELAY</code> for a signal that was
+lost</td></tr>
+<tr><td>Response time depends on which task started first</td><td>Two tasks at equal priority round-robining</td></tr>
+<tr><td>Device cannot enter sleep</td><td>The idle task never runs; something polls instead of blocking</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List five things that consume a task's stack.</li>
+  <li>Explain why running tasks on PSP reduces total stack requirements.</li>
+  <li>Describe watermarking and state its one important limitation.</li>
+  <li>Explain why recursion and VLAs are banned by embedded coding standards.</li>
+  <li>State the rate-monotonic priority rule in one sentence.</li>
+  <li>Give the schedulability bound for four tasks and apply it to an example.</li>
+  <li>Explain why 69% is a significant number for fixed-priority systems.</li>
+  <li>Show how interrupt time enters the utilisation calculation.</li>
+  <li>Explain why you must measure worst-case rather than average compute time.</li>
+  <li>Give three rules for priority assignment and justify each.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

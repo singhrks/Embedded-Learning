@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secure storage: REE FS and RPMB | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Secure storage: REE FS and RPMB</h1>
+<p class="lead">The secure world has no flash of its own. It stores data by encrypting it and handing it to
+the normal world, or by writing it to a partition of the eMMC that authenticates every access. The two
+approaches protect different things, and knowing which property you are missing is the whole point of this
+chapter.</p>
+
+<h2 id="two">Two back ends, different guarantees</h2>
+
+<p>Two back ends with genuinely different guarantees, and the difference is not performance — it is whether an attacker with physical access can roll your data back to an earlier state.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Property</th><th>REE FS</th><th>RPMB</th></tr></thead>
+<tbody>
+<tr><td>Confidentiality</td><td><strong>Yes</strong> — AES-GCM with a device key</td><td><strong>Yes</strong></td></tr>
+<tr><td>Integrity</td><td><strong>Yes</strong> — authenticated encryption</td><td><strong>Yes</strong> — HMAC in
+hardware</td></tr>
+<tr><td>Rollback protection</td><td><strong>No</strong> — an old ciphertext still verifies</td><td><strong>Yes</strong>
+— a monotonic write counter</td></tr>
+<tr><td>Availability</td><td>No — the normal world can delete the file</td><td>No — but it cannot silently
+substitute</td></tr>
+<tr><td>Needs hardware</td><td>No</td><td>eMMC or UFS with an RPMB partition</td></tr>
+<tr><td>Typical size</td><td>Whatever the filesystem has</td><td>128 KB – 16 MB</td></tr>
+<tr><td>Speed</td><td>RPC per operation; moderate</td><td>RPC plus an eMMC transaction; slow</td></tr>
+<tr><td>Build flag</td><td><code>CFG_REE_FS=y</code></td><td><code>CFG_RPMB_FS=y</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   THE ROLLBACK GAP, which is the whole reason RPMB exists.
+
+   REE FS:
+     TA writes "failed_attempts = 3"
+       -> encrypted, authenticated, written to /data/tee/xyz
+     Attacker copies that file.
+     TA writes "failed_attempts = 4", then 5, then locks out.
+     Attacker restores the copied file.
+       -> it decrypts correctly
+       -> it authenticates correctly
+       -> the TA reads "failed_attempts = 3"
+
+     Nothing was forged. An OLD, GENUINE state was replayed,
+     and encryption cannot detect that.
+
+   RPMB:
+     Every write carries a monotonically increasing counter,
+     and the eMMC itself enforces it. A replayed frame has a
+     stale counter and the eMMC rejects it. The counter lives
+     in the flash controller, not in software, and cannot be
+     rewound.
+
+   So: use REE FS for things where replay does not matter (a
+   key, a certificate - old is as good as new). Use RPMB for
+   anything COUNTED or REVOKED: attempt counters, firmware
+   anti-rollback versions, licence state, revocation lists.</pre>
+
+<h2 id="using">Using it</h2>
+
+<p>From inside a trusted application the interface is a simple object store, and the interesting decisions are about what you put in it rather than how you call it.</p>
+
+<pre><code>/* The API is the same regardless of back end - only the
+   storageID changes.                                        */
+
+#define OBJ_ID  "my-signing-key-v1"
+
+static TEE_Result store_key(const uint8_t *key, size_t len)
+{
+        TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+        TEE_Result res;
+        uint32_t flags = TEE_DATA_FLAG_ACCESS_READ  |
+                         TEE_DATA_FLAG_ACCESS_WRITE |
+                         TEE_DATA_FLAG_ACCESS_WRITE_META |
+                         TEE_DATA_FLAG_OVERWRITE;
+
+        res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+                                         OBJ_ID, sizeof(OBJ_ID) - 1,
+                                         flags,
+                                         TEE_HANDLE_NULL,   /* no
+                                            attributes - raw data */
+                                         key, len,
+                                         &amp;obj);
+        if (res != TEE_SUCCESS) {
+                EMSG("create failed 0x%08x", res);
+                return res;
+        }
+        TEE_CloseObject(obj);
+        return TEE_SUCCESS;
+}
+
+static TEE_Result load_key(uint8_t *key, size_t *len)
+{
+        TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+        TEE_ObjectInfo   info;
+        uint32_t         count;
+        TEE_Result       res;
+
+        res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                                       OBJ_ID, sizeof(OBJ_ID) - 1,
+                                       TEE_DATA_FLAG_ACCESS_READ,
+                                       &amp;obj);
+        if (res != TEE_SUCCESS)
+                return res;      /* TEE_ERROR_ITEM_NOT_FOUND if
+                                    it was never written - a
+                                    NORMAL first-run case, handle
+                                    it, do not treat it as an
+                                    error                       */
+
+        res = TEE_GetObjectInfo1(obj, &amp;info);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        if (info.dataSize &gt; *len) {
+                *len = info.dataSize;
+                res = TEE_ERROR_SHORT_BUFFER;
+                goto out;
+        }
+
+        res = TEE_ReadObjectData(obj, key, info.dataSize, &amp;count);
+        if (res == TEE_SUCCESS)
+                *len = count;
+out:
+        TEE_CloseObject(obj);
+        return res;
+}
+
+static TEE_Result delete_key(void)
+{
+        TEE_ObjectHandle obj;
+        TEE_Result res;
+
+        res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                                       OBJ_ID, sizeof(OBJ_ID) - 1,
+                                       TEE_DATA_FLAG_ACCESS_READ |
+                                       TEE_DATA_FLAG_ACCESS_WRITE_META,
+                                       &amp;obj);
+        if (res != TEE_SUCCESS)
+                return res;
+        /* This CLOSES the handle as well - do not close it
+           again.                                             */
+        return TEE_CloseAndDeletePersistentObject1(obj);
+}</code></pre>
+
+<div class="key">
+<b>Storing a key object, not raw bytes</b>
+<p><code>TEE_CreatePersistentObject</code>'s <code>attributes</code> parameter takes a
+<code>TEE_ObjectHandle</code>. Pass a populated key object there and OP-TEE stores the key
+<em>as a key</em> — you can reopen it and pass it straight to <code>TEE_SetOperationKey</code> without the
+raw material ever appearing in a buffer you manage. For key storage that is strictly better than storing
+bytes and re-populating.</p>
+</div>
+
+<pre><code>/* The better pattern for keys: */
+
+    TEE_ObjectHandle key = TEE_HANDLE_NULL, persistent = TEE_HANDLE_NULL;
+
+    TEE_AllocateTransientObject(TEE_TYPE_AES, 256, &amp;key);
+    TEE_GenerateKey(key, 256, NULL, 0);   /* never leaves the TEE */
+
+    TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+                               OBJ_ID, sizeof(OBJ_ID) - 1,
+                               flags,
+                               key,          /* &lt;-- the object   */
+                               NULL, 0,      /* no extra data     */
+                               &amp;persistent);
+
+    /* Later, in another session or after a reboot: */
+    TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                             OBJ_ID, sizeof(OBJ_ID) - 1,
+                             TEE_DATA_FLAG_ACCESS_READ, &amp;persistent);
+    TEE_SetOperationKey(op, persistent);    /* use it directly    */
+
+    /* The raw key bytes existed only inside OP-TEE, ever. */</code></pre>
+
+<h2 id="keys">The key hierarchy</h2>
+
+<p>Storage is encrypted, which immediately raises the question of what encrypts it and where that key lives. The answer is a chain terminating in hardware.</p>
+
+<pre class="diagram">   HUK - the Hardware Unique Key
+     Burned into fuses or derived from a PUF. Readable only by
+     secure-world code, often only through a hardware key
+     derivation block that never exposes it. Different on every
+     device.
+       |
+       |  KDF, with a fixed string
+       v
+   SSK - Secure Storage Key
+     huk_derive(HUK, "onlinesecurestorage")
+       |
+       |  KDF, with the TA's UUID
+       v
+   TSK - TA Storage Key
+     hmac(SSK, TA_UUID)
+       |
+       |  and, if the login type scopes it, the client identity
+       v
+   FEK - File Encryption Key
+     A FRESH RANDOM key per file, encrypted with the TSK and
+     stored in the file's own header.
+       |
+       v
+   the file contents, AES-GCM under the FEK
+
+   What each level buys:
+
+     HUK per device      one device's storage cannot be read on
+                         another, and a stolen image is useless
+     TSK per TA          TA A cannot read TA B's objects. This
+                         is enforced by key derivation, not by
+                         access control - even a compromised
+                         TA A does not have TA B's key.
+     per-client scoping  with LOGIN_USER, two users of the same
+                         TA get different storage
+     FEK per file        one file's key does not compromise
+                         another; and rewriting a file uses a
+                         new FEK
+
+   On QEMU there are no fuses, so the HUK is a hardcoded test
+   value and every "device" has the same one. That is fine for
+   development and is exactly what the "might be insecure"
+   warning is about (chapter 4).</pre>
+
+<h2 id="rpmb">RPMB in practice</h2>
+
+<p>A storage partition that authenticates every write with a counter, which is what makes rollback detectable. It requires a key provisioned once, and provisioning it is irreversible.</p>
+
+<pre><code># RPMB is a special eMMC partition. Every read and write is
+# authenticated with an HMAC-SHA256 key that is PROGRAMMED ONCE
+# and can never be read back or changed.
+
+$ ls /dev/mmcblk0*
+/dev/mmcblk0  /dev/mmcblk0boot0  /dev/mmcblk0boot1  /dev/mmcblk0rpmb
+
+$ sudo mmc rpmb read-counter /dev/mmcblk0rpmb
+Counter value: 0x00001a2f
+
+# Build OP-TEE for it:
+$ make CFG_RPMB_FS=y CFG_RPMB_WRITE_KEY=y CFG_RPMB_TESTKEY=n
+
+#   CFG_RPMB_FS=y         use RPMB for secure storage
+#   CFG_RPMB_WRITE_KEY=y  allow OP-TEE to PROGRAM the key if it
+#                         is not yet set. ONE-WAY. Enable
+#                         deliberately, in manufacturing.
+#   CFG_RPMB_TESTKEY=y    use a fixed test key. Development
+#                         only, and it makes RPMB pointless.
+
+# Under QEMU there is no real eMMC, so tee-supplicant emulates
+# one in a file:
+$ tee-supplicant -r          # emulated RPMB
+$ ls -l /var/lib/optee/rpmb_emu*
+# Useful for developing the logic; provides no real rollback
+# protection, because the emulation file can be restored.
+
+# From a TA, force RPMB explicitly:
+    TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE_RPMB, ...)</code></pre>
+
+<div class="danger">
+<b>The RPMB key is written once, for ever</b>
+<p>Programming the RPMB authentication key is irreversible. Get it wrong in manufacturing — wrong key, key
+not recorded, key derived from something you later change — and those devices can never use RPMB again. There
+is no reset, no factory tool, no vendor override. Decide the key derivation before the first production run
+and test the whole flow on sacrificial hardware.</p>
+</div>
+
+<h2 id="normalworld">What the normal world can still do</h2>
+
+<p>The default back end stores its data in the normal world's filesystem, which means the untrusted side can delete or revert it. Knowing exactly what that does and does not break is essential.</p>
+
+<pre><code># REE FS storage is just files:
+$ ls -la /data/tee/
+drwx------ 2 root root  4096 .
+-rw------- 1 root root  4096 0
+-rw------- 1 root root   512 1
+-rw------- 1 root root  4096 dirf.db
+
+$ xxd /data/tee/0 | head -3
+00000000: a3f1 8c2e 44b9 7710 ...   # ciphertext. Unreadable.
+
+# The normal world CAN:
+#   delete these files      -> the TA's data is GONE
+#   restore an old copy     -> rollback, unless RPMB
+#   fill the filesystem     -> writes fail
+#   corrupt them            -> reads fail authentication
+
+# The normal world CANNOT:
+#   read the plaintext
+#   forge a valid file
+#   move the data to another device and use it
+
+# So: AVAILABILITY IS NOT PROTECTED, on either back end. A TA
+# must handle its storage vanishing:
+#
+#   res = TEE_OpenPersistentObject(...);
+#   if (res == TEE_ERROR_ITEM_NOT_FOUND) {
+#           /* First run, OR someone deleted it. You usually
+#              cannot tell the difference. Decide, at design
+#              time, which of these your TA does:
+#                - regenerate and carry on   (a cache)
+#                - refuse to operate         (a licence)
+#                - re-provision from a server (a credential)
+#              "Regenerate silently" for something that was
+#              supposed to be counted is how rollback
+#              protection gets lost.                        */
+#   }</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>TEE_ERROR_ITEM_NOT_FOUND</code> on first run</td><td>Normal. Handle it as a create-if-absent
+case</td></tr>
+<tr><td>All stored data lost after a filesystem wipe</td><td>REE FS lives in <code>/data/tee</code>; nothing
+protects availability</td></tr>
+<tr><td>Attempt counter can be reset</td><td>REE FS has no rollback protection — this needs RPMB</td></tr>
+<tr><td><code>TEE_ERROR_MAC_INVALID</code> or <code>CORRUPT_OBJECT</code></td><td>File modified or truncated by
+the normal world — authentication working</td></tr>
+<tr><td>Storage works on one device, not another</td><td>Per-device HUK. This is the intended
+behaviour</td></tr>
+<tr><td>Storage lost after a firmware update</td><td>HUK derivation changed, or the TA's UUID changed, so the
+TSK differs</td></tr>
+<tr><td>RPMB operations fail with <code>TEE_ERROR_TIME_NOT_SET</code>-like errors</td><td>RPMB key not
+programmed, or the wrong key</td></tr>
+<tr><td>RPMB writes fail after a while</td><td>Partition full — RPMB is small; store counters, not
+blobs</td></tr>
+<tr><td>Storage is very slow</td><td>Every operation is an RPC plus an eMMC transaction. Cache in the session
+context and write rarely</td></tr>
+<tr><td>Two users share stored data</td><td><code>TEEC_LOGIN_PUBLIC</code>; use <code>LOGIN_USER</code>
+(<a href="tee-11-client-api.html">chapter 11</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compare REE FS and RPMB across confidentiality, integrity, rollback and availability.</li>
+  <li>Explain the rollback attack against REE FS in concrete steps.</li>
+  <li>Say which kinds of data require RPMB and give three examples.</li>
+  <li>Write a create-read-delete cycle for a persistent object with correct error handling.</li>
+  <li>Explain why storing a key object beats storing raw bytes.</li>
+  <li>Draw the key hierarchy from HUK to file, and say what each level isolates.</li>
+  <li>Explain how one TA is prevented from reading another's storage.</li>
+  <li>Say what the RPMB write counter protects and where it lives.</li>
+  <li>Explain why programming the RPMB key is a manufacturing decision.</li>
+  <li>List what the normal world can and cannot do to secure storage, and say how a TA should handle its
+  data disappearing.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

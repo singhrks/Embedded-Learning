@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debug information and how debuggers work | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debug information and how debuggers work</h1>
+<p class="lead">How a debugger maps machine addresses back to source lines, finds variables that live in
+registers, and walks a stack. DWARF is the format, and understanding it explains both what debuggers can do
+and why optimised code is harder to inspect.</p>
+
+<h2 id="dwarf">DWARF</h2>
+
+<pre class="diagram">   Debug information lives in ELF sections that are NOT
+   loaded at run time:
+
+     .debug_info     the DIE tree: types, variables,
+                     functions, scopes
+     .debug_abbrev   the abbreviation table it is encoded
+                     against
+     .debug_line     the LINE TABLE: address -&gt; file:line
+     .debug_str      strings
+     .debug_loclists variable LOCATIONS, per address range
+     .debug_ranges   non-contiguous address ranges
+     .debug_frame    stack unwinding
+     .eh_frame       unwinding, LOADED (used by C++
+                     exceptions, so it must exist at run
+                     time)
+
+   THE CENTRAL STRUCTURE is a tree of DIEs - Debugging
+   Information Entries. Each has a TAG and ATTRIBUTES:
+
+     DW_TAG_compile_unit
+       DW_AT_name       "prog.c"
+       DW_AT_comp_dir   "/home/me/src"
+       DW_AT_producer   "GNU C17 13.2.0 -O2 -g"
+       |
+       +- DW_TAG_base_type
+       |    DW_AT_name "int"  DW_AT_byte_size 4
+       |    DW_AT_encoding DW_ATE_signed
+       |
+       +- DW_TAG_structure_type
+       |    DW_AT_name "point"  DW_AT_byte_size 8
+       |    +- DW_TAG_member  "x"  DW_AT_data_member_location 0
+       |    +- DW_TAG_member  "y"  DW_AT_data_member_location 4
+       |
+       +- DW_TAG_subprogram
+            DW_AT_name "main"
+            DW_AT_low_pc  0x1000
+            DW_AT_high_pc 0x1080
+            DW_AT_frame_base  DW_OP_call_frame_cfa
+            +- DW_TAG_formal_parameter "argc"
+            |    DW_AT_location  ...
+            +- DW_TAG_variable "sum"
+                 DW_AT_location  ...
+
+   READ IT:
+      readelf --debug-dump=info prog | less
+      llvm-dwarfdump prog
+      objdump --dwarf=info prog
+      dwarfdump prog</pre>
+
+<h2 id="line">The line table</h2>
+
+<pre><code>/* .debug_line maps ADDRESSES to source positions. It is
+   encoded as a bytecode program for a state machine -
+   because a naive table would be enormous.               */
+
+$ readelf --debug-dump=decodedline prog
+
+File name  Line number  Starting address
+prog.c              10             0x1000
+prog.c              11             0x1008
+prog.c              12             0x1010
+prog.c              11             0x1020    &lt;- back to 11!
+prog.c              14             0x1030
+
+/* THE OUT-OF-ORDER ENTRY at 0x1020 is the optimiser: code
+   from line 11 was scheduled after code from line 12. That is
+   why single-stepping optimised code jumps around, and it is
+   not a bug in the debugger.
+
+/* EACH ROW ALSO CARRIES FLAGS:
+     is_stmt          a good place for a breakpoint
+     basic_block
+     end_sequence
+     prologue_end     &lt;-- where a `break func` actually lands
+     epilogue_begin
+
+   `prologue_end` is why a breakpoint on a function stops
+   AFTER the prologue, so the arguments are already in their
+   final locations. Without it the debugger would show
+   garbage for every parameter.
+
+/* WITH INLINING, one address may map to SEVERAL source
+   positions - the inlined line and the call site. DWARF
+   expresses this with DW_TAG_inlined_subroutine, and it is
+   how a backtrace can show:
+
+       #0  helper (x=5) at helper.c:12
+       #1  caller () at main.c:30
+   even though `helper` was inlined and there is no stack
+   frame for it. gdb calls these "inline frames".        */</code></pre>
+
+<h2 id="locations">Where variables live</h2>
+
+<pre><code>/* At -O0 a variable has one home: a stack slot. Simple.
+
+   At -O2 it moves: a register here, a different register
+   there, spilled briefly, and gone entirely where the
+   compiler proved it unnecessary. DWARF describes this with a
+   LOCATION LIST - an expression per address range.       */
+
+$ llvm-dwarfdump --debug-loclists prog
+
+0x0000000c:
+  [0x1000, 0x1018): DW_OP_reg0 W0
+  [0x1018, 0x1030): DW_OP_reg19 W19
+  [0x1030, 0x1040): DW_OP_fbreg -20
+  [0x1040, 0x1050): &lt;empty&gt;
+
+/* READS AS: between 0x1000 and 0x1018 the variable is in w0;
+   then in w19; then at frame base minus 20; then NOWHERE -
+   which is what gdb reports as `&lt;optimized out&gt;`.
+
+/* THE EXPRESSIONS are a small stack language, DWARF
+   expressions:
+        DW_OP_reg3           it IS register 3
+        DW_OP_breg3 -16      at [register 3 - 16]
+        DW_OP_fbreg -20      at [frame base - 20]
+        DW_OP_addr 0x4000    at a fixed address
+        DW_OP_piece          the value is SPLIT across
+                             several locations
+        DW_OP_stack_value    the value is computed, and does
+                             not exist in memory at all
+
+   `DW_OP_stack_value` is how a debugger can show a variable
+   that was optimised into an expression - "x is y*2" - even
+   though nothing stores x.
+
+/* THIS IS WHY -Og EXISTS: it optimises, but avoids
+   transformations that destroy variable locations. For
+   debugging code that must run at speed, -Og -g is the right
+   answer, not -O0.                                       */</code></pre>
+
+<div class="key">
+<b>Why <code>&lt;optimized out&gt;</code> is not a compiler bug</b>
+<p>If the compiler proved a variable's value is never needed at a point, it does not exist there. There is
+no location to report because there is no value. DWARF can describe registers, memory, split values and even
+computed values — but not values that were never computed. That is the honest answer, and the fix is
+<code>-Og</code>, not distrust of the debugger.</p>
+</div>
+
+<h2 id="unwinding">Stack unwinding</h2>
+
+<pre><code>/* To produce a backtrace, a debugger must find each caller's
+   frame. Two ways:
+
+   1. THE FRAME POINTER CHAIN (chapter 10). x29 points at the
+      saved x29, forming a linked list; x30 is beside it.
+      Simple, fast, and REQUIRES -fno-omit-frame-pointer.
+
+   2. CFI - CALL FRAME INFORMATION. A table describing, for
+      every address, how to compute the CANONICAL FRAME
+      ADDRESS and where each saved register is. No frame
+      pointer needed, and it works mid-prologue.        */
+
+$ readelf --debug-dump=frames-interp prog
+
+   LOC     CFA      x19 x29 x30 ra
+0000001000 sp+0                     u   (nothing saved yet)
+0000001004 sp+32    c-32 c-24  c-8      (after the stp)
+0000001008 x29+32   c-32 c-24  c-8      (after mov x29,sp)
+...
+0000001040 sp+0                     u   (after the epilogue)
+
+/* READS AS: at 0x1004 the canonical frame address is sp+32,
+   x19 is saved at CFA-32, and the return address at CFA-8.
+   An unwinder reads that row and steps to the caller.
+
+/* THE ASSEMBLER DIRECTIVES that generate it (chapter 11): */
+        .cfi_startproc
+        stp     x29, x30, [sp, #-32]!
+        .cfi_def_cfa_offset 32
+        .cfi_offset 29, -32
+        .cfi_offset 30, -24
+        mov     x29, sp
+        .cfi_def_cfa_register 29
+        ...
+        .cfi_endproc
+
+/* HAND-WRITTEN ASSEMBLY WITHOUT THESE IS INVISIBLE to
+   unwinders: the backtrace stops there, C++ exceptions
+   cannot propagate through it, and perf's call graphs are
+   truncated. Every kernel and libc assembly routine carries
+   them for this reason.
+
+/* .eh_frame VERSUS .debug_frame: identical in structure, but
+   .eh_frame is ALLOCATED - it is present in a stripped
+   binary, because C++ exception handling needs it at run
+   time. Which is why a stripped C++ binary can still produce
+   a backtrace, and a stripped C binary compiled with
+   -fno-asynchronous-unwind-tables cannot.               */</code></pre>
+
+<h2 id="how">How a debugger works</h2>
+
+<pre><code>/* --- BREAKPOINTS --- */
+/* Replace the instruction at the target with a trap. On
+   AArch64 that is BRK #0 (0xd4200000).                    */
+
+        1. read and SAVE the original 4 bytes
+        2. write BRK #0 there
+        3. continue
+        4. the CPU traps; the kernel sends SIGTRAP; the
+           debugger is notified via waitpid
+        5. to continue: restore the original instruction,
+           single-step over it, re-insert the trap, resume
+
+/* HARDWARE BREAKPOINTS use the debug registers instead - no
+   memory modification, so they work on read-only or flash
+   memory. AArch64 provides a handful (typically 6 breakpoint
+   and 4 watchpoint registers), which is why gdb limits you.
+
+/* --- WATCHPOINTS --- */
+        watch myvar
+/* Hardware watchpoints use the same debug registers and trap
+   on ACCESS. SOFTWARE watchpoints single-step the entire
+   program and compare after each instruction - correct, and
+   thousands of times slower. gdb tells you which it used.
+
+/* --- SINGLE STEPPING --- */
+        PSTATE.SS, or ptrace(PTRACE_SINGLESTEP)
+/* `step` (source line) is implemented as: repeatedly
+   single-step until the line table says we left the current
+   line. Which is why stepping optimised code jumps around -
+   the line table genuinely does.
+
+/* --- THE PTRACE INTERFACE --- */
+        ptrace(PTRACE_ATTACH, pid, 0, 0);
+        waitpid(pid, &amp;status, 0);
+        ptrace(PTRACE_PEEKDATA, pid, addr, 0);
+        ptrace(PTRACE_POKEDATA, pid, addr, value);
+        ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &amp;iov);
+        ptrace(PTRACE_CONT, pid, 0, signal);
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+
+/* THE WHOLE DEBUGGER is ptrace plus DWARF plus a great deal
+   of careful bookkeeping. A minimal one is a few hundred
+   lines, and writing one is the fastest way to understand
+   what gdb is doing.
+
+/* WHY YOU MAY NOT BE ABLE TO ATTACH: */
+        cat /proc/sys/kernel/yama/ptrace_scope
+        # 0 = any process may attach to any of its own
+        # 1 = only to descendants (the default) - which is why
+        #     `gdb -p` on an unrelated process fails
+        # 2 = admin only,  3 = nobody                       */</code></pre>
+
+<h2 id="split">Managing debug info</h2>
+
+<pre><code># Debug info is LARGE - often several times the code size.
+
+# --- SPLIT IT OUT, ship the binary, keep the symbols ---
+    objcopy --only-keep-debug prog prog.debug
+    objcopy --strip-debug prog
+    objcopy --add-gnu-debuglink=prog.debug prog
+    ; gdb finds prog.debug automatically via the debuglink,
+    ; or via a build-id path in /usr/lib/debug
+
+    readelf -n prog | grep -A1 'Build ID'
+    ; the build-id is how distributions match a binary to its
+    ; separately-packaged debug symbols
+
+# --- SPLIT DWARF: keep it out of the .o files entirely ---
+    gcc -g -gsplit-dwarf -c prog.c
+    ; produces prog.dwo alongside prog.o. The linker never
+    ; reads it, so LINK TIME DROPS SUBSTANTIALLY on large
+    ; projects - often the single biggest build-time win for
+    ; a debug build of a large C++ codebase.
+
+# --- COMPRESS ---
+    gcc -gz              ; compressed debug sections
+    -Wl,--compress-debug-sections=zlib
+
+# --- DWARF VERSION ---
+    -gdwarf-4  -gdwarf-5
+    ; DWARF 5 is smaller and better, but old tools may not
+    ; read it. Check what your target's gdb supports.
+
+# --- LEVELS ---
+    -g0    none
+    -g1    line tables and function names only - enough for
+           BACKTRACES, a fraction of the size. Good for
+           production builds.
+    -g     (= -g2) the normal level
+    -g3    plus MACRO definitions, so gdb can expand macros
+
+# THE PRODUCTION RECOMMENDATION: build with -g, split the
+# debug info out, ship the stripped binary, and archive the
+# .debug file with the build. Then a crash dump from the
+# field is analysable, and the shipped image is small.</code></pre>
+
+<h2 id="beyond">Beyond gdb</h2>
+
+<pre><code># DWARF is a general format, and many tools consume it:
+
+    pahole -C mystruct prog.o    ; STRUCT LAYOUT with holes
+                                 ; marked - the best tool for
+                                 ; finding padding
+                                 ; (chapter 10)
+    pahole --reorganize          ; suggests a better order
+
+    perf report --call-graph dwarf
+    ; unwinds using CFI rather than frame pointers, so it
+    ; works on binaries built with -fomit-frame-pointer
+
+    bpftrace, systemtap
+    ; use DWARF to attach probes to source lines and read
+    ; local variables in a running kernel
+
+    addr2line -e prog -f -i 0x1234
+    ; -i shows INLINE frames too - essential for making sense
+    ; of an optimised backtrace
+
+    llvm-symbolizer &lt; addresses.txt
+    ; what the sanitizers use to turn addresses into
+    ; file:line
+
+    eu-stack, gcore, coredumpctl
+    ; post-mortem analysis
+
+# AND THE KERNEL:
+    CONFIG_DEBUG_INFO_DWARF5=y
+    CONFIG_GDB_SCRIPTS=y         ; lx-dmesg, lx-symbols
+    CONFIG_DEBUG_INFO_BTF=y      ; BTF - a compact type format
+                                 ; derived from DWARF, used by
+                                 ; BPF and by kernel tooling.
+                                 ; A fraction of DWARF's size,
+                                 ; enough for type
+                                 ; introspection.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"No symbol table is loaded"</td><td>Built without <code>-g</code>, or stripped and the debuglink is missing</td></tr>
+<tr><td><code>&lt;optimized out&gt;</code></td><td>The value does not exist there — use <code>-Og</code></td></tr>
+<tr><td>Stepping jumps around</td><td>The line table genuinely is out of order after scheduling</td></tr>
+<tr><td>A breakpoint lands in the wrong place</td><td>Line-table granularity; try an address breakpoint</td></tr>
+<tr><td>Backtrace stops in assembly</td><td>Missing <code>.cfi_*</code> directives</td></tr>
+<tr><td>Backtrace stops after one frame</td><td><code>-fomit-frame-pointer</code> and no CFI, or a corrupted stack</td></tr>
+<tr><td>Inlined function missing from a backtrace</td><td>Use <code>addr2line -i</code>, or a debugger that shows inline frames</td></tr>
+<tr><td>Cannot set more than a few watchpoints</td><td>Hardware debug register limit</td></tr>
+<tr><td>Watchpoint makes the program crawl</td><td>Fell back to a software watchpoint</td></tr>
+<tr><td><code>gdb -p</code> refuses to attach</td><td><code>ptrace_scope</code> — check the yama setting</td></tr>
+<tr><td>Debug build links very slowly</td><td>Debug info volume — use <code>-gsplit-dwarf</code></td></tr>
+<tr><td>Symbols do not match the binary</td><td>Different build — check the build-id</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name DWARF's main sections and what each holds.</li>
+  <li>Read a DIE tree and identify a function, its parameters and its types.</li>
+  <li>Explain the line table and why <code>prologue_end</code> exists.</li>
+  <li>Explain location lists and what <code>&lt;optimized out&gt;</code> really means.</li>
+  <li>Explain the two unwinding mechanisms and when each is available.</li>
+  <li>Say what <code>.cfi_*</code> directives produce and what breaks without them.</li>
+  <li>Explain how a software breakpoint is implemented, step by step.</li>
+  <li>Explain when hardware breakpoints are required and why they are limited.</li>
+  <li>Split debug info out of a binary and have gdb find it again.</li>
+  <li>Use <code>pahole</code> and <code>addr2line -i</code> on a real binary.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QEMU with KVM on real hardware | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>QEMU with KVM on real hardware</h1>
+<p class="lead">Switching from TCG to KVM changes one flag and everything else: speed goes up a hundredfold,
+timing becomes meaningful, and every debugging tool that depended on QEMU seeing each instruction stops
+working. This chapter covers the switch, what you gain, what you lose, and how to set up a machine that
+serves both.</p>
+
+<h2 id="switch">Making the switch</h2>
+
+<pre><code># The requirement: guest architecture == host architecture, and
+# the CPU must have reached EL2 at boot (virt chapter 3).
+
+$ ls -l /dev/kvm
+crw-rw---- 1 root kvm 10, 232 /dev/kvm
+$ sudo usermod -aG kvm $USER      # then log out and back in
+
+$ dmesg | grep -i kvm
+[    0.512430] kvm [1]: Hyp mode initialized successfully
+[    0.512461] kvm [1]: VHE mode initialized successfully
+
+# TCG, for reference:
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 2G -nographic \
+    -kernel Image -append "console=ttyAMA0"
+
+# KVM. Three changes:
+$ qemu-system-aarch64 -M virt,gic-version=host -cpu host \
+    -accel kvm -smp 4 -m 2G -nographic \
+    -kernel Image -append "console=ttyAMA0"
+
+#   -accel kvm            use the hardware
+#   -cpu host             pass the real CPU through. Any other
+#                         -cpu value under KVM either fails or
+#                         silently gives you the host CPU anyway
+#                         - KVM cannot emulate a different core.
+#   gic-version=host      match the real interrupt controller.
+#                         A mismatch fails at startup.
+
+# Fall back automatically, for a script that must work on both:
+-accel kvm -accel tcg
+# QEMU tries them in order and uses the first that initialises.</code></pre>
+
+<h2 id="tradeoff">What you gain and lose</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>TCG</th><th>KVM</th></tr></thead>
+<tbody>
+<tr><td>Speed</td><td>10–50x slower than native</td><td>Near native</td></tr>
+<tr><td>Cross-architecture</td><td>Yes</td><td>No</td></tr>
+<tr><td><code>-d in_asm</code>, <code>-d exec</code>, <code>-d cpu</code></td><td>Works</td><td><strong>Nothing</strong> —
+QEMU never sees the instructions</td></tr>
+<tr><td>TCG plugins</td><td>Works</td><td><strong>Unavailable</strong></td></tr>
+<tr><td><code>-icount</code>, record/replay, reverse debugging</td><td>Works</td><td><strong>Unavailable</strong></td></tr>
+<tr><td>GDB stub</td><td>Full</td><td>Works, but breakpoints use hardware debug registers and are
+limited in number</td></tr>
+<tr><td>Watchpoints</td><td>Unlimited, software</td><td>Limited to the CPU's watchpoint registers</td></tr>
+<tr><td><code>-d int</code>, <code>-d mmu</code></td><td>Full detail</td><td>Only what KVM traps</td></tr>
+<tr><td><code>--trace</code> on device models</td><td>Works</td><td>Works — device models still run in
+QEMU</td></tr>
+<tr><td>Monitor <code>info registers</code>, <code>x</code>, <code>savevm</code></td><td>Works</td><td>Works</td></tr>
+<tr><td>Timing realism</td><td>Meaningless</td><td>Roughly meaningful</td></tr>
+<tr><td>Race reproduction</td><td>Poor — ordering is too strong</td><td>Real</td></tr>
+<tr><td>Emulated CPU features</td><td><code>-cpu max</code> gives you anything</td><td>Only what the silicon
+has</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Use both, deliberately</b>
+<p>Develop under TCG on your laptop, where <code>-d exec</code>, plugins and reverse debugging exist and where
+you can pretend to have an SoC that does not. Validate under KVM on real arm64 hardware, where timing is real
+and races reproduce. A bug found only under KVM is a timing bug; a bug found only under TCG is usually a
+logic bug you got lucky about on hardware. Both are worth finding.</p>
+</div>
+
+<h2 id="host">Setting up an arm64 host</h2>
+
+<pre><code># Options, cheapest first:
+#   Raspberry Pi 5 / Orange Pi 5 - works, slow-ish, ~$80
+#   Apple silicon Mac + Asahi Linux or a Linux VM under
+#      Virtualization.framework (nested, see below)
+#   An Ampere/Graviton cloud instance - the easiest path;
+#      c7g/t4g on AWS, or Oracle's free-tier Ampere
+#   Any arm64 server board
+
+# 1. Confirm EL2. THIS IS THE ONE THAT FAILS.
+$ dmesg | grep -i 'CPU.*started at'
+[    0.000000] CPU: All CPU(s) started at EL2       # good
+[    0.000000] CPU: All CPU(s) started at EL1       # no KVM,
+                                                    # ever
+# On a Raspberry Pi, EL2 requires:
+$ grep -q '^arm_64bit=1' /boot/firmware/config.txt
+$ echo 'arm_control=0x200' | sudo tee -a /boot/firmware/config.txt
+# (older firmwares; newer ones start at EL2 by default)
+
+# 2. Packages
+$ sudo apt install qemu-system-arm qemu-utils \
+      bridge-utils libvirt-daemon-system virtinst
+
+# 3. Permissions
+$ sudo usermod -aG kvm,libvirt $USER
+
+# 4. Hugepages, worth doing (virt chapter 21)
+$ echo 2048 | sudo tee /proc/sys/vm/nr_hugepages
+$ echo 'vm.nr_hugepages=2048' | sudo tee -a /etc/sysctl.conf
+
+# 5. Memlock limit, needed for passthrough
+$ sudo tee /etc/security/limits.d/kvm.conf &lt;&lt;'EOF'
+@kvm  soft  memlock  unlimited
+@kvm  hard  memlock  unlimited
+EOF
+
+# 6. Verify end to end
+$ qemu-system-aarch64 -M virt,gic-version=host -cpu host \
+    -accel kvm -smp 2 -m 1G -nographic \
+    -kernel Image -append "console=ttyAMA0"
+# Kernel boot in under a second = KVM is working. Twenty
+# seconds = you are still on TCG.</code></pre>
+
+<h2 id="nested">Nesting, so you can develop hypervisors</h2>
+
+<pre><code># To run KVM INSIDE a guest (virt chapter 20), the guest needs
+# EL2:
+
+$ qemu-system-aarch64 -M virt,virtualization=on \
+    -cpu host,el2=on -accel kvm -smp 4 -m 4G ...
+
+# Inside that guest:
+$ dmesg | grep -i 'started at'
+[    0.000000] CPU: All CPU(s) started at EL2
+$ ls /dev/kvm
+# ...and you can run a third-level VM.
+
+# On the HOST, nested support must be enabled:
+#   kernel command line: kvm-arm.mode=nested
+# and the hardware needs FEAT_NV2 for it to be usable rather
+# than merely possible.
+
+# Under TCG there is no such restriction - -cpu max always has
+# EL2, and nested virtualisation "works" at TCG speed. That is
+# often the right way to develop a hypervisor: correctness
+# under TCG with full tracing, performance under KVM later.
+
+$ qemu-system-aarch64 -M virt,virtualization=on,secure=on \
+    -cpu max -accel tcg -smp 2 -m 2G -nographic \
+    -kernel my-hypervisor.elf -s -S
+# EL3, EL2, S-EL2, single-steppable, fully traceable, on a
+# laptop. No hardware in the world gives you that.</code></pre>
+
+<h2 id="libvirt">libvirt, when you have more than a couple of VMs</h2>
+
+<pre><code># Hand-written command lines stop scaling around the third VM.
+# libvirt gives you persistence, autostart, networking and a
+# stable API - and it is just generating the same QEMU command
+# line underneath.
+
+$ virt-install \
+    --name test-arm64 \
+    --memory 2048 --vcpus 4 \
+    --arch aarch64 --machine virt \
+    --cpu host-passthrough \
+    --boot uefi \
+    --disk path=/var/lib/libvirt/images/test.qcow2,size=20 \
+    --network network=default,model=virtio \
+    --graphics none --console pty,target_type=serial \
+    --os-variant debian12 \
+    --location http://deb.debian.org/debian/dists/bookworm/main/installer-arm64/
+
+$ virsh list --all
+$ virsh start test-arm64
+$ virsh console test-arm64          # Ctrl-] to leave
+$ virsh edit test-arm64             # the XML
+$ virsh dumpxml test-arm64
+
+# See the command line libvirt actually built - useful when you
+# need to reproduce something by hand:
+$ virsh domxml-to-native qemu-argv --domain test-arm64
+
+# Pin vCPUs, for latency work:
+$ virsh vcpupin test-arm64 0 4
+$ virsh emulatorpin test-arm64 8-11
+
+# Hugepages, in the XML:
+#   &lt;memoryBacking&gt;&lt;hugepages/&gt;&lt;/memoryBacking&gt;</code></pre>
+
+<h2 id="perf">Confirming you are actually getting KVM speed</h2>
+
+<pre><code># The three-second check: boot time.
+$ time qemu-system-aarch64 -M virt,gic-version=host -cpu host \
+    -accel kvm -smp 4 -m 2G -nographic -kernel Image \
+    -append "console=ttyAMA0 panic=1" -no-reboot
+# under a second to userspace = KVM
+
+# Confirm from inside the guest:
+$ dmesg | grep -i 'paravirt\|hypervisor\|KVM'
+$ lscpu | grep -i hypervisor
+Hypervisor vendor:  KVM
+
+# Exit rate - the number that predicts performance (virt
+# chapter 21):
+$ sudo perf kvm --host stat live
+
+# Compare like for like:
+$ sysbench cpu --threads=4 run          # in the guest
+$ sysbench cpu --threads=4 run          # on the host
+# Within 5% = KVM working properly. 50x slower = TCG.
+
+# The most common cause of "KVM is slow": it is not KVM.
+$ ps aux | grep qemu | grep -o 'accel [a-z]*'</code></pre>
+
+<div class="warn">
+<b>Migration and <code>-cpu host</code></b>
+<p><code>-cpu host</code> exposes the exact silicon, so a VM started on one CPU model cannot migrate to
+another. If migration matters, choose a named CPU model that both machines support and accept the lost
+features. If it does not — which is the case for all development work — use <code>host</code> and get
+everything.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>Could not access KVM kernel module: Permission denied</code></td><td>Not in the
+<code>kvm</code> group, or you did not log out after being added</td></tr>
+<tr><td><code>KVM not supported for this target</code></td><td>Guest and host architectures
+differ</td></tr>
+<tr><td><code>kvm [1]: HYP mode not available</code></td><td>Booted at EL1; firmware consumed EL2</td></tr>
+<tr><td>Startup fails with a GIC error</td><td><code>gic-version</code> does not match the host — use
+<code>host</code></td></tr>
+<tr><td>Guest is slow despite <code>-accel kvm</code></td><td>Check it actually initialised; QEMU may have
+fallen back to TCG if you listed both</td></tr>
+<tr><td><code>-d exec</code> produces nothing</td><td>Expected under KVM. Switch to TCG for that
+investigation</td></tr>
+<tr><td>Plugins fail to load</td><td>Also expected under KVM</td></tr>
+<tr><td>Too many breakpoints</td><td>KVM uses hardware debug registers; there are only a handful</td></tr>
+<tr><td>Guest cannot see a CPU feature</td><td>Under KVM you get the real silicon only; use TCG with
+<code>-cpu max</code></td></tr>
+<tr><td>Migration refused</td><td><code>-cpu host</code> across dissimilar machines, or a passed-through
+device</td></tr>
+<tr><td>Nested KVM unavailable in a guest</td><td><code>virtualization=on</code> and <code>el2=on</code>
+missing, or host nesting not enabled</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the three command-line changes needed to move from TCG to KVM.</li>
+  <li>Explain why <code>-cpu host</code> is effectively mandatory under KVM.</li>
+  <li>List five debugging capabilities you lose under KVM.</li>
+  <li>Give a rule for which accelerator to use for which class of bug.</li>
+  <li>Determine whether an arm64 machine can run KVM at all, and say what to check first.</li>
+  <li>Explain what <code>-accel kvm -accel tcg</code> does.</li>
+  <li>Configure a guest that can itself run KVM.</li>
+  <li>Explain why developing a hypervisor under TCG can be better than under KVM.</li>
+  <li>Verify in three ways that a running guest is actually accelerated.</li>
+  <li>Explain the trade-off <code>-cpu host</code> imposes on migration.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

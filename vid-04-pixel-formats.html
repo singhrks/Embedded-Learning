@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel formats, strides and tiling | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Pixel formats, strides and tiling</h1>
+<p class="lead">A FourCC is a promise about byte order, plane count, subsampling and bit packing. Different
+subsystems make that promise using different names for the same layout, and one of them is almost certainly
+lying about endianness. This chapter is the decoder ring.</p>
+
+<h2 id="fourcc">The formats you will actually meet</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>FourCC</th><th>Layout</th><th>bpp</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><strong>NV12</strong></td><td>Y plane, then interleaved <strong>UV</strong>, 4:2:0</td><td>12</td><td>The
+universal video format. Hardware codecs, display controllers, cameras</td></tr>
+<tr><td><strong>NV21</strong></td><td>Same but <strong>VU</strong> order</td><td>12</td><td>Android camera
+preview. The swap is why previews come out purple</td></tr>
+<tr><td><strong>I420 / YU12</strong></td><td>Three planes: Y, U, V, 4:2:0</td><td>12</td><td>Software codecs,
+libavcodec's native layout, WebRTC</td></tr>
+<tr><td><strong>YV12</strong></td><td>Three planes: Y, <strong>V, U</strong></td><td>12</td><td>Same as I420
+with the chroma planes swapped. A classic source of purple output</td></tr>
+<tr><td><strong>P010</strong></td><td>NV12 with 16-bit samples, value in the <strong>top 10
+bits</strong></td><td>24</td><td>10-bit HDR. Note the 6 zero bits at the bottom</td></tr>
+<tr><td><strong>YUY2 / YUYV</strong></td><td>Packed 4:2:2, order Y U Y V</td><td>16</td><td>USB webcams,
+capture cards</td></tr>
+<tr><td><strong>UYVY</strong></td><td>Packed 4:2:2, order U Y V Y</td><td>16</td><td>Broadcast SDI, macOS</td></tr>
+<tr><td><strong>RGBA / BGRA</strong></td><td>Packed 8-bit</td><td>32</td><td>GPUs, UI. The order differs by
+API and by endianness</td></tr>
+<tr><td><strong>RGB565</strong></td><td>Packed 16-bit, 5-6-5</td><td>16</td><td>Embedded displays, low-memory
+framebuffers</td></tr>
+<tr><td><strong>AYUV / Y410</strong></td><td>Packed 4:4:4</td><td>32</td><td>Screen content, professional
+capture</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>NV12 is the format to know</b>
+<p>If you learn one layout, learn this one. Every hardware encoder, every hardware decoder, every display
+controller and almost every camera ISP speaks NV12. A pipeline that stays in NV12 end to end never converts;
+one that drops into RGB in the middle pays a full-frame conversion twice, and on a 4K60 stream that is
+gigabytes per second of pointless memory traffic.</p>
+</div>
+
+<pre class="diagram">   NV12, 8x4 pixels. Two planes.
+
+   Y PLANE, y_stride bytes per row, 4 rows
+     +-------------------------------+--------+
+     | Y00 Y01 Y02 Y03 Y04 Y05 Y06 Y07| padding|
+     | Y10 Y11 ...                    | padding|
+     | Y20 ...                        | padding|
+     | Y30 ...                        | padding|
+     +-------------------------------+--------+
+
+   UV PLANE, uv_stride bytes per row, 2 rows (half height)
+     +-------------------------------+--------+
+     | U00 V00 U01 V01 U02 V02 U03 V03| padding|   covers Y
+     | U10 V10 U11 V11 U12 V12 U13 V13| padding|   rows 0-1
+     +-------------------------------+--------+   and 2-3
+
+   ONE (U,V) PAIR SERVES A 2x2 BLOCK OF LUMA.
+
+   Addressing:
+     Y at (x,y)     = base   + y * y_stride + x
+     U at (x,y)     = uvbase + (y/2) * uv_stride + (x/2)*2
+     V at (x,y)     = uvbase + (y/2) * uv_stride + (x/2)*2 + 1
+
+   The uv plane usually shares the Y stride, and usually
+   follows the Y plane in one allocation - but NEITHER IS
+   GUARANTEED. Always use the offsets and strides the
+   allocator gave you.</pre>
+
+<pre><code>/* Reading a pixel from NV12, correctly. */
+
+struct nv12 {
+        uint8_t *y,  *uv;
+        int      y_stride, uv_stride;
+        int      width, height;
+};
+
+static void nv12_get(const struct nv12 *f, int x, int y,
+                     uint8_t *Y, uint8_t *U, uint8_t *V)
+{
+        *Y = f-&gt;y[(size_t)y * f-&gt;y_stride + x];
+
+        const uint8_t *uv = f-&gt;uv + (size_t)(y / 2) * f-&gt;uv_stride
+                                  + (x / 2) * 2;
+        *U = uv[0];
+        *V = uv[1];      /* NV21 swaps these two lines */
+}
+
+/* CONVERTING NV12 -> RGB, BT.709 limited range. The integer
+   form, because this runs per pixel. */
+static void nv12_to_rgb(uint8_t Y, uint8_t U, uint8_t V,
+                        uint8_t *r, uint8_t *g, uint8_t *b)
+{
+        int y = (Y - 16)  * 1192;      /* 255/219 in Q10 */
+        int u =  U - 128;
+        int v =  V - 128;
+
+        int R = (y + 1836 * v)                &gt;&gt; 10;
+        int G = (y -  547 * v -  218 * u)     &gt;&gt; 10;
+        int B = (y + 2166 * u)                &gt;&gt; 10;
+
+        *r = clamp_u8(R);  *g = clamp_u8(G);  *b = clamp_u8(B);
+        /* CLAMPING IS NOT OPTIONAL: limited-range input can
+           legally exceed 0-255 after conversion (that is what
+           the headroom is FOR), and without a clamp you wrap
+           around and get bright speckles in dark areas. */
+}
+
+/* AND IN PRACTICE: do not write this loop. Use libyuv, or
+   swscale, or a shader, or the hardware colour-space
+   converter in your display controller. All three are
+   several times faster and already correct. */</code></pre>
+
+<h2 id="p010">10-bit packing, and the trap in it</h2>
+
+<pre><code>/* P010: 16 bits per sample, value in the TOP 10 bits. */
+
+     bit  15 14 13 12 11 10 09 08 07 06 05 04 03 02 01 00
+          [------------ 10-bit value -------------] 0  0  0  0  0  0
+                                                    ^^^^^^^^^^^^^^^^
+                                                    must be zero
+
+/* SO: to read the actual value you SHIFT DOWN, and to write
+   one you SHIFT UP.                                        */
+        uint16_t sample = plane[i];
+        uint16_t value  = sample &gt;&gt; 6;        /* 0..1023      */
+
+        plane[i] = value &lt;&lt; 6;                /* writing back */
+
+/* FORGETTING THE SHIFT gives you an image that is 64x too
+   bright and clipped to white, or 64x too dark - depending on
+   which direction you missed.
+
+   THE OTHER 10-BIT PACKINGS, and they are all different:
+
+     P010      16-bit container, value in top 10.   MSB-aligned
+     P016      16-bit container, all 16 used
+     yuv420p10le  16-bit container, value in BOTTOM 10.
+                  LSB-aligned - the OPPOSITE of P010, and this
+                  is ffmpeg's native 10-bit layout
+     V210      packed 4:2:2, THREE 10-bit samples per 32-bit
+               word with 2 bits wasted. Broadcast SDI.
+     10-bit MIPI RAW  four pixels in five bytes, the low bits
+               of all four gathered in the fifth. Camera
+               sensors.
+
+   Converting between P010 and yuv420p10le is a shift by 6 in
+   one direction. Getting the direction wrong is one of the
+   most common 10-bit bugs, and it looks like a broken
+   exposure rather than a bit-packing error.                */</code></pre>
+
+<div class="warn">
+<b>The endianness lie in RGBA names</b>
+<p>DirectX's <code>DXGI_FORMAT_B8G8R8A8_UNORM</code> lists components in <em>memory order</em>. OpenGL's
+<code>GL_RGBA</code> with <code>GL_UNSIGNED_INT_8_8_8_8</code> lists them in <em>most-significant-bit-first
+order of a 32-bit integer</em>, which on a little-endian machine is the reverse. So
+<code>GL_BGRA</code> + <code>GL_UNSIGNED_BYTE</code> matches DXGI's <code>B8G8R8A8</code>, but
+<code>GL_RGBA</code> + <code>GL_UNSIGNED_INT_8_8_8_8_REV</code> also does. If red and blue are swapped,
+this is why, and the fix is one enum rather than a byte-shuffling loop.</p>
+</div>
+
+<h2 id="tiling">Tiled and compressed layouts</h2>
+
+<pre class="diagram">   LINEAR layout: row after row. Simple, and bad for 2D
+   access - a vertical neighbour is `stride` bytes away, in a
+   different DRAM page.
+
+   TILED layout: the image is cut into small rectangles and
+   each tile is stored contiguously.
+
+     LINEAR                    TILED (4x4 tiles)
+     0  1  2  3  4  5          [0  1  4  5] [2  3  6  7]
+     6  7  8  9 10 11          [8  9 12 13] [10 11 14 15]
+
+   WHY: a 2D access pattern - a filter kernel, a motion
+   compensation block, a texture sample - touches a small
+   square. In a tiled layout that square is one or two DRAM
+   pages instead of sixteen. The bandwidth saving is large,
+   and every GPU and video block uses it.
+
+   THE PROBLEM: tiling is VENDOR AND HARDWARE SPECIFIC and
+   usually undocumented. A tiled buffer produced by the
+   decoder cannot be read by the CPU without either
+   detiling or knowing the exact swizzle.
+
+   PLUS FRAMEBUFFER COMPRESSION (AFBC on Arm, DCC on AMD,
+   UBWC on Qualcomm, Delta Color Compression on NVIDIA):
+   lossless block compression applied on the fly to save
+   bandwidth, with a separate metadata plane. Also opaque.
+
+   HOW LINUX EXPRESSES THIS: DRM FORMAT MODIFIERS. A buffer is
+   described by (fourcc, modifier), where the modifier names
+   the exact tiling and compression:
+
+     DRM_FORMAT_MOD_LINEAR
+     DRM_FORMAT_MOD_ARM_AFBC(...)
+     DRM_FORMAT_MOD_QCOM_COMPRESSED
+     I915_FORMAT_MOD_Y_TILED
+
+   NEGOTIATING A COMMON MODIFIER between the camera, the
+   decoder, the GPU and the display is what makes zero-copy
+   possible (chapter 18). Get it wrong and something in the
+   chain silently inserts a full-frame detiling copy - or
+   produces a garbled image that looks like scrambled
+   rectangles.</pre>
+
+<h2 id="tools">Inspecting a buffer</h2>
+
+<pre><code># What format is this device actually offering?
+$ v4l2-ctl -d /dev/video0 --list-formats-ext
+        [0]: 'YUYV' (YUYV 4:2:2)
+                Size: Discrete 1920x1080
+                        Interval: Discrete 0.033s (30.000 fps)
+        [1]: 'MJPG' (Motion-JPEG, compressed)
+        [2]: 'NV12' (Y/UV 4:2:0)
+
+# Dump raw frames and look at them:
+$ v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=NV12 \
+           --stream-mmap --stream-count=1 --stream-to=frame.nv12
+
+$ ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 frame.nv12
+# If it looks right, your format assumption is correct. If the
+# bottom third is noise, your stride or plane offsets are wrong.
+
+# Convert and inspect:
+$ ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i frame.nv12 frame.png
+
+# Every format ffmpeg knows, with its bit depth and plane count:
+$ ffmpeg -pix_fmts | head -20
+
+# Check what a DRM buffer really is:
+$ sudo cat /sys/kernel/debug/dri/0/framebuffer
+framebuffer[42]:
+        allocated by = compositor
+        format=XR24 little-endian (0x34325258)
+        modifier=0x100000000000002        &lt;-- NOT linear
+        size=1920x1080
+        pitch[0]=7680</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Image is purple or orange, luma looks fine</td><td>U and V swapped — NV12 versus NV21, or I420 versus
+YV12</td></tr>
+<tr><td>Red and blue swapped</td><td>RGBA versus BGRA, or an endianness-naming mismatch</td></tr>
+<tr><td>Bottom third of the frame is noise</td><td>Chroma plane offset or stride wrong</td></tr>
+<tr><td>Image sheared diagonally</td><td>Width used as stride (chapter 1)</td></tr>
+<tr><td>10-bit content is blown out or nearly black</td><td>Missing the shift by 6 between P010 and
+LSB-aligned</td></tr>
+<tr><td>Bright speckles in dark areas</td><td>No clamp after limited-range conversion</td></tr>
+<tr><td>Image looks like scrambled rectangles</td><td>A tiled buffer read as linear</td></tr>
+<tr><td>Pipeline works but uses far more bandwidth than expected</td><td>A hidden detiling or format-conversion
+copy from a modifier mismatch</td></tr>
+<tr><td>Colours wrong only on one platform</td><td>Different default matrix or range for the same
+FourCC</td></tr>
+<tr><td>Zero-copy path silently stops working after an update</td><td>The negotiated modifier changed; check
+the DRM framebuffer debug node</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe NV12's plane layout and write the addressing for Y, U and V at (x, y).</li>
+  <li>Say what distinguishes NV12 from NV21 and I420 from YV12, and the symptom of confusing them.</li>
+  <li>Explain why staying in NV12 through a pipeline matters.</li>
+  <li>Explain P010's bit packing and how it differs from <code>yuv420p10le</code>.</li>
+  <li>Say why a clamp is required after limited-range YCbCr to RGB.</li>
+  <li>Explain the RGBA/BGRA endianness naming trap.</li>
+  <li>Explain why tiling exists and what it costs you.</li>
+  <li>Say what a DRM format modifier describes and why negotiating one matters.</li>
+  <li>Dump a raw frame from a V4L2 device and view it with the correct format.</li>
+  <li>Diagnose "the bottom third of my frame is noise".</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

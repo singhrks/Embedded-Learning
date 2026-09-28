@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LPIs, the ITS and direct injection | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>LPIs, the ITS and direct injection</h1>
+<p class="lead">The vGIC of the previous chapter still costs one exit per physical interrupt. GICv4 removes
+even that: a device's message-signalled interrupt can be delivered straight into a running guest with the
+hypervisor asleep. Getting there requires understanding LPIs, the ITS translation tables, and what
+"doorbell" means.</p>
+
+<h2 id="lpi">LPIs: interrupts as messages</h2>
+
+<p>Message-signalled interrupts are a different animal from wired ones, and virtualising them well requires different hardware support.</p>
+
+<pre class="diagram">   The three older interrupt kinds are WIRES:
+
+     SGI   0-15     software generated, core to core
+     PPI   16-31    private per CPU (timers, PMU)
+     SPI   32-1019  shared peripheral - a physical signal
+                    routed into the distributor
+
+   Their state lives in distributor registers, one bit per
+   interrupt. That is fine for 1000 interrupts and hopeless for
+   a NIC with 512 queues on a 128-core machine.
+
+   LPI  8192+       Locality-specific Peripheral Interrupt.
+                    NOT a wire. A MEMORY WRITE.
+
+   A device raises an LPI by writing an ID to a doorbell
+   address:
+
+       device -> AXI write of value 0x2A to GITS_TRANSLATER
+                 (an address inside the ITS)
+
+   The ITS looks up "which device is this, what does its
+   EventID 0x2A mean, which CPU should get it" and delivers.
+
+   Consequences:
+     * state lives in DDR tables, not in registers -> millions
+       of interrupts are affordable
+     * routing is per-interrupt and reprogrammable
+     * this is exactly PCIe MSI/MSI-X, which is also "a device
+       writes a value to an address"</pre>
+
+<h2 id="its">The ITS and its tables</h2>
+
+<p>The ITS is a device with its own memory-resident tables, which makes it one of the more involved things a hypervisor has to model.</p>
+
+<pre class="diagram">   ITS = Interrupt Translation Service. A little engine that
+   turns (DeviceID, EventID) into (LPI number, target
+   redistributor).
+
+     device does an MSI write
+          |
+          |  DeviceID comes from the interconnect - it is the
+          |  same identity the SMMU uses as a StreamID
+          v
+     +---------------------------------------------------+
+     |  ITS                                              |
+     |                                                   |
+     |  Device Table:  DeviceID -> ITT pointer           |
+     |         |                                         |
+     |         v                                         |
+     |  Interrupt Translation Table (per device):        |
+     |         EventID -> (LPI ID, Collection ID)        |
+     |         |                                         |
+     |         v                                         |
+     |  Collection Table: Collection -> Redistributor    |
+     +---------------------------------------------------+
+          |
+          v
+     redistributor sets the pending bit in the
+     LPI Pending Table (in DDR), then signals the CPU
+
+   THREE indirections, all through tables in normal memory that
+   software allocates and the ITS walks. You program them with
+   COMMANDS, not register writes:
+
+     MAPD    map a DeviceID to an ITT
+     MAPTI   map (DeviceID, EventID) -> (LPI, Collection)
+     MAPC    map a Collection -> a redistributor
+     INV     invalidate a cached entry after changing config
+     SYNC    wait for prior commands to complete
+     DISCARD unmap an event
+     MOVI    move an interrupt to another collection (i.e.
+             another CPU) - this is IRQ affinity for LPIs</pre>
+
+<div class="note">
+<b>DeviceID is StreamID</b>
+<p>The identity the ITS uses to look up a device is the same bus-level identity the
+<a href="sec-03-smmu-streamid.html">SMMU</a> uses to decide which translation tables apply. One identity,
+two consumers: the SMMU constrains what the device may read and write, the ITS constrains what it may
+interrupt. On a well-designed SoC they are configured together, and a device that is passed through to a
+guest gets both a stage-2 translation and an ITS mapping.</p>
+</div>
+
+<h2 id="virt">Virtualising the ITS: GICv3</h2>
+
+<p>Emulating the ITS is possible and expensive, which is what motivates the hardware feature in the next section.</p>
+
+<pre><code>/* Under GICv3 the ITS is EMULATED. The guest thinks it owns
+   one; KVM models it.                                       */
+
+  guest writes an ITS command (MAPTI) into its command queue
+     -> MMIO exit into KVM's vgic-its model
+     -> KVM records "guest LPI 8192 belongs to vCPU 3"
+     -> if a real device is behind it (passthrough), KVM ALSO
+        programs the physical ITS so the real device's MSI
+        lands on the host
+
+  device raises the MSI
+     -> physical LPI delivered to the HOST
+     -> host interrupt handler runs
+     -> looks up: this physical LPI maps to guest LPI 8192 on vCPU 3
+     -> inject into a list register (chapter 11)
+     -> if vCPU 3 is running elsewhere, IPI it to force an exit
+     -> vCPU 3 re-enters and sees the interrupt
+
+  COST: one host interrupt + one exit + one entry, per device
+  interrupt. For a 10GbE NIC at 300k interrupts/sec that is
+  300k exits/sec, and it dominates everything.
+
+/* This is why interrupt coalescing matters so much more in a
+   VM than on bare metal, and why NAPI polling wins.        */</code></pre>
+
+<h2 id="v4">GICv4: direct injection</h2>
+
+<p>Direct injection removes the hypervisor from the interrupt path entirely, and it is the closest thing to free virtualised interrupts that exists.</p>
+
+<pre class="diagram">   The insight: if the ITS already knows which vCPU an LPI
+   belongs to, and the redistributor already knows which vCPU is
+   RESIDENT on this physical CPU, then the hardware can deliver
+   straight to the guest.
+
+   GICv4 adds:
+
+     * VPE (Virtual Processing Element) - the hardware's notion
+       of a vCPU. Each has an ID and a pair of tables:
+           Virtual LPI Pending Table
+           Virtual LPI Configuration Table
+       both in normal memory.
+
+     * New ITS commands:
+           VMAPP    map a VPE to a redistributor
+           VMAPTI   map (DeviceID,EventID) -> virtual LPI on a VPE
+           VMOVP    move a VPE to another redistributor
+           VINVALL  invalidate cached virtual LPI config
+           VSYNC
+
+     * GICR_VPROPBASER / GICR_VPENDBASER - the redistributor
+       registers that say "VPE X is currently resident here"
+
+   Then:
+
+     device MSI write
+          |
+          v
+     ITS translates to a VIRTUAL LPI on VPE 3
+          |
+          +--- is VPE 3 resident on some redistributor?
+          |
+          |    YES -> set the pending bit in the VIRTUAL pending
+          |           table and signal the CPU directly.
+          |           The guest takes the interrupt.
+          |           ZERO EXITS. The hypervisor never runs.
+          |
+          |    NO  -> the vCPU is not scheduled. Send a
+          |           DOORBELL interrupt: a normal physical LPI
+          |           to the host saying "VPE 3 has work".
+          v
+     host wakes the vCPU thread, makes VPE 3 resident,
+     and the pending virtual LPI is delivered on entry.
+
+   GICv4.1 adds direct virtual SGIs too, so a guest sending an
+   IPI from vCPU 0 to vCPU 1 need not exit either.</pre>
+
+<div class="key">
+<b>The doorbell is the whole trick</b>
+<p>Direct injection would be unsafe if the target vCPU were descheduled — the interrupt would sit in memory
+unnoticed. The doorbell converts exactly that case back into a normal host interrupt. So the fast path costs
+nothing and the slow path costs what it used to. This "fast path in hardware, slow path via a wake-up
+signal" pattern shows up again in vhost and in virtio notification suppression.</p>
+</div>
+
+<h2 id="check-hw">Finding out what you have</h2>
+
+<p>These features vary considerably between implementations, so the first step is always to ask the hardware what it supports.</p>
+
+<pre><code># Host: is there an ITS at all?
+$ dmesg | grep -i its
+[    0.000000] GICv3: GIC: Using split EOI/Deactivate mode
+[    0.000000] ITS [mem 0x08080000-0x0809ffff]
+[    0.000000] ITS@0x0000000008080000: allocated 65536 Devices
+               @880000000 (indirect, esz 8, psz 64K, shr 1)
+[    0.000000] ITS: using cache flushing for cmd queue
+[    0.000000] GICv4 support enabled                       &lt;-- the line you want
+
+# GICv4.1 will say:
+[    0.000000] GICv4.1 support enabled
+
+# Is direct injection actually in use for a given VM?
+$ sudo cat /sys/kernel/debug/kvm/*/vgic-state 2>/dev/null | head -30
+
+# Per-interrupt counts inside the guest tell you the rate:
+$ cat /proc/interrupts | grep -E 'virtio|mlx|ixgbe'
+
+# Host-side, watch for the exits that direct injection removes:
+$ sudo perf stat -e kvm:kvm_exit -a sleep 5
+# then compare with and without vfio passthrough of the device.
+
+# QEMU: request an ITS in the guest
+$ qemu-system-aarch64 -M virt,gic-version=3,its=on ...
+# its=off removes it; some guests then fall back to a wired
+# interrupt path, and PCIe MSI-X will not work.</code></pre>
+
+<h2 id="tables">Memory the ITS demands of you</h2>
+
+<p>The ITS demands memory from you with specific alignment and attribute requirements, and getting them wrong fails in ways that are hard to attribute.</p>
+
+<pre><code>/* The tables are not optional and their sizes surprise people. */
+
+  Device Table        one entry per DeviceID the ITS can see.
+                      GITS_TYPER.Devbits says how wide DeviceID
+                      is. 16 bits -> 65536 entries. At 8 bytes
+                      each that is 512 KB, contiguous, unless
+                      you use the INDIRECT (two-level) form.
+
+  ITT (per device)    one entry per EventID that device can
+                      raise. A NIC with 2048 MSI-X vectors needs
+                      a 2048-entry ITT.
+
+  LPI Config Table    one BYTE per LPI, shared by all
+                      redistributors: priority + enable.
+                      1M LPIs -> 1 MB.
+
+  LPI Pending Table   one BIT per LPI, PER REDISTRIBUTOR.
+                      1M LPIs x 128 CPUs -> 16 MB.
+
+  Virtual equivalents (GICv4) - per VPE, so multiply by the
+  number of vCPUs in the system.
+
+/* And they must be:
+     - physically contiguous (or indirect)
+     - aligned as GITS_BASER demands (often 64 KB)
+     - coherent, or explicitly cleaned - GITS_BASER.InnerCache
+       tells you whether the ITS snoops. If it does not, every
+       table update needs a DC CVAC before the SYNC command.
+
+   "ITS: using cache flushing for cmd queue" in dmesg means
+   exactly that: your ITS is not coherent with the CPU caches. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>PCIe device in a guest never receives MSI-X</td><td>No ITS in the guest (<code>its=off</code>), or the
+guest's ITS command queue was never enabled</td></tr>
+<tr><td>Passthrough NIC works but at terrible packet rates</td><td>No GICv4, so every device interrupt costs an
+exit; enable coalescing or accept the cost</td></tr>
+<tr><td>Interrupts arrive on the wrong CPU after affinity change</td><td><code>MOVI</code>/<code>VMOVP</code>
+issued without a following <code>SYNC</code>, or a stale cached ITS entry (missing <code>INV</code>)</td></tr>
+<tr><td>ITS silently drops interrupts after config changes</td><td>Tables updated but not cleaned to memory on
+a non-coherent ITS</td></tr>
+<tr><td>Boot fails allocating ITS tables</td><td>Device table too large for contiguous allocation — needs the
+indirect two-level form</td></tr>
+<tr><td>A vCPU misses interrupts while descheduled</td><td>Doorbell not configured, so nothing wakes the vCPU
+thread</td></tr>
+<tr><td>Guest sees interrupts belonging to another guest</td><td>DeviceID not isolated — two devices behind one
+DeviceID, or the SMMU StreamID mapping does not match the ITS mapping</td></tr>
+<tr><td><code>ITS command queue timeout</code></td><td>The ITS stalled — usually a command referencing an
+unmapped device or an unaligned table</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain how an LPI differs from an SPI, mechanically.</li>
+  <li>Describe the three table lookups an ITS performs and what each maps.</li>
+  <li>Name five ITS commands and say what each does.</li>
+  <li>Explain the relationship between DeviceID, StreamID and PCIe requester ID.</li>
+  <li>Count the exits per device interrupt for a passed-through device under GICv3.</li>
+  <li>Explain what a VPE is and which two tables belong to it.</li>
+  <li>Describe direct injection and state precisely when it does not apply.</li>
+  <li>Explain what a doorbell interrupt is and why the design needs one.</li>
+  <li>Estimate the memory required for LPI configuration and pending tables on a 128-CPU system with 1M
+  LPIs.</li>
+  <li>Determine from a host's boot log whether GICv4 is available and in use.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

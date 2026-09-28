@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Condition variables and waiting for a state | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Condition variables and waiting for a state</h1>
+<p class="lead">A mutex answers "may I touch this?". A condition variable answers "has it become what I need
+yet?" — without burning a core asking. It is the primitive people most often get wrong, and every mistake
+comes from forgetting that the condition variable itself holds no state at all.</p>
+
+<h2 id="problem">The problem it solves</h2>
+
+<p>A mutex protects data but cannot express "wait until this becomes true". Polling in a loop while holding the lock is a deadlock; releasing and re-acquiring in a loop burns a core. Condition variables exist precisely for that gap.</p>
+
+<pre class="diagram">   You want: "wait until the queue is non-empty."
+
+   ATTEMPT 1 - spin
+       while (queue_empty(q))
+               ;
+     Burns a core. On one core, may never progress.
+
+   ATTEMPT 2 - spin with a lock
+       for (;;) {
+               lock(m);
+               if (!queue_empty(q)) break;
+               unlock(m);
+       }
+     Burns a core AND hammers the lock, so the producer
+     cannot get in to add anything.
+
+   ATTEMPT 3 - poll with a sleep
+       for (;;) {
+               lock(m);
+               if (!queue_empty(q)) break;
+               unlock(m);
+               sleep_ms(1);
+       }
+     Works. Adds up to 1 ms of latency to every item and wakes
+     up pointlessly all night. This is what people ship when
+     they do not know about condition variables.
+
+   WHAT YOU ACTUALLY WANT
+       lock(m);
+       while (queue_empty(q))
+               cond_wait(cv, m);      /* atomically: unlock m,
+                                         sleep, and relock m
+                                         on wake              */
+       take_item(q);
+       unlock(m);
+
+   Zero CPU while waiting, and wake-up latency measured in
+   microseconds.</pre>
+
+<div class="key">
+<b>The atomicity that makes it work</b>
+<p><code>cond_wait</code> must release the mutex and begin waiting <em>as one indivisible step</em>. If there
+were any gap, a producer could add an item and signal in that gap — and the consumer would then go to sleep
+waiting for an event that already happened, for ever. This is the <strong>lost wake-up</strong>, and avoiding
+it is the entire reason the API takes the mutex as an argument rather than you unlocking it
+yourself.</p>
+</div>
+
+<h2 id="rules">The three rules</h2>
+
+<p>Condition variables have a small number of rules that look like ceremony and are each preventing a specific bug. The loop around the wait in particular is not optional, for a reason the section explains.</p>
+
+<pre><code>/* RULE 1: ALWAYS wait in a loop, never an if. */
+
+        lock(m);
+        while (!condition)          /* while, not if           */
+                cond_wait(cv, m);
+        /* condition is true here */
+        unlock(m);
+
+/* Three separate reasons, any one of which is sufficient:
+
+   (a) SPURIOUS WAKE-UPS. POSIX explicitly permits cond_wait
+       to return without any signal at all. This is not a bug
+       in the implementation; it is licensed by the standard
+       so that implementations can be fast (and it genuinely
+       happens on signal delivery).
+
+   (b) BARGING. Between the signaller's signal and your
+       actually running, a THIRD thread may acquire the mutex
+       and consume the item. You wake up, the queue is empty
+       again. Most implementations are not FIFO handoff.
+
+   (c) BROADCAST. If the signaller uses broadcast, every
+       waiter wakes but only some can proceed.
+
+   A codegen or review rule of "cond_wait is only ever called
+   inside a while loop testing the predicate" catches almost
+   every condition-variable bug there is.                    */
+
+
+/* RULE 2: hold the mutex when you change the predicate. */
+
+        lock(m);
+        queue_push(q, item);        /* change the state ...    */
+        unlock(m);
+        cond_signal(cv);            /* ... then signal         */
+
+/* Signalling inside or outside the lock are both correct.
+   Outside avoids the waiter waking straight into a locked
+   mutex ("hurry up and wait"), which some implementations
+   optimise anyway. Inside is required if the condition
+   variable or the predicate might be destroyed by a woken
+   waiter - which is a real hazard on shutdown.
+
+   THE THING THAT IS NEVER CORRECT is changing the predicate
+   WITHOUT the mutex and then signalling: the waiter may test
+   the predicate between your write and your signal, and
+   sleep for ever.                                           */
+
+
+/* RULE 3: one condition variable per predicate. */
+
+/* WRONG - one cv for two different conditions */
+        while (queue_full(q))  cond_wait(cv, m);   /* producer */
+        while (queue_empty(q)) cond_wait(cv, m);   /* consumer */
+/* signal() may wake a producer when you meant a consumer, and
+   the woken thread goes straight back to sleep, having
+   consumed the signal. Deadlock with a full queue.
+
+   Either use TWO condition variables, or use broadcast and
+   accept the thundering herd.                              */</code></pre>
+
+<h2 id="bounded">The bounded buffer, written properly</h2>
+
+<p>The bounded producer-consumer queue is the canonical use and worth writing out in full, because getting both the full and empty cases right is the whole exercise.</p>
+
+<pre><code>/* The canonical example, and a good template. */
+
+#define CAP 256
+
+struct bbuf {
+        pthread_mutex_t m;
+        pthread_cond_t  not_empty;      /* two predicates,     */
+        pthread_cond_t  not_full;       /* two variables       */
+        void           *slot[CAP];
+        size_t          head, tail, count;
+        bool            closed;         /* for clean shutdown  */
+};
+
+int bbuf_put(struct bbuf *b, void *item)
+{
+        pthread_mutex_lock(&amp;b-&gt;m);
+
+        while (b-&gt;count == CAP &amp;&amp; !b-&gt;closed)
+                pthread_cond_wait(&amp;b-&gt;not_full, &amp;b-&gt;m);
+
+        if (b-&gt;closed) {                       /* shutdown path */
+                pthread_mutex_unlock(&amp;b-&gt;m);
+                return -EPIPE;
+        }
+
+        b-&gt;slot[b-&gt;tail] = item;
+        b-&gt;tail = (b-&gt;tail + 1) % CAP;
+        b-&gt;count++;
+        pthread_mutex_unlock(&amp;b-&gt;m);
+
+        pthread_cond_signal(&amp;b-&gt;not_empty);    /* exactly one
+                                                  consumer can
+                                                  proceed       */
+        return 0;
+}
+
+void *bbuf_get(struct bbuf *b)
+{
+        pthread_mutex_lock(&amp;b-&gt;m);
+
+        while (b-&gt;count == 0 &amp;&amp; !b-&gt;closed)
+                pthread_cond_wait(&amp;b-&gt;not_empty, &amp;b-&gt;m);
+
+        if (b-&gt;count == 0) {                   /* closed, empty */
+                pthread_mutex_unlock(&amp;b-&gt;m);
+                return NULL;
+        }
+
+        void *item = b-&gt;slot[b-&gt;head];
+        b-&gt;head = (b-&gt;head + 1) % CAP;
+        b-&gt;count--;
+        pthread_mutex_unlock(&amp;b-&gt;m);
+
+        pthread_cond_signal(&amp;b-&gt;not_full);
+        return item;
+}
+
+/* Shutdown. Note the BROADCAST: every waiter, on both
+   variables, must be released - and `closed` is part of every
+   predicate above precisely so they can be.                */
+void bbuf_close(struct bbuf *b)
+{
+        pthread_mutex_lock(&amp;b-&gt;m);
+        b-&gt;closed = true;
+        pthread_mutex_unlock(&amp;b-&gt;m);
+        pthread_cond_broadcast(&amp;b-&gt;not_empty);
+        pthread_cond_broadcast(&amp;b-&gt;not_full);
+}</code></pre>
+
+<pre><code>// C++, where the predicate overload removes the loop from
+// your code but not from the semantics.
+#include &lt;condition_variable&gt;
+
+std::mutex m;
+std::condition_variable cv;
+std::queue&lt;int&gt; q;
+bool closed = false;
+
+void producer(int v) {
+    { std::lock_guard&lt;std::mutex&gt; g(m); q.push(v); }
+    cv.notify_one();
+}
+
+std::optional&lt;int&gt; consumer() {
+    std::unique_lock&lt;std::mutex&gt; lk(m);      // unique_lock, not
+                                             // lock_guard: wait
+                                             // must unlock it
+    cv.wait(lk, [&amp;]{ return !q.empty() || closed; });
+    //           ^ this IS the while loop, written once
+    if (q.empty()) return std::nullopt;
+    int v = q.front(); q.pop();
+    return v;
+}
+
+// With a timeout - note wait_for returns the predicate's value,
+// so you can tell timeout from success without a second check:
+if (!cv.wait_for(lk, std::chrono::seconds(5),
+                 [&amp;]{ return !q.empty(); }))
+        return timeout();</code></pre>
+
+<div class="warn">
+<b><code>wait</code> needs <code>unique_lock</code>, and that is not arbitrary</b>
+<p><code>std::lock_guard</code> cannot unlock; <code>cv.wait</code> must. That is why the type differs, and
+why the compiler stops you. Similarly, waiting on a condition variable with a
+<code>recursive_mutex</code> locked twice releases it only once — so you sleep still holding it, and nobody
+can ever signal you. Another reason recursive mutexes cause trouble.</p>
+</div>
+
+<h2 id="signal">Signal or broadcast</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>signal</code> / <code>notify_one</code></th><th><code>broadcast</code> /
+<code>notify_all</code></th></tr></thead>
+<tbody>
+<tr><td>Wakes</td><td>One waiter (unspecified which)</td><td>Every waiter</td></tr>
+<tr><td>Correct when</td><td>Every waiter waits for the same predicate and one item satisfies exactly
+one</td><td>Waiters have different predicates, or one event satisfies many</td></tr>
+<tr><td>Cost</td><td>One wake-up</td><td>N wake-ups, N−1 of which relock, re-test and sleep again — the
+thundering herd</td></tr>
+<tr><td>Risk</td><td>Waking the wrong waiter if predicates differ, losing the signal</td><td>Only
+performance</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The safe default when unsure is <code>broadcast</code>: it is never <em>incorrect</em>, only slower. Use
+<code>signal</code> when you can state, in one sentence, that every waiter on this variable is waiting for
+exactly the same thing and one event satisfies exactly one of them.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Consumer proceeds with an empty queue</td><td><code>if</code> instead of <code>while</code> — spurious
+wake-up or barging</td></tr>
+<tr><td>Everything hangs, no CPU used</td><td>Lost wake-up: the predicate was changed without the mutex, or
+signalled before any waiter existed</td></tr>
+<tr><td>Hangs only under load</td><td>One condition variable serving two predicates; a signal woke the wrong
+kind of waiter</td></tr>
+<tr><td>Hangs on shutdown</td><td>Waiters still blocked; needs a <code>closed</code> flag in every predicate
+plus a broadcast</td></tr>
+<tr><td>Latency spikes with many consumers</td><td>Thundering herd from <code>broadcast</code></td></tr>
+<tr><td>Sleeps for ever holding the mutex</td><td>Waiting with a recursive mutex locked more than once</td></tr>
+<tr><td>Works, but one core sits at 100%</td><td>Someone replaced the wait with a polling loop</td></tr>
+<tr><td>Crash inside <code>cond_signal</code> at shutdown</td><td>A woken waiter destroyed the condition
+variable while the signaller was still inside it — signal under the lock</td></tr>
+<tr><td>Occasional 1 ms latency per item</td><td>A poll-and-sleep loop, not a condition variable</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what a condition variable adds over a mutex, and why it holds no state itself.</li>
+  <li>Explain the atomic unlock-and-wait, and the bug that exists without it.</li>
+  <li>Give three independent reasons the wait must be in a <code>while</code> loop.</li>
+  <li>State what must be true when you change a predicate, and the failure when it is not.</li>
+  <li>Explain why one condition variable per predicate matters, with the deadlock it prevents.</li>
+  <li>Write a bounded buffer with clean shutdown from memory.</li>
+  <li>Say why <code>cv.wait</code> requires <code>unique_lock</code> rather than
+  <code>lock_guard</code>.</li>
+  <li>Give the rule for choosing <code>signal</code> over <code>broadcast</code>.</li>
+  <li>Explain the risk of signalling outside the lock during shutdown.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

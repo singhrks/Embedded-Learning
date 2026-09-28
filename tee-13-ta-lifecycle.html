@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TA lifecycle, properties and flags | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TA lifecycle, properties and flags</h1>
+<p class="lead">Four flags in a header file decide whether your TA can serve several clients at once, whether
+it keeps state between them, and whether the kernel can see it. Choosing them wrongly produces bugs that only
+appear under concurrency, which is the worst kind to find late.</p>
+
+<h2 id="header">The header that configures everything</h2>
+
+<p>Every trusted application carries a header describing what it is and how it should be run. The loader reads it before any of your code executes.</p>
+
+<pre><code>/* ta/include/user_ta_header_defines.h - every TA has one.   */
+
+#ifndef USER_TA_HEADER_DEFINES_H
+#define USER_TA_HEADER_DEFINES_H
+
+#include "my_ta.h"      /* where TA_MY_UUID is defined        */
+
+#define TA_UUID  TA_MY_UUID
+
+#define TA_FLAGS            (TA_FLAG_SINGLE_INSTANCE | \
+                             TA_FLAG_MULTI_SESSION | \
+                             TA_FLAG_INSTANCE_KEEP_ALIVE)
+
+#define TA_STACK_SIZE       (2 * 1024)      /* per session     */
+#define TA_DATA_SIZE        (32 * 1024)     /* the TA's heap   */
+
+#define TA_CURRENT_TA_EXT_PROPERTIES \
+    { "gp.ta.description", USER_TA_PROP_TYPE_STRING, \
+      "My example TA" }, \
+    { "gp.ta.version", USER_TA_PROP_TYPE_U32, &amp;(const uint32_t){ 0x0100 } }
+
+#endif</code></pre>
+
+<h2 id="flags">The flags</h2>
+
+<p>A handful of flags change the execution model substantially — whether instances are shared between clients, whether they persist, whether they may be multi-threaded.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Meaning</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td><code>TA_FLAG_SINGLE_INSTANCE</code></td><td>One copy of the TA serves all clients</td><td>Global state
+is shared between sessions. Without it, each client gets its own instance and its own globals</td></tr>
+<tr><td><code>TA_FLAG_MULTI_SESSION</code></td><td>The instance accepts more than one session at a
+time</td><td>Without it, a second client waits until the first closes</td></tr>
+<tr><td><code>TA_FLAG_INSTANCE_KEEP_ALIVE</code></td><td>The instance survives when the last session
+closes</td><td>Global state and <code>TA_CreateEntryPoint</code> work persist. Costs TA_RAM
+permanently</td></tr>
+<tr><td><code>TA_FLAG_DEVICE_ENUM</code></td><td>Advertise this TA to the Linux TEE bus</td><td>Required for a
+kernel driver to bind (<a href="tee-10-linux-driver.html">chapter 10</a>)</td></tr>
+<tr><td><code>TA_FLAG_SECURE_DATA_PATH</code></td><td>May receive secure-memory buffers</td><td>For media
+pipelines</td></tr>
+<tr><td><code>TA_FLAG_CACHE_MAINTENANCE</code></td><td>May call <code>TEE_Cache*</code></td><td>Only with
+<code>CFG_CACHE_API=y</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">   The four combinations that matter, and what each is for.
+
+   1. SINGLE_INSTANCE | MULTI_SESSION | KEEP_ALIVE
+      One instance, always resident, many concurrent clients,
+      shared global state.
+      -> A SERVICE. The fTPM is exactly this: one TPM, whose
+         PCRs and NV storage are global, serving anyone.
+      -> You are now responsible for thread safety of your own
+         globals. OP-TEE does NOT serialise for you.
+
+   2. SINGLE_INSTANCE | MULTI_SESSION       (no keep-alive)
+      Same, but unloaded when idle. Saves TA_RAM; pays the
+      load-and-verify cost on the next first session.
+      -> A frequently-but-not-constantly used service.
+
+   3. SINGLE_INSTANCE only
+      One instance, ONE session at a time. Clients serialise.
+      -> The safe default when you have shared state and do
+         not want to think about locking. Simple and slow.
+
+   4. neither SINGLE_INSTANCE nor MULTI_SESSION
+      A fresh instance per client, each with its own globals
+      and its own TA_RAM allocation.
+      -> Perfect isolation between clients, at the cost of
+         memory. Good for a per-application key handler.
+
+   THE TRAP: combination 1 with global variables and no
+   locking. Two clients invoke concurrently, both touch a
+   global, and you have a data race inside the secure world.
+   It will not show up in testing with one client.</pre>
+
+<div class="danger">
+<b><code>MULTI_SESSION</code> means you must lock</b>
+<p>With <code>SINGLE_INSTANCE | MULTI_SESSION</code>, OP-TEE will run two <code>TA_InvokeCommandEntryPoint</code>
+calls concurrently on different threads, in the same address space, over the same globals. There is no
+implicit mutex. If your TA has mutable global state — a PCR bank, a key cache, a counter — you must protect it
+yourself. If you would rather not, drop <code>MULTI_SESSION</code> and accept serialisation.</p>
+</div>
+
+<h2 id="state">Where state lives</h2>
+
+<p>What survives between calls, between sessions and across a reboot is decided by those flags, and getting the model wrong produces state leaking between mutually distrusting clients.</p>
+
+<pre class="diagram">   THREE scopes, three lifetimes.
+
+   GLOBAL VARIABLES
+       lifetime: from TA_CreateEntryPoint to
+                 TA_DestroyEntryPoint
+       shared:   between all sessions, IF SINGLE_INSTANCE
+       lost on:  TA unload (unless KEEP_ALIVE), reboot
+       use for:  a service's shared state; caches
+
+   SESSION CONTEXT (*sess_ctx)
+       lifetime: TA_OpenSessionEntryPoint to
+                 TA_CloseSessionEntryPoint
+       shared:   only within that session
+       lost on:  session close, TA panic, client death
+       use for:  per-client keys, cursors, in-progress
+                 operations
+
+   PERSISTENT OBJECTS
+       lifetime: until explicitly deleted
+       shared:   per-TA, and per-client if the login type
+                 scopes it (chapter 15)
+       lost on:  explicit delete, factory reset, or a normal
+                 world that deletes the backing file
+       use for:  keys, counters, anything that must survive
+                 reboot
+
+   A common design error: keeping a key in a global "for
+   performance" in a SINGLE_INSTANCE TA, so that client B can
+   use the key client A loaded. Put per-client material in the
+   session context.</pre>
+
+<h2 id="worked">A TA with all three</h2>
+
+<p>Following the flags through a concrete sequence of client calls is what makes the abstract model concrete.</p>
+
+<pre><code>#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include &lt;string.h&gt;
+#include "my_ta.h"
+
+/* --- GLOBAL: shared, needs locking under MULTI_SESSION --- */
+static uint32_t g_invocations;
+static bool     g_initialised;
+
+/* --- SESSION: per client --- */
+struct session {
+        TEE_ObjectHandle key;     /* this client's key         */
+        uint32_t         counter;
+        uint8_t          nonce[12];
+};
+
+TEE_Result TA_CreateEntryPoint(void)
+{
+        DMSG("TA loaded");
+        g_invocations = 0;
+        g_initialised = true;
+        return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void)
+{
+        DMSG("TA unloaded after %u invocations", g_invocations);
+        g_initialised = false;
+}
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t ptypes,
+                                    TEE_Param params[4],
+                                    void **sess_ctx)
+{
+        struct session *s;
+
+        /* Even here, check the types. */
+        if (ptypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        s = TEE_Malloc(sizeof *s, TEE_MALLOC_FILL_ZERO);
+        if (!s)
+                return TEE_ERROR_OUT_OF_MEMORY;
+
+        s-&gt;key = TEE_HANDLE_NULL;
+        TEE_GenerateRandom(s-&gt;nonce, sizeof s-&gt;nonce);
+
+        /* Who is calling? */
+        {
+                TEE_Identity id;
+                TEE_Result r = TEE_GetPropertyAsIdentity(
+                        TEE_PROPSET_CURRENT_CLIENT,
+                        "gpd.client.identity", &amp;id);
+                if (r == TEE_SUCCESS)
+                        DMSG("client login type 0x%08x", id.login);
+        }
+
+        *sess_ctx = s;
+        return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess_ctx)
+{
+        struct session *s = sess_ctx;
+
+        if (!s)
+                return;
+        if (s-&gt;key != TEE_HANDLE_NULL)
+                TEE_FreeTransientObject(s-&gt;key);
+        /* Wipe before freeing - the heap is reused. */
+        TEE_MemFill(s, 0, sizeof *s);
+        TEE_Free(s);
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx,
+                                      uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+        struct session *s = sess_ctx;
+
+        /* Global mutation. Under MULTI_SESSION this is a race.
+           OP-TEE has no user-space mutex API for TAs, so
+           either drop MULTI_SESSION, or make the update
+           genuinely atomic, or keep the counter per session. */
+        g_invocations++;
+
+        s-&gt;counter++;
+
+        switch (cmd) {
+        case TA_CMD_LOAD_KEY:   return load_key(s, ptypes, params);
+        case TA_CMD_SIGN:       return sign(s, ptypes, params);
+        case TA_CMD_STATS:
+                if (ptypes != TEE_PARAM_TYPES(
+                                TEE_PARAM_TYPE_VALUE_OUTPUT,
+                                TEE_PARAM_TYPE_NONE,
+                                TEE_PARAM_TYPE_NONE,
+                                TEE_PARAM_TYPE_NONE))
+                        return TEE_ERROR_BAD_PARAMETERS;
+                params[0].value.a = s-&gt;counter;   /* per session */
+                params[0].value.b = g_invocations;/* global      */
+                return TEE_SUCCESS;
+        default:
+                return TEE_ERROR_NOT_SUPPORTED;
+        }
+}</code></pre>
+
+<h2 id="sizing">Sizing stack and heap</h2>
+
+<p>Stack and heap sizes are declared statically, because the secure world cannot grow them on demand. Getting them wrong produces a panic rather than a slowdown.</p>
+
+<pre><code>#define TA_STACK_SIZE  (2 * 1024)    /* PER SESSION            */
+#define TA_DATA_SIZE   (32 * 1024)   /* the TA's whole heap    */
+
+/* TA_STACK_SIZE: the C stack for TA code. 2 KB is the common
+   default and it is small. Things that overflow it:
+       - a large local buffer  (uint8_t buf[4096];)
+       - deep recursion
+       - a crypto call chain with its own locals
+   Symptom: a panic with a stack dump, often in an unrelated
+   function, and often only for large inputs.
+
+   Do not put big buffers on the stack. TEE_Malloc them, or
+   raise TA_STACK_SIZE deliberately.                          */
+
+/* TA_DATA_SIZE: everything TEE_Malloc returns, plus the
+   internal allocations OP-TEE makes on the TA's behalf -
+   operation handles, object handles, key material.
+   Symptom of running out: TEE_ERROR_OUT_OF_MEMORY, usually
+   after a leak rather than a genuine shortage.              */
+
+/* Measuring: build with CFG_TA_STATS=y and ask.             */
+$ xtest --stats
+TA stats:
+  &lt;uuid&gt;
+    Heap: allocated 8192, max allocated 20480, size 32768
+    Stack: max used 1152, size 2048
+
+/* "max used" is the number that matters. 1152 of 2048 is
+   comfortable; 1900 of 2048 is a crash waiting for a longer
+   input.                                                     */</code></pre>
+
+<h2 id="props">Properties</h2>
+
+<p>Properties are the configuration mechanism, readable by the trusted application at run time and fixed at build time — which is what makes them trustworthy.</p>
+
+<pre><code>/* Declared in the header, readable by the TA and, for some,
+   by the client.                                            */
+
+#define TA_CURRENT_TA_EXT_PROPERTIES \
+    { "gp.ta.description", USER_TA_PROP_TYPE_STRING, \
+      "Secure key store" }, \
+    { "gp.ta.version", USER_TA_PROP_TYPE_U32, \
+      &amp;(const uint32_t){ 0x0102 } }, \
+    { "com.example.max-keys", USER_TA_PROP_TYPE_U32, \
+      &amp;(const uint32_t){ 16 } }
+
+/* Read them: */
+    uint32_t maxkeys;
+    TEE_GetPropertyAsU32(TEE_PROPSET_CURRENT_TA,
+                         "com.example.max-keys", &amp;maxkeys);
+
+/* Standard properties every TA has: */
+    gpd.ta.appID            this TA's UUID
+    gpd.ta.singleInstance   bool, from the flags
+    gpd.ta.multiSession     bool
+    gpd.ta.instanceKeepAlive bool
+    gpd.ta.dataSize         TA_DATA_SIZE
+    gpd.ta.stackSize        TA_STACK_SIZE
+
+/* About the TEE itself: */
+    gpd.tee.apiversion
+    gpd.tee.internalCore.version
+    gpd.tee.trustedos.implementation.version
+    gpd.tee.deviceID        a per-device identifier derived
+                            from the hardware unique key -
+                            useful, and privacy-sensitive
+
+/* About the caller: */
+    gpd.client.identity     login type + uuid (chapter 12)
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works with one client, corrupts with two</td><td><code>MULTI_SESSION</code> with unprotected global
+state</td></tr>
+<tr><td>Second client blocks until the first finishes</td><td><code>MULTI_SESSION</code> not set — this may be
+what you wanted</td></tr>
+<tr><td>Global state lost between clients</td><td>No <code>INSTANCE_KEEP_ALIVE</code>; the TA unloaded when the
+last session closed</td></tr>
+<tr><td>Each client sees its own globals</td><td><code>SINGLE_INSTANCE</code> not set</td></tr>
+<tr><td>No device under <code>/sys/bus/tee/devices/</code></td><td><code>TA_FLAG_DEVICE_ENUM</code>
+missing</td></tr>
+<tr><td>Panic with a stack dump on large inputs</td><td><code>TA_STACK_SIZE</code> too small — a big local
+buffer</td></tr>
+<tr><td><code>TEE_ERROR_OUT_OF_MEMORY</code> after long uptime</td><td>Leaked handles or allocations;
+<code>TA_DATA_SIZE</code> exhausted</td></tr>
+<tr><td>One client can use another's key</td><td>Key held in a global rather than the session context</td></tr>
+<tr><td>Session context is NULL in a callback</td><td><code>*sess_ctx</code> not set, or set after an early
+error return</td></tr>
+<tr><td>Secrets recovered from TA heap</td><td>Session structure freed without being wiped</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the TA flags and say what each changes.</li>
+  <li>Give the four useful flag combinations and a use case for each.</li>
+  <li>Explain what <code>SINGLE_INSTANCE | MULTI_SESSION</code> obliges you to do.</li>
+  <li>Name the three state scopes, their lifetimes, and what belongs in each.</li>
+  <li>Explain why a per-client key must not live in a global.</li>
+  <li>Say what <code>TA_STACK_SIZE</code> and <code>TA_DATA_SIZE</code> control and how to measure
+  usage.</li>
+  <li>Give two things that overflow a 2 KB TA stack.</li>
+  <li>Declare a custom property and read it from the TA.</li>
+  <li>Explain why session state should be wiped before it is freed.</li>
+  <li>Say which flag a TA needs for a kernel driver to bind to it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

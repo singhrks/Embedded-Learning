@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces and cgroups: the mechanism behind containers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Namespaces and cgroups: the mechanism behind containers</h1>
+<p class="lead">"Container" names a way of running software, not a kernel feature — there is no
+<code>struct container</code> anywhere in Linux. What actually exists, and what
+<a href="lx-34-process-creation.html">chapter 39</a>'s <code>clone()</code> flags already hinted at, are two
+independent, much older mechanisms: namespaces, which control what a process can <em>see</em>, and cgroups,
+which control how much of the machine it can <em>use</em>. Docker, Kubernetes and every other container
+runtime are built entirely out of these two primitives.</p>
+
+<h2 id="namespaces">Namespaces: giving a process its own view of the world</h2>
+
+<p>A namespace takes something that is normally global to the whole machine — the list of processes, the network interfaces, the mount table — and gives a group of processes their own private copy of it. To the processes inside, it simply looks like they are alone on the machine.</p>
+
+<pre class="diagram">   A NAMESPACE WRAPS ONE KIND OF GLOBAL KERNEL STATE AND
+   MAKES IT PER-NAMESPACE INSTEAD OF SYSTEM-WIDE. A process
+   inside a namespace sees ONLY that namespace's version of
+   whatever it wraps - and, critically, has NO WAY TO EVEN
+   OBSERVE that other versions exist, unless it has a
+   privileged way to cross the boundary deliberately.
+
+     PID       its own process tree - PID 1 inside the
+               namespace is a real, ordinary process outside
+               it, just with a different pid number on each
+               side. A process cannot see or signal processes
+               outside its own PID namespace at all.
+
+     NET       its own network interfaces, routing table,
+               firewall rules, port numbers. Two containers
+               can both bind port 80 with zero conflict,
+               because each has its OWN loopback and its own
+               idea of "port 80" entirely.
+
+     MNT       its own mount table. Mounting or unmounting a
+               filesystem inside the namespace is invisible
+               outside it - this is what makes a container's
+               filesystem look self-contained even though it
+               is, underneath, just directories and bind
+               mounts on the host.
+
+     UTS       its own hostname and NIS domain name -
+               "UTS" is a historical name (Unix Timesharing
+               System) for what `uname` reports.
+
+     IPC       its own System V IPC objects and POSIX message
+               queues - so two containers' semaphores or
+               shared memory segments never collide by id.
+
+     USER      its own mapping of user and group IDs - a
+               process can be UID 0 (root) INSIDE the
+               namespace while being an entirely unprivileged
+               UID on the host - the single most important
+               namespace for container SECURITY, since it
+               means "root in the container" does not mean
+               root on the machine.
+
+     CGROUP    its own view of the cgroup hierarchy (below),
+               so a process inside sees paths relative to its
+               own cgroup root rather than the host's full
+               tree.</pre>
+
+<div class="key">
+<b>A container is just a process with an unusual set of namespaces</b>
+<p>There is no moment where a "container" is created as a distinct kernel object — a container runtime calls
+<code>clone()</code> with a combination of <code>CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWUTS |
+CLONE_NEWIPC | CLONE_NEWUSER</code> (the same flags <a href="lx-34-process-creation.html">chapter 39</a>
+introduced for threads, repurposed here for isolation instead of sharing), and the resulting process is what
+gets called a container. Everything that makes a container feel like a separate machine — its own process
+list, its own network stack, its own root filesystem — is a direct, mechanical consequence of which namespaces
+that one <code>clone()</code> call created.</p>
+</div>
+
+<h2 id="observe">Seeing namespaces from outside</h2>
+
+<p>Namespaces are not hidden. Every process advertises which ones it belongs to, and comparing two processes tells you immediately whether they share a given view — which is also exactly how the tooling enters a container.</p>
+
+<pre><code># Every process's namespace membership is visible as symlinks:
+ls -la /proc/PID/ns/
+    pid -&gt; pid:[4026532345]
+    net -&gt; net:[4026532210]
+    mnt -&gt; mnt:[4026531840]
+    ...
+# Two processes in the SAME namespace show the SAME inode
+# number after the colon - that number, not the symlink text,
+# is the namespace's real identity.
+
+# Two processes are in the same PID namespace exactly when:
+readlink /proc/PID1/ns/pid
+readlink /proc/PID2/ns/pid
+# ...print the same inode number.
+
+# Enter an existing process's namespaces directly - this is
+# literally how `docker exec` and `nsenter` work, no special
+# container-aware API involved:
+nsenter --target PID --pid --net --mount --uts -- /bin/bash
+
+unshare --pid --net --mount --fork /bin/bash
+# Creates a new set of namespaces for a fresh process directly
+# from the shell - a minimal, dependency-free way to see
+# namespace isolation without any container tooling installed.</code></pre>
+
+<h2 id="cgroups">cgroups: bounding how much a process may use</h2>
+
+<p>Namespaces control what a process can <em>see</em>, and that is only half of isolation. A process with a completely private view of the system can still consume all of its memory and CPU, so a second, entirely separate mechanism limits how much it may actually use.</p>
+
+<pre class="diagram">   NAMESPACES ANSWER "WHAT CAN THIS PROCESS SEE." CGROUPS
+   (control groups) ANSWER A COMPLETELY DIFFERENT QUESTION:
+   "HOW MUCH OF THE MACHINE'S ACTUAL RESOURCES CAN IT USE."
+   A process can be fully namespace-isolated and still starve
+   every other process on the machine of CPU or memory
+   without a cgroup limiting it - the two mechanisms are
+   independent and a container runtime always uses both.
+
+   CGROUPS ARE ORGANISED AS A HIERARCHY, mounted as a
+   filesystem (cgroup v2, the current unified design):
+
+     /sys/fs/cgroup/
+       my-container/
+         cgroup.procs        <- PIDs that are members
+         memory.max           <- hard memory limit
+         memory.current        <- current usage
+         cpu.max               <- CPU quota, e.g. "50000 100000"
+                                   (50ms of CPU per 100ms period
+                                   - a two-CPU-core ceiling,
+                                   expressed as a ratio, not a
+                                   raw core count)
+         io.max                <- per-device I/O bandwidth cap
+         pids.max               <- maximum number of processes
+                                   (prevents a fork-bomb)
+
+   LIMITS ARE INHERITED DOWN THE TREE: a child cgroup can only
+   be MORE restrictive than its parent, never less - the
+   kernel enforces this structurally, so a runaway container
+   cannot grant itself more resources than its own parent
+   group was ever allowed.</pre>
+
+<pre><code># Create a cgroup and put the CURRENT shell into it:
+mkdir /sys/fs/cgroup/my-limit
+echo $$ &gt; /sys/fs/cgroup/my-limit/cgroup.procs
+echo "50M" &gt; /sys/fs/cgroup/my-limit/memory.max
+
+# Every process this shell now starts inherits the same
+# cgroup automatically - and hitting the memory limit does
+# NOT get -ENOMEM back the ordinary way; the kernel invokes
+# its OOM killer scoped to just this cgroup, killing a
+# process inside it specifically, leaving the rest of the
+# machine untouched. This is the real mechanism behind a
+# container being "OOM-killed" while its host keeps running
+# normally.
+
+cat /sys/fs/cgroup/my-limit/memory.events
+    oom 1
+    oom_kill 1
+
+systemd-cgls              # see the whole cgroup tree, readable
+systemd-cgtop              # live per-cgroup resource usage,
+                           # roughly cgroup's answer to `top`</code></pre>
+
+<h2 id="together">Namespaces plus cgroups equals what "container" means</h2>
+
+<p>A container runtime's actual job, stripped of all its tooling and image formats, is exactly two kernel
+calls worth of work: create a process with the right set of <code>CLONE_NEW*</code> namespace flags so it sees
+its own PID tree, network stack and filesystem, and place that process into a cgroup that bounds its CPU,
+memory and I/O. Everything else — image layers, networking bridges, orchestration — is built on top of, and
+ultimately reduces to, these two independent mechanisms working together on one ordinary Linux process.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Two containers both successfully bind port 80</td><td>Expected — each has its own network namespace and
+its own idea of "port 80"</td></tr>
+<tr><td>"Root" inside a container cannot read a host file it should not be able to</td><td>Expected — user
+namespace remapping means container UID 0 is an unprivileged UID on the host</td></tr>
+<tr><td>A container is killed with no application-level error message</td><td>The cgroup memory limit was hit
+and the OOM killer acted, scoped to that cgroup — check <code>memory.events</code></td></tr>
+<tr><td>A process appears with different PIDs when viewed from inside versus outside a container</td><td>
+Expected — the same process has a different pid number in each PID namespace it belongs to</td></tr>
+<tr><td>Raising a child cgroup's CPU limit above its parent's has no effect</td><td>Expected — cgroup v2 limits
+can only tighten going down the hierarchy, never loosen</td></tr>
+<tr><td>A container cannot see or signal a process running on the host</td><td>Expected — PID namespace
+isolation, working as intended</td></tr>
+<tr><td>A fork bomb inside one container does not affect the host or other containers</td><td>
+<code>pids.max</code> on that cgroup capped it — the intended containment</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why "container" is not a distinct kernel object, and what actually gets created instead.</li>
+  <li>Name the seven kinds of namespace and what global state each one localises.</li>
+  <li>Explain why the user namespace matters specifically for container security.</li>
+  <li>Use <code>/proc/PID/ns/</code> to determine whether two processes share a namespace.</li>
+  <li>Explain the difference between what namespaces control and what cgroups control.</li>
+  <li>Explain why a cgroup's OOM killer acting does not affect processes outside that cgroup.</li>
+  <li>Explain why a child cgroup can only be more restrictive than its parent, never less.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

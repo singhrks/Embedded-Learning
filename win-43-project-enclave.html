@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the VBS enclave and its host | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the VBS enclave and its host</h1>
+<p class="lead">Layer 3, and the piece of plumbing that has to exist to reach it: a DLL loaded into an isolated
+VTL1 region of an ordinary process, holding a P-256 private key that neither the process, nor any other
+process, nor the kernel can read — and the service that carries requests to it without being trusted with
+anything.</p>
+
+<h2 id="model">What an enclave actually is</h2>
+
+<p>The word suggests a separate process, and it is not one. Getting the mental model right first makes the
+memory rules later look obvious instead of arbitrary.</p>
+
+<pre class="diagram">   ONE PROCESS. TWO REGIONS.
+
+   winsignhost.exe, virtual address space
+   ┌──────────────────────────────────────────────┐
+   │  normal code and data          VTL0, ring 3  │
+   │    · the IOCTL loop                          │
+   │    · can see everything below? NO            │
+   │  ┌────────────────────────────────────────┐  │
+   │  │  THE ENCLAVE           VTL1, ring 3    │  │
+   │  │    winsign_enclave.dll                 │  │
+   │  │    its own heap, its own stacks        │  │
+   │  │    the private key lives HERE          │  │
+   │  └────────────────────────────────────────┘  │
+   └──────────────────────────────────────────────┘
+
+   IT IS A RANGE OF VIRTUAL ADDRESSES IN THE HOST'S OWN
+   ADDRESS SPACE that the hypervisor does not map for VTL0.
+   The host can name those addresses. It cannot read them.
+   Neither can a debugger attached to the host, nor a kernel
+   driver, nor a memory dump.
+
+   ENTERING IT is a call: CallEnclave(fn, param, wait, &amp;out),
+   where fn is an address INSIDE the enclave. The thread does
+   not stop; it transitions to VTL1, runs, and comes back.
+   Closer to a system call than to sending a message.
+
+   THE RULE THAT FALLS OUT OF THIS:
+     enclave code CAN read VTL0 memory
+     VTL0 code CANNOT read enclave memory
+   so a pointer handed in is USABLE and UNTRUSTWORTHY at the
+   same time. That combination is the whole hazard.</pre>
+
+<div class="danger">
+<b>Enclave APIs and their constraints move between Windows releases</b>
+<p>The set of DLLs an enclave may import from, the signing requirements for the enclave image, and the helper
+functions available inside it have all changed across Windows 10 and 11 releases — including helpers for copying in and out of
+enclave memory that newer builds add. Treat the code here as the correct <em>shape</em>, and check the
+current documentation and the supported-import list for the build you are targeting before you spend an evening
+on a link error. This is the same caution as the OP-TEE crypto framework in
+<a href="tee-30-project-secure-driver.html">OP-TEE chapter 29</a>, for the same reason: these are internal
+boundaries, not frozen ABIs.</p>
+</div>
+
+<h2 id="seam">The enclave's own interface</h2>
+
+<p>Seam C needs a contract of its own, and it must not be the driver's. Keeping them separate is what stops the
+application from acquiring a dependency on how the enclave works.</p>
+
+<pre><code>/* enclave/enclave_api.h  -  SEAM C
+   Shared by the host and the enclave, and by nothing else. */
+
+#pragma once
+
+#define ENC_OP_SIGN     0
+#define ENC_OP_PUBKEY   1
+
+#define ENC_SIG_LEN     64
+#define ENC_PUBKEY_LEN  64
+#define ENC_MAX_DATA    (1024 * 1024)
+
+/* The single parameter CallEnclave passes. It lives in VTL0
+   memory, so the enclave treats every field as hostile.    */
+typedef struct _ENC_CALL {
+    unsigned __int32 Op;
+    unsigned __int32 DataLen;
+    const unsigned char *Data;     /* VTL0 pointer          */
+    unsigned char   *Out;          /* VTL0 pointer          */
+    unsigned __int32 OutCapacity;
+    unsigned __int32 OutLen;       /* written by the enclave*/
+    __int32          Status;       /* written by the enclave*/
+} ENC_CALL;</code></pre>
+
+<h2 id="enclave">Layer 3: the enclave</h2>
+
+<p>Small on purpose. Everything in it is either a copy, a check, or a cryptographic call — there is no parsing,
+no allocation driven by caller-supplied sizes beyond one bounded buffer, and no state that outlives a call
+except the key itself.</p>
+
+<pre><code>// enclave/winsign_enclave.c  -  LAYER 3
+#include &lt;windows.h&gt;
+#include &lt;winenclave.h&gt;
+#include &lt;bcrypt.h&gt;
+#include &lt;string.h&gt;
+#include "enclave_api.h"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "vertdll.lib")
+
+#define NT_OK(s) (((NTSTATUS)(s)) &gt;= 0)
+
+/* The one piece of state that outlives a call. It is in
+   enclave memory, which is the entire point.              */
+static BCRYPT_KEY_HANDLE g_key = NULL;
+static SRWLOCK           g_lock = SRWLOCK_INIT;
+
+/* ---------------------------------------------------------
+   The untrusted-memory rules, in one place
+   --------------------------------------------------------- */
+
+/* Is [p, p+len) entirely OUTSIDE the enclave? A caller that
+   hands us an enclave address would otherwise make us read
+   or - far worse - WRITE our own secrets for it.          */
+static BOOL IsVtl0Range(const void *p, SIZE_T len)
+{
+    ENCLAVE_INFORMATION info;
+    ULONG_PTR base, end, s, e;
+
+    if (p == NULL || len == 0)
+        return FALSE;
+
+    if (!NT_OK(EnclaveGetEnclaveInformation(sizeof(info),
+                                            &amp;info)))
+        return FALSE;
+
+    base = (ULONG_PTR)info.BaseAddress;
+    end  = base + info.Size;
+    s    = (ULONG_PTR)p;
+
+    if (s + len &lt; s)          /* overflow                  */
+        return FALSE;
+    e = s + len;
+
+    /* No overlap with [base, end) in either direction.    */
+    return (e &lt;= base) || (s &gt;= end);
+}
+
+/* ---------------------------------------------------------
+   The key
+   --------------------------------------------------------- */
+
+/* Chapter 43 replaces this with a sealed blob on disk. For
+   now the key is generated per enclave instance, which is
+   enough to prove seam C and nothing more.                */
+static NTSTATUS EnsureKey(void)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    NTSTATUS status;
+
+    if (g_key != NULL)
+        return 0;
+
+    status = BCryptOpenAlgorithmProvider(&amp;alg,
+                 BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0);
+    if (!NT_OK(status))
+        return status;
+
+    status = BCryptGenerateKeyPair(alg, &amp;g_key, 256, 0);
+    if (NT_OK(status))
+        status = BCryptFinalizeKeyPair(g_key, 0);
+
+    if (!NT_OK(status) &amp;&amp; g_key) {
+        BCryptDestroyKey(g_key);
+        g_key = NULL;
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return status;
+}
+
+/* ---------------------------------------------------------
+   The two operations
+   --------------------------------------------------------- */
+
+static NTSTATUS DoPubkey(unsigned char *out, ULONG cap,
+                         ULONG *outLen)
+{
+    unsigned char blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+    BCRYPT_ECCKEY_BLOB *hdr = (BCRYPT_ECCKEY_BLOB *)blob;
+    ULONG got = 0;
+    NTSTATUS status;
+
+    if (cap &lt; ENC_PUBKEY_LEN)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    status = BCryptExportKey(g_key, NULL,
+                 BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob),
+                 &amp;got, 0);
+    if (!NT_OK(status))
+        return status;
+
+    if (got &lt; sizeof(*hdr) + 64 || hdr-&gt;cbKey != 32)
+        return STATUS_UNSUCCESSFUL;
+
+    /* The blob is a header followed by X then Y, each the
+       key size. Unlike OP-TEE's attribute getter, BCrypt
+       gives them FIXED width - no left-padding needed.   */
+    memcpy(out, blob + sizeof(*hdr), 64);
+    *outLen = ENC_PUBKEY_LEN;
+    return 0;
+}
+
+static NTSTATUS DoSign(const unsigned char *data, ULONG len,
+                       unsigned char *out, ULONG cap,
+                       ULONG *outLen)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    unsigned char digest[32];
+    ULONG sigLen = 0;
+    NTSTATUS status;
+
+    if (cap &lt; ENC_SIG_LEN)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    status = BCryptOpenAlgorithmProvider(&amp;alg,
+                 BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (!NT_OK(status))
+        return status;
+
+    /* data already points at an ENCLAVE copy - see below.  */
+    status = BCryptHash(alg, NULL, 0,
+                        (PUCHAR)data, len,
+                        digest, sizeof(digest));
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!NT_OK(status))
+        return status;
+
+    /* BCryptSignHash with no padding info on an ECDSA key
+       produces r||s, fixed width. That is exactly the wire
+       format the application expects.                     */
+    status = BCryptSignHash(g_key, NULL,
+                            digest, sizeof(digest),
+                            out, cap, &amp;sigLen, 0);
+    SecureZeroMemory(digest, sizeof(digest));
+    if (!NT_OK(status))
+        return status;
+
+    *outLen = sigLen;
+    return 0;
+}
+
+/* ---------------------------------------------------------
+   The entry point
+   --------------------------------------------------------- */
+
+__declspec(dllexport)
+void *WinsignCall(void *parameter)
+{
+    ENC_CALL *caller = (ENC_CALL *)parameter;
+    ENC_CALL call;                 /* an ENCLAVE-memory copy */
+    unsigned char *copy = NULL;
+    unsigned char out[ENC_SIG_LEN];
+    ULONG outLen = 0;
+    NTSTATUS status;
+
+    /* 1. The parameter itself is in VTL0. Validate the
+          POINTER, then take a private copy of the struct so
+          the fields cannot change after we check them.    */
+    if (!IsVtl0Range(caller, sizeof(*caller)))
+        return (void *)(ULONG_PTR)STATUS_INVALID_PARAMETER;
+
+    call = *caller;                /* one read, then never
+                                      touch caller again    */
+
+    if (call.Op != ENC_OP_SIGN &amp;&amp; call.Op != ENC_OP_PUBKEY)
+        return (void *)(ULONG_PTR)STATUS_INVALID_PARAMETER;
+
+    if (!IsVtl0Range(call.Out, call.OutCapacity) ||
+        call.OutCapacity &lt; ENC_SIG_LEN)
+        return (void *)(ULONG_PTR)STATUS_INVALID_PARAMETER;
+
+    AcquireSRWLockExclusive(&amp;g_lock);
+
+    status = EnsureKey();
+    if (!NT_OK(status))
+        goto done;
+
+    if (call.Op == ENC_OP_PUBKEY) {
+        status = DoPubkey(out, sizeof(out), &amp;outLen);
+        goto done;
+    }
+
+    /* 2. THE RULE. The input lives in VTL0 memory that the
+          untrusted side can rewrite WHILE WE READ IT. Copy
+          it into the enclave first, then validate and use
+          only the copy. Validating in place and then
+          hashing in place is the bug this prevents, and it
+          is the same bug as OP-TEE chapter 20's rule 2.   */
+    if (call.DataLen == 0 || call.DataLen &gt; ENC_MAX_DATA ||
+        !IsVtl0Range(call.Data, call.DataLen)) {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+
+    copy = (unsigned char *)malloc(call.DataLen);
+    if (copy == NULL) {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    memcpy(copy, call.Data, call.DataLen);
+
+    status = DoSign(copy, call.DataLen, out, sizeof(out),
+                    &amp;outLen);
+
+done:
+    ReleaseSRWLockExclusive(&amp;g_lock);
+
+    if (copy) {
+        SecureZeroMemory(copy, call.DataLen);
+        free(copy);
+    }
+
+    /* 3. Write results out LAST, and only as much as we
+          said we would.                                   */
+    if (NT_OK(status) &amp;&amp; outLen &lt;= call.OutCapacity) {
+        memcpy(call.Out, out, outLen);
+        caller-&gt;OutLen = outLen;
+    } else {
+        caller-&gt;OutLen = 0;
+    }
+    caller-&gt;Status = (__int32)status;
+
+    SecureZeroMemory(out, sizeof(out));
+    return (void *)(ULONG_PTR)status;
+}
+
+BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID r)
+{
+    UNREFERENCED_PARAMETER(h);
+    UNREFERENCED_PARAMETER(r);
+    if (reason == DLL_PROCESS_DETACH &amp;&amp; g_key) {
+        BCryptDestroyKey(g_key);
+        g_key = NULL;
+    }
+    return TRUE;
+}</code></pre>
+
+<div class="key">
+<b>The three lines that carry the whole security property</b>
+<p><code>call = *caller;</code> — one read of the request, after which the untrusted side cannot change what we
+believe it asked for. <code>IsVtl0Range(call.Data, call.DataLen)</code> — a buffer that overlaps the enclave
+would let a caller aim our own <code>memcpy</code> at our own key. <code>memcpy(copy, call.Data,
+call.DataLen);</code> followed by hashing <em>the copy</em> — this is what closes the window between validating
+and using. Delete any one of them and the code still works perfectly in every test you would normally write,
+which is exactly why they are worth naming.</p>
+</div>
+
+<h2 id="def">Exporting the entry point</h2>
+
+<p>An enclave's callable functions are resolved by name from the loaded image, so the export must survive both
+the compiler's name decoration and the linker's discarding of anything apparently unused.</p>
+
+<pre><code>; enclave/winsign_enclave.def
+LIBRARY winsign_enclave
+EXPORTS
+    WinsignCall</code></pre>
+
+<h2 id="host">The host: the part that is not a layer</h2>
+
+<p>Its whole job is to own a process, create the enclave inside it, and shuttle work between the driver and
+<code>CallEnclave</code>. It makes no decisions, because as chapter 40 argued, no decision it made could be
+relied upon.</p>
+
+<pre><code>// host/winsignhost.cpp  -  PLUMBING, NOT A LAYER
+#include &lt;windows.h&gt;
+#include &lt;winenclaveapi.h&gt;
+#include &lt;stdio.h&gt;
+#include "../inc/winsign_ioctl.h"
+#include "../enclave/enclave_api.h"
+
+typedef void *(*WINSIGN_CALL)(void *);
+
+static void *g_enclave = NULL;
+static WINSIGN_CALL g_call = NULL;
+
+static bool StartEnclave(void)
+{
+    if (!IsEnclaveTypeSupported(ENCLAVE_TYPE_VBS)) {
+        fprintf(stderr, "VBS enclaves not available. "
+                        "Is VBS actually running?\n");
+        return false;
+    }
+
+    ENCLAVE_CREATE_INFO_VBS info = {};
+    /* OwnerID is yours to choose; it participates in the
+       identity a sealed blob can be bound to (chapter 43). */
+    info.Flags = 0;                /* | ENCLAVE_VBS_FLAG_DEBUG
+                                      while developing      */
+
+    g_enclave = CreateEnclave(GetCurrentProcess(), NULL,
+                              0x1000000,   /* reserve 16 MB */
+                              0,           /* commit lazily */
+                              ENCLAVE_TYPE_VBS,
+                              &amp;info, sizeof(info), NULL);
+    if (g_enclave == NULL) {
+        fprintf(stderr, "CreateEnclave %lu\n", GetLastError());
+        return false;
+    }
+
+    if (!LoadEnclaveImageW(g_enclave, L"winsign_enclave.dll")) {
+        fprintf(stderr, "LoadEnclaveImage %lu - check the "
+                        "signature and the imports\n",
+                GetLastError());
+        return false;
+    }
+
+    ENCLAVE_INIT_INFO_VBS init = {};
+    init.Length = sizeof(init);
+    init.ThreadCount = 4;
+    if (!InitializeEnclave(GetCurrentProcess(), g_enclave,
+                           &amp;init, sizeof(init), NULL)) {
+        fprintf(stderr, "InitializeEnclave %lu\n",
+                GetLastError());
+        return false;
+    }
+
+    /* Resolve the export INSIDE the enclave image.        */
+    g_call = (WINSIGN_CALL)GetProcAddress(
+                 (HMODULE)g_enclave, "WinsignCall");
+    if (g_call == NULL) {
+        fprintf(stderr, "export not found - check the .def\n");
+        return false;
+    }
+    return true;
+}
+
+/* One unit of work: driver -> enclave -> driver.          */
+static void Serve(HANDLE dev, const WINSIGN_WORK &amp;work)
+{
+    unsigned char out[WINSIGN_SIG_LEN] = {};
+    ENC_CALL call = {};
+    void *ret = NULL;
+    DWORD n = 0;
+
+    call.Op          = work.Op;
+    call.DataLen     = work.DataLen;
+    call.Data        = work.Data;
+    call.Out         = out;
+    call.OutCapacity = sizeof(out);
+
+    /* The transition. waitForThread = TRUE means block if
+       every enclave thread is busy rather than fail.      */
+    if (!CallEnclave(g_call, &amp;call, TRUE, &amp;ret)) {
+        call.Status = -1;
+        call.OutLen = 0;
+    }
+
+    WINSIGN_RESULT res = {};
+    res.RequestId = work.RequestId;
+    res.Status    = call.Status;
+    res.OutLen    = call.OutLen;
+    if (call.OutLen &gt; 0 &amp;&amp; call.OutLen &lt;= sizeof(res.Out))
+        memcpy(res.Out, out, call.OutLen);
+
+    DeviceIoControl(dev, IOCTL_WINSIGN_HOST_RESULT,
+                    &amp;res, sizeof(res), NULL, 0, &amp;n, NULL);
+}
+
+int main(void)
+{
+    if (!StartEnclave())
+        return 1;
+
+    HANDLE dev = OpenWinsign();      /* as in chapter 41   */
+    if (dev == INVALID_HANDLE_VALUE)
+        return 1;
+
+    DWORD n = 0;
+    if (!DeviceIoControl(dev, IOCTL_WINSIGN_HOST_REGISTER,
+                         NULL, 0, NULL, 0, &amp;n, NULL)) {
+        fprintf(stderr, "register: %lu - another host "
+                        "already running?\n", GetLastError());
+        return 1;
+    }
+
+    /* THE INVERTED CALL LOOP. Ask for work; the driver does
+       not answer until there is some.                     */
+    for (;;) {
+        WINSIGN_WORK work;
+        if (!DeviceIoControl(dev, IOCTL_WINSIGN_HOST_WAIT,
+                             NULL, 0, &amp;work, sizeof(work),
+                             &amp;n, NULL)) {
+            fprintf(stderr, "wait: %lu\n", GetLastError());
+            break;
+        }
+        if (n != sizeof(work))
+            break;
+
+        Serve(dev, work);
+    }
+
+    CloseHandle(dev);
+    return 0;
+}</code></pre>
+
+<div class="warn">
+<b>One host thread is a deliberate simplification, and it is the first thing to fix</b>
+<p>The loop above serves one request at a time, so a large signing request delays every other caller —
+which, since the driver's client queue has no timeout, means a slow enclave looks exactly like a hung one. A
+real service runs several threads each in its own <code>HOST_WAIT</code> loop, which the driver already
+supports because the host queue can hold many pended requests. It is left single-threaded here because
+concurrency would obscure the mechanism on first reading, not because it is adequate.</p>
+</div>
+
+<h2 id="signing">Building and signing the enclave</h2>
+
+<p>This is where most of the first day goes, and almost none of it is your code. Two constraints cause nearly
+every failure.</p>
+
+<pre class="diagram">   CONSTRAINT 1: THE IMPORT LIST
+
+     An enclave DLL may only import from a small, fixed set
+     of enclave-aware modules - vertdll.dll, the enclave
+     subset of the C runtime, bcrypt, and a few others that
+     varies by Windows version. Anything else fails at
+     LoadEnclaveImage, not at link time.
+
+     SO: check what you actually import.
+       dumpbin /dependents winsign_enclave.dll
+
+     THE USUAL CULPRIT is the C runtime. Link the enclave
+     against the enclave-specific runtime, not the normal
+     one, or a single printf will pull in kernel32.
+
+   CONSTRAINT 2: THE SIGNATURE
+
+     Enclave images are signature-checked when loaded, with
+     requirements stricter than ordinary code signing and
+     different across Windows versions. For development,
+     ENCLAVE_VBS_FLAG_DEBUG plus test signing is the path;
+     for shipping, check the current requirements before you
+     design around an assumption.
+
+     A DEBUG-FLAGGED ENCLAVE IS NOT PROTECTED. It can be
+     debugged, which is the point - and means it must never
+     be used to hold a real key. Chapter 43's attack tests
+     deliberately run against a non-debug build for exactly
+     this reason.</pre>
+
+<h2 id="prove">Proving layer 3 on its own</h2>
+
+<p>Per the build order, this runs before the driver exists at all. A host that calls the enclave directly and
+prints the result isolates every enclave problem from every driver problem.</p>
+
+<pre><code>/* tools/directcall.cpp - no driver, no IOCTL, no service. */
+if (!StartEnclave()) return 1;
+
+unsigned char msg[] = "hello";
+unsigned char sig[ENC_SIG_LEN] = {};
+ENC_CALL call = {};
+call.Op = ENC_OP_SIGN;
+call.Data = msg;
+call.DataLen = 5;
+call.Out = sig;
+call.OutCapacity = sizeof(sig);
+
+void *ret = NULL;
+CallEnclave(g_call, &amp;call, TRUE, &amp;ret);
+printf("status %d len %u\n", call.Status, call.OutLen);
+
+/* THEN THE TEST THAT MATTERS: ask for the public key twice
+   in the same process and confirm it is the same, then
+   restart and confirm it is DIFFERENT. That difference is
+   the missing piece - the key is not yet persisted, which
+   is what chapter 43 is for.                             */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>IsEnclaveTypeSupported</code> returns false</td><td>VBS is not running — check before blaming
+anything else</td></tr>
+<tr><td><code>CreateEnclave</code> fails with invalid parameter</td><td>The reserve size, or an
+<code>ENCLAVE_CREATE_INFO_VBS</code> field left uninitialised</td></tr>
+<tr><td><code>LoadEnclaveImage</code> fails</td><td>An import outside the supported set, or the image
+signature</td></tr>
+<tr><td><code>GetProcAddress</code> returns NULL</td><td>The export was decorated or discarded — check the
+<code>.def</code></td></tr>
+<tr><td>The process dies instantly on <code>CallEnclave</code></td><td>An unhandled exception inside the
+enclave terminates it; there is no second chance</td></tr>
+<tr><td><code>CallEnclave</code> blocks forever</td><td>Every enclave thread is busy and
+<code>waitForThread</code> is TRUE — raise <code>ThreadCount</code></td></tr>
+<tr><td>Signature verifies sometimes and not others</td><td>The input was hashed in place instead of from the
+enclave-side copy</td></tr>
+<tr><td>The public key changes on every run</td><td>Expected at this stage — nothing is sealed yet</td></tr>
+<tr><td>A debugger can read the key</td><td>The enclave was built with the debug flag, which disables the
+protection by design</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what an enclave is in terms of address ranges, not processes.</li>
+  <li>State which direction memory access works across the enclave boundary, and the hazard that creates.</li>
+  <li>Explain why the entry point copies the parameter structure before reading any field.</li>
+  <li>Say what <code>IsVtl0Range</code> prevents, and what a caller could do without it.</li>
+  <li>Explain why the input is copied into the enclave before it is hashed.</li>
+  <li>Name the three lines that carry the security property and what each one stops.</li>
+  <li>Explain why the host makes no security decisions.</li>
+  <li>Describe the two constraints that make enclave DLLs hard to load.</li>
+  <li>Say why a debug-flagged enclave must never hold a real key.</li>
+  <li>Run the direct-call test and explain why the public key changes between runs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

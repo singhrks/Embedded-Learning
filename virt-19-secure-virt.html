@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S-EL2, Hafnium and FF-A | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>S-EL2, Hafnium and FF-A</h1>
+<p class="lead">TrustZone gave the secure world one privileged OS and no way to isolate its parts from each
+other. As secure firmware grew — a TEE, a firmware TPM, a DRM stack, a vendor's key manager, all from
+different suppliers — that became untenable. S-EL2 adds virtualisation <em>inside</em> the secure world, and
+FF-A is the standard that makes the pieces interoperate.</p>
+
+<h2 id="problem">The problem with one secure world</h2>
+
+<p>The secure world was designed for one trusted OS, and the moment several vendors each need their own trusted code, that assumption breaks down.</p>
+
+<pre class="diagram">   BEFORE S-EL2
+
+   S-EL0   TA   TA   TA          isolated from each other by
+                                 the trusted OS's MMU
+   S-EL1   OP-TEE                ONE trusted OS. Everything
+                                 privileged in the secure world
+                                 lives here.
+   EL3     TF-A
+
+   So: a firmware TPM, a vendor keystore, a DRM widevine
+   implementation and OP-TEE itself all end up either
+     (a) as trusted applications, sharing one trusted OS's
+         privilege domain and trusting its kernel completely, or
+     (b) bolted INTO the trusted OS as pseudo-TAs, which means
+         a bug in a vendor's DRM blob is a bug in the most
+         privileged non-EL3 software on the phone.
+
+   Neither is acceptable when the components come from
+   different vendors with different assurance levels.
+
+
+   AFTER S-EL2
+
+   S-EL0   TA  TA        app          app
+   S-EL1   OP-TEE     |  fTPM SP   |  vendor SP
+                      |            |
+   S-EL2   HAFNIUM - the Secure Partition Manager.
+           Stage-2 translation for the SECURE world. Each
+           secure partition gets its own IPA space, its own
+           memory, its own devices, and cannot see the others.
+   EL3     TF-A - now also the SPM Dispatcher, routing FF-A
+           calls between worlds.
+
+   Same architecture as the normal world, one world across.
+   Stage 2, VMIDs, traps - all of it, but with NS=0.</pre>
+
+<div class="key">
+<b>The naming</b>
+<p>In the normal world you say hypervisor, VM, vCPU. In the secure world you say <strong>SPM</strong> (Secure
+Partition Manager), <strong>SP</strong> (Secure Partition), and <strong>execution context</strong>. The
+mechanisms are the same; the vocabulary comes from the FF-A specification, and using the wrong one in a
+review makes conversations harder than they need to be.</p>
+</div>
+
+<h2 id="ffa">FF-A: the Firmware Framework</h2>
+
+<p>Arm's Firmware Framework for A-profile defines how partitions discover each other, send messages, and
+share memory — across the world boundary and within a world. It replaces a decade of incompatible vendor
+SMC conventions with one ABI.</p>
+
+<pre><code>/* FF-A calls are SMCs with function IDs in a reserved range,
+   following SMCCC. The ones you will actually use:        */
+
+  SETUP AND DISCOVERY
+    FFA_VERSION                 negotiate the version
+    FFA_FEATURES                what does this implementation do?
+    FFA_ID_GET                  what is my own partition ID?
+    FFA_PARTITION_INFO_GET      who else exists, and what UUID?
+    FFA_RXTX_MAP                give the SPM my message buffers
+    FFA_RXTX_UNMAP
+
+  MESSAGING
+    FFA_MSG_SEND_DIRECT_REQ     synchronous call to a partition
+    FFA_MSG_SEND_DIRECT_RESP    its reply
+    FFA_MSG_WAIT                "I am idle, wake me on a message"
+    FFA_RUN                     schedule a partition's context
+    FFA_YIELD
+    FFA_INTERRUPT               an interrupt arrived for you
+
+  MEMORY MANAGEMENT - the interesting part
+    FFA_MEM_DONATE              transfer ownership permanently
+    FFA_MEM_LEND                transfer access, keep ownership
+    FFA_MEM_SHARE               both parties may access
+    FFA_MEM_RETRIEVE_REQ        receiver claims the transfer
+    FFA_MEM_RETRIEVE_RESP
+    FFA_MEM_RELINQUISH          receiver gives it back
+    FFA_MEM_RECLAIM             sender takes it back
+
+  ERROR / SUCCESS
+    FFA_SUCCESS   FFA_ERROR
+
+/* A direct request, from a normal-world driver: */
+
+    x0 = FFA_MSG_SEND_DIRECT_REQ_64   /* 0xC400006F          */
+    x1 = (sender_id &lt;&lt; 16) | receiver_id
+    x2 = 0                            /* flags               */
+    x3..x7 = up to five 64-bit values of payload
+    smc #0
+
+    /* returns in x0 = FFA_MSG_SEND_DIRECT_RESP, x3..x7 = the
+       reply. Synchronous, and the caller's context is
+       blocked meanwhile.                                    */</code></pre>
+
+<h2 id="memory">Memory transfer, done properly</h2>
+
+<p>Moving memory between the normal and secure worlds needs a protocol, because both sides must agree about ownership before either can safely use it.</p>
+
+<pre class="diagram">   The old way: a normal-world driver passes a physical address
+   in an SMC and the trusted OS trusts it. Every parameter-
+   validation bug in every TEE ever, in one sentence.
+
+   FF-A instead makes the transfer an explicit, mediated
+   transaction with THREE distinct semantics:
+
+   DONATE   ownership moves. The sender can never get it back.
+            Used for: handing a buffer to a partition for its
+            own permanent use.
+
+   LEND     access moves, ownership stays. The sender loses
+            access while the loan is outstanding. Exclusive.
+            Used for: "process this buffer and give it back" -
+            and because the sender loses access, there is no
+            time-of-check-to-time-of-use window.
+
+   SHARE    both may access concurrently. Cheapest, and the
+            one that reintroduces TOCTOU if you are careless.
+
+   The protocol:
+
+     sender:   FFA_MEM_LEND with a descriptor listing
+               address ranges, receiver ID, and permissions
+                  -> SPM validates the sender OWNS those pages
+                  -> SPM returns a HANDLE
+     sender:   passes the handle to the receiver (by message)
+     receiver: FFA_MEM_RETRIEVE_REQ(handle)
+                  -> SPM maps the pages into the RECEIVER'S
+                     stage-2 tables with the agreed permissions
+                  -> and UNMAPS them from the sender if LEND
+     ...work happens...
+     receiver: FFA_MEM_RELINQUISH(handle)
+     sender:   FFA_MEM_RECLAIM(handle)
+                  -> SPM restores the sender's mapping
+
+   The SPM is the only component that edits stage-2 tables, and
+   it validates every claim of ownership. A partition cannot
+   lend what it does not have.</pre>
+
+<div class="warn">
+<b>LEND versus SHARE is a security decision</b>
+<p>With <code>SHARE</code>, the sender can modify a buffer after the receiver has validated its contents —
+the classic double-fetch. With <code>LEND</code>, the sender's mapping is removed, so it physically cannot.
+Use <code>LEND</code> for anything where the receiver makes a trust decision based on the buffer's contents,
+and pay the extra unmap cost.</p>
+</div>
+
+<h2 id="hafnium">Hafnium</h2>
+
+<p>The reference implementation of a secure-world hypervisor is small and readable, and its design choices are all visible consequences of its threat model.</p>
+
+<pre><code>/* Hafnium is Arm's reference SPM. Small, C, no dynamic
+   allocation, and it is also usable as a normal-world
+   hypervisor (that was its original life, as the Android
+   "protected VM" hypervisor before pKVM).                  */
+
+  Runs at:      S-EL2   (as an SPM)
+                EL2     (as a plain hypervisor)
+  Language:     C, ~20k lines
+  Scheduling:   cooperative - partitions are RUN by the normal
+                world's scheduler via FFA_RUN. Hafnium does not
+                have a scheduler of its own, deliberately.
+  Memory:       fully static. Every partition's memory comes
+                from its manifest, allocated at boot.
+
+/* A secure partition manifest - device tree, compiled into
+   the SP package:                                          */
+
+  sp {
+      compatible = "arm,ffa-manifest-1.0";
+      ffa-version = &lt;0x00010001&gt;;      /* FF-A v1.1          */
+      uuid = &lt;0xb476b8a1 0xdcbf474f 0xa4b7a2a1 0x6f0f4d3c&gt;;
+      id = &lt;0x8001&gt;;
+      execution-ctx-count = &lt;1&gt;;
+      exception-level = &lt;2&gt;;           /* S-EL1              */
+      execution-state = &lt;0&gt;;           /* AArch64            */
+      load-address = &lt;0x6280000&gt;;
+      entrypoint-offset = &lt;0x2000&gt;;
+      xlat-granule = &lt;0&gt;;              /* 4 KB               */
+      boot-order = &lt;0&gt;;
+      messaging-method = &lt;3&gt;;          /* direct req + resp  */
+
+      memory-regions {
+          compatible = "arm,ffa-manifest-memory-regions";
+          rx-buffer { base-address = &lt;0x0 0x7300000&gt;;
+                      pages-count = &lt;1&gt;; attributes = &lt;1&gt;; };
+          tx-buffer { base-address = &lt;0x0 0x7301000&gt;;
+                      pages-count = &lt;1&gt;; attributes = &lt;3&gt;; };
+      };
+
+      device-regions {
+          compatible = "arm,ffa-manifest-device-regions";
+          crypto-accel {
+              base-address = &lt;0x0 0x40010000&gt;;
+              pages-count = &lt;16&gt;;
+              attributes = &lt;3&gt;;        /* read-write          */
+              smmu-id = &lt;0&gt;;
+              stream-ids = &lt;0x0 0x1&gt;;  /* SMMU isolation too  */
+          };
+      };
+  };
+
+/* Read it as a contract: this is EXACTLY what partition 0x8001
+   may touch. Anything else faults. And because it is static,
+   a reviewer can check it without running anything.        */</code></pre>
+
+<h2 id="linux">Talking to a secure partition from Linux</h2>
+
+<p>From the normal world, a secure partition is reached through a defined interface rather than through ad-hoc SMCs, which is the main practical improvement.</p>
+
+<pre><code># Linux has an FF-A bus, like any other bus.
+
+$ ls /sys/bus/ffa/devices/
+arm-ffa-8001   arm-ffa-8002
+
+$ cat /sys/bus/ffa/devices/arm-ffa-8001/uuid
+b476b8a1-dcbf-474f-a4b7-a2a16f0f4d3c
+
+$ dmesg | grep -i ff-a
+[    0.812] ARM FF-A: Initialized with version 1.1
+[    0.813] ARM FF-A: Partition ID 0x8001 : 1 exec ctx, props 0x3
+
+/* And a driver binds to it exactly as it would to a PCI or
+   platform device:                                         */
+
+static const struct ffa_device_id my_sp_ids[] = {
+        { UUID_INIT(0xb476b8a1, 0xdcbf, 0x474f,
+                    0xa4, 0xb7, 0xa2, 0xa1,
+                    0x6f, 0x0f, 0x4d, 0x3c) },
+        {}
+};
+
+static int my_sp_probe(struct ffa_device *dev)
+{
+        const struct ffa_ops *ops = dev-&gt;ops;
+        struct ffa_send_direct_data d = {
+                .data0 = MY_CMD_GET_VERSION,
+        };
+
+        ops-&gt;msg_ops-&gt;sync_send_receive(dev, &amp;d);
+        dev_info(&amp;dev-&gt;dev, "SP version %llu\n", d.data0);
+        return 0;
+}
+
+static struct ffa_driver my_sp_driver = {
+        .name     = "my_sp",
+        .probe    = my_sp_probe,
+        .id_table = my_sp_ids,
+};
+module_ffa_driver(my_sp_driver);
+
+/* This is how the upstream fTPM driver will eventually talk to
+   an fTPM secure partition, replacing the OP-TEE-specific path
+   we build in the OP-TEE track. The TA logic is the same; the
+   transport changes.                                        */</code></pre>
+
+<h2 id="cca">Realms, in one page</h2>
+
+<p>A brief orientation on the newest security state, which <a href="virt-23-confidential-computing.html">chapter 21</a> covers properly — the point here is only where it sits relative to the worlds you already know.</p>
+
+<pre class="diagram">   ARMv9 Confidential Compute Architecture adds a FOURTH
+   security state, for a different threat model again:
+
+     Non-secure   normal world - hypervisor and its VMs
+     Secure       TrustZone - TEE, secure partitions
+     Realm        confidential VMs
+     Root         EL3, and the Granule Protection Table
+
+   Threat model: protect a guest from the HYPERVISOR and from
+   the cloud operator. Not from itself; not from the TEE.
+
+     R-EL2   RMM (Realm Management Monitor) - a small, spec'd
+             component that manages realms
+     Root    Monitor + GPT: hardware-checked ownership of every
+             granule of physical memory. GPC (Granule
+             Protection Check) happens on EVERY access, in
+             addition to stage 1 and stage 2.
+
+   The hypervisor still SCHEDULES realms and still allocates
+   their memory - but it cannot READ it. Attempts fault with a
+   Granule Protection Fault.
+
+   Where it fits with this track: everything you know about
+   stage 2 and vCPUs still applies. What changes is that the
+   hypervisor's stage-2 edits must be ratified by the RMM, and
+   the guest's memory is not in the hypervisor's address space.
+   The mental model is "pKVM, enforced by hardware rather than
+   by trusting a small EL2 component".</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No FF-A devices in <code>/sys/bus/ffa/</code></td><td>No SPM in firmware, or TF-A built without the SPM
+dispatcher</td></tr>
+<tr><td><code>FFA_ERROR NOT_SUPPORTED</code> on a direct request</td><td>The partition's manifest declares a
+different <code>messaging-method</code></td></tr>
+<tr><td>Memory retrieve fails with <code>DENIED</code></td><td>Sender does not own the pages, or the receiver
+requested different permissions than were offered</td></tr>
+<tr><td>Secure partition faults on its device registers</td><td>Device region missing from the manifest, or the
+StreamID not listed so the SMMU blocks its DMA</td></tr>
+<tr><td>Partition never runs</td><td>Nothing called <code>FFA_RUN</code> — Hafnium has no scheduler of its
+own</td></tr>
+<tr><td>Version negotiation fails</td><td>Caller and SPM implement different FF-A versions; check
+<code>FFA_VERSION</code> first and downgrade</td></tr>
+<tr><td>Double-fetch vulnerability found in review</td><td><code>SHARE</code> used where <code>LEND</code> was
+required</td></tr>
+<tr><td>Works on one board, not another</td><td>Manifest load addresses are physical and board-specific</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the problem with a single S-EL1 trusted OS when components come from several vendors.</li>
+  <li>Draw the exception levels and security states with an SPM and two secure partitions.</li>
+  <li>Translate hypervisor/VM/vCPU into the FF-A vocabulary.</li>
+  <li>Name the three FF-A memory-transfer semantics and say when each is correct.</li>
+  <li>Explain why <code>LEND</code> closes a TOCTOU window that <code>SHARE</code> leaves open.</li>
+  <li>Walk through a lend-retrieve-relinquish-reclaim sequence and say who edits the page tables.</li>
+  <li>Read a secure-partition manifest and list exactly what that partition may touch.</li>
+  <li>Explain why Hafnium deliberately has no scheduler.</li>
+  <li>Describe how a Linux driver binds to a secure partition.</li>
+  <li>State the Realm threat model in one sentence and say what a Granule Protection Fault means.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

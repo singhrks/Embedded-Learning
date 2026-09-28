@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The I/O subsystem and device drivers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The I/O subsystem and device drivers</h1>
+<p class="lead">A driver is the adapter between one piece of hardware and one kernel subsystem. This chapter
+covers the concepts every driver model shares — device classes, the discovery and binding lifecycle, I/O
+models, and the layering that lets one <code>read()</code> reach a hundred different kinds of device.</p>
+
+<h2 id="job">What a driver actually does</h2>
+
+<div class="key">
+<b>Two interfaces, one translator</b>
+<p>Upward, a driver implements a <strong>subsystem interface</strong> — the operations a network stack, a
+block layer or a VFS expects. Downward, it speaks the <strong>device's register protocol</strong>. Everything
+else in a driver is lifecycle and error handling.</p>
+<p>This is why "write a driver" is not one skill: you must know the subsystem's contract as well as the
+hardware's. Reading an existing driver for the same subsystem is nearly always the fastest route.</p>
+</div>
+
+<pre class="diagram">   application            read()
+        │
+   ┌────▼────────────────────────────────────┐
+   │  SUBSYSTEM: VFS / net / block / input    │  uniform semantics
+   └────┬────────────────────────────────────┘
+   ┌────▼────────────────────────────────────┐
+   │  CLASS driver     (usb-storage, hid)     │  device-type logic
+   └────┬────────────────────────────────────┘
+   ┌────▼────────────────────────────────────┐
+   │  BUS driver       (USB core, PCI, I2C)   │  enumeration,
+   └────┬────────────────────────────────────┘  transport
+   ┌────▼────────────────────────────────────┐
+   │  HOST CONTROLLER driver (xHCI, AHCI)     │  the actual silicon
+   └────┬────────────────────────────────────┘
+        ▼   MMIO, interrupts, DMA
+     hardware
+
+  A USB flash drive traverses every layer: VFS → block → SCSI →
+  usb-storage → USB core → xHCI → the controller's registers.
+  Each layer is reusable, which is why adding one new USB device
+  usually requires no new code at all.</pre>
+
+<h2 id="classes">The three device classes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Character</th><th>Block</th><th>Network</th></tr></thead>
+<tbody>
+<tr><td>Access</td><td>Byte stream, usually sequential</td><td>Fixed-size blocks, random access</td><td>Packets</td></tr>
+<tr><td>Buffered by the kernel</td><td>Usually not</td><td>Page cache</td><td>Socket buffers</td></tr>
+<tr><td>Appears as</td><td><code>/dev/ttyS0</code></td><td><code>/dev/sda</code></td><td><strong>No <code>/dev</code> node</strong> — <code>eth0</code></td></tr>
+<tr><td>Interface</td><td><code>file_operations</code></td><td><code>block_device_operations</code> + request queue</td><td><code>net_device_ops</code></td></tr>
+<tr><td>Examples</td><td>Serial, input, GPIO, sensors, your custom device</td><td>Disks, SD, NVMe</td><td>Ethernet, Wi-Fi, modems</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Network devices are the odd one out: they are not files, because a packet interface does not fit
+<code>read</code>/<code>write</code> semantics well and because routing decisions happen above the device.
+Sockets are the file-like abstraction instead.</p>
+
+<h2 id="discovery">Discovery and binding</h2>
+
+<p>Before a driver can run, something must establish that a device exists. How that happens differs fundamentally between buses that can enumerate themselves and hardware that must be described externally.</p>
+
+<pre class="diagram">Two worlds, and the difference drives everything:
+
+  DISCOVERABLE BUSES — hardware can be interrogated
+      PCI:  read configuration space → vendor ID, device ID, class,
+            BAR sizes and types
+      USB:  request descriptors from the device
+      → the bus driver enumerates, and the core matches a driver
+        by ID. Hotplug works naturally.
+
+  NON-DISCOVERABLE — you cannot ask
+      on-SoC peripherals, I2C and SPI slaves.
+      There is no safe way to probe address 0x40001000; a wrong
+      guess can hang the bus or trigger a side effect.
+      → hardware must be DESCRIBED out of band:
+            device tree (embedded, ARM)
+            ACPI tables (servers, x86, Windows on ARM)
+
+This is exactly why the device tree exists, and why an embedded
+Linux driver looks structurally different from a PCIe driver.</pre>
+
+<pre class="diagram">   HARDWARE SIDE                    DRIVER SIDE
+   device tree node                 module loads
+   or PCI enumeration               registers a driver with
+        │                           its match table
+        ▼                                 │
+   struct device created                  ▼
+   added to the bus                 struct device_driver added
+        └───────────┬───────────────────┘
+                    ▼
+             bus->match(dev, drv)
+             compare compatible strings / vendor+device IDs
+                    │
+                    ▼ match
+             driver->probe(dev)
+             ── get resources: registers, IRQ, clocks, regulators
+             ── map MMIO
+             ── initialise the hardware
+             ── register with the SUBSYSTEM
+                    │
+                    ▼
+                 in service
+                    │
+             driver->remove(dev)   on unbind, unload, or hot-unplug
+             ── quiesce hardware FIRST, then release, in reverse</pre>
+
+<div class="warn">
+<b>Probe ordering is not guaranteed</b>
+<p>Your driver may probe before the clock controller or regulator it depends on exists. Every modern driver
+model has an answer: Linux returns <code>-EPROBE_DEFER</code> and the core retries later; Windows' PnP manager
+starts devices as their dependencies become available. Never assume initialisation order, and never work
+around it with <code>late_initcall</code> — that is a race, not a fix.</p>
+</div>
+
+<h2 id="resources">The four resources every driver needs</h2>
+
+<p>Nearly every driver needs the same four things before it can talk to hardware, and each is assigned by the system rather than chosen by the driver. Acquiring them correctly is most of what a probe function does.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Resource</th><th>Why</th><th>Failure if missing</th></tr></thead>
+<tbody>
+<tr><td><strong>Registers (MMIO)</strong></td><td>To control the device</td><td>Fault, or reads of garbage</td></tr>
+<tr><td><strong>Interrupt</strong></td><td>To learn about completions</td><td>Hangs waiting forever, or polls wastefully</td></tr>
+<tr><td><strong>Clocks</strong></td><td>An unclocked block does not respond</td><td>Registers read as 0 or abort</td></tr>
+<tr><td><strong>Power / regulators</strong></td><td>Same</td><td>Same</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The order matters: enable clocks and power BEFORE touching any
+   register. This is the single most common bring-up bug, and it
+   presents identically to a wrong base address.               */
+
+regulator_enable(vdd);
+clk_prepare_enable(clk);
+reset_control_deassert(rst);
+/* ... only now is it safe to read the ID register ... */
+id = readl(base + REG_ID);</code></pre>
+
+<h2 id="models">The three I/O models</h2>
+
+<p>There are three ways a driver can wait for a device, and they differ in how much processor time they waste. The choice is usually forced by how fast the device responds.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Polling</th><th>Interrupt</th><th>DMA</th></tr></thead>
+<tbody>
+<tr><td>CPU cost</td><td>100% while waiting</td><td>Per event</td><td>Near zero</td></tr>
+<tr><td>Latency</td><td>Lowest, most deterministic</td><td>Interrupt entry overhead</td><td>Setup cost, amortised</td></tr>
+<tr><td>Best for</td><td>Very short waits, early boot, hard real time, ultra-high-rate NICs</td><td>Most peripherals</td><td>Bulk transfer</td></tr>
+<tr><td>Hazard</td><td>Wastes power; must be bounded</td><td>Storms if not cleared at the source</td><td>Coherency and address translation</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Polling, done correctly — ALWAYS with a timeout */
+ret = readl_poll_timeout(base + STATUS, val, val &amp; READY, 10, 1000);
+if (ret)
+        return -ETIMEDOUT;      /* say so, rather than hanging */
+
+/* Hybrid models are common in practice:
+     NAPI (network)   take one interrupt, then POLL until the
+                      queue drains. Interrupt latency at low
+                      rates, no interrupt storm at high rates.
+     Adaptive coalescing  the device delays interrupts until N
+                      packets or T microseconds.               */</code></pre>
+
+<h2 id="dma">DMA from the driver's point of view</h2>
+
+<p>Letting a device read and write memory directly removes the processor from the transfer entirely. The complication is that the device sees a different address space, and getting that translation wrong corrupts memory silently.</p>
+
+<pre class="diagram">The three rules, which are the same on every OS:
+
+  1. Program the device with the address the DEVICE must use —
+     Linux calls it dma_addr_t, Windows calls it a logical address.
+     It is NOT a virtual address and NOT necessarily a physical one:
+     with an IOMMU it is an IOVA.
+
+  2. Respect BUFFER OWNERSHIP. Between map and unmap the buffer
+     belongs to the device. Touching it from the CPU without an
+     explicit sync gives stale or corrupt data on non-coherent
+     systems (CA chapter 15).
+
+  3. Never DMA to stack memory or vmalloc memory. Stack buffers may
+     share a cache line with unrelated data; vmalloc memory is not
+     physically contiguous.
+
+  And the reason an SMMU/IOMMU exists at all: a device issuing
+  addresses bypasses the CPU's MMU entirely, so every isolation
+  guarantee built with page tables has a hole in it unless
+  something checks those transactions. Security track, ch. 02-07.</pre>
+
+<h2 id="userspace">Drivers outside the kernel</h2>
+
+<p>Not every driver has to be in the kernel. Running one in user space trades some performance for a crash that takes down a process rather than the machine, which is frequently the right trade.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mechanism</th><th>Gives user space</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><strong>UIO</strong></td><td>Mapped registers and interrupt notification via a file descriptor</td><td>Simple custom hardware</td></tr>
+<tr><td><strong>VFIO</strong></td><td>The same, plus IOMMU-enforced DMA isolation</td><td>Device passthrough to VMs; DPDK, SPDK</td></tr>
+<tr><td><strong>libusb</strong></td><td>Direct USB transfers</td><td>Instruments, programmers, cameras</td></tr>
+<tr><td><strong>spidev / i2c-dev</strong></td><td>Raw bus transactions</td><td>Prototyping, one-off sensors</td></tr>
+<tr><td><strong>gpiod</strong></td><td>GPIO lines by fd (replaces the deprecated sysfs interface)</td><td>Scripts, tooling</td></tr>
+<tr><td><strong>FUSE</strong></td><td>A filesystem implemented in user space</td><td>sshfs, s3fs, experimentation</td></tr>
+<tr><td><strong>UMDF</strong> (Windows)</td><td>A full driver framework in user mode</td><td>USB, HID, sensors — the recommended default</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">The trade-off (OS chapter 02, again):
+
+  IN KERNEL       full speed, direct access, no context switches
+                  a bug panics the machine
+                  a vulnerability is total compromise
+
+  IN USER SPACE   a crash kills one process
+                  can use any language, any library, a debugger
+                  can be restarted
+                  syscall or mapping overhead per operation
+                  needs an IOMMU to make DMA safe
+
+  DPDK and SPDK take the user-space path AND remove the overhead,
+  by mapping the device with VFIO and POLLING it from a dedicated
+  core — no syscalls, no interrupts, no kernel in the data path.
+  They trade a whole CPU core for latency and throughput.</pre>
+
+<h2 id="interfaces">Exposing a device to user space</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Interface</th><th>Good for</th><th>Caution</th></tr></thead>
+<tbody>
+<tr><td><strong>Device node</strong> + <code>read</code>/<code>write</code></td><td>Streams of data</td><td>Needs framing if messages have boundaries</td></tr>
+<tr><td><strong>ioctl</strong> / <code>DeviceIoControl</code></td><td>Arbitrary commands with structured arguments</td><td>The struct is permanent ABI — design for extension</td></tr>
+<tr><td><strong>sysfs</strong> attributes</td><td>One value per file; scriptable configuration and status</td><td>It is ABI: cannot be changed once shipped</td></tr>
+<tr><td><strong>debugfs</strong></td><td>Anything, during development</td><td>No stability guarantee — never depend on it</td></tr>
+<tr><td><strong>mmap</strong></td><td>Zero-copy access to buffers or registers</td><td>Exposes hardware directly; validate carefully</td></tr>
+<tr><td><strong>netlink</strong> / uevents</td><td>Asynchronous notifications to user space</td><td></td></tr>
+<tr><td><strong>A subsystem</strong> (IIO, input, v4l2, hwmon)</td><td><strong>Preferred.</strong> Existing tools and libraries work immediately</td><td>Must fit the subsystem's model</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tip">
+<b>Use an existing subsystem if one fits</b>
+<p>A temperature sensor registered with <strong>hwmon</strong> is immediately visible to <code>sensors</code>,
+monitoring agents and fan control. The same sensor behind a custom ioctl needs bespoke tooling forever. Before
+inventing an interface, search for a subsystem that already models your device class — IIO for sensors, input
+for buttons and touch, v4l2 for video, ALSA for audio, hwmon for monitoring, rtc, watchdog, pwm, led. This is
+the difference between a driver that gets merged and one that does not.</p>
+</div>
+
+<h2 id="lifecycle">Getting removal right</h2>
+
+<p>A driver is not simply loaded and run. It binds to a device, may be unbound, and must survive the device disappearing while in use — which is the path that receives the least testing and causes the most crashes.</p>
+
+<pre><code>/* Removal is where most driver bugs live, because it races with
+   everything still in flight.                                */
+
+static void my_remove(struct device *dev)
+{
+        struct my_dev *d = dev_get_drvdata(dev);
+
+        /* 1. STOP the hardware generating events, FIRST */
+        writel(0, d-&gt;regs + REG_IRQ_ENABLE);
+        writel(0, d-&gt;regs + REG_CTRL);
+
+        /* 2. unregister from the subsystem, so no NEW requests
+              can arrive */
+        unregister_device(&amp;d-&gt;cdev);
+
+        /* 3. wait for in-flight work to finish */
+        cancel_work_sync(&amp;d-&gt;work);
+        del_timer_sync(&amp;d-&gt;timer);
+
+        /* 4. release resources in reverse order of acquisition */
+        clk_disable_unprepare(d-&gt;clk);
+        /* devm_ resources released automatically after this   */
+}
+
+/* Get the ORDER wrong and an interrupt fires after you freed the
+   structure it references — a use-after-free that only appears
+   under load.                                                */</code></pre>
+
+<pre><code># the single best driver test there is: bind/unbind in a loop
+for i in $(seq 100); do
+  echo 40010000.widget &gt; /sys/bus/platform/drivers/mydrv/unbind
+  echo 40010000.widget &gt; /sys/bus/platform/drivers/mydrv/bind
+done
+dmesg | grep -iE 'kasan|use-after|warn|leak'
+# Nearly every resource leak, missing-quiesce and lifetime bug
+# surfaces here and almost nowhere else. Run it with KASAN on.</code></pre>
+
+<h2 id="observing">Observing the I/O subsystem</h2>
+
+<p>Which drivers are bound to which devices, and what resources each holds, is fully visible on a running system — which answers most "why is my device not working" questions immediately.</p>
+
+<pre><code>lspci -vv                    # PCI devices, BARs, capabilities, driver
+lsusb -t                     # USB topology
+ls /sys/bus/*/devices/       # everything the device model knows
+ls /sys/bus/platform/drivers/mydrv/    # what bound to this driver
+ls /sys/class/                # by device class
+
+cat /proc/interrupts         # is the handler firing?
+cat /proc/iomem              # who owns which physical range
+cat /proc/devices            # major numbers
+ls /sys/kernel/iommu_groups/*/devices/
+
+udevadm info -a -n /dev/ttyUSB0     # every attribute, for writing rules
+udevadm monitor                      # watch hotplug events live
+
+dmesg -w                             # driver messages as they happen</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device present but no driver bound</td><td>Match table missing the ID or compatible string</td></tr>
+<tr><td>Registers read all zeros or abort</td><td>Clock or power not enabled — check this before the address</td></tr>
+<tr><td>Probe fails intermittently at boot</td><td>Dependency not ready; return <code>-EPROBE_DEFER</code></td></tr>
+<tr><td>Interrupt count never increases</td><td>Wrong number, wrong trigger type, or not enabled at the device</td></tr>
+<tr><td>Interrupt fires continuously</td><td>Not cleared at the source before acknowledging</td></tr>
+<tr><td>DMA writes land in the wrong place</td><td>Programmed with a virtual or physical address instead of the DMA address</td></tr>
+<tr><td>Crash on module unload under load</td><td>Removal order wrong; something still in flight</td></tr>
+<tr><td>Works once, fails on re-bind</td><td>State not reset in probe, or leaked in remove</td></tr>
+<tr><td>Custom tooling needed for a common device type</td><td>Should have used an existing subsystem</td></tr>
+<tr><td>User-space driver cannot DMA safely</td><td>Needs VFIO with an IOMMU, not UIO</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State a driver's two interfaces and why writing one needs two kinds of knowledge.</li>
+  <li>Give the three device classes and say why network devices have no <code>/dev</code> node.</li>
+  <li>Explain discoverable versus described buses and why the device tree exists.</li>
+  <li>Walk the discovery-to-probe binding flow.</li>
+  <li>Name the four resources a driver acquires and the ordering rule between them.</li>
+  <li>Compare polling, interrupts and DMA, and describe one hybrid model.</li>
+  <li>Give the three DMA rules and the reason an IOMMU exists.</li>
+  <li>Give the correct order of operations in <code>remove()</code> and the bug that wrong order causes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

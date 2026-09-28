@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threads and scheduling | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Threads and scheduling</h1>
+<p class="lead">System threads, thread priorities, APCs, and the context rules that decide whether a
+user-mode address means anything to your code. Shorter than the Linux equivalent, because most drivers
+should not create threads at all — but you need to know when they should.</p>
+
+<h2 id="priorities">Priorities</h2>
+
+<p>Windows schedules threads by numeric priority, and a driver can affect that in ways that are easy to get wrong. The important thing for a driver author is knowing which priorities are real-time, and why raising a thread's priority is rarely the fix it appears to be.</p>
+
+<pre class="diagram">   31  ┐
+   ...  │  REAL-TIME range (16-31)
+   16  ┘  Fixed. NEVER boosted, never decayed.
+          A runaway thread here starves everything below.
+
+   15  ┐
+   ...  │  DYNAMIC range (1-15)
+    1  ┘  Boosted on I/O completion, decayed over time.
+    0     the zero-page thread only
+
+   THREAD PRIORITY = process priority class + thread relative
+   priority, for user threads. Kernel threads set an absolute
+   value.
+
+   FOR DRIVER THREADS the useful constants:
+
+     LOW_REALTIME_PRIORITY     16
+     HIGH_PRIORITY             31
+     LOW_PRIORITY               0
+     THREAD_PRIORITY_NORMAL     8   (dynamic)
+
+   A driver's worker thread usually wants LOW_REALTIME_PRIORITY
+   (16) if it services hardware with timing requirements, or
+   simply the default 8 if it does background work.
+
+   THE RULE: raising priority is almost never the fix for a
+   latency problem. If a driver thread is not running promptly
+   the usual causes are a long DPC somewhere (chapter 11), a
+   lock it is waiting on, or too much work in the wrong tier.
+   Raising priority moves the problem onto someone else.</pre>
+
+<h2 id="threads">System threads</h2>
+
+<p>Sometimes a driver needs work done in the background, in a context where it may block, with no application involved. A system thread is exactly that — a thread with no user-mode side, running only your kernel code.</p>
+
+<pre><code>#include &lt;ntddk.h&gt;
+
+VOID
+MyThreadRoutine(_In_ PVOID Context)
+{
+        PMY_CONTEXT ctx = (PMY_CONTEXT)Context;
+        NTSTATUS status;
+
+        /* PASSIVE_LEVEL. May sleep. No user address space -
+           we are in the SYSTEM process.                    */
+
+        KeSetPriorityThread(KeGetCurrentThread(),
+                            LOW_REALTIME_PRIORITY);
+
+        for (;;) {
+                status = KeWaitForSingleObject(&amp;ctx-&gt;WorkEvent,
+                                Executive, KernelMode, FALSE,
+                                NULL);   /* or a timeout */
+
+                if (ctx-&gt;Stopping)
+                        break;
+
+                MyDoLongRunningWork(ctx);
+        }
+
+        PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+/* CREATING one: */
+        HANDLE threadHandle;
+        NTSTATUS status;
+
+        status = PsCreateSystemThread(&amp;threadHandle,
+                                      THREAD_ALL_ACCESS,
+                                      NULL,     /* attributes */
+                                      NULL,     /* process:
+                                                   NULL = the
+                                                   system one  */
+                                      NULL,     /* client id  */
+                                      MyThreadRoutine,
+                                      ctx);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        /* Take a REFERENCE so we can wait for it later, then
+           close the handle - we do not need it. */
+        status = ObReferenceObjectByHandle(threadHandle,
+                        THREAD_ALL_ACCESS, *PsThreadType,
+                        KernelMode, &amp;ctx-&gt;ThreadObject, NULL);
+        ZwClose(threadHandle);
+
+/* STOPPING it - and this must be exactly right: */
+        ctx-&gt;Stopping = TRUE;
+        KeSetEvent(&amp;ctx-&gt;WorkEvent, IO_NO_INCREMENT, FALSE);
+
+        KeWaitForSingleObject(ctx-&gt;ThreadObject, Executive,
+                              KernelMode, FALSE, NULL);
+        /* the thread has now RETURNED - it is safe to free its
+           context and to unload                            */
+
+        ObDereferenceObject(ctx-&gt;ThreadObject);
+
+/* WITHOUT THAT WAIT, the driver can unload while the thread
+   is still executing its code, and the next instruction it
+   runs is in freed memory. Exactly the Linux kthread_stop()
+   requirement (ch. 10).                                    */</code></pre>
+
+<div class="key">
+<b>When to create a thread — rarely</b>
+<p>Use a <strong>work item</strong> (<a href="win-10-isr-dpc.html">chapter 11</a>) for short deferred work;
+it shares the system worker pool and costs nothing when idle. Create a dedicated system thread only when you
+need a long-lived loop that blocks — a polling loop, a thread servicing a hardware queue, a watchdog. A
+thread per device that mostly sleeps is wasted memory and a scheduler entry; a work item that blocks for
+seconds starves the shared pool. Match the tool to the duration.</p>
+</div>
+
+<h2 id="context">Thread and process context</h2>
+
+<p>This distinction causes more confusion than any other in driver work: the thread your code runs in is often not the thread that made the request, and the process context — and therefore the user address space — may be completely unrelated.</p>
+
+<pre><code>/* WHICH PROCESS AM I IN? It determines whether a user-mode
+   address means anything.                                  */
+
+        PEPROCESS process = IoGetCurrentProcess();
+        PETHREAD  thread  = PsGetCurrentThread();
+        HANDLE    pid     = PsGetCurrentProcessId();
+        HANDLE    tid     = PsGetCurrentThreadId();
+
+/* THE THREE CONTEXTS a driver routine can run in:
+
+   1. THE CALLER'S CONTEXT
+        A dispatch routine called synchronously from a
+        syscall. `IoGetCurrentProcess()` is the requesting
+        process, and user-mode addresses are valid.
+        -&gt; only reliable for synchronous, non-queued requests
+
+   2. AN ARBITRARY THREAD CONTEXT
+        A DPC, a completion routine, a timer callback. You are
+        on whatever thread happened to be interrupted. User
+        addresses are MEANINGLESS.
+        -&gt; this is why METHOD_BUFFERED and MDLs exist
+           (chapter 08)
+
+   3. A SYSTEM THREAD CONTEXT
+        Your own thread, or a work item. In the System
+        process. No user address space at all.
+
+/* THE ONE-LINE RULE: unless you are certain you are in case
+   1, never touch a user-mode address. Use SystemBuffer or a
+   mapped MDL, which are valid everywhere.
+
+/* IF YOU MUST reach a specific process's address space: */
+        KAPC_STATE apcState;
+
+        KeStackAttachProcess(targetProcess, &amp;apcState);
+        /* now user addresses in targetProcess are valid */
+        __try {
+                ProbeForRead(userVa, len, 1);
+                RtlCopyMemory(local, userVa, len);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+        }
+        KeUnstackDetachProcess(&amp;apcState);
+
+/* ATTACHING IS EXPENSIVE and constrained: PASSIVE_LEVEL only,
+   no nesting across other attaches, and you must detach on
+   every path. Treat it as a last resort - the existence of
+   MDLs means you almost never need it.                   */</code></pre>
+
+<h2 id="apcs">APCs</h2>
+
+<p>An asynchronous procedure call is a way to run code in the context of a specific thread. Drivers rarely queue them directly, but they explain several behaviours you will otherwise find inexplicable, including how I/O completion reaches the right thread.</p>
+
+<pre><code>/* An Asynchronous Procedure Call runs a function IN THE
+   CONTEXT OF A SPECIFIC THREAD. It is the mechanism behind
+   asynchronous I/O completion, thread suspension, and
+   termination.                                             */
+
+   KERNEL APCs      run at APC_LEVEL, in the target thread.
+                    Used by the I/O manager to copy results
+                    back into the caller's buffer at
+                    completion - which is why METHOD_BUFFERED
+                    output lands in the right process without
+                    you doing anything.
+
+   SPECIAL KERNEL APCs  a higher-priority variant, used for
+                    I/O completion and thread termination.
+                    Cannot be disabled by a critical region.
+
+   USER APCs        run at PASSIVE_LEVEL in user mode, when
+                    the thread enters an ALERTABLE wait.
+                    QueueUserAPC, and the completion routine
+                    of ReadFileEx.
+
+/* WHY A DRIVER CARES:
+
+   1. KeEnterCriticalRegion() disables normal kernel APCs.
+      Required around ERESOURCE (chapter 10), because an APC
+      could otherwise suspend a thread holding the resource.
+
+   2. An ALERTABLE wait can be interrupted by a user APC:
+        KeWaitForSingleObject(..., TRUE, ...)   /* alertable */
+      returns STATUS_USER_APC. Handle it, or use FALSE.
+
+   3. Thread termination is delivered as a special kernel APC.
+      A thread that never enters an alertable wait can be hard
+      to terminate - which is why driver threads should use an
+      explicit stop flag plus an event, as above, rather than
+      relying on termination.
+
+/* QUEUEING ONE yourself is possible but rarely right - the
+   APC structures are undocumented in detail and the lifetime
+   rules are unforgiving. If you think you need an APC, you
+   probably want a work item.                              */</code></pre>
+
+<h2 id="cancellation">Cancellation and thread exit</h2>
+
+<p>Applications exit, sometimes while your driver is still holding their requests. What the system does then — and what it expects your driver to do — is the difference between a clean shutdown and a hung process that cannot be killed.</p>
+
+<pre><code>/* When a thread exits with I/O outstanding, the I/O manager
+   cancels its pending IRPs. Your driver must cooperate or the
+   process hangs in termination.                            */
+
+/* THE OBLIGATIONS:
+     1. every queued request must have a cancel path
+        (chapter 05, or WDF queues in chapter 16)
+     2. IRP_MJ_CLEANUP must cancel everything belonging to
+        that file object
+     3. no wait without a timeout
+
+/* WDF DOES ALL OF THIS if you use queues:
+     · WdfIoQueuePurgeSynchronously cancels and waits
+     · the framework cancels per-file-object requests on
+       cleanup automatically
+     · EvtIoCanceledOnQueue lets you clean up device state
+
+/* SEEING A HUNG TERMINATION in WinDbg (chapter 23): */
+        !process 0 7                /* find the process */
+        !thread ffff8a0c...         /* what is it waiting on */
+        !irpfind -v 0 0 device ...  /* which IRP is stuck */
+
+/* THE PATTERN: a process stuck in "Terminated" state with a
+   non-zero thread count almost always means a driver holds an
+   IRP it never completes and never cancels. The Linux
+   equivalent is a task stuck in D state (ch. 10), and it is
+   diagnosed the same way: find the request, find the driver
+   holding it.                                            */</code></pre>
+
+<h2 id="observe">Observing</h2>
+
+<p>Every thread in the system is inspectable from the debugger, including what it is waiting on. When something is hung, that is usually the fastest route to the responsible driver.</p>
+
+<pre><code># --- On the machine ---
+    Process Explorer           per-thread CPU, priority,
+                               start address, stack
+    Process Monitor            I/O by thread
+    Performance Monitor        Thread \ Priority Current
+    xperf / WPA                scheduling traces, wait
+                               analysis - the best tool for
+                               "why was my thread not running"
+
+# --- In WinDbg ---
+    !process 0 0               every process, brief
+    !process ffff8a0c... 7     one process, all threads,
+                               all stacks
+    !thread ffff8a0c...        one thread: priority, state,
+                               wait reason, stack
+    !ready                     threads ready to run, by
+                               priority
+    !running                   what each CPU is running now
+    !stacks 2                  every thread's stack, filtered
+    ~*k                        all stacks in the current
+                               process
+
+# WAIT REASONS worth recognising in !thread output:
+    Executive        waiting on a dispatcher object
+    UserRequest      a user-mode wait
+    WrQueue          waiting on a work queue
+    Suspended
+    WrLpcReceive     an ALPC call
+
+# THE QUESTION !thread ANSWERS: "what is this thread blocked
+# on, and who owns it?" That is usually the whole diagnosis
+# for a hang.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck after driver unload</td><td>Thread not waited for — <code>KeWaitForSingleObject</code> on the thread object is mandatory</td></tr>
+<tr><td>Driver will not unload</td><td>Thread never exits; the stop flag is not checked, or the event is never signalled</td></tr>
+<tr><td>Process stuck in "Terminated"</td><td>A driver holds an IRP it never completes or cancels</td></tr>
+<tr><td>User buffer is garbage in a DPC</td><td>Arbitrary thread context — the address means nothing there</td></tr>
+<tr><td>Works synchronously, fails when queued</td><td>Same cause; the request completed in a different context</td></tr>
+<tr><td>Wait returns <code>STATUS_USER_APC</code></td><td>An alertable wait was interrupted — handle it or pass FALSE</td></tr>
+<tr><td>System-wide starvation</td><td>A real-time-priority driver thread that never blocks</td></tr>
+<tr><td>ERESOURCE assertion</td><td>Missing <code>KeEnterCriticalRegion</code> (<a href="win-09-synchronisation.html">ch. 10</a>)</td></tr>
+<tr><td>Worker pool exhausted</td><td>Work items blocking for a long time — use a dedicated thread</td></tr>
+<tr><td>Crash in <code>KeUnstackDetachProcess</code></td><td>Attach/detach not paired on every path</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the real-time and dynamic priority ranges and why raising priority rarely fixes latency.</li>
+  <li>Create a system thread and stop it correctly, including the reference and the wait.</li>
+  <li>Say when a work item is right and when a dedicated thread is.</li>
+  <li>Name the three contexts a driver routine can run in and which allows user addresses.</li>
+  <li>Explain why <code>KeStackAttachProcess</code> is a last resort.</li>
+  <li>Explain what APCs are used for and the three reasons a driver cares.</li>
+  <li>Explain why <code>IRP_MJ_CLEANUP</code> matters to process termination.</li>
+  <li>Use <code>!thread</code> to determine what a blocked thread is waiting on.</li>
+  <li>Map each of these onto its Linux equivalent.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

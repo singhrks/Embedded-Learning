@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scenario: a smart camera | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Scenario: a smart camera</h1>
+<p class="lead">This round is about bandwidth arithmetic and where computation happens. The candidate who
+computes the pixel rate in the first five minutes reaches the right architecture; the one who starts by naming
+a processor does not.</p>
+
+<div class="key">
+<b>The prompt</b>
+<p>"Design a camera that detects people entering a restricted area and alerts a security system. It must work
+day and night, mount outdoors, and there are a few thousand of them. Take me through it."</p>
+</div>
+
+<h2 id="clarify">1 · Clarify</h2>
+
+<pre><code>  RESOLUTION AND FRAME RATE? -&gt; my choice, driven by
+        detection range. Assume 1080p at 15 fps is enough
+        to detect a person at 20 m.
+  DETECT OR IDENTIFY? -&gt; CRITICAL DISTINCTION. Detecting
+        "a person is present" is far cheaper than
+        identifying WHO. Assume detection plus a saved
+        clip.
+  WHAT IS SENT? -&gt; alerts, plus a short clip on event.
+        NOT continuous video, which changes everything.
+  LATENCY? -&gt; alert within a second or two.
+  POWER? -&gt; PoE or mains available. -&gt; the energy
+        constraint largely disappears, which is worth
+        saying out loud.
+  NIGHT? -&gt; IR illumination, so a sensor with good
+        near-IR response and a mechanical IR-cut filter
+        that swaps day/night.
+  ENVIRONMENT? -&gt; outdoor, -20 to +50 C, IP66.
+  VOLUME? -&gt; a few thousand. -&gt; modules and off-the-shelf
+        SoCs, not a custom silicon path.
+  FALSE ALARMS? -&gt; ASK THIS. A security system that cries
+        wolf gets ignored. It is a product requirement
+        with heavy architectural consequences.
+
+RESTATE:
+  "Mains-powered outdoor camera, 1080p15, on-device person
+  detection, alert plus clip on event, a few thousand
+  units. Power is not the constraint here - bandwidth and
+  compute are, and the false-alarm rate is the product
+  requirement that will drive the detection design. I'll
+  start with the data rates."</code></pre>
+
+<h2 id="budget">2 · Budget — the numbers that decide it</h2>
+
+<pre><code>PIXEL RATE:
+    1920 x 1080 x 15 fps = 31.1 Mpixel/s
+    at 10 bits raw       = 311 Mbit/s from the sensor
+
+  That is a MIPI CSI-2 link - two lanes comfortably. It is
+  far beyond SPI, USB 2.0 or anything the buses track's
+  simpler options offer, and it immediately rules out a
+  microcontroller-class part.
+
+NETWORK, IF WE SENT EVERYTHING:
+    H.264 1080p15 at reasonable quality ~ 2-4 Mbit/s
+    x 3000 cameras = 6-12 Gbit/s aggregate, continuously,
+    plus storage.
+
+  Nobody wants that. THIS ARITHMETIC IS THE WHOLE
+  ARCHITECTURAL ARGUMENT: detection must happen ON THE
+  DEVICE, and the network carries events plus short clips.
+
+  ON-DEVICE:  3000 cameras x maybe 20 events/day x 5 s
+              clip = tiny by comparison.
+
+COMPUTE FOR DETECTION:
+    A person-detection model on 1080p is expensive. But we
+    do not need to run it on every full frame:
+      - downscale to e.g. 320x320 for the detector
+      - run motion detection first (cheap) and only invoke
+        the model when something moves
+      - run at 2-5 fps, not 15
+
+    That gating is the difference between needing an NPU
+    and not, and it is the same "cheap trigger gates
+    expensive classifier" pattern from chapter 04.
+
+MEMORY:
+    frame buffers at 1080p YUV420 = 3.1 MB each; several
+    in flight for capture, encode and detect -&gt; tens of MB
+    of CMA reserved at boot (chapter 05). This must be
+    sized up front and cannot be changed later.
+
+STORAGE:
+    a local ring buffer of recent video so a clip can
+    include PRE-event footage - which is what makes a
+    security clip useful. Sized in seconds x bitrate.</code></pre>
+
+<h2 id="architecture">3 · Architecture</h2>
+
+<pre class="diagram">   AN APPLICATION PROCESSOR, not a microcontroller. The
+   pixel rate, the codec requirement and the model all
+   demand it, and there is no battery constraint to argue
+   against it.
+
+   +------------------------------------------------------+
+   |  SoC: quad Cortex-A, ISP, hardware H.264 encoder, NPU |
+   |                                                       |
+   |   sensor --CSI-2--&gt; ISP --&gt; [ encoder ] --&gt; ring buf  |
+   |    (I2C for control)   \                              |
+   |                         \-&gt; downscale --&gt; NPU --&gt; det |
+   |                                                       |
+   |   Linux: capture (V4L2) -&gt; detection -&gt; event logic   |
+   |          -&gt; network (TLS) -&gt; security system          |
+   +------------------------------------------------------+
+        |            |              |            |
+      sensor      IR LEDs      IR-cut filter   Ethernet
+      + lens      (PWM)        (solenoid)      + PoE
+
+   KEY POINTS TO STATE:
+
+   HARDWARE ENCODE, NOT SOFTWARE. Encoding 1080p15 in
+   software would consume most of the CPU; the SoC's
+   encoder does it with none. Same for the ISP - demosaic,
+   white balance, noise reduction are dedicated hardware.
+
+   ZERO COPY. The camera's buffers are exported (dmabuf)
+   and imported by the encoder and the NPU, so no pixel is
+   ever copied by the CPU. At 31 Mpixel/s a single memcpy
+   per frame is real bandwidth. This is the vid track's
+   capture-to-encode pipeline.
+
+   THE RING BUFFER holds the last N seconds encoded, so
+   when an event fires the clip includes what happened
+   BEFORE it - which is the difference between a useful
+   security clip and a useless one.
+
+   A SMALL MCU IS OPTIONAL BUT USEFUL: watchdog for the
+   SoC, power sequencing, IR-cut solenoid and IR LED
+   control, tamper detection, and it can keep working
+   while the SoC reboots for an update. Worth proposing
+   with its cost.</pre>
+
+<h2 id="fail">4 · Failure modes and the false-alarm problem</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Failure</th><th>Detection</th><th>Response</th></tr></thead>
+<tbody>
+<tr><td>Camera obscured or sprayed</td><td>Scene variance collapses; sudden permanent change</td><td>Report a
+tamper alert — this is a security product, so obstruction <em>is</em> an event</td></tr>
+<tr><td>Sensor stops delivering frames</td><td>Frame timeout in the capture path</td><td>Re-initialise the
+sensor; power-cycle it; report; the MCU resets the SoC if it persists</td></tr>
+<tr><td>Network unreachable</td><td>Connection failure</td><td>Buffer events and clips locally; retry with
+backoff and jitter; alert on reconnect that a gap occurred</td></tr>
+<tr><td>Storage full or worn out</td><td>Write errors; erase-cycle counter</td><td>Ring buffer overwrites
+oldest by design; report media health as telemetry</td></tr>
+<tr><td>SoC hangs</td><td>MCU watchdog, fed only on real progress</td><td>Reset the SoC; log the cause;
+report</td></tr>
+<tr><td>Night-time IR failure</td><td>Illumination current sense; image brightness</td><td>Report; the camera
+is blind at night and that must not be silent</td></tr>
+<tr><td>False alarms from rain, insects, headlights, shadows</td><td>—</td><td>See below: this is the hardest
+part of the product</td></tr>
+<tr><td>Bad firmware update</td><td>A/B confirmation requiring a successful server check-in</td><td>Revert;
+staged rollout across the fleet</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>THE FALSE-ALARM PROBLEM deserves its own treatment,
+because it is what determines whether the product is
+useful:
+
+  causes: insects near the IR LEDs (very common and often
+  overlooked - they are lit brightly and close), spiders
+  building webs on the lens, rain and snow, moving
+  vegetation, vehicle headlights sweeping, shadows,
+  and animals.
+
+  mitigations, layered:
+    - the detector classifies rather than just detecting
+      motion, so a swaying branch is not a person
+    - temporal consistency: require detection across N
+      consecutive frames before alerting
+    - spatial masking: exclude regions (a road, a tree)
+    - size and aspect plausibility given the known
+      geometry
+    - confidence thresholds tuned per site during
+      commissioning
+    - and CAPTURE THE CLIP EVEN WHEN SUPPRESSING the
+      alert, so the false-alarm rate can be measured and
+      the thresholds improved from real data
+
+  The last point is the design insight: you cannot tune
+  what you cannot measure, so the system must record its
+  own near-misses.</code></pre>
+
+<div class="qbank">
+<div class="qbank-head"><h3 id="q">Follow-up questions</h3><span class="qbank-count"></span></div>
+
+<details class="qa">
+<summary>Why not send all video to a server and do detection centrally?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Bandwidth and cost, and the arithmetic settles it. 1080p15 encoded is roughly 2–4 Mbit/s per camera; three
+thousand cameras is 6–12 Gbit/s continuously, plus the storage to hold it and the compute to analyse it. That
+is a data-centre-scale problem created by a design decision.</p>
+<p>Beyond cost: it makes every camera dependent on the link, so a network outage means no detection at all
+rather than degraded reporting; it adds latency; and it moves all the video off-site, which for a security
+product has privacy and regulatory implications that a customer may not accept.</p>
+<p>On-device detection inverts all of that: the network carries events and short clips, the camera keeps working
+when the link is down, latency is local, and only relevant footage leaves the device.</p>
+<p>The counter-case worth acknowledging: central processing allows better models, easier updates to the
+detection logic, and cross-camera correlation. A hybrid — cheap on-device detection gating an optional
+server-side confirmation on the clip — gets much of both, and is a reasonable answer if the customer wants
+higher accuracy.</p>
+<div class="qa-listen"><b>Listening for</b>The aggregate bandwidth computed, plus the availability and
+privacy arguments.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you avoid the CPU touching pixels?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Zero copy throughout, using buffer sharing between hardware blocks. The sensor delivers into buffers
+allocated by the capture device; those buffers are exported as file descriptors (dmabuf) and imported by the
+ISP, the encoder and the NPU, so each block reads and writes the same physical memory and the CPU only ever
+handles the descriptors.</p>
+<p>Concretely on Linux that is V4L2 with <code>VIDIOC_EXPBUF</code> to export and <code>V4L2_MEMORY_DMABUF</code>
+to import on the consumer side. The proof it is working is measuring memory bandwidth — a single
+<code>memcpy</code> of a 3.1 MB frame at 15 fps is about 47 MB/s of unnecessary traffic each way, and on a
+constrained SoC that is significant.</p>
+<p>The things that break it and must be watched: any format conversion the hardware cannot do, which forces a
+CPU pass; a library that quietly copies into its own buffer; and alignment or stride requirements that differ
+between blocks, which is the usual reason a pipeline that should be zero-copy is not.</p>
+<p>And cache coherency: on some SoCs the blocks are not coherent, so buffers need explicit maintenance or
+must be mapped uncached — which is itself a performance decision.</p>
+<div class="qa-listen"><b>Listening for</b>dmabuf by name, and knowing how to verify it rather than assuming
+it.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you decide the model and where it runs?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>By sizing the workload against the available compute, and by gating the expensive stage behind a cheap
+one.</p>
+<p>First reduce what the model sees: it does not need 1080p. Downscaling to something like 320×320 and running
+at 2–5 fps rather than 15 cuts the work by two orders of magnitude, and for detecting a person walking that is
+ample — a person does not appear and vanish within 200 ms.</p>
+<p>Then gate it: run cheap motion detection on the downscaled stream continuously, and invoke the model only
+when something changes. Most of the time in a restricted area nothing moves, so average compute is far below
+peak.</p>
+<p>Then choose where: if the SoC has an NPU, quantise the model to int8 and use it — typically 4× smaller and
+much faster with small accuracy loss. If not, a small model on the CPU with SIMD may suffice given the gating,
+and that possibility should be checked before specifying more expensive silicon.</p>
+<p>What I would want measured before committing: inference latency and accuracy on <em>representative</em> data
+— night-time IR images look very different from daylight, and a model validated only on daylight will fail at
+exactly the time the product matters most.</p>
+<div class="qa-listen"><b>Listening for</b>Gating, downscaling and the night-time data point.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>The customer says the false-alarm rate is too high. How do you approach it?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Measure before changing anything. I would want the system to have been recording its own detections
+including suppressed ones, with the clip, so there is a dataset of actual false positives from actual sites
+rather than a theory. Without that, tuning is guesswork.</p>
+<p>Then categorise: insects near the IR illuminators are extremely common and often the largest single cause,
+because they are lit brightly and close to the lens; then spider webs, rain and snow, moving vegetation,
+headlights, and shadows. Each has a different mitigation, so the mix determines the work.</p>
+<p>The mitigations, cheapest first: spatial masks to exclude a road or a tree; temporal consistency requiring
+detection across several consecutive frames; size and aspect plausibility given the known camera geometry;
+confidence threshold tuning per site; and only then retraining the model with the collected false positives,
+which is the expensive option but the one that generalises.</p>
+<p>A hardware mitigation worth raising: separating the IR illuminators from the lens reduces insect attraction
+into the field of view dramatically — sometimes the best fix is not in software at all.</p>
+<div class="qa-listen"><b>Listening for</b>Measuring first, insects specifically, and the hardware
+mitigation.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Why include a small MCU alongside the application processor?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>For the jobs the SoC is bad at, and to supervise it. Concretely: an independent watchdog that resets the SoC
+if Linux hangs — a self-watchdog on the SoC cannot recover every failure; power sequencing for the multiple
+rails an application processor needs; driving the IR-cut filter solenoid and the IR LED PWM, which want
+deterministic timing and current control; tamper and enclosure-open detection, which must work even while the
+SoC is rebooting; and reading temperature and controlling any heater or fan.</p>
+<p>The property that makes it valuable in this product: it keeps working during an SoC update or crash, so the
+camera can report "I am rebooting" rather than simply vanishing from the network — which for a security device
+is the difference between a known maintenance window and a suspected attack.</p>
+<p>The costs to state: another part, another firmware to build, sign, update and version; a protocol between
+them that needs framing, a CRC and a version field; and a second thing that can fail. For a few thousand units
+the reliability and supervision benefit generally justifies it, but it is a decision with a price rather than
+an obvious win.</p>
+<div class="qa-listen"><b>Listening for</b>Independent supervision as the main motivation, and naming the
+two-firmware cost.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you handle day/night transitions?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Physically and algorithmically. The mechanical <strong>IR-cut filter</strong> must be in the optical path
+during the day — otherwise near-IR light desaturates colours and the image looks washed out — and swung out at
+night so the sensor can use the IR illumination. That is a solenoid with a defined actuation and a position
+that should be sensed rather than assumed, because a filter stuck halfway is a failure that produces
+consistently poor images.</p>
+<p>The switching decision needs <strong>hysteresis</strong> and a time delay, or the camera oscillates at dusk
+and at every passing headlight — each transition is a mechanical actuation, an exposure re-convergence and a
+brief period of unusable images, so oscillation is both wear and blindness.</p>
+<p>Then the algorithmic side: exposure and gain re-converge after the switch, so detection should be suppressed
+or its confidence lowered for a short settling period. And crucially the detection model must be validated on
+IR imagery — monochrome, differently lit, with strong foreground illumination falloff — because a model trained
+on daylight will underperform at night, which is when a security product matters most.</p>
+<div class="qa-listen"><b>Listening for</b>Hysteresis on the switch and validating the model on night
+imagery.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What does outdoor mounting change?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Thermal, environmental and serviceability constraints that reach back into the electronics.</p>
+<p><strong>Sealed enclosure means no convection</strong>, so an application processor plus IR LEDs — both
+significant heat sources — must dissipate through the case. The thermal budget tightens, and in summer sun the
+internal ambient can be far above air temperature. Meanwhile in winter the same enclosure may need a heater to
+prevent condensation and to keep the lens clear, which is an additional power draw and a control loop.</p>
+<p><strong>Condensation and pressure cycling:</strong> a sealed box that heats and cools breathes through any
+imperfection and accumulates moisture; a vented membrane and conformal coating address that.</p>
+<p><strong>Optical:</strong> the window must stay clear — a hydrophobic coating, and a design that keeps IR
+illumination from reflecting off it back into the lens, which is a common cause of poor night images.</p>
+<p><strong>PoE:</strong> convenient because it carries power and data on one cable, but the power budget is
+bounded by the PoE class and must include the IR LEDs at full output and any heater — which is often the
+binding constraint.</p>
+<p>And serviceability: mounted high outdoors, every physical intervention costs a site visit, which is what
+makes the remote update path and the diagnostics genuinely load-bearing.</p>
+<div class="qa-listen"><b>Listening for</b>The PoE power budget including IR and heater, and the site-visit
+cost driving observability.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Where would this design fail at ten times the scale?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Mostly outside the device. At thirty thousand cameras: the aggregate event and clip traffic becomes a real
+ingest problem, and a synchronised reconnection after any network incident would overwhelm it — so jitter on
+backoff and rate-limited backlog upload move from good practice to essential.</p>
+<p>Fleet management becomes the dominant operational problem: firmware version distribution, staged rollouts
+with automatic halt, certificate lifecycle across tens of thousands of devices, and the ability to see that
+0.5% of cameras are blind at night without anyone reporting it — which means health telemetry (frame rate,
+detection rate, illumination current, temperature, storage health) needs designing as a first-class feature
+rather than added later.</p>
+<p>Support scales badly too: at 30,000 units even a 1% annual failure rate is 300 returns, so diagnosis must be
+possible remotely and the return process is a business function.</p>
+<p>On the device itself, relatively little changes — which is the point. The design should be roughly the same;
+what needs designing differently is the system around it. Recognising that the answer is mostly not about the
+device is what the question is testing.</p>
+<div class="qa-listen"><b>Listening for</b>Recognising the device barely changes, and naming health telemetry
+as a designed feature.</div>
+</div>
+</details>
+
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute the pixel rate for 1080p15 and say what interface it demands.</li>
+  <li>Compute the aggregate bandwidth if all cameras streamed, and state the conclusion.</li>
+  <li>Explain the cheap-trigger-gates-expensive-model pattern and its effect here.</li>
+  <li>Explain zero copy, the mechanism, and how you would verify it.</li>
+  <li>Say why the encoder and ISP must be hardware.</li>
+  <li>Explain what the pre-event ring buffer buys and why it matters.</li>
+  <li>List five causes of false alarms and a mitigation for each.</li>
+  <li>Explain why the system must record suppressed detections.</li>
+  <li>Give three jobs for a companion MCU and the costs of adding one.</li>
+  <li>Say what outdoor mounting changes about power, thermal and serviceability.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/qa.js"></script>
+</body>
+</html>

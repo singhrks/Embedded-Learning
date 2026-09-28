@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trusted applications and secure storage | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Trusted applications and secure storage</h1>
+<p class="lead">Now write one. A complete trusted application — client side, TA side, build, sign, install —
+plus the mechanism that lets it keep a secret across reboots on a device whose filesystem the attacker
+controls.</p>
+
+<h2 id="what">What belongs in a TA</h2>
+
+<p>A trusted application is an ordinary program with an unusual set of restrictions and one unusual privilege: it can hold secrets the rest of the device cannot read, including the kernel.</p>
+
+<pre class="diagram">A good TA is SMALL, does ONE thing, and its interface is narrow.
+
+  Good candidates:
+    · key generation, storage and use - the key never leaves
+    · device attestation and identity
+    · payment authorisation
+    · biometric template matching (template never leaves)
+    · DRM licence handling and content key management
+    · secure firmware update verification
+    · a monotonic counter, or a rollback-resistant state blob
+
+  Bad candidates:
+    · anything large or complex - it is attack surface at the
+      highest privilege in the system
+    · anything performance-critical per-operation, because of
+      the world-switch cost (chapter 11)
+    · anything needing drivers, filesystems or a network stack
+    · "make this hard to reverse engineer" - obscurity is not
+      what the boundary provides
+    · business logic that merely wants to be tamper-resistant
+
+  THE TEST: would you be comfortable if this code were audited
+  line by line as security-critical? If not, it does not belong
+  in the secure world.</pre>
+
+<h2 id="uuid">Identity: the UUID</h2>
+
+<p>Trusted applications are identified by a unique identifier rather than a path, which is what allows them to be located and authenticated independently of where their binary is stored.</p>
+
+<pre><code>/* A TA is named by a 128-bit UUID, not a filename. It appears
+   in three places and they must agree.                      */
+
+/* 1. include/my_ta.h - shared by both sides */
+#define TA_MY_UUID \
+        { 0x12345678, 0x5b69, 0x11d4, \
+          { 0x9f, 0xee, 0x00, 0xc0, 0x4f, 0x4c, 0x32, 0x01 } }
+
+/* 2. ta/user_ta_header_defines.h */
+#define TA_UUID  TA_MY_UUID
+
+/* 3. the installed filename, in canonical text form:
+      /lib/optee_armtz/12345678-5b69-11d4-9fee-00c04f4c3201.ta
+
+   tee-supplicant builds that path from the UUID the secure
+   world asks for. Get any character wrong and you get
+   TEEC_ERROR_ITEM_NOT_FOUND with no further explanation.   */
+
+/* Generate a real one - never copy an example's: */
+        uuidgen
+
+/* The UUID is also the TA's IDENTITY for secure storage. Change
+   it and the TA loses access to everything it previously
+   stored, permanently. Choose it once.                      */</code></pre>
+
+<h2 id="ta">The TA</h2>
+
+<p>The structure of a trusted application is fixed by the standard entry points it must provide, and those entry points map directly onto the client-side calls from the previous chapter.</p>
+
+<pre><code>/* ta/my_ta.c - a key store: generate a key inside the secure
+   world, sign with it, and never let it out.               */
+
+#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include &lt;string.h&gt;
+#include "my_ta.h"
+
+#define KEY_OBJ_ID      "device-signing-key-v1"
+#define KEY_BITS        256
+
+/* ---- lifecycle ---------------------------------------- */
+
+TEE_Result TA_CreateEntryPoint(void)
+{
+        DMSG("my_ta loaded");
+        return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void) { }
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t ptypes,
+                                    TEE_Param params[4],
+                                    void **sess_ctx)
+{
+        struct session *s;
+
+        (void)params;
+        if (ptypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE,
+                                      TEE_PARAM_TYPE_NONE))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        s = TEE_Malloc(sizeof(*s), TEE_MALLOC_FILL_ZERO);
+        if (!s)
+                return TEE_ERROR_OUT_OF_MEMORY;
+
+        *sess_ctx = s;                 /* per-client state */
+        return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess_ctx)
+{
+        TEE_Free(sess_ctx);            /* no leaks - the secure
+                                          heap is tiny        */
+}
+
+/* ---- generate a key that never leaves ------------------ */
+
+static TEE_Result cmd_generate_key(void)
+{
+        TEE_ObjectHandle key = TEE_HANDLE_NULL;
+        TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+        TEE_Result res;
+
+        res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR,
+                                          KEY_BITS, &amp;key);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = TEE_GenerateKey(key, KEY_BITS, NULL, 0);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        /* persist it - encrypted with a key derived from the
+           HUK, so only this TA on this device can read it   */
+        res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+                        KEY_OBJ_ID, sizeof(KEY_OBJ_ID) - 1,
+                        TEE_DATA_FLAG_ACCESS_WRITE |
+                        TEE_DATA_FLAG_OVERWRITE,
+                        key,           /* the attributes go in */
+                        NULL, 0,       /* no extra data stream */
+                        &amp;obj);
+        if (res == TEE_SUCCESS)
+                TEE_CloseObject(obj);
+out:
+        TEE_FreeTransientObject(key);
+        return res;
+}
+
+/* ---- sign, with a client-supplied digest --------------- */
+
+static TEE_Result cmd_sign(uint32_t ptypes, TEE_Param params[4])
+{
+        const uint32_t exp = TEE_PARAM_TYPES(
+                        TEE_PARAM_TYPE_MEMREF_INPUT,   /* digest */
+                        TEE_PARAM_TYPE_MEMREF_OUTPUT,  /* sig    */
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE);
+        uint8_t digest[32];
+        uint8_t sig[128];
+        uint32_t siglen = sizeof(sig);
+        TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+        TEE_OperationHandle op = TEE_HANDLE_NULL;
+        TEE_Result res;
+
+        if (ptypes != exp)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* the digest must be exactly SHA-256 sized */
+        if (params[0].memref.size != sizeof(digest))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* COPY IN before doing anything with it (chapter 12) */
+        TEE_MemMove(digest, params[0].memref.buffer, sizeof(digest));
+
+        /* is the output buffer big enough? Tell the caller how
+           much it needs rather than truncating.             */
+        if (params[1].memref.size &lt; sizeof(sig)) {
+                params[1].memref.size = sizeof(sig);
+                return TEE_ERROR_SHORT_BUFFER;
+        }
+
+        res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                        KEY_OBJ_ID, sizeof(KEY_OBJ_ID) - 1,
+                        TEE_DATA_FLAG_ACCESS_READ, &amp;obj);
+        if (res != TEE_SUCCESS)
+                return res;            /* not provisioned yet */
+
+        res = TEE_AllocateOperation(&amp;op, TEE_ALG_ECDSA_P256,
+                                    TEE_MODE_SIGN, KEY_BITS);
+        if (res != TEE_SUCCESS)
+                goto out_obj;
+
+        res = TEE_SetOperationKey(op, obj);
+        if (res != TEE_SUCCESS)
+                goto out_op;
+
+        res = TEE_AsymmetricSignDigest(op, NULL, 0,
+                                       digest, sizeof(digest),
+                                       sig, &amp;siglen);
+        if (res != TEE_SUCCESS)
+                goto out_op;
+
+        /* write the result ONCE, at the end, on success only */
+        TEE_MemMove(params[1].memref.buffer, sig, siglen);
+        params[1].memref.size = siglen;
+
+out_op:
+        TEE_FreeOperation(op);
+out_obj:
+        TEE_CloseObject(obj);
+        return res;
+}
+
+/* ---- dispatch ------------------------------------------ */
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx, uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+        (void)sess_ctx;
+
+        switch (cmd) {
+        case TA_CMD_GENERATE_KEY:
+                return cmd_generate_key();
+        case TA_CMD_SIGN:
+                return cmd_sign(ptypes, params);
+        default:
+                return TEE_ERROR_NOT_SUPPORTED;
+        }
+}</code></pre>
+
+<div class="key">
+<b>Read that dispatch function as an attacker would</b>
+<p>The command number, the parameter types, every buffer size, and the contents of every input buffer are
+all chosen by an untrusted caller. The <code>ptypes</code> check, the exact-size check on the digest, the
+copy-in, the short-buffer path, and writing the output only on success are each there to close a specific
+hole. Take any one out and there is a real bug.</p>
+</div>
+
+<h2 id="client">The client</h2>
+
+<p>The normal-world side is a short program, and the important part is that it treats everything coming back as data from a different trust domain rather than as trusted results.</p>
+
+<pre><code>/* host/main.c */
+
+#include &lt;tee_client_api.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include "my_ta.h"
+
+int main(void)
+{
+        TEEC_Context ctx;
+        TEEC_Session sess;
+        TEEC_Operation op;
+        TEEC_UUID uuid = TA_MY_UUID;
+        uint8_t digest[32] = { 0 };
+        uint8_t sig[128];
+        uint32_t origin;
+        TEEC_Result res;
+
+        res = TEEC_InitializeContext(NULL, &amp;ctx);
+        if (res != TEEC_SUCCESS)
+                errx(1, "InitializeContext: 0x%x", res);
+
+        res = TEEC_OpenSession(&amp;ctx, &amp;sess, &amp;uuid,
+                               TEEC_LOGIN_PUBLIC, NULL, NULL,
+                               &amp;origin);
+        if (res != TEEC_SUCCESS)
+                errx(1, "OpenSession: 0x%x origin 0x%x", res, origin);
+
+        /* one-time provisioning */
+        memset(&amp;op, 0, sizeof(op));
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE,
+                                         TEEC_NONE, TEEC_NONE);
+        res = TEEC_InvokeCommand(&amp;sess, TA_CMD_GENERATE_KEY,
+                                 &amp;op, &amp;origin);
+        if (res != TEEC_SUCCESS)
+                errx(1, "GENERATE_KEY: 0x%x", res);
+
+        /* sign something */
+        memset(&amp;op, 0, sizeof(op));
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+                                         TEEC_MEMREF_TEMP_OUTPUT,
+                                         TEEC_NONE, TEEC_NONE);
+        op.params[0].tmpref.buffer = digest;
+        op.params[0].tmpref.size   = sizeof(digest);
+        op.params[1].tmpref.buffer = sig;
+        op.params[1].tmpref.size   = sizeof(sig);
+
+        res = TEEC_InvokeCommand(&amp;sess, TA_CMD_SIGN, &amp;op, &amp;origin);
+        if (res != TEEC_SUCCESS)
+                errx(1, "SIGN: 0x%x origin 0x%x", res, origin);
+
+        printf("signature: %u bytes\n", op.params[1].tmpref.size);
+
+        TEEC_CloseSession(&amp;sess);
+        TEEC_FinalizeContext(&amp;ctx);
+        return 0;
+}</code></pre>
+
+<div class="note">
+<b><code>origin</code> tells you who failed</b>
+<p><code>TEEC_ORIGIN_API</code> (libteec), <code>_COMMS</code> (the driver or the transport),
+<code>_TEE</code> (the trusted OS) or <code>_TRUSTED_APP</code> (your TA's return value). Print it on every
+failure — the difference between "the TEE could not load your TA" and "your TA returned an error" saves
+hours.</p>
+</div>
+
+<h2 id="build">Building and signing</h2>
+
+<p>Building for the secure world means a different toolchain configuration and a signing step, because an unsigned trusted application is not loadable on a properly configured device.</p>
+
+<pre><code># Layout, matching optee_examples:
+
+my_ta/
+  host/     Makefile   main.c
+  ta/       Makefile   my_ta.c   user_ta_header_defines.h
+            sub.mk     Android.mk
+  include/  my_ta.h
+
+# ta/Makefile is three lines - OP-TEE supplies the rest:
+BINARY = 12345678-5b69-11d4-9fee-00c04f4c3201
+include $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk
+
+# ta/sub.mk:
+global-incdirs-y += ../include
+srcs-y += my_ta.c
+
+# Build:
+make -C ta CROSS_COMPILE=aarch64-linux-gnu- \
+        TA_DEV_KIT_DIR=.../export-ta_arm64
+make -C host CROSS_COMPILE=aarch64-linux-gnu- \
+        TEEC_EXPORT=.../out/export
+
+# The build SIGNS the TA automatically with the key in
+#   optee_os/keys/default_ta.pem
+# and OP-TEE checks that signature before loading (chapter 11:
+# never trust what RPC hands you).
+
+# Install:
+scp ta/*.ta   root@target:/lib/optee_armtz/
+scp host/my_ta root@target:/usr/bin/</code></pre>
+
+<div class="danger">
+<b>The default signing key is public</b>
+<p><code>default_ta.pem</code> ships in the OP-TEE source tree. A product built with it will load a TA
+written by anyone. Generate a per-product key, keep the private half in an HSM, and build with
+<code>TA_SIGN_KEY=</code>. Better still, on parts that support it, use OP-TEE's asymmetric-key
+provisioning so the public half is itself anchored in the fuses
+(<a href="sec-14-secure-boot.html">chapter 14</a>).</p>
+</div>
+
+<h2 id="storage">Secure storage: the problem</h2>
+
+<p>Secure storage lets a trusted application keep data across reboots with confidentiality and integrity, which raises the question of what it is ultimately encrypted with and where that key lives.</p>
+
+<pre class="diagram">The TA has no filesystem. The bytes must end up somewhere the
+NORMAL world controls - eMMC, UFS, a file in /data. So an
+attacker with root can read, modify, delete, or restore an old
+copy of them.
+
+  Four properties are needed:
+
+  CONFIDENTIALITY  attacker cannot read the contents
+     -&gt; encrypt with a key derived from the HUK
+
+  INTEGRITY        attacker cannot modify them undetected
+     -&gt; authenticated encryption (AES-GCM), a MAC over
+        everything
+
+  BINDING          the blob cannot be moved to another device
+     -&gt; the HUK is per-device, so a blob from device A is
+        undecryptable on device B
+
+  FRESHNESS        attacker cannot restore an OLD copy
+     -&gt; this is the hard one. Encryption and MACs do not help:
+        the old blob is authentic, just stale.
+        Needs a MONOTONIC COUNTER in hardware, or RPMB.</pre>
+
+<h2 id="rpmb">The two backends</h2>
+
+<p>Two storage backends, differing in whether they can be rolled back by an attacker with physical access. That difference matters enormously for anything with a counter or a revocation list.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>REE filesystem</th><th>RPMB</th></tr></thead>
+<tbody>
+<tr><td>Stored in</td><td><code>/data/tee/</code>, via <code>tee-supplicant</code></td><td>The eMMC/UFS Replay Protected Memory Block partition</td></tr>
+<tr><td>Confidentiality</td><td>Yes — AES-GCM, HUK-derived key</td><td>Yes</td></tr>
+<tr><td>Integrity</td><td>Yes — hash tree</td><td>Yes — HMAC on every access</td></tr>
+<tr><td>Device binding</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><strong>Rollback protection</strong></td><td><strong>No</strong> — the whole tree can be restored</td><td><strong>Yes</strong> — a write counter inside the eMMC, monotonic, unresettable</td></tr>
+<tr><td>Deletion resistance</td><td>No — root can <code>rm -rf</code> it</td><td>No — but the counter proves it happened</td></tr>
+<tr><td>Size</td><td>Large</td><td>Small: typically 128 KB to 4 MB</td></tr>
+<tr><td>Speed</td><td>Faster</td><td>Slower — one HMAC round trip per block</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* RPMB works because the eMMC itself enforces the rules: */
+
+   Provisioning (ONCE, irreversibly):
+        the secure world writes an RPMB AUTHENTICATION KEY
+        into the eMMC. It can never be read back and never
+        changed.
+
+   Every write:
+        host sends  { data, write_counter, nonce, HMAC }
+        eMMC checks the HMAC with its stored key
+        eMMC checks the write_counter matches its own
+        on success it writes AND increments the counter
+
+   Every read:
+        eMMC returns { data, nonce, HMAC }
+        the secure world checks the HMAC and the nonce
+
+   So a replayed write is rejected because its counter is stale,
+   and a forged read is rejected because the HMAC will not
+   verify. The trusted OS holds the key; Linux merely carries
+   the frames (chapter 11's RPC, again - the normal world is
+   the transport, never the authority).                     */
+
+/* Select it per object: */
+        TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE_RPMB, ...)
+
+/* Or build OP-TEE with CFG_RPMB_FS=y and make it the default.
+   Use RPMB for the SMALL things where freshness matters -
+   counters, key versions, lock state - and the REE filesystem
+   for bulk.                                                */</code></pre>
+
+<h2 id="derive">Key derivation</h2>
+
+<p>Keys should be derived from a hardware root rather than stored, so that extracting the storage yields nothing useful. How that derivation is bound to the device is the whole point.</p>
+
+<pre><code>/* Never use the HUK directly. Derive per-purpose keys from it,
+   binding in the TA's identity so one TA cannot read another's
+   storage.                                                  */
+
+static TEE_Result derive_key(const char *label,
+                             uint8_t *out, size_t outlen)
+{
+        /* extra_data mixes in the caller's identity; OP-TEE adds
+           the TA UUID internally for TEE_STORAGE_PRIVATE      */
+        return tee_otp_get_hw_unique_key_derived(label,
+                                                 strlen(label),
+                                                 out, outlen);
+}
+
+/* PROPERTIES you want:
+     - per-device      from the HUK
+     - per-TA          UUID mixed in (OP-TEE does this)
+     - per-purpose     a distinct label per use - storage,
+                       attestation, transport - so compromise
+                       of one does not give the others
+     - versioned       so a key can be rotated after a fix
+
+   Cryptography chapters 12 and 13 cover KDFs properly; the
+   embedded-specific point is only that the ROOT is a hardware
+   secret, not a constant in the binary.                    */</code></pre>
+
+<h2 id="pitfalls">TA security checklist</h2>
+
+<div class="key">
+<b>Before you ship a TA</b>
+<ul>
+<li><code>paramTypes</code> checked in every command handler.</li>
+<li>Every <code>memref.size</code> validated before use; overflow considered on every size arithmetic.</li>
+<li>Inputs copied into TA memory before validation and use — never validated in place.</li>
+<li>Outputs written once, on success, never used as scratch.</li>
+<li>Secrets zeroed with <code>TEE_MemFill</code> before <code>TEE_Free</code>.</li>
+<li>Every handle closed and every operation freed on <em>every</em> path, including errors.</li>
+<li>Session state freed in <code>TA_CloseSessionEntryPoint</code>.</li>
+<li>Error returns carry no information about secret data — no distinct code for "wrong PIN, byte 3".</li>
+<li>Comparisons on secrets are constant-time.</li>
+<li>No secret-dependent branch or memory-access pattern (<a href="sec-16-tee-attacks.html">chapter 16</a>).</li>
+<li>Anything with a retry limit is counted in RPMB, not in RAM or REE storage.</li>
+<li>Stack usage measured, not guessed.</li>
+<li>Signed with a product key, not the default.</li>
+</ul>
+</div>
+
+<h2 id="deeper">Where this goes next</h2>
+
+<p><a href="tee-12-internal-api.html">Chapter 12 of the OP-TEE track</a> covers the Internal Core API in
+full, <a href="tee-15-secure-storage.html">chapter 15</a> covers REE FS and RPMB storage properly, and
+<a href="tee-20-ta-security.html">chapter 20</a> is the one that matters most: writing a TA that survives a
+client actively trying to break it. The <a href="tee-21-project-keystore.html">key-store project</a> applies
+all three.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>ITEM_NOT_FOUND</code> on open session</td><td>UUID mismatch between header and installed filename</td></tr>
+<tr><td><code>TEEC_ERROR_SECURITY</code> at load</td><td>Signed with a key OP-TEE does not trust</td></tr>
+<tr><td><code>ERROR_SHORT_BUFFER</code></td><td>Expected — call again with the size the TA returned</td></tr>
+<tr><td><code>ERROR_ITEM_NOT_FOUND</code> from <code>TEE_OpenPersistentObject</code></td><td>Not provisioned, or storage wiped, or the UUID changed</td></tr>
+<tr><td>Storage works, then fails after a reflash</td><td>REE storage wiped with <code>/data</code>; the key survived, the blob did not</td></tr>
+<tr><td>Old state reappears after a downgrade attack</td><td>REE storage has no rollback protection — use RPMB</td></tr>
+<tr><td><code>ERROR_OUT_OF_MEMORY</code> after many sessions</td><td>Session context leaked in <code>TA_CloseSessionEntryPoint</code></td></tr>
+<tr><td>TA panics on the third concurrent client</td><td>Not <code>MULTI_SESSION</code>-safe, or shared state without locking</td></tr>
+<tr><td>RPMB writes fail with a counter error</td><td>Two writers, or the key was never provisioned</td></tr>
+<tr><td>Works on the dev board, storage empty on production</td><td>Different HUK — blobs are device-bound by design</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Decide whether a given feature belongs in a TA, and justify it.</li>
+  <li>Explain where a TA's UUID appears and why changing it destroys its storage.</li>
+  <li>Write a command handler with correct <code>paramTypes</code>, size and copy-in handling.</li>
+  <li>Explain the <code>SHORT_BUFFER</code> convention.</li>
+  <li>Use <code>origin</code> to localise a failure.</li>
+  <li>Explain why shipping with the default signing key is a vulnerability.</li>
+  <li>Name the four properties secure storage needs, and which one encryption alone cannot give.</li>
+  <li>Explain how RPMB achieves rollback protection and why Linux cannot forge a write.</li>
+  <li>Explain why keys are derived per-TA and per-purpose rather than used directly.</li>
+  <li>Walk the TA security checklist against your own code.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

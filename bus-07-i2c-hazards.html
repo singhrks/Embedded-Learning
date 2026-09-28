@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>I2C: clock stretching, arbitration and bus recovery | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>I2C: clock stretching, arbitration and bus recovery</h1>
+<p class="lead">I2C's open-drain wiring gives it three capabilities no other simple bus has, and each brings a
+failure mode. A stuck bus that needs software to unstick it is the one every embedded engineer eventually
+meets at three in the morning.</p>
+
+<h2 id="stretching">Clock stretching</h2>
+
+<pre class="diagram">   A slave that needs more time HOLDS SCL LOW after the
+   acknowledge bit. The master, which only RELEASES SCL and
+   waits for it to rise, sees it stay low and waits.
+
+     master releases SCL --+
+                           |
+     SCL  ______/----------+___________/------
+                           ^           ^
+                    slave holds it   slave releases,
+                    low here         clock resumes
+
+   Entirely automatic in hardware IF the master implements
+   it: the master must read SCL back after releasing it and
+   not proceed until it is actually high.
+
+   WHO STRETCHES:
+     - EEPROMs during an internal write
+     - sensors computing a conversion
+     - MCUs acting as I2C slaves, between the interrupt and
+       the software loading the next byte - this one can
+       stretch for a LONG time
+     - bit-banged slaves, unpredictably
+
+   THE HAZARDS:
+
+   1. SOME MASTERS DO NOT SUPPORT IT. A bit-banged master
+      that drives SCL push-pull instead of releasing it will
+      fight the slave, and both are damaged or the data is
+      corrupt. Bit-banged I2C MUST use open-drain or
+      input/output-low switching, never push-pull high.
+
+   2. IT CAN BE UNBOUNDED. A slave that stretches forever -
+      because its firmware crashed mid-transaction - hangs
+      the master indefinitely. This is why every wait needs
+      a timeout (chapter 06) and why SMBus, unlike I2C,
+      specifies a 25 ms maximum.
+
+   3. SOME PERIPHERALS HAVE ERRATA. Several MCU I2C blocks
+      have documented bugs when a slave stretches at a
+      particular moment. Read the errata sheet - this is one
+      of the few times it genuinely matters.</pre>
+
+<h2 id="arbitration">Multi-master arbitration</h2>
+
+<pre class="diagram">   Two masters may start transmitting at the same instant.
+   Because the bus is open-drain, LOW ALWAYS WINS, and that
+   is enough to resolve it with no extra protocol.
+
+   Master A sends address 0x50 = 1010000
+   Master B sends address 0x44 = 1000100
+
+   bit:        6  5  4  3  2  1  0
+   A drives:   1  0  1  0  0  0  0
+   B drives:   1  0  0  0  1  0  0
+   BUS is:     1  0  0  ...
+                     ^
+                     A wanted 1, bus shows 0.
+
+   At bit 4, A releases SDA (writing a 1) but reads back a
+   0 - B is pulling it low. A has LOST ARBITRATION. It
+   immediately stops driving and becomes a slave for the
+   rest of the transaction.
+
+   PROPERTIES THAT MAKE THIS ELEGANT:
+     - no data is lost: B's message continues uncorrupted,
+       and B does not even know a collision occurred
+     - no time is wasted on a retry of the winner
+     - lower addresses win, so priority is implicit
+
+   This is the same mechanism CAN uses, and for the same
+   reason (chapter 09). Both are "wired-AND" buses where a
+   dominant level overrides a recessive one.
+
+   IN PRACTICE multi-master I2C is uncommon and often
+   avoided, because the error handling is fiddly and few
+   designs need it. But the ARBITRATION LOST flag still
+   fires in single-master systems - and when it does, it
+   means something is corrupting SDA. Treat it as a wiring
+   or noise diagnosis, not a multi-master event.</pre>
+
+<h2 id="stuck">The stuck bus, and how to unstick it</h2>
+
+<pre class="diagram">   THE FAILURE:
+
+   1. The master is reading. The slave is transmitting and
+      has pulled SDA LOW for a zero bit.
+   2. The MASTER RESETS - watchdog, crash, debugger, or
+      power glitch on the master only.
+   3. The master restarts and stops clocking.
+   4. The slave is still mid-byte, still holding SDA low,
+      waiting for the clock that will never come.
+   5. SDA is stuck low. The master cannot generate a START,
+      because START requires SDA to FALL - and it is already
+      low. The bus is dead until power-cycled.
+
+   This is extremely common in development, because you
+   reset the master constantly and the sensor never does.
+   "I2C only works after a full power cycle" is exactly
+   this.
+
+   THE RECOVERY, from the I2C specification:
+
+   1. Switch SCL and SDA to GPIO, open-drain.
+   2. Clock SCL up to 9 times, checking SDA after each.
+      The slave advances through its byte and, after at
+      most 9 clocks, finishes and releases SDA.
+   3. Once SDA is high, generate a manual STOP: SDA low,
+      SCL high, then SDA high.
+   4. Re-initialise the peripheral.
+
+   RUN THIS AT EVERY BOOT, unconditionally, before the
+   first transaction. It costs 100 microseconds and it
+   eliminates a whole class of "needs a power cycle" bug.</pre>
+
+<pre><code>/* The recovery, complete. */
+
+void i2c_bus_recover(void)
+{
+    /* Peripheral off; take the pins as open-drain GPIO. */
+    I2C1-&gt;CR1 &amp;= ~I2C_CR1_PE;
+    gpio_open_drain_output(SCL_PORT, SCL_PIN);
+    gpio_open_drain_output(SDA_PORT, SDA_PIN);
+    SDA_HIGH(); SCL_HIGH();
+    delay_us(10);
+
+    /* Up to 9 clocks to walk the slave out of its byte. */
+    for (int i = 0; i &lt; 9 &amp;&amp; !SDA_READ(); i++) {
+        SCL_LOW();  delay_us(5);
+        SCL_HIGH(); delay_us(5);
+    }
+
+    /* Manual STOP: SDA must RISE while SCL is high. */
+    SDA_LOW();  delay_us(5);
+    SCL_HIGH(); delay_us(5);
+    SDA_HIGH(); delay_us(5);
+
+    if (!SDA_READ()) {
+        /* Still stuck: the slave is not merely mid-byte, it
+           is crashed or the line is shorted. If the design
+           has a power-gate FET on the sensor rail, this is
+           where you use it - the ONLY remaining fix.       */
+        stats.i2c_unrecoverable++;
+        sensor_power_cycle();
+    }
+
+    gpio_af(SCL_PORT, SCL_PIN, I2C_AF);
+    gpio_af(SDA_PORT, SDA_PIN, I2C_AF);
+    i2c_init();
+}
+
+/* THE DESIGN LESSON: put a MOSFET in the sensor's supply.
+   It costs a few cents and turns "unrecoverable, RMA the
+   unit" into "power-cycle that rail and continue". Any
+   product with an I2C sensor it cannot reach physically
+   should have one.                                        */
+</code></pre>
+
+<div class="danger">
+<b>Never leave I2C without a timeout and a recovery path</b>
+<p>Of all the buses in this track, I2C is the one that hangs. A slave holding SCL, a slave holding SDA, a
+missing pull-up, a noise glitch that desynchronises a state machine — each produces a wait that never ends.
+A driver that blocks forever in a wait loop turns a recoverable bus glitch into a dead product. Every wait gets
+a deadline; every timeout calls the recovery above; every recovery failure is counted and reported.</p>
+</div>
+
+<h2 id="noise">Electrical realities</h2>
+
+<pre class="diagram">   I2C IS THE MOST ELECTRICALLY FRAGILE BUS HERE. It is slow,
+   high-impedance, and has no error detection whatsoever -
+   a corrupted bit is simply wrong data with a valid ACK.
+
+   THE BUS CAPACITANCE BUDGET: 400 pF maximum, total.
+     - each device pin        ~10 pF
+     - PCB trace           ~1 pF per cm
+     - a ribbon cable      ~50-100 pF per metre
+
+   So 30 cm of PCB plus six devices is ~90 pF: fine. Add a
+   metre of ribbon and you are at 190 pF and the rise time
+   has doubled. Two metres and you are out of specification
+   entirely.
+
+   I2C WAS DESIGNED FOR CHIPS ON ONE BOARD. Running it
+   between boards, through a connector, or down a cable is
+   the single most common cause of intermittent I2C. If you
+   must:
+     - lower the speed to 100 kHz
+     - lower the pull-ups to 2.2k (more current, faster edge)
+     - use a bus buffer/extender (P82B715 and similar)
+     - or use a bus designed for it: RS-485 or CAN
+       (chapters 14, 09)
+
+   ENABLE THE DIGITAL NOISE FILTER if the peripheral has one:
+     I2C1-&gt;CR1 |= (2u &lt;&lt; I2C_CR1_DNF_Pos);   /* 2 clocks   */
+   It suppresses spikes shorter than N clock periods, at the
+   cost of a little timing margin. Cheap insurance.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works only after a full power cycle</td><td>Bus stuck from a master reset mid-read — add boot-time
+recovery</td></tr>
+<tr><td>SDA measured low with nothing running</td><td>A slave mid-byte, waiting for clocks</td></tr>
+<tr><td>Master hangs forever on one transaction</td><td>Slave stretching indefinitely, and no timeout</td></tr>
+<tr><td>Arbitration-lost flag in a single-master system</td><td>Noise or a wiring fault corrupting SDA — not a
+protocol event</td></tr>
+<tr><td>Bit-banged master corrupts data with some slaves</td><td>SCL driven push-pull, fighting a stretching
+slave</td></tr>
+<tr><td>Intermittent failures with a cable</td><td>Bus capacitance over budget; slow down or use a
+buffer</td></tr>
+<tr><td>Fails only when a motor runs</td><td>Coupled noise; add the digital filter and check
+grounding</td></tr>
+<tr><td>Occasional wrong sensor values, no error flags</td><td>I2C has no error detection — add a checksum at
+the protocol level or sanity-check the range</td></tr>
+<tr><td>Recovery clocks do not free the bus</td><td>Slave is crashed rather than mid-byte; power-cycle the
+rail</td></tr>
+<tr><td>Works on the bench, fails in the enclosure</td><td>Longer wiring, more capacitance, more coupled
+noise</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain clock stretching and what the master must do to support it.</li>
+  <li>Give three kinds of device that stretch and one that may stretch unboundedly.</li>
+  <li>Explain why a bit-banged master must never drive SCL push-pull high.</li>
+  <li>Walk through arbitration between two masters and say which wins.</li>
+  <li>Explain what an arbitration-lost flag means in a single-master system.</li>
+  <li>Describe exactly how a bus becomes stuck with SDA low.</li>
+  <li>Give the four steps of the standard bus recovery, and say why nine clocks.</li>
+  <li>Explain why a power-gate FET on the sensor rail is worth its cost.</li>
+  <li>State the bus capacitance budget and estimate it for a metre of ribbon cable.</li>
+  <li>Explain why a corrupted I2C bit produces wrong data rather than an error.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

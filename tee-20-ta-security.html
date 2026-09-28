@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Writing a TA that resists its own client | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Writing a TA that resists its own client</h1>
+<p class="lead">The client is the attacker. Not "might be" — the entire reason your TA exists is that the
+normal world may be compromised, so you must write every entry point assuming the caller is hostile,
+competent and patient. This chapter is the checklist, ordered by how often each mistake appears in real
+audits.</p>
+
+<h2 id="model">The mental shift</h2>
+
+<p>Before the specific rules, the mental model: everything crossing into your trusted application is attacker-controlled, including things that look like framework guarantees.</p>
+
+<pre class="diagram">   ORDINARY LIBRARY               TRUSTED APPLICATION
+
+   caller is your own code        caller is an attacker
+   arguments are well-formed      arguments are chosen to break
+                                    you
+   a crash is a bug               a crash is a denial of
+                                    service, and a controlled
+                                    crash may be an exploit
+   memory is stable               shared memory CHANGES WHILE
+                                    YOU READ IT
+   an error message helps         an error message may leak the
+                                    secret
+   timing does not matter         timing IS a channel
+
+   Every parameter, every length, every index, every pointer.
+   There is no trusted input.</pre>
+
+<h2 id="one">1. Check parameter types. Always.</h2>
+
+<p>Validate every parameter, every time. The framework checks the shape of the parameters, not their meaning, and the difference is where exploits live.</p>
+
+<pre><code>TEE_Result TA_InvokeCommandEntryPoint(void *sess, uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+        const uint32_t exp =
+                TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+                                TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                                TEE_PARAM_TYPE_NONE,
+                                TEE_PARAM_TYPE_NONE);
+
+        if (ptypes != exp) {
+                EMSG("ptypes 0x%08x expected 0x%08x", ptypes, exp);
+                return TEE_ERROR_BAD_PARAMETERS;
+        }
+        ...
+}
+
+/* WITHOUT this, a client passes VALUE where you expect MEMREF.
+   You then read params[0].memref.buffer - which is now an
+   arbitrary 64-bit number the attacker chose - and
+   dereference it with secure privilege.
+
+   This is the number one OP-TEE TA vulnerability class. It is
+   four lines. Check EVERY command, and check it in
+   TA_OpenSessionEntryPoint too.                            */</code></pre>
+
+<h2 id="two">2. Never read shared memory twice</h2>
+
+<p>A buffer in shared memory can change after you validate it and before you use it, because the normal world still has access to it. Copy before checking.</p>
+
+<pre><code>/* WRONG - the classic double fetch. */
+
+static TEE_Result bad(TEE_Param params[4])
+{
+        struct hdr *h = params[0].memref.buffer;
+
+        if (h-&gt;len &gt; MAX)                 /* fetch 1: check    */
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* the client's other thread changes h-&gt;len HERE */
+
+        memcpy(dst, h-&gt;data, h-&gt;len);     /* fetch 2: use      */
+        /* h-&gt;len is now 0xFFFFFFFF. Heap overflow, in the
+           secure world, with attacker-controlled data.      */
+}
+
+/* RIGHT - copy once, then work only on the copy. */
+
+static TEE_Result good(TEE_Param params[4])
+{
+        struct hdr local;
+        uint8_t    buf[MAX];
+
+        if (params[0].memref.size &lt; sizeof local)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* ONE read of the shared region. */
+        TEE_MemMove(&amp;local, params[0].memref.buffer, sizeof local);
+
+        /* Validate the COPY. It cannot change now. */
+        if (local.len &gt; MAX ||
+            local.len &gt; params[0].memref.size - sizeof local)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        TEE_MemMove(buf,
+                    (uint8_t *)params[0].memref.buffer + sizeof local,
+                    local.len);
+
+        return process(buf, local.len);
+}
+
+/* The rule, stated once: SHARED MEMORY IS A NETWORK
+   CONNECTION. You read from it once, into your own storage,
+   and everything after that operates on your storage.     */</code></pre>
+
+<div class="danger">
+<b>This is the bug that gets CVEs</b>
+<p>Search any TEE vendor's advisory list and the double fetch appears again and again, because the code looks
+correct — the check is right there, immediately above the use. The window is a few instructions wide and an
+attacker with another thread will hit it. There is no defence except never fetching twice.</p>
+</div>
+
+<h2 id="three">3. Validate every length and index</h2>
+
+<p>Memory safety errors in C are ordinary bugs in ordinary code and privilege escalations here, because of where this code runs and what it can reach.</p>
+
+<pre><code>/* Integer overflow in a bounds check is the second-commonest
+   finding.                                                 */
+
+    /* WRONG: offset + len can wrap */
+    if (offset + len &gt; buffer_size)
+            return TEE_ERROR_BAD_PARAMETERS;
+    /* offset = 0xFFFFFFF0, len = 0x20  ->  sum wraps to 0x10,
+       check passes, and you read far outside the buffer.  */
+
+    /* RIGHT: rearrange so nothing can overflow */
+    if (offset &gt; buffer_size || len &gt; buffer_size - offset)
+            return TEE_ERROR_BAD_PARAMETERS;
+
+    /* Also wrong: */
+    uint32_t total = count * sizeof(struct item);   /* wraps  */
+    /* Right: */
+    if (count &gt; UINT32_MAX / sizeof(struct item))
+            return TEE_ERROR_OVERFLOW;
+
+    /* Signedness: */
+    int idx = params[0].value.a;      /* a uint32_t from the
+                                         client              */
+    if (idx &lt; n)                      /* -1 &lt; n is TRUE       */
+            table[idx] = ...;         /* writes before the
+                                         table                */
+    /* Use unsigned types for anything that indexes. */
+
+    /* And check ranges explicitly, not implicitly: */
+    if (params[0].value.a &gt;= ARRAY_SIZE(g_slots))
+            return TEE_ERROR_BAD_PARAMETERS;</code></pre>
+
+<h2 id="four">4. Validate pointers with the API</h2>
+
+<p>Secrets must be cleared after use, and the compiler is entitled to remove the code that clears them if it can prove the value is never read again.</p>
+
+<pre><code>    res = TEE_CheckMemoryAccessRights(
+                TEE_MEMORY_ACCESS_READ |
+                TEE_MEMORY_ACCESS_ANY_OWNER,
+                params[0].memref.buffer,
+                params[0].memref.size);
+    if (res != TEE_SUCCESS)
+            return res;
+
+/* This asks OP-TEE whether that pointer, for that length, is
+   really memory this session was given. It catches a client
+   that registered a 4 KB buffer and then claimed 4 MB.
+
+   It does NOT catch a double fetch - the memory is legitimate,
+   it just changes. Both checks are needed.               */
+
+/* When your TA is called BY ANOTHER TA (chapter 18), the
+   buffer may be secure memory:
+      TEE_MEMORY_ACCESS_SECURE      it must be secure
+      TEE_MEMORY_ACCESS_NONSECURE   it must not be
+   Being explicit about which you expect stops a confused
+   deputy.                                                 */</code></pre>
+
+<h2 id="five">5. Write output once, on success only</h2>
+
+<p>Comparing secrets must take constant time, or the comparison itself leaks how much of the secret was correct.</p>
+
+<pre><code>/* WRONG - leaks intermediate state on the error path. */
+    memcpy(out, partial_result, n);      /* client can see this */
+    if (verify_something() != OK)
+            return TEE_ERROR_SECURITY;   /* too late            */
+
+/* RIGHT */
+    uint8_t local_out[MAX];
+
+    res = compute(local_out, &amp;n);
+    if (res != TEE_SUCCESS)
+            return res;                  /* client sees nothing */
+
+    if (params[1].memref.size &lt; n) {
+            params[1].memref.size = n;   /* the ONE allowed
+                                            early write         */
+            return TEE_ERROR_SHORT_BUFFER;
+    }
+    TEE_MemMove(params[1].memref.buffer, local_out, n);
+    params[1].memref.size = n;
+    return TEE_SUCCESS;
+
+/* For a crypto TA the intermediate state often IS the secret -
+   a partially decrypted block, a key schedule, an unverified
+   plaintext. Compute in private memory, publish at the end. */</code></pre>
+
+<h2 id="six">6. Constant time where it matters</h2>
+
+<p>Error messages that distinguish failure causes can hand an attacker exactly the oracle they need, which is why secure-world errors are deliberately uninformative.</p>
+
+<pre><code>/* Comparison, of anything secret: */
+
+    /* WRONG - returns as soon as bytes differ */
+    if (TEE_MemCompare(mac, expected, 32) == 0) ...
+    if (memcmp(pin, stored, 4) == 0) ...
+
+    /* RIGHT */
+    static bool ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
+    {
+            uint8_t d = 0;
+            for (size_t i = 0; i &lt; n; i++)
+                    d |= a[i] ^ b[i];
+            return d == 0;
+    }
+    /* or, for MACs, the API does it: */
+    TEE_MACCompareFinal(op, msg, len, mac, maclen);
+
+/* Branching on secrets: */
+
+    /* WRONG - the branch is observable */
+    if (key[0] &amp; 1)
+            do_a();
+    else
+            do_b();
+
+    /* Table lookups indexed by secrets are also observable,
+       through the cache. This is how AES T-table
+       implementations were broken. Use the hardware
+       accelerator, or an implementation written to be
+       constant time - do not write your own.              */
+
+/* Error messages that distinguish cases: */
+
+    /* WRONG - an oracle */
+    if (!user_exists(u)) return TEE_ERROR_ITEM_NOT_FOUND;
+    if (!pin_matches(p)) return TEE_ERROR_ACCESS_DENIED;
+
+    /* RIGHT - one answer, one timing */
+    bool ok = user_exists(u);
+    ok &amp;= pin_matches(p);          /* NOT &amp;&amp;: always evaluate */
+    return ok ? TEE_SUCCESS : TEE_ERROR_ACCESS_DENIED;</code></pre>
+
+<h2 id="seven">7. Fail closed, and rate limit</h2>
+
+<p>State shared between sessions can leak from one client to another unless the instance model is chosen deliberately — which is the flag discussion from chapter 13 seen as a security matter.</p>
+
+<pre><code>    /* Default to refusal, not permission. */
+    TEE_Result res = TEE_ERROR_ACCESS_DENIED;   /* not SUCCESS */
+    ...
+    if (everything_checked_out)
+            res = TEE_SUCCESS;
+    return res;
+
+    /* A missing case in a switch must deny: */
+    switch (cmd) {
+    case CMD_A: return do_a(...);
+    case CMD_B: return do_b(...);
+    default:    return TEE_ERROR_NOT_SUPPORTED;   /* never
+                                                     fall
+                                                     through */
+    }
+
+    /* Anything guessable needs a counter, and the counter
+       needs rollback protection (chapter 17): */
+    if (state.failures &gt;= MAX_FAILURES)
+            return TEE_ERROR_ACCESS_DENIED;
+
+    state.failures++;
+    write_protected_state(&amp;state);      /* BEFORE checking -
+                                           so a power cut
+                                           during the attempt
+                                           counts against the
+                                           attacker           */
+    if (check_pin(pin)) {
+            state.failures = 0;
+            write_protected_state(&amp;state);
+            return TEE_SUCCESS;
+    }
+    return TEE_ERROR_ACCESS_DENIED;</code></pre>
+
+<h2 id="eight">8. Clean up on every path</h2>
+
+<p>Counting and limiting resource use matters because a trusted application that exhausts secure-world contexts denies service to everything else on the device.</p>
+
+<pre><code>static TEE_Result do_work(TEE_Param params[4])
+{
+        TEE_OperationHandle op  = TEE_HANDLE_NULL;
+        TEE_ObjectHandle    key = TEE_HANDLE_NULL;
+        uint8_t             secret[32] = {0};
+        TEE_Result          res;
+
+        res = TEE_AllocateOperation(&amp;op, ...);
+        if (res) goto out;
+
+        res = TEE_AllocateTransientObject(&amp;key, ...);
+        if (res) goto out;
+
+        res = actually_do_it(op, key, secret);
+out:
+        /* Wipe secrets BEFORE freeing - the heap is reused
+           and OP-TEE does not zero on free.               */
+        TEE_MemFill(secret, 0, sizeof secret);
+        TEE_FreeOperation(op);          /* NULL-safe          */
+        TEE_FreeTransientObject(key);   /* NULL-safe          */
+        return res;
+}
+
+/* A leak here is not merely untidy: TA_DATA_SIZE is small
+   (chapter 13), so a leak on an error path that an attacker
+   can trigger repeatedly is a denial of service against the
+   whole TA.                                               */</code></pre>
+
+<h2 id="review">The review checklist</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>#</th><th>Check</th><th>Look for</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>paramTypes</code> checked in every entry point</td><td>A command with no
+<code>exp</code> comparison</td></tr>
+<tr><td>2</td><td>No value read twice from shared memory</td><td>Any <code>params[i].memref.buffer</code>
+dereferenced more than once</td></tr>
+<tr><td>3</td><td>Arithmetic cannot overflow</td><td><code>a + b &gt; limit</code>, <code>n * size</code>,
+signed indices</td></tr>
+<tr><td>4</td><td><code>TEE_CheckMemoryAccessRights</code> on client buffers</td><td>Missing before a large
+copy</td></tr>
+<tr><td>5</td><td>Output written once, at the end</td><td>A write to <code>memref.buffer</code> before the
+final <code>return TEE_SUCCESS</code></td></tr>
+<tr><td>6</td><td>Constant-time comparison of secrets</td><td><code>memcmp</code>,
+<code>TEE_MemCompare</code> on a MAC or PIN</td></tr>
+<tr><td>7</td><td>Fails closed</td><td>A <code>switch</code> without <code>default</code>; a result variable
+initialised to success</td></tr>
+<tr><td>8</td><td>Every handle freed, every secret wiped</td><td>An early <code>return</code> that skips
+cleanup</td></tr>
+<tr><td>9</td><td>Rate limiting with rollback protection</td><td>A counter in REE FS
+(<a href="tee-17-time-rollback.html">chapter 17</a>)</td></tr>
+<tr><td>10</td><td>No secrets in logs</td><td><code>DHEXDUMP</code>, <code>%s</code> of key material</td></tr>
+<tr><td>11</td><td>Session state is per session</td><td>A key in a global under
+<code>SINGLE_INSTANCE</code></td></tr>
+<tr><td>12</td><td>Thread safety under <code>MULTI_SESSION</code></td><td>Any mutable global
+(<a href="tee-13-ta-lifecycle.html">chapter 13</a>)</td></tr>
+<tr><td>13</td><td>Attack surface is minimal</td><td>Commands that exist "for debugging"</td></tr>
+<tr><td>14</td><td>No untrusted parsing</td><td>ASN.1, protobuf, JSON, X.509 inside the TA</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Row 14 deserves emphasis</b>
+<p>A parser for a complex, attacker-controlled format is the largest single source of memory-safety bugs in
+any codebase, and putting one inside the secure world concentrates the risk exactly where it hurts most.
+Parse in Linux; pass the TA a fixed-size, fully validated struct. If the TA genuinely must parse — a
+certificate, a TPM command — keep the parser small, total, and fuzzed.</p>
+</div>
+
+<h2 id="fuzz">Testing hostilely</h2>
+
+<p>The interface is small, well-defined and takes attacker-controlled input, which makes it an unusually good fuzzing target — and fuzzing it is far cheaper than an audit.</p>
+
+<pre><code>/* Write a client whose job is to break your TA. Run it in CI. */
+
+    /* wrong parameter types for every command */
+    for (uint32_t pt = 0; pt &lt; 0x10000; pt++) {
+            op.paramTypes = pt;
+            TEEC_InvokeCommand(&amp;sess, cmd, &amp;op, &amp;origin);
+            /* must never panic the TA */
+    }
+
+    /* boundary sizes */
+    size_t sizes[] = {0, 1, MAX-1, MAX, MAX+1, SIZE_MAX};
+
+    /* concurrent mutation - the double-fetch test */
+    pthread_create(&amp;t, NULL, mutate_shared_buffer_forever, shm);
+    for (int i = 0; i &lt; 100000; i++)
+            TEEC_InvokeCommand(&amp;sess, cmd, &amp;op, &amp;origin);
+
+    /* every command in every order, including before the
+       session is properly set up */
+
+    /* resource exhaustion: open sessions until it fails, then
+       check the TA still works after they close */
+
+/* Fuzzing the parsing code natively is cheaper and finds more:
+   compile the TA's pure logic for the host with
+   -fsanitize=fuzzer,address and run libFuzzer against it. The
+   GP API calls need stubbing, which is a good exercise in
+   itself - it forces the security-relevant logic to be
+   separable from the plumbing.                             */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>TA panics when a client sends odd arguments</td><td>Missing <code>paramTypes</code> check — and this is
+the mild version of that bug</td></tr>
+<tr><td>Heap corruption only under concurrency</td><td>Double fetch</td></tr>
+<tr><td>Read or write far outside a buffer</td><td>Integer overflow in a bounds check</td></tr>
+<tr><td>Client observes partial results on failure</td><td>Output written before success</td></tr>
+<tr><td>PIN recoverable in far fewer attempts than expected</td><td>Timing oracle, or distinguishable error
+codes</td></tr>
+<tr><td>Attempt counter resettable</td><td>Rate limiting without rollback protection</td></tr>
+<tr><td>TA stops working after repeated failed calls</td><td>A leak on an error path an attacker can trigger at
+will</td></tr>
+<tr><td>Two clients interfere</td><td>Shared global state under <code>MULTI_SESSION</code></td></tr>
+<tr><td>Security review finds the whole design wrong</td><td>Untrusted parsing inside the TA</td></tr>
+<tr><td>Keys in a log from a shipped device</td><td><code>DHEXDUMP</code> in a release build</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the assumption you must make about every client.</li>
+  <li>Write the <code>paramTypes</code> check and explain the attack it prevents.</li>
+  <li>Explain the double fetch with a concrete example and give the rule that prevents it.</li>
+  <li>Rewrite <code>offset + len &gt; size</code> so it cannot overflow.</li>
+  <li>Say what <code>TEE_CheckMemoryAccessRights</code> catches and what it does not.</li>
+  <li>Explain why output must be written once, at the end.</li>
+  <li>Write a constant-time comparison and say why <code>TEE_MemCompare</code> is unsuitable.</li>
+  <li>Give two ways an error path can become an oracle.</li>
+  <li>Explain why a leak on an error path is a security bug in a TA.</li>
+  <li>Explain why untrusted parsing does not belong in the secure world.</li>
+  <li>Design a hostile test client covering at least four of the checklist rows.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

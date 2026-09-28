@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bringing OP-TEE up on QEMU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Bringing OP-TEE up on QEMU</h1>
+<p class="lead">This is the chapter to get right before any other. A working QEMU setup with two consoles —
+one per world — and a passing <code>xtest</code> is the foundation for everything that follows, and every
+later failure is much easier to diagnose when you have seen the system work once.</p>
+
+<h2 id="fast">The fast path</h2>
+
+<p>The shortest path from nothing to a running secure world. Getting this working early matters because every later chapter assumes you can try things.</p>
+
+<pre><code>$ cd ~/optee/build
+$ make -j$(nproc)
+$ make run
+
+# Three windows appear:
+#   1. QEMU's own monitor
+#   2. "Normal World" - Linux
+#   3. "Secure World" - OP-TEE's console
+#
+# In window 1:
+(qemu) c
+
+# In window 2, after Linux boots (login: root, no password):
+buildroot login: root
+# ls /dev/tee*
+/dev/tee0  /dev/teepriv0
+# ps | grep supplicant
+  123 root     tee-supplicant
+# optee_example_hello_world
+Invoking TA to increment 42
+TA incremented value to 43
+
+# WATCH WINDOW 3 while that runs. You will see the TA load and
+# print. That split - one console per world - is the single
+# most useful property of this setup, and the reason to invest
+# in getting it working.
+
+# The full conformance suite:
+# xtest
+Test ID: ...
+...
+23807 subtests of which 0 failed
+78 test cases of which 0 failed
+0 test case was skipped
+TEE test application done!
+
+# A quick subset, when you only want a sanity check:
+# xtest -l 0
+# xtest -t regression 1001 1004 1013</code></pre>
+
+<h2 id="noX">Without a graphical display</h2>
+
+<p>The default configuration wants a graphical terminal, which is inconvenient on a build server or over a connection. This is how to run it entirely in a console.</p>
+
+<pre><code># make run needs X for the three xterms. On a headless machine
+# or over SSH, drive QEMU yourself.
+
+$ cd ~/optee/build
+$ make -n run-only | tr ' ' '\n' | grep -v '^$' | head -40
+# ...prints the exact qemu invocation. Adapt it:
+
+$ cd ~/optee
+$ qemu-system-aarch64 \
+    -nographic \
+    -serial mon:stdio \
+    -serial file:secure.log \
+    -smp 2 \
+    -machine virt,secure=on,mte=off,gic-version=3,virtualization=false \
+    -cpu max,sve=off \
+    -d unimp -semihosting-config enable=on,target=native \
+    -m 1057 \
+    -bios bl1.bin \
+    -initrd rootfs.cpio.gz \
+    -kernel Image -no-acpi \
+    -append 'console=ttyAMA0,38400 keep_bootcon root=/dev/vda2'
+
+# The two -serial lines are the point:
+#   first  -> ttyAMA0 -> the NORMAL world, on your terminal
+#   second -> the SECURE world's console -> secure.log
+#
+# Watch the secure console live in another terminal:
+$ tail -f secure.log
+
+# To have both on one screen without X, use tmux:
+$ tmux new-session -d 'cd ~/optee/build &amp;&amp; make run-only'
+$ tmux split-window -h 'tail -f ~/optee/secure.log'
+$ tmux attach</code></pre>
+
+<div class="key">
+<b>Two consoles or nothing</b>
+<p>OP-TEE reports TA panics, parameter errors, allocation failures and its own assertions on the secure
+console — never on the normal-world one. A client that returns <code>TEEC_ERROR_GENERIC</code> tells you
+nothing; the secure console tells you exactly which assertion failed and where. If you set up only one thing
+from this chapter, set up the second serial port.</p>
+</div>
+
+<h2 id="whatran">Reading the boot log</h2>
+
+<p>Understanding what just booted — which components, in what order — turns a working demo into something you can reason about and modify.</p>
+
+<pre><code># Secure world (secure.log):
+I/TC:
+I/TC: Non-secure external DT found
+I/TC: Reserved shared memory is enabled
+I/TC: Dynamic shared memory is enabled
+I/TC: Normal World virtualization support is disabled
+I/TC: Asynchronous notifications are disabled
+I/TC: OP-TEE version: 4.1.0 (gcc version 12.3.0) #1 ... aarch64
+I/TC: WARNING: This OP-TEE configuration might be insecure!
+I/TC: WARNING: Please check https://optee.readthedocs.io/...
+I/TC: Primary CPU initializing
+I/TC: Primary CPU switching to normal world boot
+
+# That WARNING is not noise: it means the build has development
+# keys, test RPMB keys, or debug features enabled. Every
+# tutorial build shows it. A product build must not.
+
+# Normal world:
+[    1.883] optee: probing for conduit method.
+[    1.884] optee: revision 4.1 (0e3e9c9d)
+[    1.891] optee: dynamic shared memory is enabled
+[    1.904] optee: initialized driver
+
+# Four lines, four things confirmed:
+#   "probing for conduit method"  the DT has an optee node
+#   "revision 4.1"                the SMC handshake worked -
+#                                 Linux talked to OP-TEE
+#   "dynamic shared memory"       buffer registration will work
+#   "initialized driver"          /dev/tee0 now exists
+
+# If any of the four is missing, stop and fix it before writing
+# a client.</code></pre>
+
+<h2 id="dt">The device tree node</h2>
+
+<p>The device tree tells the normal-world kernel that a TEE exists and how to reach it. Without that node, the driver never probes and nothing works.</p>
+
+<pre><code>/* Linux finds OP-TEE through the device tree. On QEMU the node
+   is added by TF-A/QEMU; on real hardware you write it.     */
+
+    firmware {
+        optee {
+            compatible = "linaro,optee-tz";
+            method = "smc";
+        };
+    };
+
+# Confirm it is there, from inside the guest:
+$ ls /proc/device-tree/firmware/optee/
+compatible  method  name
+$ cat /proc/device-tree/firmware/optee/method
+smc
+
+# method = "smc"  bare metal - the driver issues SMC directly
+# method = "hvc"  running under a hypervisor that forwards
+
+# Kernel config required:
+#   CONFIG_TEE=y
+#   CONFIG_OPTEE=y
+#   CONFIG_ARM_PSCI_FW=y
+$ zcat /proc/config.gz | grep -E 'CONFIG_(TEE|OPTEE)='
+CONFIG_TEE=y
+CONFIG_OPTEE=y</code></pre>
+
+<h2 id="supplicant">tee-supplicant</h2>
+
+<p>A user-space daemon provides services the secure world cannot perform itself. If it is not running, operations fail in ways that look unrelated to it.</p>
+
+<pre><code># Without it, sessions fail with TEEC_ERROR_ITEM_NOT_FOUND,
+# because nothing can load the .ta file from the filesystem.
+# It is a normal-world daemon (chapter 9 explains why it must
+# exist at all).
+
+# Is it running?
+$ ps aux | grep [t]ee-supplicant
+root  123  tee-supplicant /dev/teepriv0
+
+# Start it by hand:
+$ tee-supplicant -d          # daemonise
+$ tee-supplicant -f          # foreground, so you see its errors
+
+# Where it looks for trusted applications:
+$ ls /lib/optee_armtz/
+8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta   # hello_world
+f4e750bb-1437-4fbf-8785-8d3580c34994.ta   # aes
+...
+
+# The filename IS the UUID. A TA whose UUID does not match its
+# filename will never be found.
+
+# systemd unit, on a real distribution:
+$ systemctl status tee-supplicant
+$ systemctl enable --now tee-supplicant</code></pre>
+
+<h2 id="first">Your first client, from nothing</h2>
+
+<p>Running the supplied examples confirms the whole stack works end to end before you write anything of your own — which is the right order to establish confidence in.</p>
+
+<pre><code>// hello.c - the smallest complete client. Links against
+// libteec, talks to the hello_world TA that ships with
+// optee_examples.
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;tee_client_api.h&gt;
+
+#define TA_HELLO_WORLD_UUID \
+    { 0x8aaaf200, 0x2450, 0x11e4, \
+      { 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b} }
+#define TA_HELLO_WORLD_CMD_INC_VALUE 0
+
+int main(void)
+{
+        TEEC_Context   ctx;
+        TEEC_Session   sess;
+        TEEC_Operation op;
+        TEEC_UUID      uuid = TA_HELLO_WORLD_UUID;
+        uint32_t       err_origin;
+        TEEC_Result    res;
+
+        res = TEEC_InitializeContext(NULL, &amp;ctx);
+        if (res != TEEC_SUCCESS) {
+                printf("InitializeContext failed 0x%x\n", res);
+                return 1;
+        }
+
+        res = TEEC_OpenSession(&amp;ctx, &amp;sess, &amp;uuid,
+                               TEEC_LOGIN_PUBLIC, NULL, NULL,
+                               &amp;err_origin);
+        if (res != TEEC_SUCCESS) {
+                printf("OpenSession failed 0x%x origin 0x%x\n",
+                       res, err_origin);
+                TEEC_FinalizeContext(&amp;ctx);
+                return 1;
+        }
+
+        memset(&amp;op, 0, sizeof op);
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INOUT,
+                                         TEEC_NONE,
+                                         TEEC_NONE,
+                                         TEEC_NONE);
+        op.params[0].value.a = 42;
+
+        res = TEEC_InvokeCommand(&amp;sess, TA_HELLO_WORLD_CMD_INC_VALUE,
+                                 &amp;op, &amp;err_origin);
+        if (res != TEEC_SUCCESS)
+                printf("InvokeCommand failed 0x%x origin 0x%x\n",
+                       res, err_origin);
+        else
+                printf("TA returned %u\n", op.params[0].value.a);
+
+        TEEC_CloseSession(&amp;sess);
+        TEEC_FinalizeContext(&amp;ctx);
+        return 0;
+}</code></pre>
+
+<pre><code>$ aarch64-linux-gnu-gcc -o hello hello.c \
+    -I ~/optee/optee_client/out/export/usr/include \
+    -L ~/optee/optee_client/out/export/usr/lib \
+    -lteec
+
+# Get it into the guest. Easiest: put it in the rootfs and
+# repack (chapter 3), or use the shared 9p mount:
+$ cp hello ~/optee/out-br/target/root/
+$ cd ~/optee/build &amp;&amp; make buildroot run-only
+
+# In the guest:
+# ./hello
+TA returned 43
+
+# And the secure console shows:
+D/TC:0 0 tee_ta_init_user_ta_session:1035 Lookup user TA ELF
+       8aaaf200-2450-11e4-abe2-0002a5d5c51b (Secure Storage TA)
+I/TA: has been called
+I/TA: Got value: 42 from NW
+I/TA: Increase value to: 43</code></pre>
+
+<h2 id="checklist">The bring-up checklist</h2>
+
+<p>When the environment does not come up, these are the checks in the order that finds the problem fastest.</p>
+
+<pre class="diagram">   Work through these in order. Each one depends on the last.
+
+   [ ] 1. TF-A prints "BL31: v2.x"
+          -> if not: FIP or build problem (ch. 2)
+
+   [ ] 2. Secure console shows "I/TC: OP-TEE version:"
+          -> if not: SPD=opteed missing, or BL32 not in the FIP
+
+   [ ] 3. Secure console shows "switching to normal world boot"
+          -> if not: OP-TEE init failed. Read the lines above it.
+
+   [ ] 4. Linux boots to a shell
+          -> ordinary kernel debugging (QEMU ch. 5)
+
+   [ ] 5. dmesg | grep optee shows all four driver lines
+          -> if not: device tree node, or CONFIG_OPTEE
+
+   [ ] 6. /dev/tee0 exists
+          -> follows from 5
+
+   [ ] 7. tee-supplicant is running
+          -> if not: start it, check /lib/optee_armtz exists
+
+   [ ] 8. optee_example_hello_world works
+          -> if not: the .ta is missing, or signed with the
+             wrong key
+
+   [ ] 9. xtest -l 0 passes
+          -> broad sanity
+
+   [ ] 10. xtest passes completely
+          -> you have a working system. STOP HERE and commit
+             the exact versions you used.
+
+   Do not start writing your own TA before step 10 passes. A
+   failure at step 11 with steps 1-10 unverified is
+   unattributable, and you will spend the afternoon looking in
+   the wrong place.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No secure-world output anywhere</td><td>Only one <code>-serial</code>; add a second</td></tr>
+<tr><td><code>make run</code> does nothing</td><td>No X display — use <code>make run-only</code> and
+<code>make -n run</code></td></tr>
+<tr><td>QEMU sits doing nothing</td><td>It starts paused; type <code>c</code> in the monitor</td></tr>
+<tr><td><code>/dev/tee0</code> missing</td><td>Device tree node absent, <code>CONFIG_OPTEE</code> off, or OP-TEE
+never initialised</td></tr>
+<tr><td><code>TEEC_ERROR_ITEM_NOT_FOUND</code> (0xFFFF0008)</td><td>TA not in <code>/lib/optee_armtz</code>, or
+<code>tee-supplicant</code> not running</td></tr>
+<tr><td><code>TEEC_ERROR_SECURITY</code> (0xFFFF000F) on load</td><td>TA signed with a key OP-TEE does not
+trust</td></tr>
+<tr><td><code>TEEC_ERROR_COMMUNICATION</code></td><td><code>/dev/tee0</code> exists but the SMC path is broken —
+check the secure console</td></tr>
+<tr><td>Client links but fails at runtime with a missing library</td><td><code>libteec.so</code> not in the
+rootfs; static-link or copy it</td></tr>
+<tr><td>Everything works, then stops after a rebuild</td><td><code>make buildroot</code> not run — old binaries
+in the image</td></tr>
+<tr><td><code>WARNING: This OP-TEE configuration might be insecure</code></td><td>Expected in development.
+Never acceptable in a product</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Get <code>xtest</code> passing on QEMU and record the exact versions.</li>
+  <li>Explain what each of the three <code>make run</code> windows shows.</li>
+  <li>Set up two serial ports without X and explain why the second one matters.</li>
+  <li>Name the four <code>optee:</code> lines in <code>dmesg</code> and what each confirms.</li>
+  <li>Write the device tree node OP-TEE needs and say what <code>method</code> selects.</li>
+  <li>Explain what <code>tee-supplicant</code> does and what fails without it.</li>
+  <li>Say where <code>.ta</code> files live and how their filename relates to the UUID.</li>
+  <li>Write and run a client that opens a session and invokes one command.</li>
+  <li>Work through the ten-step bring-up checklist and say why the order matters.</li>
+  <li>Explain what the "might be insecure" warning is telling you.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

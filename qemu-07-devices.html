@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Devices, buses and the command line | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Devices, buses and the command line</h1>
+<p class="lead">QEMU's command line looks arbitrary until you see the object model underneath it. There are
+three layers — a backend that does real work, a frontend the guest sees, and a bus they plug into — and every
+confusing option is one of those three. Learn the shape and the syntax stops needing memorisation.</p>
+
+<h2 id="model">Backend, frontend, bus</h2>
+
+<pre class="diagram">   HOST SIDE                 GUEST SIDE
+   "backend"                 "frontend" / device
+
+   a file on disk    &lt;----&gt;  virtio-blk-device      on virtio-mmio
+   a tap interface   &lt;----&gt;  virtio-net-pci         on PCIe
+   your terminal     &lt;----&gt;  pl011 UART             on the SoC
+   a unix socket     &lt;----&gt;  virtio-serial port     on virtio
+   /dev/urandom      &lt;----&gt;  virtio-rng-device
+
+   The command line names them SEPARATELY and joins them by id:
+
+     -drive   file=disk.img,if=none,format=raw,id=hd0
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  backend
+                                          ^^^^  its name
+
+     -device  virtio-blk-device,drive=hd0
+              ^^^^^^^^^^^^^^^^^                 frontend
+                                ^^^^^^^^^       the link
+
+   Once you see that, every option follows:
+
+     -netdev   TYPE,id=NAME,...        network backend
+     -device   virtio-net-...,netdev=NAME
+     -chardev  TYPE,id=NAME,...        character backend
+     -device   ...,chardev=NAME
+     -blockdev TYPE,node-name=NAME,... modern block backend
+     -object   TYPE,id=NAME,...        memory, rng, crypto,
+                                       tls credentials
+
+   "if=none" means "do not auto-attach this backend to a
+   default controller - I will attach it myself with -device".
+   Forgetting it is the most common mistake, and the symptom is
+   a disk that appears twice or not at all.</pre>
+
+<h2 id="which">Which frontend for which bus</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Suffix</th><th>Bus</th><th>Example</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>-device</code></td><td>virtio-mmio</td><td><code>virtio-blk-device</code></td><td>The 32 mmio
+slots on <code>virt</code>. Simple, no PCIe needed. Best for minimal guests</td></tr>
+<tr><td><code>-pci</code></td><td>PCIe</td><td><code>virtio-blk-pci</code></td><td>Enumerable, hotpluggable,
+supports MSI-X and multiqueue properly. Best for full guests</td></tr>
+<tr><td><code>-ccw</code></td><td>s390 channel</td><td><code>virtio-blk-ccw</code></td><td>s390x only</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># The same disk, three ways:
+
+# 1. virtio-mmio - no PCIe involved
+-drive file=d.img,if=none,format=raw,id=hd0 \
+-device virtio-blk-device,drive=hd0
+
+# 2. virtio-pci - needs the PCIe host bridge (virt has one)
+-drive file=d.img,if=none,format=raw,id=hd0 \
+-device virtio-blk-pci,drive=hd0
+
+# 3. The shorthand, which auto-picks a controller.
+#    Convenient, and it hides which bus you got.
+-drive file=d.img,format=raw,if=virtio
+
+# Prefer the explicit forms. When something does not appear in
+# the guest, the explicit form tells you where to look.
+
+# See what you actually built:
+$ qemu-system-aarch64 -M virt ... -monitor stdio
+(qemu) info qtree
+(qemu) info pci
+(qemu) info block</code></pre>
+
+<h2 id="chardev">Character devices: where output goes</h2>
+
+<pre><code># Every serial port, console, monitor and debug channel is a
+# chardev. This is the layer people fight with most.
+
+# The simple forms:
+-nographic                 # serial + monitor multiplexed to
+                           # stdio. Ctrl-A c switches, Ctrl-A x
+                           # quits.
+-serial mon:stdio          # exactly what -nographic does
+-serial null               # discard
+-serial file:boot.log      # write to a file
+-serial tcp::4444,server,nowait     # telnet to it
+-serial unix:/tmp/sock,server,nowait
+-serial pty                # QEMU prints "char device redirected
+                           # to /dev/pts/5" - screen or minicom
+                           # to it
+
+# Named chardevs, so several devices can each have their own:
+-chardev stdio,id=con0,mux=on \
+-chardev file,id=log1,path=secure.log \
+-chardev socket,id=dbg,path=/tmp/dbg.sock,server=on,wait=off \
+-serial chardev:con0 \
+-serial chardev:log1
+
+# TWO UARTs, which the OP-TEE track needs (normal world on one,
+# secure world on the other):
+-serial mon:stdio -serial file:secure-world.log
+
+# The order matters: the first -serial is ttyAMA0, the second
+# is ttyAMA1, and so on. On virt only the first is in the
+# generated device tree unless the machine adds more.
+
+# Logging everything to a file while still watching it:
+$ qemu-system-aarch64 ... -nographic 2&gt;&amp;1 | tee boot.log
+
+# A virtio-serial channel, for a guest agent:
+-device virtio-serial-device \
+-chardev socket,path=/tmp/agent.sock,server=on,wait=off,id=ag \
+-device virtserialport,chardev=ag,name=org.example.agent
+# guest sees /dev/virtio-ports/org.example.agent</code></pre>
+
+<div class="tip">
+<b>Ctrl-A is the escape key</b>
+<p><code>Ctrl-A c</code> toggles between the guest console and the QEMU monitor. <code>Ctrl-A x</code> quits.
+<code>Ctrl-A h</code> lists the rest. If your terminal multiplexer already uses <code>Ctrl-A</code> (screen
+does), change QEMU's with <code>-echr 0x05</code> to use <code>Ctrl-E</code> instead.</p>
+</div>
+
+<h2 id="tour">A tour of devices worth knowing</h2>
+
+<pre><code># Storage
+-device virtio-blk-device,drive=hd0            # the fast path
+-device virtio-scsi-device -device scsi-hd,drive=hd0
+-device nvme,drive=hd0,serial=deadbeef         # a real NVMe
+                                               # controller model -
+                                               # excellent for
+                                               # driver work
+-device usb-storage,drive=hd0
+
+# Network
+-device virtio-net-device,netdev=n0
+-device e1000e,netdev=n0                       # Intel NIC model
+-device rtl8139,netdev=n0                      # ancient, useful
+                                               # for driver
+                                               # teaching
+
+# Console and input
+-device virtio-serial-device
+-device virtio-keyboard-device
+-device virtio-tablet-device
+-device usb-kbd -device usb-mouse
+
+# Graphics
+-device virtio-gpu-device
+-device ramfb                                  # a dumb
+                                               # framebuffer -
+                                               # simplest possible
+-device virtio-gpu-gl-device                   # with virgl
+
+# Entropy - add this to every guest
+-object rng-random,filename=/dev/urandom,id=rng0 \
+-device virtio-rng-device,rng=rng0
+
+# USB
+-device qemu-xhci,id=xhci \
+-device usb-host,hostbus=1,hostaddr=5          # pass a real
+                                               # USB device
+                                               # through!
+
+# The one that matters most for this site:
+-device loader,file=payload.bin,addr=0x40100000,force-raw=on
+-device loader,addr=0x40100000,cpu-num=0       # set the PC
+# Loads arbitrary blobs anywhere. This is how TF-A, OP-TEE and
+# bare-metal payloads get placed.
+
+# Ask what a device accepts:
+$ qemu-system-aarch64 -device virtio-blk-device,help
+$ qemu-system-aarch64 -device help | less</code></pre>
+
+<h2 id="hotplug">Hotplug</h2>
+
+<pre><code># PCIe devices can be added and removed while the guest runs.
+# virtio-mmio devices cannot - the slots are fixed at startup.
+# That alone is a reason to prefer -pci for a long-lived guest.
+
+$ qemu-system-aarch64 -M virt -nographic -monitor stdio ...
+
+(qemu) drive_add 0 if=none,file=extra.img,format=raw,id=hd1
+(qemu) device_add virtio-blk-pci,drive=hd1,id=blk1
+# guest: a new /dev/vdb appears
+
+(qemu) device_del blk1
+# guest: the device is unplugged (the guest must cooperate)
+
+(qemu) info block
+(qemu) info pci
+
+# The same through QMP, which is what you would automate
+# (chapter 10):
+{"execute":"device_add",
+ "arguments":{"driver":"virtio-blk-pci","drive":"hd1","id":"blk1"}}
+
+# CPU hotplug on arm64 needs the machine to reserve slots:
+$ qemu-system-aarch64 -M virt -smp 2,maxcpus=8 ...
+(qemu) device_add cortex-a57-arm-cpu,id=cpu2,core-id=2
+
+# Memory hotplug:
+$ qemu-system-aarch64 -m 1G,slots=4,maxmem=8G ...
+(qemu) object_add memory-backend-ram,id=m1,size=1G
+(qemu) device_add pc-dimm,id=d1,memdev=m1</code></pre>
+
+<h2 id="readable">Making command lines survivable</h2>
+
+<pre><code># A real command line is 20 lines long. Do not retype it.
+
+# 1. A shell script with a variable per concern:
+#!/bin/sh
+MACHINE="-M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 2G"
+KERNEL="-kernel Image -append 'console=ttyAMA0 earlycon root=/dev/vda'"
+DISK="-drive file=rootfs.ext4,if=none,format=raw,id=hd0
+      -device virtio-blk-device,drive=hd0"
+NET="-netdev user,id=n0,hostfwd=tcp::2222-:22
+     -device virtio-net-device,netdev=n0"
+DEBUG="-s -S -d guest_errors,unimp -D qemu.log"
+exec qemu-system-aarch64 $MACHINE $KERNEL $DISK $NET -nographic "$@"
+
+# 2. -readconfig, a config file QEMU parses itself:
+$ cat vm.cfg
+[machine]
+  type = "virt"
+  gic-version = "3"
+[memory]
+  size = "2G"
+[drive "hd0"]
+  file = "rootfs.ext4"
+  format = "raw"
+  if = "none"
+[device "blk0"]
+  driver = "virtio-blk-device"
+  drive = "hd0"
+
+$ qemu-system-aarch64 -readconfig vm.cfg -kernel Image -nographic
+
+# 3. Dump the configuration QEMU derived, to see defaults:
+$ qemu-system-aarch64 -M virt -writeconfig - -m 1G 2&gt;/dev/null
+
+# 4. -nodefaults, when you want NOTHING you did not ask for:
+$ qemu-system-aarch64 -M virt -nodefaults \
+    -serial mon:stdio -device virtio-blk-device,drive=hd0 ...
+# Without it QEMU adds a default VGA, a default NIC, a default
+# serial and a default parallel port. -nodefaults plus explicit
+# devices is how you get a reproducible machine.</code></pre>
+
+<div class="warn">
+<b>Defaults change between QEMU versions</b>
+<p>A machine type is versioned (<code>virt-8.2</code>) precisely so that migration and reproducibility work,
+but <code>-M virt</code> means "the newest", which moves. For anything you want to reproduce in six months —
+CI, a bug report, a test baseline — pin the versioned machine type and use <code>-nodefaults</code>.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>Property 'drive' not found</code></td><td>Frontend name wrong for the bus —
+<code>virtio-blk-device</code> vs <code>virtio-blk-pci</code></td></tr>
+<tr><td>Disk appears twice in the guest</td><td>Missing <code>if=none</code>, so QEMU auto-attached it as well
+as your <code>-device</code></td></tr>
+<tr><td><code>Drive 'hd0' is already in use</code></td><td>Same, or two <code>-device</code> lines referencing
+one drive</td></tr>
+<tr><td>Device configured but absent in the guest</td><td>Wrong bus for the machine, or the guest kernel lacks
+the driver. Check <code>info qtree</code> then guest <code>dmesg</code></td></tr>
+<tr><td>No console output</td><td>chardev routed elsewhere; check the <code>-serial</code> ordering and
+<code>console=</code></td></tr>
+<tr><td>Cannot escape QEMU</td><td>Terminal multiplexer eating <code>Ctrl-A</code>; use
+<code>-echr</code></td></tr>
+<tr><td>Hotplug fails on <code>virt</code></td><td>Device is on virtio-mmio, which is not hotpluggable — use
+<code>-pci</code></td></tr>
+<tr><td>Guest gets a NIC you did not ask for</td><td>Default devices; add <code>-nodefaults</code></td></tr>
+<tr><td>Command line works on one machine, not another</td><td>Different QEMU version, different
+defaults</td></tr>
+<tr><td><code>-device help</code> lists a device that then fails</td><td>Present in the binary but not valid on
+this machine type</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the backend/frontend split and how the two are linked on the command line.</li>
+  <li>Say what <code>if=none</code> means and what happens without it.</li>
+  <li>Give the three virtio frontend suffixes and the bus each attaches to.</li>
+  <li>Configure two serial ports, one to the terminal and one to a file.</li>
+  <li>Explain how a guest agent gets a private channel with <code>virtio-serial</code>.</li>
+  <li>Name the escape key and how to change it.</li>
+  <li>Hotplug a disk from the monitor and explain why it must be PCIe.</li>
+  <li>Explain what <code>-nodefaults</code> is for.</li>
+  <li>Say why a versioned machine type matters for CI.</li>
+  <li>Use <code>info qtree</code> to determine whether a device was actually created.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

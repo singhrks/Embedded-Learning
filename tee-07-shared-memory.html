@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared memory across the boundary | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Shared memory across the boundary</h1>
+<p class="lead">Every byte that crosses between worlds crosses through non-secure shared memory, because the
+normal world cannot be given a pointer into secure memory and the secure world will not trust a pointer the
+normal world chose. How that buffer is allocated, registered and validated is the security-critical seam of
+the whole design.</p>
+
+<h2 id="why">Why it must be non-secure</h2>
+
+<p>The two worlds must exchange data, and they cannot do so through secure memory. The shared region is therefore the one place untrusted input legitimately reaches trusted code — which makes it the most security-sensitive memory on the device.</p>
+
+<pre class="diagram">   Consider the two alternatives and why both fail.
+
+   1. The TA writes directly into normal-world memory at an
+      address the client supplied.
+
+      -> The client controls the address. It can name kernel
+         memory, another process's memory, a device register,
+         or OP-TEE's own memory. The TA, running with secure
+         privilege, would perform the write.
+      -> This is the single most dangerous class of TEE bug,
+         and it is why every address must be VALIDATED, not
+         merely used.
+
+   2. The client reads from secure memory the TA allocated.
+
+      -> Impossible. The TZASC refuses (chapter 6).
+
+   So: a third region, non-secure, agreed by both sides.
+
+     +-------------------+
+     |  SHM              |  NS=1, so:
+     |  non-secure       |    normal world: read/write
+     |  shared memory    |    secure world: read/write
+     +-------------------+
+
+   The secure world can read and write non-secure memory - it
+   is more privileged, not less. The restriction is one-way.
+
+   And therefore: ANYTHING IN SHM IS ATTACKER-CONTROLLED. The
+   client can change it at any moment, including between the
+   TA's validation of a value and the TA's use of it.</pre>
+
+<div class="danger">
+<b>The double-fetch rule</b>
+<p>Shared memory can change under you. A TA that reads a length field, checks it, and then reads it again to
+use it has a time-of-check-to-time-of-use bug: the client can change the value in between, from another
+thread, and defeat the check. <strong>Copy everything you will act on into secure memory first, then validate
+the copy, then use only the copy.</strong> This is elaborated in <a href="tee-20-ta-security.html">chapter
+20</a> and it is the rule that matters most in this entire track.</p>
+</div>
+
+<h2 id="two">Two kinds of shared memory</h2>
+
+<p>Two mechanisms for sharing, differing in who allocates and how long the sharing lasts. The choice affects both performance and what the trusted application must validate.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Static / reserved SHM</th><th>Dynamic SHM</th></tr></thead>
+<tbody>
+<tr><td>Where it comes from</td><td>A carve-out declared at build time; OP-TEE tells Linux the physical
+range</td><td>Ordinary kernel pages, registered with OP-TEE on demand</td></tr>
+<tr><td>Contiguity</td><td>Physically contiguous</td><td>Scattered pages, described by a page list</td></tr>
+<tr><td>Size limit</td><td>Fixed at build time (often 2 MB)</td><td>Whatever the kernel can pin</td></tr>
+<tr><td>Registration cost</td><td>None</td><td>An SMC per registration</td></tr>
+<tr><td>Enabled by</td><td>Always</td><td><code>CFG_CORE_DYN_SHM=y</code> and driver support</td></tr>
+<tr><td>Best for</td><td>Small, frequent transfers</td><td>Large buffers, or buffers the application already
+has</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Which do you have? The driver says so at probe:
+$ dmesg | grep optee
+optee: dynamic shared memory is enabled
+
+# Static-only systems say nothing about dynamic, and
+# TEEC_RegisterSharedMemory on an arbitrary pointer will fail.</code></pre>
+
+<h2 id="client">Three ways a client provides a buffer</h2>
+
+<p>From the application side, sharing memory is a few API calls — and the details of who owns the buffer and when it may be touched matter more than the call signatures.</p>
+
+<pre><code>/* 1. ALLOCATE - let the TEE choose the memory. Simplest,
+      always works, always contiguous.                      */
+
+    TEEC_SharedMemory shm = {
+            .size  = 4096,
+            .flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT,
+    };
+    res = TEEC_AllocateSharedMemory(&amp;ctx, &amp;shm);
+    memcpy(shm.buffer, data, len);
+
+    op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE,
+                                     TEEC_NONE, TEEC_NONE,
+                                     TEEC_NONE);
+    op.params[0].memref.parent = &amp;shm;
+    /* ... invoke ... */
+    TEEC_ReleaseSharedMemory(&amp;shm);
+
+
+/* 2. REGISTER - hand the TEE memory you already have. Avoids
+      a copy; needs dynamic SHM.                            */
+
+    void *mybuf = malloc(65536);          /* or mmap, or a
+                                             dmabuf           */
+    TEEC_SharedMemory shm = {
+            .buffer = mybuf,
+            .size   = 65536,
+            .flags  = TEEC_MEM_INPUT,
+    };
+    res = TEEC_RegisterSharedMemory(&amp;ctx, &amp;shm);
+    /* the kernel pins the pages and sends OP-TEE a page list */
+
+
+/* 3. TEMPORARY - a pointer passed inline; libteec allocates,
+      copies in, invokes, copies out, frees. Convenient and it
+      COPIES TWICE.                                         */
+
+    op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+                                     TEEC_MEMREF_TEMP_OUTPUT,
+                                     TEEC_NONE, TEEC_NONE);
+    op.params[0].tmpref.buffer = input;
+    op.params[0].tmpref.size   = inlen;
+    op.params[1].tmpref.buffer = output;
+    op.params[1].tmpref.size   = sizeof output;
+
+/* Use TEMP for small parameters and control messages. Use
+   REGISTER for anything large or repeated - a 1 MB buffer
+   copied twice per call, at 60 calls a second, is 120 MB/s of
+   pure waste.                                              */</code></pre>
+
+<h2 id="types">The parameter model</h2>
+
+<p>The parameter types the interface supports encode the direction and ownership of each buffer, which is what lets the framework check some of the rules for you.</p>
+
+<pre><code>/* Four slots per invocation. Each is a VALUE (two 32-bit
+   numbers) or a MEMREF (a buffer), each with a direction.  */
+
+    TEEC_NONE
+    TEEC_VALUE_INPUT           a, b: two uint32_t in
+    TEEC_VALUE_OUTPUT          two uint32_t out
+    TEEC_VALUE_INOUT
+    TEEC_MEMREF_TEMP_INPUT     an inline buffer
+    TEEC_MEMREF_TEMP_OUTPUT
+    TEEC_MEMREF_TEMP_INOUT
+    TEEC_MEMREF_WHOLE          all of a registered shm
+    TEEC_MEMREF_PARTIAL_INPUT  part of a registered shm
+    TEEC_MEMREF_PARTIAL_OUTPUT
+    TEEC_MEMREF_PARTIAL_INOUT
+
+    op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT,
+                                     TEEC_MEMREF_TEMP_OUTPUT,
+                                     TEEC_NONE,
+                                     TEEC_NONE);
+
+/* On the TA side the same four slots arrive, and the TA MUST
+   check that it got what it expected: */
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess, uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+        uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT,
+                                       TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                                       TEE_PARAM_TYPE_NONE,
+                                       TEE_PARAM_TYPE_NONE);
+        if (ptypes != exp)
+                return TEE_ERROR_BAD_PARAMETERS;   /* MANDATORY */
+        ...
+}
+
+/* Skip that check and a client can pass a VALUE where you
+   expect a MEMREF. You then read params[1].memref.buffer -
+   which is now an arbitrary 64-bit integer the attacker chose,
+   dereferenced by code running with secure privilege.
+
+   This is the most common OP-TEE TA vulnerability class, and
+   it is prevented by four lines.                            */</code></pre>
+
+<h2 id="ta-side">What the TA must do with a buffer</h2>
+
+<p>On the trusted side, every shared buffer is attacker-controlled: its contents, its size, and whether it changes while you are reading it. The validation rules follow from that.</p>
+
+<pre><code>/* The four rules, in order of importance.                   */
+
+/* RULE 1: check the parameter types. Above. */
+
+/* RULE 2: check that the memory is really where it claims. */
+
+    res = TEE_CheckMemoryAccessRights(
+                TEE_MEMORY_ACCESS_READ |
+                TEE_MEMORY_ACCESS_ANY_OWNER,
+                params[1].memref.buffer,
+                params[1].memref.size);
+    if (res != TEE_SUCCESS)
+            return res;
+
+/* This asks OP-TEE: is this pointer, for this length, actually
+   a buffer this session was given? It catches a client that
+   passed a length larger than the buffer it registered.    */
+
+/* RULE 3: copy before you use. */
+
+    if (params[0].memref.size &gt; MAX_INPUT)
+            return TEE_ERROR_SHORT_BUFFER;
+
+    uint8_t local[MAX_INPUT];
+    /* ONE read of the shared memory. */
+    memcpy(local, params[0].memref.buffer, params[0].memref.size);
+
+    /* validate the COPY, act on the COPY */
+    if (!looks_sane(local, params[0].memref.size))
+            return TEE_ERROR_BAD_PARAMETERS;
+    do_work(local, params[0].memref.size);
+
+/* RULE 4: write output once, at the end, and only on success. */
+
+    if (params[1].memref.size &lt; needed) {
+            params[1].memref.size = needed;   /* tell them how
+                                                 much          */
+            return TEE_ERROR_SHORT_BUFFER;
+    }
+    memcpy(params[1].memref.buffer, result, needed);
+    params[1].memref.size = needed;
+    return TEE_SUCCESS;
+
+/* Writing partial results into the output buffer as you go
+   leaks intermediate state to the client on the error path -
+   and for a crypto TA, intermediate state is often the
+   secret.                                                    */</code></pre>
+
+<div class="key">
+<b>The short-buffer protocol</b>
+<p>GlobalPlatform's convention: if the output buffer is too small, set <code>memref.size</code> to the size
+you need and return <code>TEE_ERROR_SHORT_BUFFER</code>. The client sees the required size, reallocates and
+retries. Clients rely on this, so implement it — and note that it means writing to <code>memref.size</code>
+even on the error path, which is the one output write that <em>is</em> allowed before success.</p>
+</div>
+
+<h2 id="cache">Cache and coherency</h2>
+
+<p>Two worlds with different cache attributes looking at the same memory raises exactly the coherency questions the ARM track covered — and getting them wrong produces data that is correct on one side only.</p>
+
+<pre><code>/* Shared memory is Normal, cacheable memory on both sides, and
+   the interconnect is coherent on any SoC that runs OP-TEE. So
+   ordinarily NO cache maintenance is required.
+
+   Where it does bite:
+
+   1. CFG_CORE_UNMAP_CORE_AT_EL0 / different mapping
+      attributes on the two sides. If OP-TEE maps SHM
+      non-cacheable and Linux maps it cacheable, you have a
+      mismatched-attribute alias (virtualisation chapter 07) and
+      the behaviour is architecturally unpredictable.
+
+   2. A non-coherent DMA master reading the buffer. Then
+      whoever set it up must clean/invalidate:
+          TEE_CacheClean(buf, len);
+          TEE_CacheInvalidate(buf, len);
+          TEE_CacheFlush(buf, len);
+      These are OP-TEE extensions, available only if
+      CFG_CACHE_API=y - they are not standard GlobalPlatform.
+
+   3. Suspend/resume, where a cache may be powered down with
+      dirty lines.
+
+   The normal case needs nothing. If you find yourself adding
+   cache maintenance to make a bug go away, you probably have
+   an attribute mismatch instead - fix that.               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>TEEC_ERROR_BAD_PARAMETERS</code></td><td><code>paramTypes</code> disagree between client and TA —
+the check is working</td></tr>
+<tr><td><code>TEEC_ERROR_OUT_OF_MEMORY</code> allocating shared memory</td><td>Static SHM pool exhausted; use
+dynamic SHM or a smaller buffer</td></tr>
+<tr><td><code>TEEC_RegisterSharedMemory</code> fails</td><td>Dynamic SHM not enabled on this
+platform</td></tr>
+<tr><td>TA panics dereferencing a pointer</td><td>Missing <code>paramTypes</code> or
+<code>TEE_CheckMemoryAccessRights</code> check — this is the vulnerability, caught late</td></tr>
+<tr><td>Intermittent wrong results under concurrency</td><td>Double-fetch: the TA read shared memory twice and
+the client changed it in between</td></tr>
+<tr><td>Client sees partial output after an error</td><td>TA wrote into the output buffer before it
+succeeded</td></tr>
+<tr><td>Client's retry loop never terminates</td><td>Short-buffer protocol not implemented — the TA did not set
+<code>memref.size</code></td></tr>
+<tr><td>Throughput far below expectations</td><td><code>TEMP</code> memrefs copying large buffers twice per
+call</td></tr>
+<tr><td>Data corruption only with a DMA-capable accelerator</td><td>Non-coherent master with no cache
+maintenance</td></tr>
+<tr><td>Works on QEMU, corrupts on hardware</td><td>Mismatched cacheability attributes between the two
+worlds' mappings</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the shared region must be non-secure, and why the restriction is one-way.</li>
+  <li>State the double-fetch rule and the three-step pattern that avoids it.</li>
+  <li>Compare static and dynamic shared memory across contiguity, size and cost.</li>
+  <li>Give the three ways a client supplies a buffer and say when each is right.</li>
+  <li>List the parameter types and explain what <code>TEEC_PARAM_TYPES</code> packs.</li>
+  <li>Write the four lines that check <code>paramTypes</code> in a TA and explain what they
+  prevent.</li>
+  <li>Explain what <code>TEE_CheckMemoryAccessRights</code> verifies.</li>
+  <li>State the four rules for handling a client buffer, in order.</li>
+  <li>Implement the short-buffer protocol and say why it is the one early output write allowed.</li>
+  <li>Say when cache maintenance is genuinely needed and what a need for it usually indicates
+  instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

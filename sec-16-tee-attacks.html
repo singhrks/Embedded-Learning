@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TEE attacks and mitigations | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TEE attacks and mitigations</h1>
+<p class="lead">Every mechanism in this track has been broken on real hardware. Knowing how is not
+pessimism — it is the only way to build something that holds, and to judge honestly what a TEE is and is
+not worth.</p>
+
+<h2 id="frame">Where attacks land</h2>
+
+<p>A trusted execution environment is a boundary, and boundaries get attacked. Framing the attack surface honestly is what separates a design that resists attack from one that merely assumes trust.</p>
+
+<pre class="diagram">   +---------------------------------------------------+
+   |  1. THE INTERFACE                                 |
+   |     SMC handlers, TA commands, parameter parsing  |
+   |     -&gt; by far the most productive target          |
+   +---------------------------------------------------+
+   |  2. THE TRUSTED CODE ITSELF                       |
+   |     memory safety bugs in the TEE or a TA         |
+   +---------------------------------------------------+
+   |  3. SIDE CHANNELS                                 |
+   |     cache timing, power, EM - no bug required     |
+   +---------------------------------------------------+
+   |  4. FAULT INJECTION                               |
+   |     glitch the hardware into skipping the check   |
+   +---------------------------------------------------+
+   |  5. THE CHAIN OF TRUST                            |
+   |     boot ROM parsing, downgrade, key handling     |
+   +---------------------------------------------------+
+   |  6. THE SYSTEM AROUND IT                          |
+   |     DMA, debug, an unprotected peripheral         |
+   +---------------------------------------------------+
+
+  Note the ordering. Almost every publicly disclosed TEE
+  compromise has been in layer 1 or 2 - ordinary software bugs
+  in code that happened to be very privileged. The exotic
+  attacks get the conference talks; the boring ones get the
+  CVEs.</pre>
+
+<h2 id="iface">1. Interface attacks</h2>
+
+<p>The interface between the worlds is the primary attack surface, because it is the one place where untrusted input legitimately reaches trusted code. Every parameter is attacker-controlled.</p>
+
+<pre><code>/* THE CONFUSED DEPUTY - the defining TEE vulnerability. */
+
+/* VULNERABLE: */
+static TEE_Result cmd_read_key(uint32_t ptypes, TEE_Param p[4])
+{
+        /* attacker sets p[0].memref.buffer to a SECURE address */
+        memcpy(p[0].memref.buffer, secret_key, 32);
+        return TEE_SUCCESS;
+}
+/* The TA has the privilege to write anywhere. The attacker
+   supplies the destination. Result: an arbitrary write
+   primitive inside the secure world, driven from userspace. */
+
+/* FIXED: */
+        if (!tee_buffer_is_non_secure(p[0].memref.buffer,
+                                      p[0].memref.size))
+                return TEE_ERROR_ACCESS_DENIED;
+
+/* --- MISSING paramTypes CHECK ------------------------------ */
+/* If the TA does not verify ptypes, the client passes a VALUE
+   where a MEMREF is expected. params[0].memref.buffer is then
+   whatever 64-bit number the attacker put in params[0].value.a.
+   Same primitive, reached differently.                       */
+
+/* --- INTEGER OVERFLOW IN A SIZE CHECK ---------------------- */
+        if (offset + len &gt; buffer_size)     /* WRAPS */
+                return TEE_ERROR_BAD_PARAMETERS;
+        memcpy(dst + offset, src, len);
+/* offset = 0xFFFFFFF0, len = 0x20 -&gt; sum wraps to 0x10, check
+   passes, memcpy writes far out of bounds.                  */
+        if (offset &gt; buffer_size || len &gt; buffer_size - offset)
+                return TEE_ERROR_BAD_PARAMETERS;   /* no wrap */
+
+/* --- TOCTOU ------------------------------------------------ */
+        if (validate(shm-&gt;cmd))         /* read 1 */
+                execute(shm-&gt;cmd);      /* read 2 - DIFFERENT */
+/* Another CPU rewrote it in between. Copy in ONCE, then
+   validate and use only the copy.                           */
+
+/* --- STATE CONFUSION --------------------------------------- */
+/* Call sequence: OPEN, then USE. What if the attacker calls
+   USE twice? USE after CLOSE? OPEN twice? Two USEs on two CPUs
+   at once? A session state machine that assumes the documented
+   order is a use-after-free waiting to happen.              */</code></pre>
+
+<div class="key">
+<b>The interface rules, restated as attacks</b>
+<table>
+<thead><tr><th>Rule</th><th>What it stops</th></tr></thead>
+<tbody>
+<tr><td>Check <code>paramTypes</code></td><td>Type confusion into an arbitrary pointer</td></tr>
+<tr><td>Validate every buffer address and size</td><td>Confused deputy</td></tr>
+<tr><td>Do size arithmetic without wrapping</td><td>Overflow into a heap or stack overflow</td></tr>
+<tr><td>Copy in before validating</td><td>TOCTOU from another CPU or a DMA engine</td></tr>
+<tr><td>Write outputs once, on success</td><td>Partial-result and error-path leaks</td></tr>
+<tr><td>Enforce the session state machine</td><td>Use-after-free, double-free, replay</td></tr>
+<tr><td>Lock shared state</td><td>Races between concurrent calls</td></tr>
+<tr><td>Return coarse errors</td><td>Oracles that leak secret-dependent detail</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="memsafety">2. Memory safety in trusted code</h2>
+
+<p>Trusted applications are usually written in C and run with substantial privilege, so an ordinary memory-safety bug there is far more valuable to an attacker than the same bug elsewhere.</p>
+
+<pre><code>/* The secure world is C. It has all of C's problems (see the C
+   track, chapter 15) with none of the mitigations you get for
+   free in Linux userspace.                                  */
+
+   What is usually MISSING in a TEE:
+        ASLR             often none, or very coarse
+        stack canaries   sometimes; check your build flags
+        NX / W^X         usually yes, but verify
+        guard pages      often not - the heap is a fixed array
+        a hardened allocator   rarely
+        CFI              rarely
+        MTE / PAC        only on newer parts, and only if enabled
+
+   And the payoff for a bug is total: S-EL1 code owns the keys,
+   the fuses, and the ability to lie to the normal world about
+   attestation.
+
+/* MITIGATIONS THAT ARE WORTH THE EFFORT: */
+
+   -fstack-protector-strong    cheap, catches real bugs
+   -D_FORTIFY_SOURCE=2
+   -Wall -Wextra -Werror       and actually fix the warnings
+   -fsanitize=... in a HOST harness, not on target
+
+   CFG_TA_ASLR=y               OP-TEE: randomise TA layout
+   CFG_CORE_SANITIZE_KADDRESS  debug builds only
+   PAC and BTI on Armv8.3+     enable them
+
+   Fuzz the SMC and TA interfaces on the host, with the same
+   code compiled natively. Every TEE interface is a parser, and
+   parsers are what fuzzers are good at.
+
+   And: KEEP IT SMALL. A 20,000-line trusted OS can be audited.
+   A 500,000-line one cannot, no matter how good the process. */</code></pre>
+
+<h2 id="side">3. Side channels</h2>
+
+<p>Secure-world code shares caches, branch predictors and power rails with the normal world, and each of those has been used to extract secrets across the boundary without breaking it.</p>
+
+<pre class="diagram">The two worlds SHARE the microarchitecture: caches, branch
+predictors, TLBs, the memory controller, the power rail. Sharing
+a resource means measuring one another.
+
+  CACHE TIMING (Prime+Probe, Flush+Reload)
+     Normal-world code fills a cache set, lets the secure world
+     run, then times its own re-access. Slow = the secure world
+     evicted it = it touched that set. Repeat, and the pattern
+     of accesses reveals the key - because table-driven AES and
+     square-and-multiply RSA access memory in key-dependent
+     ways.
+     -&gt; TruSpy, ARMageddon, and many since.
+
+  BRANCH PREDICTOR
+     Same idea, different shared structure. Secret-dependent
+     branches leave traces.
+
+  POWER and EM
+     Physical access, an oscilloscope and a probe. DPA on a
+     naive AES implementation needs a few thousand traces and
+     an afternoon.
+
+  MICROARCHITECTURAL SPECULATION
+     Spectre-style: train a predictor, make secure code
+     speculatively access secret-dependent addresses, read the
+     cache. Applies across the world boundary on affected
+     cores.
+
+  MITIGATIONS:
+     · CONSTANT-TIME code for anything touching a secret:
+          no branch on secret data
+          no memory INDEX derived from secret data
+          no early exit from a comparison
+     · bitsliced or table-free crypto, or a hardware engine
+     · masking / blinding - randomise the intermediate values
+     · flush or partition caches on world switch (costly)
+     · disable SMT on the secure side, or do not use SMT
+     · use the crypto accelerator: it is not sharing the cache
+
+  ACCEPT THE LIMIT: a TEE does not defend against an attacker
+  with physical access, an oscilloscope and time. It defends
+  against a compromised NORMAL WORLD. Say so in your threat
+  model rather than pretending otherwise.</pre>
+
+<pre><code>/* Constant-time comparison - the smallest example, and the one
+   people still get wrong.                                   */
+
+/* LEAKS: returns as soon as it finds a difference, so the time
+   reveals how many bytes matched.                           */
+int bad_compare(const uint8_t *a, const uint8_t *b, size_t n)
+{
+        for (size_t i = 0; i &lt; n; i++)
+                if (a[i] != b[i])
+                        return -1;
+        return 0;
+}
+
+/* CONSTANT TIME: always touches every byte, no branch on data */
+int ct_compare(const uint8_t *a, const uint8_t *b, size_t n)
+{
+        uint8_t diff = 0;
+
+        for (size_t i = 0; i &lt; n; i++)
+                diff |= a[i] ^ b[i];
+
+        return diff;            /* 0 iff equal */
+}
+
+/* And the same discipline everywhere: */
+        if (secret_flag) x = a; else x = b;     /* leaks       */
+        mask = -(uint32_t)!!secret_flag;
+        x = (a &amp; mask) | (b &amp; ~mask);           /* does not    */
+
+/* Beware the compiler. It can reintroduce a branch. Check the
+   generated assembly for anything genuinely critical, and
+   consider a barrier or volatile to pin it down.            */</code></pre>
+
+<h2 id="fault">4. Fault injection</h2>
+
+<p>An attacker with physical access can glitch voltage or clock to make a processor skip an instruction — which turns a signature check into an unconditional success. Defending against this is a design discipline, not a library.</p>
+
+<pre class="diagram">Do not break the crypto - break the CHECK.
+
+     if (verify_signature(img) != OK)
+             fail();            &lt;-- glitch the branch, skip this
+     boot(img);
+
+  Techniques, roughly by cost:
+     VOLTAGE GLITCH   drop Vcc for nanoseconds. ~$50 of kit.
+     CLOCK GLITCH     an extra or shortened clock edge.
+     EM PULSE         a coil over the die. No decapsulation.
+     LASER            decapsulated die, single-bit precision.
+                      Six figures, and a lab.
+     ROWHAMMER        software-only DRAM bit flips - a fault
+                      attack with no hardware at all.
+
+  Effects: an instruction skipped, a register corrupted, a
+  comparison inverted, a loop counter changed.
+
+  SOFTWARE COUNTERMEASURES - none is sufficient alone, but
+  together they raise the cost a great deal:
+
+     · DOUBLE-CHECK critical decisions, with different code
+     · use non-trivial constants: a "success" value of
+       0x5A3C96C3, never 0 or 1, so a cleared register is not
+       automatically a pass
+     · random delays before sensitive operations
+     · redundant loop counters, verified after the loop
+     · verify the result of the operation you just did
+     · a "flow counter" incremented at each checkpoint and
+       validated at the end - so a skipped stage is detectable
+
+  HARDWARE COUNTERMEASURES: voltage and clock glitch detectors,
+  light sensors, redundant logic, error-correcting registers.
+  If your threat model includes physical attackers, choose
+  silicon that has them - you cannot add them later.</pre>
+
+<pre><code>/* Fault-hardened verification, as it is actually written in
+   boot ROMs.                                                */
+
+#define FLOW_OK    0x5A3C96C3u
+#define FLOW_FAIL  0xA5C36939u
+
+static uint32_t verify_hardened(const image_t *img)
+{
+        uint32_t r1, r2;
+        volatile uint32_t counter = 0;
+
+        r1 = verify_signature(img);
+        counter++;
+
+        random_delay();
+
+        r2 = verify_signature(img);     /* again, independently */
+        counter++;
+
+        if (r1 != FLOW_OK)  return FLOW_FAIL;
+        if (r2 != FLOW_OK)  return FLOW_FAIL;
+        if (r1 != r2)       return FLOW_FAIL;
+        if (counter != 2)   return FLOW_FAIL;   /* skipped step? */
+
+        return FLOW_OK;
+}
+
+        if (verify_hardened(img) == FLOW_OK) {
+                if (verify_hardened(img) != FLOW_OK)  /* again */
+                        panic();
+                boot(img);
+        } else {
+                panic();
+        }
+
+/* Ugly, redundant, and deliberately so. A single glitch must
+   not produce a boot. Reviewers should be able to point at
+   each redundant check and name the fault it catches.      */</code></pre>
+
+<h2 id="real">Real compromises, and what they teach</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>What happened</th><th>Lesson</th></tr></thead>
+<tbody>
+<tr><td>TA buffer overflow</td><td>Widevine and other TAs on several vendors: a length field from the client overflowed a fixed buffer, giving code execution at S-EL0, then S-EL1 through a second bug</td><td>TAs are attack surface; keep them minimal and fuzz them</td></tr>
+<tr><td>Confused deputy</td><td>Multiple CVEs across vendors where a TA wrote a result to a client-supplied pointer without checking it was non-secure</td><td>Validate <em>every</em> pointer that crosses the boundary</td></tr>
+<tr><td>Downgrade</td><td>Old, signed, vulnerable TAs reloaded on patched devices — the signature was still valid</td><td>Rollback protection must cover TAs, not just firmware</td></tr>
+<tr><td>Boot ROM parsing</td><td>Unpatchable ROM bugs on very large device populations, exploited before any signature check ran</td><td>Parse nothing you have not verified; keep the ROM tiny</td></tr>
+<tr><td>Cache side channel</td><td>Academic extraction of AES and RSA keys from a TEE by a normal-world process</td><td>Constant-time code, or a hardware engine</td></tr>
+<tr><td>Fault injection</td><td>Voltage glitching past secure boot on shipped consumer devices with inexpensive equipment</td><td>Redundant checks; glitch detectors in silicon</td></tr>
+<tr><td>Debug left enabled</td><td>Production units with secure debug signals never fused off</td><td>Test the production lifecycle state, not the dev board</td></tr>
+<tr><td>Unprotected DMA master</td><td>A peripheral with neither SMMU nor XPU used to read secure DRAM</td><td>Enumerate <em>every</em> bus master (<a href="sec-17-xpu-concepts.html">ch. 17</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="honest">What a TEE is actually worth</h2>
+
+<div class="note">
+<b>An honest threat model</b>
+<p><strong>A TEE defends well against:</strong> a compromised normal-world OS, malicious applications, an
+attacker with root, offline extraction of keys from storage, and cloning a device by copying its
+filesystem.</p>
+<p><strong>A TEE defends poorly or not at all against:</strong> an attacker with physical access, time and
+laboratory equipment; side channels, unless the code was written for it; bugs in the trusted code itself;
+and anything the silicon integration left unprotected.</p>
+<p>That is still a great deal of value — it is the difference between "root compromises every device
+forever" and "root compromises this device's session". Just do not let a datasheet's security bullet points
+substitute for stating which of the two you are buying.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Secure world crashes on a malformed request</td><td>Missing input validation — and a crash means the parser is reachable</td></tr>
+<tr><td>A TA works but fails a fuzz run in minutes</td><td>Unvalidated length or offset fields</td></tr>
+<tr><td>Timing varies with a secret</td><td>Non-constant-time comparison or table lookup</td></tr>
+<tr><td>Different error codes for different failure reasons</td><td>An oracle — collapse them into one</td></tr>
+<tr><td>Device boots unsigned images intermittently</td><td>Glitch attack, or an unhardened single check</td></tr>
+<tr><td>Old firmware still accepted</td><td>Rollback counter never burned</td></tr>
+<tr><td>Secure memory readable via a peripheral</td><td>A bus master outside the SMMU/XPU policy</td></tr>
+<tr><td>Attestation passes on a rooted device</td><td>Measurement not covering the compromised component</td></tr>
+<tr><td>A fix in the TEE does not take effect</td><td>The old, signed TA is still loadable</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the six layers where TEE attacks land, and say which produce most real CVEs.</li>
+  <li>Explain the confused deputy and write the check that stops it.</li>
+  <li>Show a size check that overflows, and rewrite it so it cannot.</li>
+  <li>Explain TOCTOU across the world boundary and the copy-in fix.</li>
+  <li>List the exploit mitigations usually missing from a TEE and the build flags that add some back.</li>
+  <li>Explain a cache timing attack and the properties constant-time code must have.</li>
+  <li>Write a constant-time comparison and a branchless select.</li>
+  <li>Explain why fault injection targets the check rather than the crypto, and list four software
+  countermeasures.</li>
+  <li>State plainly what a TEE does and does not defend against.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

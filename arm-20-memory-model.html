@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The weak memory model | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The weak memory model</h1>
+<p class="lead">ARM permits your memory accesses to become visible to other cores in almost any order. This is
+not a bug or an implementation detail — it is the specification, and it is why lock-free code that has worked
+on x86 for a decade can fail the first time it runs on ARM.</p>
+
+<h2 id="model">What "weak" means</h2>
+
+<div class="key">
+<b>The guarantee</b>
+<p>ARM guarantees that a single thread observes its own accesses in program order. It guarantees
+<em>nothing</em> about the order in which <em>other</em> observers see them, unless you use a barrier or an
+ordered access.</p>
+<p>Accesses to the <em>same</em> location are always coherent and ordered — that is a separate guarantee
+(<a href="ca-15-coherence.html">CA ch. 15</a>). The weakness is entirely about accesses to
+<em>different</em> locations.</p>
+</div>
+
+<p>This table is the concrete meaning of "weak" versus x86's "strong" (TSO) model, expressed as which
+reorderings a real program can actually observe. Three of the four rows are allowed on ARM and forbidden on
+x86: a core is free to complete a later load before an earlier one, to complete a load before an earlier store
+has become globally visible, or to complete a later store before an earlier one — all in the name of letting
+the hardware overlap independent work rather than draining everything in strict program order. The one row that
+is allowed on <em>both</em> — a store followed by a later, independent load reordered ahead of it — exists on
+x86 too, which is the detail that catches people who assume TSO means "no reordering at all": it means
+almost none, not none.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Reordering</th><th>x86-64 (TSO)</th><th>ARM (weak)</th></tr></thead>
+<tbody>
+<tr><td>Load &rarr; Load</td><td>Not allowed</td><td><strong>Allowed</strong></td></tr>
+<tr><td>Load &rarr; Store</td><td>Not allowed</td><td><strong>Allowed</strong></td></tr>
+<tr><td>Store &rarr; Store</td><td>Not allowed</td><td><strong>Allowed</strong></td></tr>
+<tr><td>Store &rarr; Load</td><td><strong>Allowed</strong></td><td>Allowed</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Why ARM chose this:
+
+  Enforcing order costs hardware. A store buffer that must drain
+  in order, load queues that must not reorder, and snoop
+  responses that must be sequenced all consume area, power and
+  latency. Relaxing them lets the core:
+
+     · retire stores into a buffer and continue
+     · issue loads as soon as their address is known
+     · let the interconnect route messages by any path
+     · merge and reorder writes for bandwidth
+
+  The cost is moved to SOFTWARE, which must ask for ordering
+  where it genuinely needs it — which is a small fraction of the
+  time. Given that, the trade is clearly correct for a
+  power-sensitive architecture.
+
+  x86 made the opposite choice for compatibility reasons, and
+  pays for it in hardware complexity.</pre>
+
+<h2 id="canonical">The canonical failure</h2>
+
+<p>Start with the example that shows the problem exists. This sequence looks obviously correct, runs correctly on x86, and can fail on ARM — and understanding why is the entire point of the chapter.</p>
+
+<pre><code>/* Both variables start at 0. */
+
+/* Core 0 — producer */          /* Core 1 — consumer */
+data = 42;                       while (flag == 0)
+flag = 1;                                ;
+                                 use(data);        /* may read 0! */</code></pre>
+
+<pre class="diagram">Three independent things can produce the failure:
+
+  1. COMPILER reordering — nothing in the source forbids swapping
+     the two stores, since they are independent single-threaded.
+
+  2. STORE BUFFER — the store to `data` retires into a buffer and
+     has not yet reached the coherency point when `flag`'s store
+     does. Other cores see flag=1 first.
+
+  3. LOAD reordering on the consumer — the load of `data` can
+     issue BEFORE the load of `flag`, because its address is known
+     and there is no dependency between them.
+
+  Point 3 is the one that surprises people most: even if the
+  producer's stores are ordered, the CONSUMER can still break it.
+  Both sides need ordering.</pre>
+
+<h2 id="dependencies">Dependencies that <em>do</em> order</h2>
+
+<p>Not everything can be reordered. Certain relationships between instructions are respected by the hardware for free, and knowing which ones lets you avoid barriers you do not actually need.</p>
+
+<pre><code>/* Not everything requires an explicit barrier. Some orderings
+   come free from the dependency structure.                    */
+
+/* ADDRESS DEPENDENCY — guaranteed ordered */
+        ptr = atomic_load(&amp;head);
+        val = ptr-&gt;field;          /* the second load CANNOT be
+                                      reordered before the first —
+                                      its address depends on it   */
+/* This is what makes RCU readers free on ARM (OS chapter 09):
+   rcu_dereference() relies on exactly this.                   */
+
+/* DATA DEPENDENCY on a STORE — guaranteed ordered */
+        x = load(&amp;a);
+        store(&amp;b, x);              /* ordered: b's value needs a  */
+
+/* CONTROL DEPENDENCY on a STORE — ordered, but fragile */
+        if (load(&amp;a))
+                store(&amp;b, 1);      /* the store cannot be
+                                      speculated before the load */
+
+/* CONTROL DEPENDENCY on a LOAD — NOT ordered */
+        if (load(&amp;a))
+                y = load(&amp;b);      /* the second load CAN be
+                                      speculated. No ordering.   */</code></pre>
+
+<div class="warn">
+<b>Do not rely on control dependencies</b>
+<p>They order stores but not loads, they are not expressible in the C or C++ memory model, and the compiler is
+entitled to remove them — by turning a branch into a conditional select (<code>CSEL</code>), or by hoisting a
+store that occurs on both paths. The Linux kernel documents this at length in
+<code>Documentation/memory-barriers.txt</code> and the advice is: use
+<code>smp_load_acquire()</code> or an explicit barrier instead. Address dependencies are safe; control
+dependencies are a trap.</p>
+</div>
+
+<h2 id="fixing">Fixing it</h2>
+
+<p>With the failure understood, the repair is straightforward — the difficulty is choosing the weakest construct that is still sufficient, because the strongest one is always correct and often needlessly expensive.</p>
+
+<pre><code>/* Option 1: explicit barriers */
+/* Core 0 */                      /* Core 1 */
+data = 42;                        while (flag == 0)
+DMB ISHST;                                ;
+flag = 1;                         DMB ISHLD;
+                                  use(data);
+
+/* Option 2: acquire/release — cheaper, and the modern idiom */
+/* Core 0 */                      /* Core 1 */
+data = 42;                        while (LDAR(flag) == 0)
+STLR(flag, 1);                            ;
+                                  use(data);
+
+/*  STLR — store-release:  no EARLIER access may be reordered
+                           after it
+    LDAR — load-acquire:   no LATER access may be reordered
+                           before it
+
+   Together they form a RELEASE-ACQUIRE PAIR: everything core 0
+   did before the release is visible to core 1 after the acquire.
+
+   Cheaper than a standalone barrier because the ordering is
+   attached to an access the core was performing anyway — the
+   core can keep other work in flight.                        */</code></pre>
+
+<h2 id="c11">The C and C++ view</h2>
+
+<p>You will usually express ordering in C rather than assembly. The language's model maps onto the architecture's, and knowing the correspondence is what lets you reason about the generated code.</p>
+
+<pre><code>#include &lt;stdatomic.h&gt;
+
+_Atomic int flag = 0;
+int data = 0;                     /* a plain int is fine now */
+
+/* producer */
+data = 42;
+atomic_store_explicit(&amp;flag, 1, memory_order_release);
+
+/* consumer */
+while (atomic_load_explicit(&amp;flag, memory_order_acquire) == 0)
+        ;
+use(data);                        /* guaranteed to see 42 */</code></pre>
+
+<p>C11's <code>memory_order</code> values exist to let one piece of portable source code compile to the
+cheapest correct instruction on whatever architecture it targets, and on ARM each level maps onto a distinct
+instruction rather than onto extra fence instructions bolted on afterwards. That mapping is worth internalising
+because it explains a real performance property of the architecture: <code>acquire</code> and
+<code>release</code> are essentially free here — <code>LDAR</code>/<code>STLR</code> are ordinary loads and
+stores with an ordering bit set, not a load plus a separate barrier — where on a weaker-in-different-ways
+architecture the same C code might need extra fence instructions. <code>seq_cst</code> is the one exception:
+because it additionally demands a single global total order across every thread's accesses, ARM sometimes needs
+a real <code>DMB</code> alongside the ordered load or store to deliver it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>memory_order</code></th><th>Guarantee</th><th>AArch64 instruction</th></tr></thead>
+<tbody>
+<tr><td><code>relaxed</code></td><td>Atomicity only</td><td>Plain <code>LDR</code>/<code>STR</code>, or a plain atomic</td></tr>
+<tr><td><code>consume</code></td><td>Address dependencies (deprecated in practice)</td><td>Plain load — ARM gives it for free</td></tr>
+<tr><td><code>acquire</code></td><td>Later accesses cannot move before</td><td><code>LDAR</code></td></tr>
+<tr><td><code>release</code></td><td>Earlier accesses cannot move after</td><td><code>STLR</code></td></tr>
+<tr><td><code>acq_rel</code></td><td>Both, for RMW</td><td><code>LDAXR</code>/<code>STLXR</code>, or <code>CASAL</code></td></tr>
+<tr><td><code>seq_cst</code></td><td>Plus one global total order</td><td><code>LDAR</code>/<code>STLR</code> (plus <code>DMB</code> in some cases)</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Linux kernel spellings of the same concepts: */
+smp_store_release(&amp;flag, 1);
+val = smp_load_acquire(&amp;flag);
+smp_mb();   smp_rmb();   smp_wmb();      /* full / read / write */
+READ_ONCE(x);   WRITE_ONCE(x, v);        /* stop the COMPILER only */
+rcu_dereference(p);                       /* address dependency     */
+
+/* READ_ONCE/WRITE_ONCE are worth understanding: they prevent the
+   COMPILER from tearing, fusing or inventing accesses, but emit
+   NO hardware barrier. They are the minimum for any shared
+   variable, even one you think is "just a flag".            */</code></pre>
+
+<h2 id="litmus">Litmus tests</h2>
+
+<p>These small tests are the standard vocabulary for discussing memory models precisely. Each isolates one reordering, and recognising them by name makes the literature on this subject readable.</p>
+
+<pre class="diagram">The standard vocabulary for reasoning about memory models. Worth
+knowing by name, because papers, kernel documentation and tooling
+all use them.
+
+MESSAGE PASSING (MP) — the flag/data case above
+   P0: x = 1; y = 1        P1: r1 = y; r2 = x
+   Can r1 == 1 && r2 == 0?     ARM: YES.  x86: no.
+
+STORE BUFFERING (SB)
+   P0: x = 1; r1 = y       P1: y = 1; r2 = x
+   Can r1 == 0 && r2 == 0?     ARM: YES.  x86: YES.
+   → the one reordering even TSO allows. Requires a full barrier
+     on BOTH sides to prevent; acquire/release is not enough.
+
+LOAD BUFFERING (LB)
+   P0: r1 = x; y = 1       P1: r2 = y; x = 1
+   Can r1 == 1 && r2 == 1?     ARM: YES.  x86: no.
+
+INDEPENDENT READS OF INDEPENDENT WRITES (IRIW)
+   P0: x = 1    P1: y = 1
+   P2: r1 = x; r2 = y      P3: r3 = y; r4 = x
+   Can P2 and P3 disagree about the ORDER of the two writes?
+   ARM: NO — ARMv8 is MULTI-COPY ATOMIC. A write becomes visible
+   to all observers at the same time. (ARMv7 was not, which made
+   reasoning far harder.)
+
+  Multi-copy atomicity is the single most important simplification
+  ARMv8 made over ARMv7, and it is why the ARMv8 model is
+  formally tractable.</pre>
+
+<pre><code># tools that check these mechanically — worth knowing they exist
+#   herd7 / diy7        the ARM/Inria memory model simulator
+#   litmus7             runs litmus tests on real hardware
+#   linux/tools/memory-model/   the kernel's formal LKMM, with
+#                       its own herd7 model and documentation
+
+# run a litmus test on your own machine and watch it fail:
+litmus7 MP.litmus
+#   Histogram (4 states)
+#   ...
+#   1     :&gt;0:X0=1; 0:X1=0;   ← the reordering, observed</code></pre>
+
+<h2 id="mmio">Device memory is different</h2>
+
+<p>Everything above concerns ordinary memory. Device memory has stricter rules by default, which is why driver code sometimes needs fewer barriers than you would expect — and sometimes more.</p>
+
+<pre><code>/* Device memory (chapter 11) has its OWN ordering rules, and they
+   are much stronger:
+
+     Device-nGnRnE   no gathering, no reordering, no early ack —
+                     accesses arrive in program order
+     Device-nGnRE    reordering still forbidden between Device
+                     accesses to the same peripheral
+
+   But note what is NOT guaranteed: ordering between a Device
+   access and a NORMAL memory access. That combination needs an
+   explicit barrier, and it is exactly the DMA handoff case:  */
+
+        /* fill the DMA buffer — Normal memory */
+        memcpy(buf, data, len);
+
+        /* the buffer writes must be VISIBLE before the device
+           is told to start                                     */
+        dsb     sy                    /* or dma_wmb() in Linux */
+
+        /* start the transfer — Device memory */
+        writel(START, regs + CTRL);
+
+/* Linux's writel() includes a barrier for exactly this reason;
+   writel_relaxed() does not, and is for when you have already
+   ordered things yourself or genuinely do not care.        */</code></pre>
+
+<h2 id="porting">Porting from x86</h2>
+
+<div class="danger">
+<b>The code was always wrong; x86 hid it</b>
+<p>x86's TSO forbids three of the four reorderings, which happens to be enough for most naive lock-free code
+to work by accident. On ARM those reorderings are permitted and do occur.</p>
+<p>Worse, the failure is <strong>rare and load-dependent</strong>: it needs the store buffer to be occupied, or
+two cores to interleave in a particular way. It typically passes every test and appears in production, once,
+on a customer's machine.</p>
+<p>Practical steps when porting:</p>
+<ul>
+<li>Search for every shared variable accessed without a lock. Each one is a candidate.</li>
+<li>Replace hand-rolled flags with <code>_Atomic</code> and explicit memory orders — the compiler then emits
+correct code for both architectures.</li>
+<li>Run under ThreadSanitizer, which models the C++ memory model rather than any one CPU.</li>
+<li>Do not "fix" it by adding <code>volatile</code>. It constrains the compiler and does nothing to the
+hardware (<a href="c-10-qualifiers.html">C ch. 10</a>).</li>
+</ul>
+</div>
+
+<h2 id="rules">Practical rules</h2>
+
+<p>Everything above this point is the theory; this table is the cheat sheet you actually reach for while
+writing code. The organising idea is to match the <em>strength</em> of the ordering to the <em>shape</em> of
+the pattern rather than defaulting to the strongest tool everywhere — a publish-then-flag pattern needs only a
+release on the write side and an acquire on the read side, because that pairing alone is sufficient to make the
+published data visible; the store-buffering pattern is the one well-known case where acquire/release genuinely
+is not enough and a full barrier is required on both sides, because that pattern depends on a total order that
+acquire/release does not provide. When none of the specific rows obviously apply, the last row is the safe
+fallback: reach for <code>seq_cst</code>, get it working, and only relax it once you have measured that the
+ordering cost actually matters.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>Publishing data then a flag</td><td><code>store-release</code> on the flag</td></tr>
+<tr><td>Reading a flag then the data</td><td><code>load-acquire</code> on the flag</td></tr>
+<tr><td>Following a published pointer</td><td>Address dependency — free on ARM; use <code>rcu_dereference</code></td></tr>
+<tr><td>A counter nobody synchronises on</td><td><code>relaxed</code></td></tr>
+<tr><td>Store-buffering pattern (SB)</td><td>A full barrier on <em>both</em> sides; acquire/release is insufficient</td></tr>
+<tr><td>Any shared variable at all</td><td>At minimum <code>READ_ONCE</code>/<code>WRITE_ONCE</code></td></tr>
+<tr><td>DMA handoff</td><td><code>dsb sy</code> / <code>dma_wmb()</code> before the doorbell</td></tr>
+<tr><td>Unsure</td><td><code>seq_cst</code> — correct, and you can relax it later with measurement</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works on x86, fails on ARM</td><td>Missing ordering that TSO happened to provide</td></tr>
+<tr><td>Consumer sees the flag but stale data</td><td>Missing release/acquire pairing</td></tr>
+<tr><td>Fails only under load, on many cores</td><td>The reordering window widened; the bug was always there</td></tr>
+<tr><td>Adding a <code>printf</code> makes it disappear</td><td>Timing changed; the race remains</td></tr>
+<tr><td><code>volatile</code> did not fix it</td><td><code>volatile</code> is not a barrier</td></tr>
+<tr><td>Works with one compiler, fails with another</td><td>Relied on a control dependency the optimiser removed</td></tr>
+<tr><td>Both cores see zero in an SB pattern</td><td>Store buffering — needs a full barrier both sides</td></tr>
+<tr><td>DMA starts before the buffer is visible</td><td>Missing barrier between Normal and Device accesses</td></tr>
+<tr><td>Lock-free queue corrupts occasionally</td><td>Insufficient memory order on the head/tail updates</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State exactly what ARM guarantees about a single thread and about other observers.</li>
+  <li>Give the four reorderings and which x86 permits.</li>
+  <li>Explain the three separate mechanisms that break the flag/data example.</li>
+  <li>Say which dependencies order accesses for free, and which do not.</li>
+  <li>Explain why control dependencies are unsafe to rely on.</li>
+  <li>Give the release-acquire pairing and what it guarantees.</li>
+  <li>Name three litmus tests and say what each demonstrates.</li>
+  <li>Explain multi-copy atomicity and why it simplified ARMv8.</li>
+  <li>Explain why an SB pattern needs more than acquire/release.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

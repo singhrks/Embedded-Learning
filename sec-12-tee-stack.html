@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The TEE software stack and OP-TEE | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The TEE software stack and OP-TEE</h1>
+<p class="lead">Six pieces of software cooperate to run one trusted operation. This chapter names every one
+of them, follows a single request through all six, and gets OP-TEE running on QEMU so you can watch it
+happen.</p>
+
+<h2 id="stack">The whole stack</h2>
+
+<p>A trusted execution environment is a full software stack rather than a single component, spanning both worlds. Knowing which piece lives where is what makes the call flow comprehensible.</p>
+
+<pre class="diagram">   NORMAL WORLD                        SECURE WORLD
+   ============                        ============
+
+   your application                    Trusted Application
+        |  libteec                         |  TA framework
+        |  (GlobalPlatform Client API)     |  (GP Internal API)
+        v                                  ^
+   +----------------+                 +----+-------------+
+   | tee-supplicant |                 |   OP-TEE OS      |  S-EL1
+   | (daemon, EL0)  |                 |   (trusted OS)   |
+   +--------+-------+                 +----+-------------+
+            |  RPC                          ^
+            v                                |
+   +----------------------+                  |
+   | optee driver         |  EL1             |
+   | drivers/tee/optee    |                  |
+   +----------+-----------+                  |
+              |  SMC                         |
+              v                              |
+   +-----------------------------------------+------------+
+   |  TF-A  BL31 - the secure monitor              EL3     |
+   +-------------------------------------------------------+
+
+   Six pieces, each with one job:
+
+   1. your app        wants a secret operation performed
+   2. libteec         turns API calls into ioctls on /dev/tee0
+   3. optee driver    turns ioctls into SMCs, manages shared memory
+   4. TF-A BL31       switches worlds
+   5. OP-TEE OS       schedules and isolates trusted applications
+   6. the TA          does the actual work
+
+   plus tee-supplicant, off to the side, servicing RPC requests
+   the secure world cannot perform for itself (chapter 11).</pre>
+
+<h2 id="gp">The GlobalPlatform APIs</h2>
+
+<p>Standard APIs exist for both the client and the trusted-application sides, which is what allows a trusted application to be portable between TEE implementations rather than tied to one vendor.</p>
+
+<pre><code>/* Two standard APIs, one on each side of the boundary. Learn
+   these and your knowledge transfers between OP-TEE, Trusty,
+   QSEE and Kinibi.                                          */
+
+/* --- CLIENT API, normal world, libteec ------------------- */
+
+   TEEC_InitializeContext()   connect to the TEE
+   TEEC_OpenSession()         start talking to a TA (by UUID)
+   TEEC_InvokeCommand()       ask it to do something
+   TEEC_CloseSession()
+   TEEC_FinalizeContext()
+   TEEC_RegisterSharedMemory()  register your own buffer
+   TEEC_AllocateSharedMemory()  or let the TEE allocate one
+
+/* --- INTERNAL API, secure world, inside the TA ----------- */
+
+   TA_CreateEntryPoint()          once, when the TA is loaded
+   TA_OpenSessionEntryPoint()     per client session
+   TA_InvokeCommandEntryPoint()   per command  &lt;- the real work
+   TA_CloseSessionEntryPoint()
+   TA_DestroyEntryPoint()
+
+   TEE_AllocateOperation()        crypto
+   TEE_CipherInit/Update/DoFinal()
+   TEE_DigestDoFinal()
+   TEE_AsymmetricSignDigest()
+   TEE_GenerateRandom()
+   TEE_DeriveKey()
+
+   TEE_CreatePersistentObject()   secure storage (chapter 13)
+   TEE_OpenPersistentObject()
+   TEE_ReadObjectData()
+
+   TEE_Malloc/Free()              heap, inside the TA
+   TEE_CheckMemoryAccessRights()  IS this pointer safe to touch?
+   TEE_Panic()                    give up loudly</code></pre>
+
+<h2 id="params">The parameter model</h2>
+
+<p>How arguments cross the boundary is the most security-sensitive part of the interface, because it is where untrusted data enters trusted code. The parameter model constrains that deliberately.</p>
+
+<pre><code>/* Every invocation carries FOUR parameter slots. Each slot is
+   either a VALUE (two 32-bit numbers) or a MEMREF (a shared
+   buffer), and each has a direction.                        */
+
+   TEEC_NONE
+   TEEC_VALUE_INPUT        a.b: two u32 in
+   TEEC_VALUE_OUTPUT       two u32 out
+   TEEC_VALUE_INOUT
+   TEEC_MEMREF_TEMP_INPUT      a buffer, registered for this call
+   TEEC_MEMREF_TEMP_OUTPUT
+   TEEC_MEMREF_TEMP_INOUT
+   TEEC_MEMREF_WHOLE           a pre-registered shared memory
+   TEEC_MEMREF_PARTIAL_INPUT   part of a pre-registered one
+   TEEC_MEMREF_PARTIAL_OUTPUT
+   TEEC_MEMREF_PARTIAL_INOUT
+
+/* Packed into one word: */
+   op.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT,
+                                    TEEC_MEMREF_TEMP_OUTPUT,
+                                    TEEC_NONE,
+                                    TEEC_NONE);
+
+/* And the TA MUST check that it got what it expected: */
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess, uint32_t cmd,
+                                      uint32_t ptypes,
+                                      TEE_Param params[4])
+{
+        uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT,
+                                       TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                                       TEE_PARAM_TYPE_NONE,
+                                       TEE_PARAM_TYPE_NONE);
+
+        if (ptypes != exp)
+                return TEE_ERROR_BAD_PARAMETERS;   /* not optional */
+        ...
+}
+
+/* Skipping that check means the client can pass a VALUE where
+   you expect a MEMREF. You then read params[1].memref.buffer -
+   which is now an arbitrary 64-bit number the attacker chose,
+   dereferenced by the most privileged code in the system.
+
+   This is the single most common OP-TEE TA vulnerability
+   class.                                                   */</code></pre>
+
+<div class="danger">
+<b>Every buffer from the client is hostile</b>
+<p>A MEMREF points into <em>non-secure shared memory</em>. The client can change its contents at any moment,
+including between your bounds check and your read — and on another CPU it does not even need your call to
+return first.</p>
+<ul>
+<li>Check <code>params[i].memref.size</code> before trusting it, and check it against what you will
+actually write.</li>
+<li>Call <code>TEE_CheckMemoryAccessRights()</code> to confirm the buffer is where it claims to be.</li>
+<li><strong>Copy the input into TA-local memory, then validate the copy, then use only the copy.</strong></li>
+<li>Write outputs once, at the end. Never use the shared buffer as scratch space.</li>
+<li>Never place a secret in an output buffer before deciding the caller is entitled to it.</li>
+</ul>
+</div>
+
+<h2 id="flow">One request, end to end</h2>
+
+<p>Following one client call from an application, through the kernel driver, across the world switch and into a trusted application ties every layer together — and it is the path you will trace when debugging.</p>
+
+<pre class="diagram">app: TEEC_InvokeCommand(&amp;sess, CMD_SIGN, &amp;op, &amp;origin)
+  |
+  v
+libteec: build struct tee_ioctl_invoke_arg, translate the
+         parameters, ioctl(fd, TEE_IOC_INVOKE, &amp;arg)
+  |
+  v
+optee driver (optee_invoke_func):
+     get a free "call queue" entry
+     translate each MEMREF: virtual -&gt; the shared-memory cookie
+       and physical address the secure world understands
+     fill an optee_msg_arg in the shared memory pool
+     arm_smccc_smc(OPTEE_SMC_CALL_WITH_ARG, msg_pa, ...)
+  |
+  v
+TF-A BL31: save NS context, SCR_EL3.NS = 0, restore secure
+           context, ERET to S-EL1
+  |
+  v
+OP-TEE OS:
+     entry from the monitor, pick the thread for this call
+     find the session, find the TA
+     is the TA loaded? -&gt; if not, RPC to tee-supplicant to
+                          fetch it, VERIFY ITS SIGNATURE, map it
+     map the shared buffers into the TA's address space,
+       NON-SECURE, non-executable
+     drop to S-EL0 and call TA_InvokeCommandEntryPoint
+  |
+  v
+TA: validate ptypes, copy input in, do the crypto with a key
+    it derived from the HUK, write the result out, return
+  |
+  v
+OP-TEE OS: unmap the buffers, set the return code, SMC back
+  |
+  v
+TF-A BL31: save secure context, SCR_EL3.NS = 1, restore NS,
+           ERET to Linux
+  |
+  v
+optee driver: copy results back into the ioctl arg, return
+  |
+  v
+libteec: fill in op.params, set return origin, return
+  |
+  v
+app: TEEC_SUCCESS
+
+  Two privilege boundaries crossed in each direction
+  (S-EL0/S-EL1 and the world switch), plus a possible RPC
+  excursion in the middle.</pre>
+
+<h2 id="tatypes">Where a TA runs</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Runs at</th><th>Loaded from</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>User-mode TA</strong></td><td>S-EL0</td><td>Signed <code>.ta</code> file, fetched by RPC</td><td>Almost everything — isolated, crashable, updatable</td></tr>
+<tr><td><strong>Early TA</strong></td><td>S-EL0</td><td>Linked into the OP-TEE binary</td><td>Needed before the filesystem exists</td></tr>
+<tr><td><strong>Pseudo TA</strong></td><td>S-EL1, inside the kernel</td><td>Compiled in</td><td>Only when it truly needs kernel privilege</td></tr>
+<tr><td><strong>Secure partition</strong></td><td>S-EL1 under S-EL2</td><td>FF-A manifest</td><td>Mutually distrusting secure components</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>A pseudo TA has no memory protection at all</b>
+<p>It runs in the trusted OS's own address space, at S-EL1, with full access to secure memory and every
+system register. A buffer overflow in a pseudo TA is not a crash — it is total compromise of the secure
+world. Write a user-mode TA unless you can state exactly which S-EL1-only operation forces your hand.</p>
+</div>
+
+<h2 id="isolation">How OP-TEE isolates TAs</h2>
+
+<p>Trusted applications must be isolated from each other as well as from the normal world, because a compromise of one should not yield the keys of another.</p>
+
+<pre><code>/* Each user-mode TA gets:
+
+     its own S-EL0 address space, with its own translation
+       tables and its own ASID
+     its own heap and stack, sized by its manifest
+     no access to another TA's memory
+     no access to OP-TEE OS memory
+     no MMIO mappings unless explicitly granted
+     no way to execute privileged instructions
+
+   So the isolation model inside the secure world mirrors
+   user/kernel in Linux (OS chapters 4 and 12) - and for the
+   same reason. A trusted application is trusted RELATIVE TO
+   THE NORMAL WORLD, not absolutely.                        */
+
+/* A TA declares its needs in a header: */
+
+#define TA_UUID  { 0x8aaaf200, 0x2450, 0x11e4, \
+                 { 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }
+
+#define TA_FLAGS                (TA_FLAG_EXEC_DDR | \
+                                 TA_FLAG_SINGLE_INSTANCE | \
+                                 TA_FLAG_MULTI_SESSION)
+#define TA_STACK_SIZE           (2 * 1024)
+#define TA_DATA_SIZE            (32 * 1024)
+
+/* SINGLE_INSTANCE  one copy shared by all clients
+   MULTI_SESSION    several concurrent sessions allowed
+   INSTANCE_KEEP_ALIVE   stays resident after the last session
+   SECURE_DATA_PATH      may touch secure buffers (video, DRM)
+
+   Ask for the SMALLEST stack and heap that work. The secure
+   world's memory is a scarce, permanently carved-out resource
+   (chapter 10), not Linux's elastic pool.                   */</code></pre>
+
+<h2 id="threads">The thread model</h2>
+
+<p>The secure world has a limited number of execution contexts, and exhausting them is a real failure mode with real denial-of-service consequences for the normal world.</p>
+
+<pre><code>/* OP-TEE has a FIXED number of threads - CFG_NUM_THREADS,
+   typically 2 to 8, often one per CPU.
+
+   Each concurrent secure call occupies one. When they are all
+   busy the SMC returns OPTEE_SMC_RETURN_ETHREAD_LIMIT and the
+   Linux driver puts the caller to sleep until one frees.
+
+   CONSEQUENCES:
+     - the secure world does not scale to hundreds of concurrent
+       clients; it is not a server
+     - a TA that blocks holds a thread the whole time
+     - an RPC excursion also holds its thread - the normal world
+       is servicing a request from a thread that is still
+       "inside" the secure world
+     - deadlock is possible: all threads waiting on an RPC that
+       needs a thread to complete. This is why tee-supplicant
+       must never itself call into the TEE.                  */
+
+/* Each thread has a fixed stack, typically 8 KB. Deep recursion
+   or a large local array in a pseudo TA overflows it, and the
+   result is a secure-world crash with a stack dump on the
+   console - which on production silicon you cannot see
+   (chapter 10).                                            */</code></pre>
+
+<h2 id="lab">Hands-on: OP-TEE on QEMU</h2>
+
+<p>The whole stack runs under emulation, which makes it possible to experiment with a real TEE without any specialised hardware.</p>
+
+<pre><code># The complete stack - TF-A, OP-TEE, Linux, buildroot, the test
+# suite - built from one manifest. Budget an hour and ~20 GB.
+
+mkdir -p ~/optee &amp;&amp; cd ~/optee
+repo init -u https://github.com/OP-TEE/manifest.git -m qemu_v8.xml
+repo sync -j8
+cd build
+make toolchains -j4
+make run -j$(nproc)
+
+# Three windows open: QEMU's own console, a "Normal World" UART
+# and a "Secure World" UART. In the QEMU console:
+(qemu) c
+
+# Log in as root in the normal world, then:
+xtest                     # the full GlobalPlatform test suite
+xtest -l 0                # quick pass
+optee_example_hello_world # the smallest complete example
+
+# WATCH THE SECURE CONSOLE while these run. Every TA load,
+# every panic and every trace line appears there. That split -
+# normal-world output in one window, secure-world in another -
+# is exactly the boundary this track is about.</code></pre>
+
+<div class="tip">
+<b>Read <code>optee_example_hello_world</code> before writing anything</b>
+<p>It is about 120 lines across the two sides: <code>host/main.c</code> does
+<code>InitializeContext / OpenSession / InvokeCommand</code>, and <code>ta/hello_world_ta.c</code>
+implements the five entry points. Every TA you ever write has that skeleton. Copy the
+<code>optee_examples</code> directory structure rather than inventing a build.</p>
+</div>
+
+<h2 id="others">The other implementations</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>TEE</th><th>Where</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>OP-TEE</strong></td><td>Open source, Linaro</td><td>GlobalPlatform-compliant; the one to learn on</td></tr>
+<tr><td><strong>Trusty</strong></td><td>Android / Google</td><td>Own API, not GP; C++ and Rust TAs; used for Keymint and Gatekeeper</td></tr>
+<tr><td><strong>QSEE / QTEE</strong></td><td>Qualcomm</td><td>Proprietary; the biggest deployed base</td></tr>
+<tr><td><strong>Kinibi</strong></td><td>Trustonic</td><td>Proprietary; long history on Samsung Exynos</td></tr>
+<tr><td><strong>TEEGRIS</strong></td><td>Samsung</td><td>Replaced Kinibi on newer Exynos parts</td></tr>
+<tr><td><strong>Hafnium</strong></td><td>Open source</td><td>Not a TEE — an S-EL2 partition manager that hosts them</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>They differ in API and in TA packaging; the <em>architecture</em> — normal-world driver, monitor, trusted
+OS, isolated TAs, RPC to a supplicant — is the same in every one. Learn it once here.</p>
+
+<h2 id="deeper">Where this goes next</h2>
+
+<p>This chapter is the map; the <a href="tee-01-landscape.html">OP-TEE track</a> is the territory. It takes
+each of the six pieces above and gives it a chapter — the <a href="tee-02-boot-flow.html">boot handover from
+TF-A</a>, the <a href="tee-08-smc-abi.html">message protocol carried over SMC</a>,
+<a href="tee-09-rpc-supplicant.html">RPC and tee-supplicant</a>, the
+<a href="tee-10-linux-driver.html">Linux TEE subsystem</a>, and both GlobalPlatform APIs in depth.</p>
+
+<p>It ends in three projects: a <a href="tee-21-project-keystore.html">secure key store with its own
+client</a>, and a <a href="tee-22-project-ftpm-arch.html">firmware TPM built as a trusted application</a>
+that Linux then <a href="tee-23-project-ftpm-linux.html">drives as <code>/dev/tpm0</code></a>. If you want to
+actually write a TA rather than read about one, start there.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>/dev/tee0</code> missing</td><td>OP-TEE not running, or the driver did not probe — check <code>dmesg | grep -i optee</code></td></tr>
+<tr><td><code>TEEC_ERROR_ITEM_NOT_FOUND</code> on open session</td><td>TA not found; <code>tee-supplicant</code> not running, or the <code>.ta</code> is not in <code>/lib/optee_armtz</code></td></tr>
+<tr><td><code>TEEC_ERROR_SECURITY</code> on load</td><td>TA signature check failed — signed with the wrong key</td></tr>
+<tr><td><code>TEEC_ERROR_BAD_PARAMETERS</code></td><td><code>paramTypes</code> disagree between client and TA</td></tr>
+<tr><td><code>TEEC_ERROR_OUT_OF_MEMORY</code></td><td>Secure heap exhausted, or <code>TA_DATA_SIZE</code> too small</td></tr>
+<tr><td>TA panics with a stack dump on the secure console</td><td>Bad pointer, failed assertion, or stack overflow inside the TA</td></tr>
+<tr><td>Calls block for a long time under load</td><td>All OP-TEE threads busy — <code>ETHREAD_LIMIT</code></td></tr>
+<tr><td>Everything hangs after an RPC</td><td>Thread-exhaustion deadlock, or <code>tee-supplicant</code> died</td></tr>
+<tr><td>Works on QEMU, fails on hardware</td><td>Secure memory carve-out too small, or the TZASC region does not match</td></tr>
+<tr><td>Output buffer contains a partial result on error</td><td>The TA wrote into shared memory before it had finished — write once, at the end</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name all six pieces of the stack and say what each contributes.</li>
+  <li>Distinguish the GlobalPlatform Client API from the Internal API.</li>
+  <li>List the five TA entry points and when each is called.</li>
+  <li>Explain the parameter model and why checking <code>paramTypes</code> is a security control.</li>
+  <li>Give four rules for handling a client-supplied buffer inside a TA.</li>
+  <li>Trace one <code>TEEC_InvokeCommand</code> through every layer and back.</li>
+  <li>Explain the difference between a user-mode TA and a pseudo TA, and why you should default to the
+  former.</li>
+  <li>Explain OP-TEE's fixed thread pool and the deadlock it can produce.</li>
+  <li>Get <code>xtest</code> passing on QEMU and find the secure-world console.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

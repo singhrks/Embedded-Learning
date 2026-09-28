@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why you need a scheduler: the superloop and its limits | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Why you need a scheduler: the superloop and its limits</h1>
+<p class="lead">Most embedded products ship with no RTOS at all, and that is often the right decision. This
+chapter covers the architectures between "one loop" and "preemptive kernel", what each costs, and the specific
+symptom that tells you it is time to move up.</p>
+
+<h2 id="superloop">The superloop</h2>
+
+<pre><code>/* The architecture behind more shipped firmware than every
+   RTOS combined.                                          */
+
+int main(void)
+{
+    clock_init();
+    gpio_init();
+    uart_init();
+
+    for (;;) {
+        poll_sensors();
+        update_control();
+        service_comms();
+        update_display();
+    }
+}
+
+/* WHAT IS GOOD ABOUT IT
+
+   - No concurrency. Nothing preempts anything, so there are
+     no races between the four functions and no locks. Every
+     data-sharing bug you have ever read about is absent by
+     construction.
+   - Trivially analysable. The worst-case loop time is the
+     sum of four numbers.
+   - No kernel: no scheduler RAM, no per-task stacks, no
+     kernel code. On a part with 8 kB of RAM this is not a
+     preference, it is the only option.
+   - Nothing to learn or misconfigure.
+
+   WHAT IS BAD ABOUT IT
+
+   - LATENCY IS THE WHOLE LOOP. If update_display() takes
+     40 ms, the control loop cannot respond faster than that,
+     no matter how urgent.
+   - One slow function degrades everything.
+   - Any blocking call is fatal to responsiveness.        */
+</code></pre>
+
+<div class="key">
+<b>The rule that makes a superloop work</b>
+<p>Every function in the loop must return quickly and never block. That single discipline is what keeps the
+architecture viable, and it is why superloop code is written as state machines rather than sequences. A
+function that waits — for a UART byte, an I2C transfer, a sensor conversion — has stolen the whole loop's
+responsiveness. The moment you cannot express something without waiting, you have found the boundary of the
+architecture.</p>
+</div>
+
+<h2 id="statemachines">Non-blocking state machines</h2>
+
+<pre><code>/* THE BLOCKING VERSION - 210 ms of the loop, unavailable
+   to everything else.                                     */
+void read_sensor_blocking(void)
+{
+    i2c_write(ADDR, CMD_START);
+    delay_ms(200);                    /* conversion time    */
+    value = i2c_read16(ADDR, REG_DATA);
+}
+
+/* THE STATE MACHINE - returns in microseconds, every time. */
+typedef enum { S_IDLE, S_WAIT, S_READ } sensor_state_t;
+
+void read_sensor_step(void)
+{
+    static sensor_state_t st = S_IDLE;
+    static uint32_t       t0;
+
+    switch (st) {
+    case S_IDLE:
+        i2c_write(ADDR, CMD_START);
+        t0 = g_ms;
+        st = S_WAIT;
+        break;
+
+    case S_WAIT:
+        if ((int32_t)(g_ms - (t0 + 200)) &gt;= 0) {   /* wrap-safe */
+            st = S_READ;
+        }
+        break;                        /* returns immediately */
+
+    case S_READ:
+        value = i2c_read16(ADDR, REG_DATA);
+        st = S_IDLE;
+        break;
+    }
+}
+
+/* This is the central skill of superloop design, and it is
+   also its central cost: the CONTROL FLOW IS INSIDE OUT.
+   The sequence "start, wait, read" is obvious in the
+   blocking version and scattered across a switch in the
+   non-blocking one. With three such sequences interleaved,
+   each with error handling and timeouts, the state count
+   multiplies and the code becomes genuinely hard to follow.
+
+   THAT is the real argument for an RTOS. Not performance -
+   readability. An RTOS lets you write the blocking version
+   and have it be correct, because the kernel switches away
+   from a blocked task instead of the whole system waiting. */
+</code></pre>
+
+<h2 id="spectrum">The spectrum</h2>
+
+<pre class="diagram">   1. SUPERLOOP
+      for(;;) { a(); b(); c(); }
+      Latency: whole loop.  RAM: one stack.
+      Use when: every function is short, few deadlines.
+
+   2. SUPERLOOP + INTERRUPTS  &lt;- most shipped firmware
+      ISRs handle urgent work; the loop handles the rest;
+      they communicate through flags and ring buffers.
+      Latency: microseconds for ISR work, whole loop for
+               the rest. RAM: one stack + ISR frames.
+      Use when: the urgent work is SHORT. This covers a
+               remarkable proportion of real products.
+
+   3. COOPERATIVE SCHEDULER
+      Tasks yield explicitly; the scheduler picks the next.
+      No preemption, so still no data races between tasks.
+      Latency: longest run between yields.
+      RAM: one stack per task.
+      Use when: you want task structure but cannot afford
+               preemption's synchronisation burden.
+
+   4. PREEMPTIVE RTOS
+      The kernel switches on a tick or an event; a
+      high-priority task runs as soon as it is ready.
+      Latency: bounded by the kernel, typically a few us.
+      RAM: one stack per task + kernel overhead (2-10 kB).
+      Cost: RACES ARE NOW POSSIBLE. Every shared variable
+            needs a mutex, a queue, or an atomic.
+      Use when: multiple independent deadlines, or blocking
+               sequences you want written as sequences.
+
+   Moving from 2 to 4 buys bounded latency and pays for it
+   in synchronisation bugs. That is a real trade and the
+   step should be deliberate.</pre>
+
+<h2 id="deferred">The pattern that delays the decision</h2>
+
+<pre><code>/* Most "we need an RTOS" moments are actually "we need to
+   get work out of the ISR". Deferred processing solves that
+   without a kernel.                                       */
+
+static volatile uint8_t  ring[256];
+static volatile uint8_t  head, tail;   /* single producer,  */
+                                       /* single consumer   */
+
+void USART1_IRQHandler(void)           /* PRODUCER: ISR     */
+{
+    uint8_t next = (uint8_t)(head + 1);
+    if (next != tail) {                /* drop if full      */
+        ring[head] = (uint8_t) USART1-&gt;RDR;
+        head = next;                   /* publish LAST      */
+    }
+}
+
+void service_comms(void)               /* CONSUMER: loop    */
+{
+    while (tail != head) {
+        parse_byte(ring[tail]);
+        tail = (uint8_t)(tail + 1);
+    }
+}
+
+/* WHY THIS IS SAFE WITHOUT A LOCK:
+   - exactly one writer of head (the ISR), one writer of
+     tail (the loop);
+   - both are single bytes, so reads and writes are atomic
+     on Cortex-M;
+   - head is published AFTER the data is written, so the
+     consumer never sees an index for a byte not yet
+     stored. On Cortex-M's ordering this holds; on a weakly
+     ordered core you would need a release barrier here,
+     which is exactly what the ARM track's barriers chapter
+     is about.
+   - the size is a power of two, so the wrap is free and
+     the index arithmetic cannot go wrong.
+
+   THE ISR IS NOW ~10 CYCLES. All the parsing happens in the
+   loop, at whatever rate it manages, and a burst is
+   absorbed by the buffer. This single pattern removes the
+   need for an RTOS in a large fraction of designs.        */
+</code></pre>
+
+<h2 id="when">When to actually move up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>One function occasionally takes 50 ms and everything stutters</td><td>Split it into a state machine
+first; an RTOS only hides the problem</td></tr>
+<tr><td>ISR does too much work</td><td>Deferred processing with a ring buffer — no kernel needed</td></tr>
+<tr><td>Two independent deadlines that cannot both be met by one loop</td><td>A preemptive RTOS. This is the
+real reason</td></tr>
+<tr><td>Sequential protocols with many wait states become unreadable</td><td>A preemptive RTOS, for
+readability</td></tr>
+<tr><td>A third-party stack (TCP/IP, BLE, USB) demands one</td><td>Use the one it expects — fighting it costs
+more than it saves</td></tr>
+<tr><td>You want "threads" because it feels more professional</td><td>Not a reason. The superloop is a
+legitimate architecture</td></tr>
+<tr><td>RAM is under 8 kB</td><td>You cannot afford a preemptive kernel; stay with 1 or 2</td></tr>
+<tr><td>Safety certification is required</td><td>Either — but the superloop is far easier to argue for,
+which is why safety-critical code often uses it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>An RTOS does not make a slow system fast</b>
+<p>If your control loop misses its deadline because the computation takes too long, adding a scheduler adds
+overhead and changes nothing. An RTOS reallocates <em>latency</em>, letting urgent work preempt unimportant
+work. It cannot create CPU time. Diagnose which problem you have — measure with the cycle counter from
+<a href="mcu-16-debugging-bare-metal.html">chapter 16</a> — before assuming a kernel is the answer.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Response time equals the slowest function</td><td>Inherent to a superloop — that is the
+architecture</td></tr>
+<tr><td>Display update makes the control loop jitter</td><td>A long non-blocking-but-slow function; split
+it</td></tr>
+<tr><td>Serial bytes lost during a long operation</td><td>No ring buffer; the ISR had nowhere to put
+them</td></tr>
+<tr><td>Adding a feature broke unrelated timing</td><td>Loop time grew; every deadline is coupled to every
+function</td></tr>
+<tr><td>Code became unreadable after three state machines</td><td>The genuine signal to consider an
+RTOS</td></tr>
+<tr><td>Races appeared right after adopting an RTOS</td><td>Expected — preemption is what you bought; add
+proper synchronisation</td></tr>
+<tr><td>RTOS added and the system got slower</td><td>The problem was throughput, not latency</td></tr>
+<tr><td>Kernel does not fit in RAM</td><td>Below roughly 8 kB a preemptive kernel is not viable</td></tr>
+<tr><td>Ring buffer occasionally loses a byte</td><td>Index published before the data was written, or a size
+that is not a power of two</td></tr>
+<tr><td>Two producers into one ring buffer corrupt it</td><td>The lock-free argument holds for one producer
+only</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the one discipline that makes a superloop viable.</li>
+  <li>Give two genuine advantages of a superloop over an RTOS.</li>
+  <li>Convert a blocking sensor read into a non-blocking state machine.</li>
+  <li>Explain the real cost of state machines, and why it argues for an RTOS.</li>
+  <li>Name the four architectures on the spectrum and the latency of each.</li>
+  <li>Explain why the single-producer ring buffer needs no lock on Cortex-M.</li>
+  <li>Say why the head index must be published after the data.</li>
+  <li>Give the one symptom that genuinely calls for a preemptive kernel.</li>
+  <li>Explain why an RTOS cannot fix a throughput problem.</li>
+  <li>Say what a preemptive kernel costs you that a superloop does not.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

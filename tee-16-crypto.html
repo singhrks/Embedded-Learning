@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cryptography inside a TA | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Cryptography inside a TA</h1>
+<p class="lead">The whole reason a TA exists is usually to hold a key. This chapter covers the algorithms
+OP-TEE offers, how keys are generated and derived so that raw material never crosses the boundary, where the
+hardware accelerator fits, and the handful of mistakes that turn a correct algorithm into a broken
+system.</p>
+
+<h2 id="rule">The rule that shapes every design</h2>
+
+<p>One rule governs everything in this chapter: keys must not leave the secure world, even into shared memory. Everything else here is a consequence of holding that line.</p>
+
+<pre class="diagram">   A key that crosses into the normal world is not protected.
+   Design so it never has to.
+
+   BAD                          GOOD
+
+   client: generate key         client: "generate a key for me"
+   client -&gt; TA: here is the      TA: TEE_GenerateKey()
+       key, please sign               store it persistently
+   TA: sign with it                   return only a HANDLE/ID
+   TA -&gt; client: signature       client: "sign this, with key 7"
+                                  TA: load key 7, sign, return
+                                      the signature
+
+   In the second design the key material exists only inside
+   OP-TEE, from generation to destruction. There is no moment
+   at which a compromised kernel could read it.
+
+   The client's interface becomes:
+       create_key()  -&gt; key_id
+       sign(key_id, digest) -&gt; signature
+       get_public_key(key_id) -&gt; public key
+       delete_key(key_id)
+
+   That is exactly the shape of Android Keymint, of a PKCS#11
+   token, and of the project in chapter 21. It is not a
+   coincidence: it is the only shape that works.</pre>
+
+<h2 id="algs">What OP-TEE offers</h2>
+
+<p>What the implementation offers, and which of those are backed by hardware on a given platform — because the same API call can differ by an order of magnitude in cost depending on that.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>Algorithms</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Hashes</td><td>MD5, SHA-1, SHA-224/256/384/512, SHA3-*, SM3</td><td>MD5 and SHA-1 exist for legacy
+interop only</td></tr>
+<tr><td>Symmetric</td><td>AES (ECB, CBC, CTR, CTS, XTS, CBC-MAC), DES, 3DES, SM4</td><td>Do not use ECB. Ever.
+It is there for building other things</td></tr>
+<tr><td>AEAD</td><td>AES-GCM, AES-CCM</td><td>The default choice for encrypting anything</td></tr>
+<tr><td>MAC</td><td>HMAC-*, AES-CMAC, AES-CBC-MAC</td><td>Verify with
+<code>TEE_MACCompareFinal</code></td></tr>
+<tr><td>Asymmetric</td><td>RSA (PKCS#1 v1.5, PSS, OAEP), DSA, ECDSA, Ed25519, SM2</td><td>PSS over v1.5 for new
+designs</td></tr>
+<tr><td>Key agreement</td><td>DH, ECDH, X25519</td><td>Followed by a KDF — never use the raw shared secret as a
+key</td></tr>
+<tr><td>Derivation</td><td>HKDF, PBKDF2, Concat KDF</td><td>Availability depends on
+<code>CFG_CRYPTO_*</code></td></tr>
+<tr><td>Random</td><td><code>TEE_GenerateRandom</code></td><td>Backed by a hardware TRNG where the platform has
+one</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Which are actually compiled in? They are individually
+# selectable, and a missing one gives TEE_ERROR_NOT_SUPPORTED
+# at runtime rather than a build error.
+
+$ grep -E '^CFG_CRYPTO' optee_os/core/crypto/sub.mk | head -20
+CFG_CRYPTO_AES ?= y
+CFG_CRYPTO_GCM ?= y
+CFG_CRYPTO_ECC ?= y
+CFG_CRYPTO_RSA ?= y
+CFG_CRYPTO_SHA512 ?= y
+CFG_CRYPTO_HKDF ?= y
+CFG_CRYPTO_SM2_PKE ?= n
+...
+
+# Turn off what you do not need - it is code in your trusted
+# computing base:
+$ make CFG_CRYPTO_MD5=n CFG_CRYPTO_DES=n CFG_CRYPTO_DSA=n
+
+# And confirm from a TA, at runtime, rather than assuming:
+    res = TEE_AllocateOperation(&amp;op, TEE_ALG_AES_GCM,
+                                TEE_MODE_ENCRYPT, 256);
+    if (res == TEE_ERROR_NOT_SUPPORTED)
+            /* this build does not have GCM */</code></pre>
+
+<h2 id="generate">Generating and keeping a key</h2>
+
+<p>Generating a key inside the secure world means it never existed anywhere else, which is a stronger property than importing one and worth preferring wherever possible.</p>
+
+<pre><code>/* An ECDSA P-256 signing key that is generated inside the TEE,
+   stored persistently, and never exported.                  */
+
+static TEE_Result create_signing_key(const char *id, size_t idlen)
+{
+        TEE_ObjectHandle key  = TEE_HANDLE_NULL;
+        TEE_ObjectHandle pobj = TEE_HANDLE_NULL;
+        TEE_Attribute    attr;
+        TEE_Result       res;
+
+        res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR,
+                                          256, &amp;key);
+        if (res) goto out;
+
+        /* The curve must be given as a generation parameter. */
+        TEE_InitValueAttribute(&amp;attr, TEE_ATTR_ECC_CURVE,
+                               TEE_ECC_CURVE_NIST_P256, 0);
+
+        res = TEE_GenerateKey(key, 256, &amp;attr, 1);
+        if (res) goto out;
+
+        /* Persist it AS AN OBJECT. */
+        res = TEE_CreatePersistentObject(
+                TEE_STORAGE_PRIVATE, id, idlen,
+                TEE_DATA_FLAG_ACCESS_READ |
+                TEE_DATA_FLAG_ACCESS_WRITE_META |
+                TEE_DATA_FLAG_OVERWRITE,
+                key, NULL, 0, &amp;pobj);
+out:
+        TEE_FreeTransientObject(key);
+        if (pobj != TEE_HANDLE_NULL)
+                TEE_CloseObject(pobj);
+        return res;
+}
+
+/* Exporting ONLY the public half - which is safe and
+   necessary, because someone must verify the signatures.   */
+
+static TEE_Result export_public(const char *id, size_t idlen,
+                                uint8_t *x, size_t *xlen,
+                                uint8_t *y, size_t *ylen)
+{
+        TEE_ObjectHandle pobj = TEE_HANDLE_NULL;
+        TEE_Result res;
+        uint32_t l;
+
+        res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                                       id, idlen,
+                                       TEE_DATA_FLAG_ACCESS_READ,
+                                       &amp;pobj);
+        if (res) return res;
+
+        l = *xlen;
+        res = TEE_GetObjectBufferAttribute(pobj,
+                        TEE_ATTR_ECC_PUBLIC_VALUE_X, x, &amp;l);
+        if (res) goto out;
+        *xlen = l;
+
+        l = *ylen;
+        res = TEE_GetObjectBufferAttribute(pobj,
+                        TEE_ATTR_ECC_PUBLIC_VALUE_Y, y, &amp;l);
+        if (res == TEE_SUCCESS)
+                *ylen = l;
+out:
+        TEE_CloseObject(pobj);
+        return res;
+}
+
+/* Asking for TEE_ATTR_ECC_PRIVATE_VALUE on a generated key
+   returns TEE_ERROR_ACCESS_DENIED. That refusal is the
+   guarantee: the private half is structurally unexportable,
+   not merely undocumented.                                 */</code></pre>
+
+<div class="key">
+<b>Derive, do not store</b>
+<p>A TA that needs many keys does not have to store many keys. Derive them from one root plus a label:
+<code>key_i = HKDF(root, "purpose" || i)</code>. Storage holds one secret; the derived keys exist only while
+in use. Fewer persistent objects, no per-key storage failure, and rotating the root rotates everything at
+once.</p>
+</div>
+
+<h2 id="derive">Key derivation</h2>
+
+<p>Deriving keys from a root rather than storing them means a compromise of storage yields nothing usable, and it is how per-purpose keys are obtained without provisioning each one.</p>
+
+<pre><code>/* HKDF: the right tool for turning one secret into many. */
+
+static TEE_Result derive(TEE_ObjectHandle root,
+                         const char *label, size_t labellen,
+                         TEE_ObjectHandle out)
+{
+        TEE_OperationHandle op = TEE_HANDLE_NULL;
+        TEE_Attribute params[2];
+        TEE_Result res;
+
+        res = TEE_AllocateOperation(&amp;op,
+                        TEE_ALG_HKDF_SHA256_DERIVE_KEY,
+                        TEE_MODE_DERIVE, 256);
+        if (res) goto out;
+
+        res = TEE_SetOperationKey(op, root);
+        if (res) goto out;
+
+        TEE_InitRefAttribute(&amp;params[0], TEE_ATTR_HKDF_INFO,
+                             label, labellen);
+        TEE_InitRefAttribute(&amp;params[1], TEE_ATTR_HKDF_SALT,
+                             SALT, sizeof SALT);
+
+        TEE_DeriveKey(op, params, 2, out);
+out:
+        TEE_FreeOperation(op);
+        return res;
+}
+
+/* ECDH, and the mistake everyone makes: */
+
+    /* WRONG: use the shared secret directly as an AES key.
+       The X coordinate of an ECDH result is NOT uniformly
+       distributed and has algebraic structure. */
+
+    /* RIGHT: */
+    TEE_AllocateOperation(&amp;op, TEE_ALG_ECDH_DERIVE_SHARED_SECRET,
+                          TEE_MODE_DERIVE, 256);
+    TEE_SetOperationKey(op, my_keypair);
+    TEE_InitRefAttribute(&amp;p[0], TEE_ATTR_ECC_PUBLIC_VALUE_X,
+                         peer_x, sizeof peer_x);
+    TEE_InitRefAttribute(&amp;p[1], TEE_ATTR_ECC_PUBLIC_VALUE_Y,
+                         peer_y, sizeof peer_y);
+    TEE_DeriveKey(op, p, 2, shared);       /* a GENERIC_SECRET */
+    /* ...then run HKDF over `shared` to get the actual AES key */</code></pre>
+
+<h2 id="huk">The hardware unique key</h2>
+
+<p>The hardware unique key is the root of the whole chain: per-device, unreadable by software, and the reason data encrypted on one device is useless on another.</p>
+
+<pre><code>/* Every device has a different HUK (chapter 15). A TA can
+   derive from it, which gives you a secret that:
+     - is different on every device
+     - never existed anywhere else
+     - needs no storage at all                              */
+
+#include &lt;tee_internal_api_extensions.h&gt;
+
+    uint8_t key[32];
+    TEE_Result res = TEE_GetHUKDerivedKey(
+                        (const uint8_t *)"my-ta-purpose-v1", 16,
+                        key, sizeof key);
+    /* NOT standard GlobalPlatform - an OP-TEE extension,
+       available when CFG_HUK_SUBKEY is enabled.            */
+
+/* Uses:
+     - encrypting something without a persistent key object
+     - a device-binding value, so data cannot move devices
+     - a per-device seed for a deterministic key
+
+   Cautions:
+     - the derivation label is part of the contract. Change it
+       and every previously derived key is gone. Version it.
+     - on QEMU the HUK is a fixed test value, so every
+       "device" derives the same key. Do not conclude from a
+       QEMU test that device binding works.
+     - wipe the buffer when you are done:
+           TEE_MemFill(key, 0, sizeof key);                 */</code></pre>
+
+<h2 id="accel">Hardware acceleration</h2>
+
+<p>Hardware acceleration matters here beyond speed — an accelerator that keeps the key in hardware means the key is never in memory at all, which closes an entire class of attack.</p>
+
+<pre><code>/* Most SoCs have a crypto accelerator. OP-TEE abstracts it
+   behind the same API, so a TA does not change - but the
+   performance difference is large.                         */
+
+  core/drivers/crypto/
+    caam/       NXP i.MX
+    se050/      NXP secure element
+    stm32/      ST
+    hisilicon/  HiSilicon
+    versal/     AMD/Xilinx
+    aspeed/     ASPEED
+
+  Enabled per platform, e.g.:
+    CFG_NXP_CAAM=y
+    CFG_NXP_CAAM_SHA_DRV=y
+    CFG_NXP_CAAM_CIPHER_DRV=y
+
+/* Rough figures - measure your own part:
+     AES-256-GCM, software (libtomcrypt)   ~20-60 MB/s
+     AES-256-GCM, CAAM/SAHARA             ~200-800 MB/s
+     RSA-2048 sign, software              ~10-40 ms
+     RSA-2048 sign, accelerator           ~1-5 ms
+     ECDSA P-256 sign, software           ~2-10 ms
+
+   The fixed cost of a TA invocation (chapter 5) is tens of
+   microseconds, so for small operations the world switch
+   dominates and the accelerator barely shows. For bulk data
+   it is the whole story.
+
+   The design consequence: BATCH. One invocation that signs 100
+   digests beats 100 invocations that sign one each, by a large
+   factor, regardless of the accelerator.                    */</code></pre>
+
+<h2 id="mistakes">The mistakes that matter</h2>
+
+<p>The recurring errors in trusted-application cryptography are rarely exotic algorithm choices. They are ordinary mistakes made in a context where the consequences are far larger.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mistake</th><th>Why it is fatal</th><th>Do this</th></tr></thead>
+<tbody>
+<tr><td>Reusing a GCM nonce with the same key</td><td>Recovers the authentication key; forgeries become
+trivial</td><td>Counter, or 96 bits of <code>TEE_GenerateRandom</code>, and never repeat</td></tr>
+<tr><td>Comparing MACs with <code>TEE_MemCompare</code></td><td>Timing oracle</td><td><code>TEE_MACCompareFinal</code>,
+or a constant-time loop</td></tr>
+<tr><td>Using an ECDH shared secret as a key</td><td>Not uniform; has structure</td><td>Run it through
+HKDF</td></tr>
+<tr><td>AES-ECB</td><td>Identical plaintext blocks give identical ciphertext</td><td>GCM</td></tr>
+<tr><td>RSA PKCS#1 v1.5 encryption</td><td>Padding-oracle attacks</td><td>OAEP, or better, don't use RSA
+encryption</td></tr>
+<tr><td>Decrypt-then-check</td><td>Acting on unauthenticated plaintext</td><td>AEAD, which does it in the right
+order for you</td></tr>
+<tr><td>Key material in a local buffer</td><td>Left on the TA heap or stack after use</td><td>Key objects, and
+<code>TEE_MemFill(0)</code> anything raw</td></tr>
+<tr><td>Trusting <code>TEE_GetREETime</code> for expiry</td><td>The attacker sets the
+clock</td><td><a href="tee-17-time-rollback.html">Chapter 17</a></td></tr>
+<tr><td>Logging a key with <code>DHEXDUMP</code></td><td>It ships</td><td>Never; guard it out of release
+builds</td></tr>
+<tr><td>Rolling your own primitive</td><td>You will get it wrong</td><td>Use the API; it is there</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>TEE_ERROR_NOT_SUPPORTED</code></td><td>Algorithm not compiled in — check the
+<code>CFG_CRYPTO_*</code> flags</td></tr>
+<tr><td><code>TEE_ERROR_BAD_PARAMETERS</code> on <code>AllocateOperation</code></td><td>Key size outside the
+declared maximum, or algorithm/mode mismatch</td></tr>
+<tr><td><code>TEE_ERROR_ACCESS_DENIED</code> reading a private attribute</td><td>Working as designed — private
+key material is not exportable</td></tr>
+<tr><td><code>TEE_ERROR_MAC_INVALID</code> on decrypt</td><td>Wrong key, wrong nonce, or genuinely tampered
+data</td></tr>
+<tr><td>Works, then fails after hours</td><td>Leaked operation or object handles</td></tr>
+<tr><td>Signature verifies in the TA, fails in OpenSSL</td><td>Format mismatch — ECDSA raw r||s versus DER, or
+a digest applied twice</td></tr>
+<tr><td>Slow despite a hardware accelerator</td><td>Per-invocation overhead dominates; batch</td></tr>
+<tr><td>Different results on QEMU and hardware</td><td>Accelerator driver differences, or the HUK being a fixed
+test value on QEMU</td></tr>
+<tr><td>Key lost after a firmware update</td><td>HUK derivation label or TA UUID changed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the rule about keys crossing the boundary and give the client interface it implies.</li>
+  <li>Generate an ECDSA keypair inside a TA and store it as an object.</li>
+  <li>Explain what happens when you ask for the private attribute, and why that is the guarantee.</li>
+  <li>Explain the derive-do-not-store pattern and its advantages.</li>
+  <li>Say why an ECDH shared secret must not be used directly as a key.</li>
+  <li>Describe <code>TEE_GetHUKDerivedKey</code>, two uses, and two cautions.</li>
+  <li>Explain why batching matters more than hardware acceleration for small operations.</li>
+  <li>Name five cryptographic mistakes from the table and the correct alternative for each.</li>
+  <li>Explain what GCM nonce reuse costs you.</li>
+  <li>Determine at runtime whether an algorithm is available in the current build.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

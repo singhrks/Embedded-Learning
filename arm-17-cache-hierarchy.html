@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The cache hierarchy | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The cache hierarchy</h1>
+<p class="lead"><a href="ca-14-caches.html">CA chapter 14</a> covered cache theory. This chapter covers what
+ARM specifically architects, what it leaves to the implementation, and the terminology — points of coherency
+and unification — that every cache maintenance operation is defined in terms of.</p>
+
+<h2 id="architected">What the architecture actually guarantees</h2>
+
+<div class="key">
+<b>Very little, deliberately</b>
+<p>Cache sizes, associativity, replacement policy, the number of levels, whether they are inclusive — all are
+<strong>IMPLEMENTATION DEFINED</strong>. The architecture specifies only:</p>
+<ul>
+<li>That caches are <em>transparent</em> for Normal memory — correct programs need no maintenance for
+CPU-to-CPU sharing within a shareability domain.</li>
+<li>The <strong>points</strong> (PoU, PoC, PoP) that maintenance operations target.</li>
+<li>The maintenance instructions themselves and their semantics.</li>
+<li>Discovery registers so software can find out what it is running on.</li>
+</ul>
+<p>This is the architecture/microarchitecture split from <a href="arm-01-what-is-arm.html">chapter 01</a> in
+its purest form: portable correctness, implementation-specific performance.</p>
+</div>
+
+<h2 id="structure">How a cache is actually indexed</h2>
+
+<p>Before the sizes, the shape. A cache is not an associative memory that searches every entry — that would be
+far too slow and too power-hungry. It splits the address into three fields and uses them for three different
+jobs, and nearly every surprising cache behaviour follows from that split.</p>
+
+<pre class="diagram">   AN ADDRESS, DIVIDED:
+
+    63                    n+m        n         0
+   ┌───────────────────────┬──────────┬─────────┐
+   │         TAG           │  INDEX   │ OFFSET  │
+   └───────────────────────┴──────────┴─────────┘
+                                 │         │
+                                 │         └─ WHICH BYTE within
+                                 │            the line. For a
+                                 │            64-byte line this
+                                 │            is 6 bits.
+                                 │
+                                 └─ WHICH SET to look in. This
+                                    is a direct array index -
+                                    no searching at all.
+
+     TAG  is then compared against the tags of the few lines
+          in that set, in parallel. An N-way cache compares N
+          tags; that is the only search that happens.
+
+   SO:  sets = size / (line_size x ways)
+
+     32 KB, 64-byte lines, 4-way
+       => 32768 / (64 x 4) = 128 sets => 7 index bits
+
+   THE CONSEQUENCE THAT BITES: two addresses with the SAME
+   index bits compete for the same set, no matter how far
+   apart they are. Walking an array with a stride that is a
+   large power of two makes every access land in one set, so
+   a 32 KB cache behaves as if it held only `ways` lines.
+   That is the cache-thrashing effect chapter 13 of the
+   computer architecture track measures.</pre>
+
+<div class="key">
+<b>VIPT, PIPT, and the aliasing problem</b>
+<p>The index is needed <em>immediately</em>, but the physical address is not available until the MMU has
+translated it (<a href="arm-13-page-walk.html">chapter 13</a>). Waiting would put a translation in series with
+every L1 access, so L1 caches are typically <strong>virtually indexed, physically tagged</strong>: the index
+comes from the virtual address and is available at once, while the tag comes from the physical address and is
+compared a cycle later once translation completes. This is only safe if the index bits fall entirely within the
+page offset — because those bits are identical in the virtual and physical address, so the set chosen is the
+same either way. If the cache is large enough that the index extends above the page offset, two virtual
+addresses mapping to one physical address can land in <em>different</em> sets, giving the same data two
+locations in the cache: an alias. Implementations either avoid it by construction (limiting size, or increasing
+associativity) or detect and resolve it in hardware. Outer caches have no such time pressure and are simply
+<strong>physically indexed, physically tagged</strong>, which cannot alias at all.</p>
+</div>
+
+<h2 id="discovery">Discovering the hierarchy</h2>
+
+<p>Cache sizes and levels vary enormously between implementations, so nothing here should be hard-coded. The architecture provides registers describing the actual hierarchy, which is what portable cache-aware code reads at start-up.</p>
+
+<pre><code>/* Never hardcode a line size. Read it. */
+
+        mrs     x0, ctr_el0            /* Cache Type Register,
+                                          readable from EL0        */
+/*  CTR_EL0:
+       [3:0]    IminLine  log2 of the smallest ICACHE line, in words
+       [19:16]  DminLine  log2 of the smallest DCACHE line, in words
+       [27:24]  CWG       cache writeback granule
+       [23:20]  ERG       exclusives reservation granule
+       [31]     DIC       instruction cache is coherent with data
+       [29]     IDC       data cache clean not needed for I-fetch  */
+
+static inline unsigned dcache_line_size(void)
+{
+        uint64_t ctr;
+        asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        return 4U &lt;&lt; ((ctr &gt;&gt; 16) &amp; 0xF);
+}
+
+/* Enumerating the levels: */
+        mrs     x0, clidr_el1          /* how many levels, and their
+                                          types (I, D, unified)    */
+        msr     csselr_el1, x1         /* select level and type    */
+        isb
+        mrs     x2, ccsidr_el1         /* size, associativity, sets */
+
+/* CTR_EL0.DIC and .IDC are worth checking: on cores where they
+   are set, some cache maintenance around self-modifying code
+   becomes unnecessary. Linux uses them to skip work.        */</code></pre>
+
+<pre><code># from userspace
+lscpu -C
+#  NAME ONE-SIZE ALL-SIZE WAYS TYPE        LEVEL SETS
+#  L1d       64K     512K    4 Data            1  256
+#  L1i      128K       1M    4 Instruction     1  512
+#  L2         4M      32M    8 Unified         2 8192
+#  L3        16M      16M   16 Unified         3 16384
+
+cat /sys/devices/system/cpu/cpu0/cache/index*/{level,type,size,\
+ways_of_associativity,coherency_line_size,shared_cpu_list}
+
+getconf LEVEL1_DCACHE_LINESIZE</code></pre>
+
+<h2 id="points">The points: PoU, PoC, PoP</h2>
+
+<p>These three terms appear throughout the cache maintenance instructions and are the most common source of confusion in this area. Each names how far down the hierarchy an operation must reach to be meaningful.</p>
+
+<pre class="diagram">Every cache maintenance operation names a POINT — how far down
+the hierarchy the operation must reach. These are the terms the
+whole instruction set is defined in.
+
+   PoU — Point of Unification
+   ┌──────────────────────────────────────────────────┐
+   │ The point where THIS CORE's instruction cache,    │
+   │ data cache and table walker see the same copy.    │
+   │ Typically the L2 or the unified cache level.      │
+   │                                                   │
+   │ Used for: making written INSTRUCTIONS visible to  │
+   │ instruction fetch — JIT, module loading,          │
+   │ self-modifying boot code.                         │
+   └──────────────────────────────────────────────────┘
+
+   PoC — Point of Coherency
+   ┌──────────────────────────────────────────────────┐
+   │ The point where ALL observers that can access     │
+   │ memory see the same copy — every core, and every  │
+   │ DMA master. Usually main memory, or a             │
+   │ system-level cache that DMA also sees.            │
+   │                                                   │
+   │ Used for: DMA to and from a non-coherent device.  │
+   └──────────────────────────────────────────────────┘
+
+   PoP — Point of Persistence   (ARMv8.2, DC CVAP)
+   ┌──────────────────────────────────────────────────┐
+   │ The point at which data survives power loss —     │
+   │ relevant only for persistent memory.              │
+   └──────────────────────────────────────────────────┘
+
+   PoU is CLOSER than PoC. Cleaning to PoU is cheaper and is
+   sufficient for instruction visibility on the same core;
+   cleaning to PoC is required for anything a device will read.
+
+   Choosing PoU where PoC was needed is a classic DMA bug: it
+   works on a system where the L2 happens to be coherent with
+   the device, and fails on one where it is not.</pre>
+
+<h2 id="coherency">CPU-to-CPU coherency is automatic</h2>
+
+<p>One thing you do <em>not</em> need to manage by hand: caches on different CPUs are kept consistent by hardware. Knowing that this is automatic — and precisely where it stops being automatic — saves a great deal of unnecessary maintenance.</p>
+
+<pre><code>/* Within a shareability domain, hardware keeps caches coherent
+   (MESI/MOESI over ACE or CHI — CA chapter 15). You do NOT need
+   cache maintenance between coherent cores.                  */
+
+/* What you DO need is ORDERING — barriers (chapter 21). These are
+   different things and confusing them is common:
+
+     COHERENCY  guarantees all cores eventually see the same value
+                for one location. Automatic.
+     ORDERING   guarantees the RELATIVE order of accesses to
+                DIFFERENT locations. NOT automatic — you must ask.
+
+   A missing DMB is not fixed by a cache flush, and a stale DMA
+   buffer is not fixed by a barrier. Diagnose which one you have.  */
+
+/* The shareability attribute in the descriptor (chapter 14)
+   determines the domain. Marking SMP memory Non-shareable takes
+   it OUT of the coherency domain — and then hardware coherency
+   genuinely does not apply, which produces exactly the bugs
+   people wrongly attribute to missing barriers.             */</code></pre>
+
+<h2 id="noncoherent">Where maintenance is genuinely required</h2>
+
+<p>The rule underneath every row here is the same: whenever a producer and a consumer of some data are on
+different sides of a cache that is not automatically kept coherent between them, one side must explicitly push
+its view of memory out (<strong>clean</strong>) and the other must explicitly discard its possibly-stale view
+(<strong>invalidate</strong>) before trusting what it reads. A CPU writing a DMA buffer and a non-coherent DMA
+engine reading it are exactly such a pair; so are a CPU that just wrote new instruction bytes and the same
+CPU's instruction fetch path, which reads through a separate I-cache that data writes never touch. The "Point"
+column tells you how far the operation needs to reach — PoU (Point of Unification) is enough when the only
+thing to satisfy is another cache on the same core, while PoC (Point of Coherency) pushes all the way to where
+every observer in the system, including non-coherent DMA masters, will see it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Situation</th><th>Operation</th><th>Point</th></tr></thead>
+<tbody>
+<tr><td>CPU wrote a buffer, a non-coherent device will read it</td><td><strong>Clean</strong></td><td>PoC</td></tr>
+<tr><td>A non-coherent device wrote a buffer, the CPU will read it</td><td><strong>Invalidate</strong></td><td>PoC</td></tr>
+<tr><td>Bidirectional DMA buffer</td><td>Clean <em>and</em> invalidate</td><td>PoC</td></tr>
+<tr><td>Wrote instructions to memory, about to execute them</td><td>Clean D-cache, invalidate I-cache</td><td>PoU</td></tr>
+<tr><td>Changed page tables</td><td>Clean, if the walker is not coherent</td><td>PoC or PoU</td></tr>
+<tr><td>Powering down a core or a cluster</td><td>Clean and invalidate everything</td><td>PoC</td></tr>
+<tr><td>Before enabling or disabling the MMU</td><td>Clean and invalidate</td><td>PoC</td></tr>
+<tr><td>Writing to persistent memory</td><td>Clean</td><td>PoP</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The instructions themselves are <a href="arm-18-cache-maintenance.html">chapter 18</a>. What matters here
+is recognising <em>which</em> of these situations you are in — that determines both the operation and the
+point.</p>
+
+<h2 id="inclusive">Inclusion policy</h2>
+
+<p>Whether a line present in L1 must also be present in L2 is an implementation choice, and it changes both the effective capacity of the hierarchy and what an eviction actually costs.</p>
+
+<pre class="diagram">   INCLUSIVE      everything in L1 is also in L2
+                  + coherency is simple: snoop L2 and you know
+                    what the cores hold
+                  - wastes capacity: L2 duplicates all of L1
+
+   EXCLUSIVE      a line lives at exactly one level
+                  + maximum effective capacity (L1 + L2)
+                  - more bookkeeping for coherency
+
+   NON-INCLUSIVE  neither guaranteed
+                  the common compromise on ARM designs
+
+  Software cannot generally observe which policy is in use, and
+  should not depend on it. It matters for two things:
+
+  1. Reasoning about effective capacity when tuning working-set
+     sizes.
+  2. The "clean and invalidate all levels" sequence used at power
+     down, which must walk every level by set and way precisely
+     because inclusion cannot be assumed.</pre>
+
+<h2 id="setway">Set/way operations and why you should not use them</h2>
+
+<div class="danger">
+<b><code>DC CISW</code> is almost always wrong</b>
+<p>The set/way operations (<code>DC ISW</code>, <code>DC CSW</code>, <code>DC CISW</code>) iterate over cache
+<em>geometry</em> rather than addresses. They are:</p>
+<ul>
+<li><strong>Not broadcast.</strong> They affect only the executing core's caches. On SMP they do not do what
+you want.</li>
+<li><strong>Not architecturally reliable for coherency.</strong> A line can migrate between levels or cores
+while you iterate, and be missed.</li>
+<li><strong>Implementation-dependent</strong> in which levels they reach.</li>
+</ul>
+<p>Their <em>only</em> legitimate use is powering down a core or cluster, where you must flush everything and
+no other agent is running. For every other purpose — DMA, self-modifying code, MMU changes — use the
+address-based (<code>VA</code>) operations, which <em>are</em> broadcast within the shareability domain.</p>
+<p>This mistake is common in bare-metal and bootloader code copied from older ARMv7 examples.</p>
+</div>
+
+<pre><code>/* The legitimate set/way use: flush the whole cache before power
+   down. Note this is genuinely intricate, which is another
+   reason to avoid it unless you must.                        */
+
+flush_all_levels:
+        mrs     x0, clidr_el1
+        and     w3, w0, #0x07000000     /* LoC: level of coherency */
+        lsr     w3, w3, #23
+        cbz     w3, finished
+        mov     w10, #0                 /* level*2                 */
+        mov     w8, #1
+loop_level:
+        add     w2, w10, w10, lsr #1
+        lsr     w1, w0, w2
+        and     w1, w1, #7              /* cache type at this level */
+        cmp     w1, #2
+        b.lt    next_level              /* no data cache here       */
+
+        msr     csselr_el1, x10         /* select this level        */
+        isb
+        mrs     x1, ccsidr_el1
+        /* ... extract line size, ways, sets; iterate DC CISW ... */
+next_level:
+        add     w10, w10, #2
+        cmp     w3, w10
+        b.gt    loop_level
+finished:
+        ret
+
+/* Linux does this in __flush_dcache_all(), used only from CPU
+   hotplug and suspend paths. Nowhere else.                   */</code></pre>
+
+<h2 id="slc">System-level caches</h2>
+
+<p>Beyond the CPU's own caches, many systems have a further cache shared with the GPU, display and other masters. It is invisible to the architecture's cache instructions, which has consequences for anything sharing memory with a device.</p>
+
+<pre class="diagram">Beyond the CPU cluster, many SoCs have a SYSTEM LEVEL CACHE
+shared by the CPU, GPU, NPU and display controller.
+
+   ┌────┐ ┌────┐ ┌────┐  ┌─────┐ ┌─────┐
+   │CPU0│ │CPU1│ │CPU2│  │ GPU │ │ NPU │
+   └─┬──┘ └─┬──┘ └─┬──┘  └──┬──┘ └──┬──┘
+     └──────┴──────┘        │       │
+        cluster L2          │       │
+            │               │       │
+   ┌────────┴───────────────┴───────┴────┐
+   │   System Level Cache / Last Level    │  ← the PoC may be HERE,
+   └──────────────────┬───────────────────┘    not at DRAM
+                      │
+                   ┌──┴──┐
+                   │ DRAM│
+                   └─────┘
+
+  Consequences worth knowing:
+   · the Point of Coherency may be the SLC rather than memory,
+     which makes DMA to a device behind the SLC coherent without
+     any maintenance
+   · a device NOT behind the SLC still needs maintenance to PoC
+   · whether a given master is coherent is a SoC integration
+     property, which is exactly what `dma-coherent` in the device
+     tree records
+   · MPAM (ARMv8.4) can partition the SLC between agents, which
+     is how mixed-criticality systems bound interference
+     (OS chapter 19)</pre>
+
+<h2 id="performance">Performance characteristics</h2>
+
+<p>Reading this table top to bottom is reading the cost of a cache miss cascading outward: each level is
+bigger, shared by more cores, and roughly an order of magnitude slower to reach than the one above it. The
+number that actually matters for software is not any single row but the <em>ratio</em> between adjacent rows —
+an L1 miss that hits L2 costs perhaps 3–4x as long as a hit, but an L2 miss that goes all the way to DRAM costs
+30–50x as long. That is why the memory-hierarchy chapters in the computer architecture track spend so much
+effort on locality: a working set that fits in L2 rather than spilling to DRAM is not a modest optimisation,
+it is the difference between a loop running at near-peak speed and one that is almost entirely waiting.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Level</th><th>Typical size</th><th>Latency</th><th>Shared by</th></tr></thead>
+<tbody>
+<tr><td>L1 I / L1 D</td><td>32–128 KB each</td><td>3–5 cycles</td><td>One core</td></tr>
+<tr><td>L2</td><td>256 KB – 2 MB</td><td>10–20 cycles</td><td>One core, or a cluster</td></tr>
+<tr><td>L3 / cluster cache</td><td>4–32 MB</td><td>30–60 cycles</td><td>The cluster</td></tr>
+<tr><td>SLC</td><td>4–64 MB</td><td>60–120 cycles</td><td>The whole SoC</td></tr>
+<tr><td>DRAM</td><td>GBs</td><td>150–300 cycles</td><td>Everything</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># measure your own machine's steps empirically
+perf stat -e l1d_cache,l1d_cache_refill,\
+l2d_cache,l2d_cache_refill,\
+ll_cache_rd,ll_cache_miss_rd ./prog
+
+# the ratio refill/access at each level is the miss rate there
+# a pointer-chase benchmark over increasing working-set sizes
+# reveals the capacity of each level as a step in the latency
+
+# non-temporal access, to avoid polluting the hierarchy for a
+# streaming copy (CA chapter 14)
+        ldnp    q0, q1, [x1], #32
+        stnp    q0, q1, [x0], #32</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hardcoded 64-byte line size fails on some SoC</td><td>Line size is implementation defined — read <code>CTR_EL0</code></td></tr>
+<tr><td>DMA works on one board, corrupts on another</td><td>One is coherent, the other is not; maintenance missing</td></tr>
+<tr><td>Cleaned to PoU, device still reads stale data</td><td>Needed PoC — the device is beyond the point of unification</td></tr>
+<tr><td>JIT code executes garbage</td><td>Missing D-cache clean plus I-cache invalidate to PoU</td></tr>
+<tr><td>Set/way flush does not fix an SMP problem</td><td>Set/way is not broadcast; use VA operations</td></tr>
+<tr><td>Bootloader code from an ARMv7 example misbehaves</td><td>Set/way semantics differ; use address-based operations</td></tr>
+<tr><td>Coherency bug only on multi-core</td><td>Memory marked Non-shareable, so it is outside the domain</td></tr>
+<tr><td>Barrier added, stale DMA data persists</td><td>An ordering fix applied to a coherency problem</td></tr>
+<tr><td>Large copy destroys unrelated performance</td><td>Cache pollution; use non-temporal stores</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what the architecture guarantees about caches and what it leaves implementation defined.</li>
+  <li>Explain how to discover the cache line size correctly.</li>
+  <li>Define PoU and PoC, and give a case that needs each.</li>
+  <li>Explain why choosing PoU where PoC was needed is a portable-looking bug.</li>
+  <li>State the difference between coherency and ordering, and give a symptom of each.</li>
+  <li>Give three reasons set/way operations are the wrong tool for DMA.</li>
+  <li>Explain what a system-level cache changes about the Point of Coherency.</li>
+  <li>List the situations that genuinely require cache maintenance.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

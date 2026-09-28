@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decoding a HardFault | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Decoding a HardFault</h1>
+<p class="lead">A HardFault is not a mystery. The hardware records what happened, where, and in which
+instruction — you simply have to read four registers and know where the stack frame is. This chapter turns
+the most feared event on Cortex-M into a five-minute procedure.</p>
+
+<h2 id="taxonomy">The fault taxonomy</h2>
+
+<pre class="diagram">   CONFIGURABLE FAULTS - specific, informative, and DISABLED
+   at reset:
+
+     MemManage   MPU permission violation (chapter 14)
+     BusFault    the bus said no: bad address, peripheral
+                 with no clock, external memory not ready
+     UsageFault  undefined instruction, illegal state,
+                 unaligned access, divide by zero
+
+   HARDFAULT - the catch-all. You land here when:
+
+     a) the specific fault is not enabled (the default!), so
+        it ESCALATES; or
+     b) a fault occurs inside a fault handler; or
+     c) a fault occurs at a priority that cannot be
+        preempted - "priority escalation".
+
+   FIRST ACTION IN ANY NEW PROJECT: enable the specific
+   faults, so you get the informative one instead of the
+   catch-all.
+
+     SCB-&gt;SHCSR |= SCB_SHCSR_USGFAULTENA_Msk
+                |  SCB_SHCSR_BUSFAULTENA_Msk
+                |  SCB_SHCSR_MEMFAULTENA_Msk;
+
+   This one line converts "HardFault, no information" into
+   "UsageFault, UNALIGNED, at address X" and saves hours on
+   every future bug.</pre>
+
+<h2 id="cfsr">The Configurable Fault Status Register</h2>
+
+<pre><code>/* CFSR at 0xE000ED28 packs all three status bytes. */
+
+/*  MMFSR   bits 0-7    MemManage
+      0  IACCVIOL   instruction fetch from XN region
+      1  DACCVIOL   data access violation
+      3  MUNSTKERR  fault unstacking on exception return
+      4  MSTKERR    fault stacking on entry = STACK OVERFLOW
+      5  MLSPERR    fault during lazy FP stacking
+      7  MMARVALID  MMFAR is valid
+
+    BFSR    bits 8-15   BusFault
+      8  IBUSERR       instruction bus error
+      9  PRECISERR     data error, BFAR holds the address
+     10  IMPRECISERR   data error, address UNKNOWN (see below)
+     11  UNSTKERR      unstacking error
+     12  STKERR        stacking error
+     13  LSPERR        lazy FP stacking error
+     15  BFARVALID     BFAR is valid
+
+    UFSR    bits 16-31  UsageFault
+     16  UNDEFINSTR    undefined instruction
+     17  INVSTATE      invalid state - usually the Thumb bit
+     18  INVPC         invalid PC on exception return
+     19  NOCP          coprocessor absent - FPU not enabled
+     24  UNALIGNED     unaligned access
+     25  DIVBYZERO     divide by zero (if DIV_0_TRP set)  */
+
+/* The three that account for most real faults:
+
+   PRECISERR + BFARVALID
+     A bad pointer, and BFAR names the address. Usually a
+     null pointer (address near 0) or a peripheral whose
+     clock is off (address in 0x4xxxxxxx).
+
+   IMPRECISERR
+     The write was buffered; the core moved on before the
+     bus reported the error, so the address is LOST. Fix by
+     putting a DSB after suspect writes to force precision
+     while debugging, or set DISDEFWBUF in ACTLR to disable
+     write buffering entirely - slow, but every fault
+     becomes precise.
+
+   MSTKERR
+     Stack overflow, caught by an MPU guard region. The most
+     valuable single bit on the chip.                      */
+</code></pre>
+
+<h2 id="frame">Reading the stacked frame</h2>
+
+<p>The hardware pushed eight registers before entering the handler. The stacked PC is the instruction that
+faulted, and that is what you actually want.</p>
+
+<pre><code>/* Step 1: a naked handler that finds the right stack and
+   hands it to C. EXC_RETURN bit 2 says which one.         */
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    __asm volatile (
+        "tst   lr, #4            \n"  /* bit 2 of EXC_RETURN */
+        "ite   eq                \n"
+        "mrseq r0, msp           \n"  /* clear -> MSP        */
+        "mrsne r0, psp           \n"  /* set   -> PSP        */
+        "b     hardfault_report  \n"
+    );
+}
+
+/* Step 2: the frame, in the order the hardware pushed it. */
+typedef struct {
+    uint32_t r0, r1, r2, r3;
+    uint32_t r12;
+    uint32_t lr;      /* return address of the faulting fn */
+    uint32_t pc;      /* THE FAULTING INSTRUCTION          */
+    uint32_t psr;
+} frame_t;
+
+void hardfault_report(frame_t *f)
+{
+    uint32_t cfsr = SCB-&gt;CFSR;
+    uint32_t hfsr = SCB-&gt;HFSR;
+
+    /* HFSR bit 30 = FORCED: a configurable fault escalated.
+       If this is set, CFSR tells you the real cause.      */
+
+    fault_log_t *log = &amp;g_crash_log;      /* in .noinit    */
+    log-&gt;magic = 0xDEADBEEF;
+    log-&gt;pc    = f-&gt;pc;
+    log-&gt;lr    = f-&gt;lr;
+    log-&gt;cfsr  = cfsr;
+    log-&gt;hfsr  = hfsr;
+    log-&gt;bfar  = (cfsr &amp; (1u &lt;&lt; 15)) ? SCB-&gt;BFAR : 0;
+    log-&gt;mmfar = (cfsr &amp; (1u &lt;&lt; 7))  ? SCB-&gt;MMFAR : 0;
+
+    __asm volatile ("bkpt #0");   /* halt if debugger present */
+    NVIC_SystemReset();           /* otherwise reboot          */
+}
+
+/* Step 3: turn the PC into a line of source.
+
+     $ arm-none-eabi-addr2line -e firmware.elf -f -C 0x080012a4
+     i2c_read
+     /home/user/proj/src/i2c.c:142
+
+   That is the whole procedure. Fault -> PC -> source line,
+   in about a minute once the handler is in place.         */
+</code></pre>
+
+<div class="key">
+<b>Put the crash log in <code>.noinit</code> and report it after reboot</b>
+<p>A fault handler that only halts is useful on your desk and useless in the field. Writing the log to a
+<code>.noinit</code> section (<a href="mcu-05-memory-map.html">chapter 05</a>) means it survives the reset;
+early in the next boot you check the magic number, transmit or store the record, and clear it. Now a unit that
+crashed in a customer's cabinet tells you the faulting PC when it comes back up. This costs about forty lines
+and is the difference between diagnosing a field failure and asking for the unit back.</p>
+</div>
+
+<h2 id="causes">What actually causes them</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Fault bits</th><th>Almost always means</th></tr></thead>
+<tbody>
+<tr><td><code>PRECISERR</code>, BFAR near 0</td><td>Null pointer dereference — an
+<code>malloc</code>/lookup that returned NULL and went unchecked</td></tr>
+<tr><td><code>PRECISERR</code>, BFAR in 0x4xxxxxxx</td><td>Peripheral register accessed with its clock gated
+off</td></tr>
+<tr><td><code>IMPRECISERR</code></td><td>A buffered write went bad earlier; add <code>DSB</code> or disable
+write buffering to localise it</td></tr>
+<tr><td><code>MSTKERR</code></td><td>Stack overflow — the MPU guard did its job</td></tr>
+<tr><td><code>INVSTATE</code></td><td>Branch to an address with the Thumb bit clear — a corrupted or
+hand-built function pointer</td></tr>
+<tr><td><code>UNDEFINSTR</code></td><td>Executing data: a wild jump, or a corrupted return address</td></tr>
+<tr><td><code>NOCP</code></td><td>Float instruction with the FPU not enabled in <code>CPACR</code></td></tr>
+<tr><td><code>UNALIGNED</code></td><td>A packed struct member or a cast to a wider type at an odd
+address</td></tr>
+<tr><td><code>INVPC</code></td><td>Corrupted <code>EXC_RETURN</code>, usually a context-switch bug</td></tr>
+<tr><td><code>FORCED</code> only, CFSR zero</td><td>A fault inside a fault handler — check that your handler
+does nothing that can fault</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="imprecise">The imprecise fault, and how to corner it</h2>
+
+<pre><code>/* IMPRECISERR is the frustrating one: the address is gone
+   and the stacked PC points several instructions past the
+   real culprit. Three techniques, in order of cost:       */
+
+/* 1. Disable the write buffer. Every fault becomes precise.
+      Costs perhaps 10-20% performance - fine for a debug
+      build.                                               */
+SCnSCB-&gt;ACTLR |= SCnSCB_ACTLR_DISDEFWBUF_Msk;
+
+/* 2. Bisect with barriers. Put __DSB() after groups of
+      suspect writes; the fault becomes precise at whichever
+      barrier follows the bad one.                          */
+
+/* 3. Use the DWT watchpoint unit to trap writes to a
+      specific address, which catches the corruptor rather
+      than the victim - covered in chapter 16.              */
+
+/* The single most common source: writing to a peripheral
+   whose clock you have not enabled. The write is posted,
+   the bus rejects it later, and the fault arrives with no
+   address. If you see IMPRECISERR in code that just
+   initialised a peripheral, check the RCC enable and the
+   read-back (chapter 09) before anything else.            */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>HardFault with CFSR all zero</td><td>Fault inside a handler, or a double fault — check
+<code>HFSR</code></td></tr>
+<tr><td>Always HardFault, never a specific fault</td><td>Configurable faults not enabled in
+<code>SHCSR</code></td></tr>
+<tr><td>Stacked PC points at innocent code</td><td>Imprecise bus fault — disable write buffering to
+localise</td></tr>
+<tr><td>Fault handler itself faults</td><td>It touched a peripheral, used floating point, or overflowed the
+stack further</td></tr>
+<tr><td>Debugger shows the handler but no frame</td><td>Read the frame via MSP/PSP as the naked handler above
+does</td></tr>
+<tr><td>Fault only in release builds</td><td>Inlining changed stack usage, or exposed undefined
+behaviour</td></tr>
+<tr><td>Fault on the first floating-point operation</td><td><code>NOCP</code> — enable the FPU in
+<code>CPACR</code> with a barrier after</td></tr>
+<tr><td>Fault after a context switch</td><td><code>INVPC</code> — <code>EXC_RETURN</code> or the saved frame
+is corrupt</td></tr>
+<tr><td>Unit crashes in the field, works on the bench</td><td>Add a <code>.noinit</code> crash log and report
+it after reboot</td></tr>
+<tr><td>Crash log is empty after reset</td><td>Log placed in <code>.bss</code>, so startup zeroed it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three configurable faults and say why they are usually disabled.</li>
+  <li>Give the one line that makes future faults far more informative.</li>
+  <li>List three ways a fault escalates to HardFault.</li>
+  <li>Explain how to determine which stack pointer holds the exception frame.</li>
+  <li>Give the layout of the stacked frame and say which field you want most.</li>
+  <li>Give the command that turns a faulting PC into a source line.</li>
+  <li>Distinguish <code>PRECISERR</code> from <code>IMPRECISERR</code> and say why one loses the
+  address.</li>
+  <li>Name two techniques for localising an imprecise fault.</li>
+  <li>Say what <code>MSTKERR</code> indicates and what must be configured for it to occur.</li>
+  <li>Explain how to make a crash log survive the reset that follows it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The SMC calling convention and the world switch | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The SMC calling convention and the world switch</h1>
+<p class="lead">One instruction crosses the security boundary. This chapter follows it: the register
+convention, what EL3 does on the way through, how a long secure operation is interrupted, and why the
+whole design is shaped by the fact that only one world runs at a time.</p>
+
+<h2 id="smc">The instruction</h2>
+
+<p>There is exactly one instruction that crosses between the worlds, and it works like a system call aimed at the monitor rather than at a kernel. Everything the normal world asks of the secure world travels this way.</p>
+
+<pre><code>        SMC     #imm16          /* Secure Monitor Call */
+
+/* Behaves exactly like SVC and HVC (ARM chapter 30), one level
+   up:
+
+     SVC  from EL0  -&gt; EL1     the syscall
+     HVC  from EL1  -&gt; EL2     the hypercall
+     SMC  from EL1  -&gt; EL3     the secure monitor call
+
+   On execution:
+     ELR_EL3   &lt;- address of the instruction AFTER the SMC
+     SPSR_EL3  &lt;- PSTATE, including the security state
+     ESR_EL3   &lt;- EC 0x17 (AArch64 SMC), ISS = the imm16
+     PC        &lt;- VBAR_EL3 + 0x400  (sync, lower EL, AArch64)
+
+   The imm16 is CAPTURED but not used by any real convention -
+   everybody passes the function ID in X0 instead, because that
+   gives 32 bits instead of 16 and can be computed at runtime. */</code></pre>
+
+<div class="warn">
+<b>SMC can be disabled, or stolen</b>
+<p><code>SCR_EL3.SMD = 1</code> makes <code>SMC</code> undefined at EL1 and EL2. And separately,
+<code>HCR_EL2.TSC = 1</code> makes an EL1 <code>SMC</code> trap to <em>EL2</em> instead of EL3 — which is
+how a hypervisor filters or virtualises the calls its guests make. A guest that thinks it is talking to
+firmware may be talking to the hypervisor.</p>
+</div>
+
+<h2 id="smccc">SMCCC — the calling convention</h2>
+
+<p>Without a convention, every vendor's firmware would take arguments differently and no portable software could call it. The calling convention standardises the function numbering and the register usage.</p>
+
+<pre class="diagram">Arm's SMC Calling Convention makes the function ID in X0
+self-describing:
+
+  bit 31     call type      0 = Yielding, 1 = Fast
+  bit 30     calling conv   0 = SMC32,    1 = SMC64
+  bits 29:24 owning entity
+  bits 23:16 reserved / hint
+  bits 15:0  function number
+
+  OWNING ENTITY ranges:
+     0x00  Arm architecture calls (SMCCC_VERSION, workarounds)
+     0x01  CPU service        (PSCI lives here)
+     0x02  SiP service        (vendor firmware)
+     0x03  OEM service        (board integrator)
+     0x04  Standard Secure    (PSCI, SDEI, FF-A, TRNG)
+     0x05  Standard Hypervisor
+     0x06  Vendor Hypervisor
+     0x30-0x31  Trusted Application calls
+     0x32-0x3F  Trusted OS calls
+
+  FAST vs YIELDING:
+     Fast     atomic-ish, must not be preempted, returns quickly.
+              PSCI, version queries, register reads.
+     Yielding may block, may be interrupted by a normal-world
+              interrupt, may need to be resumed. TEE requests.
+
+  SMC32 vs SMC64: whether arguments are 32-bit values in W
+  registers or 64-bit in X registers. A 32-bit normal world can
+  only issue SMC32.</pre>
+
+<pre><code>/* Registers, SMC64: */
+
+   X0        function ID          -&gt; return value / status
+   X1..X6    arguments            -&gt; return values X1..X3
+   X7        hint / session       (SMCCC 1.2: also an argument)
+   X8..X17   volatile             the callee may clobber
+   X18       platform register    preserved
+   X19..X29  callee-saved         PRESERVED across the SMC
+   X30, SP   preserved
+
+/* SMCCC 1.2 extends the argument and result set to X0..X17 for
+   SMC64, which is what FF-A uses.
+
+   Standard return codes:
+        0   SUCCESS
+       -1   NOT_SUPPORTED          (also: unknown function ID)
+       -2   INVALID_PARAMETER
+       -3   DENIED
+   Anything else is service-specific.                          */
+
+/* The unknown-ID rule matters: an SMC with a function ID nobody
+   claims must return -1 in X0, not hang and not panic. That is
+   how a caller DISCOVERS what firmware supports - it asks, and
+   a clean "no" is a valid answer.                            */</code></pre>
+
+<h2 id="switch">What EL3 actually does</h2>
+
+<p>What the monitor actually does between your instruction and the secure world running is a full context save and restore, plus the bit flip. Seeing the sequence explains where the cost comes from.</p>
+
+<pre class="diagram">   Non-secure EL1 (Linux)                   Secure world
+   ----------------------                   ------------
+   set X0 = function ID
+   set X1..X6 = args
+   SMC #0
+      |
+      | hardware: save ELR_EL3, SPSR_EL3, set ESR_EL3
+      v
+   EL3 vector +0x400
+      |
+      +-- push X19..X30 of the caller into the NS context
+      +-- save NS system registers into the NS context:
+      |     TTBR0/1_EL1, TCR_EL1, SCTLR_EL1, MAIR_EL1,
+      |     VBAR_EL1, SPSR_EL1, ELR_EL1, ESR_EL1, FAR_EL1,
+      |     TPIDR_EL0/EL1, CONTEXTIDR_EL1, MDSCR_EL1, ...
+      +-- save the FP/SIMD state if it is in use
+      +-- decode X0: which owning entity?
+      |
+      +--&gt; PSCI?  handled INSIDE EL3, no world switch at all.
+      |           result placed in X0, restore NS, ERET back.
+      |
+      +--&gt; Trusted OS call?
+             |
+             +-- SCR_EL3.NS = 0
+             +-- restore the SECURE context saved from last time
+             +-- ERET to Secure EL1
+                    |
+                    v                          Trusted OS runs
+                                               with X0..X6 as
+                                               passed through
+                                                      |
+                                               does the work
+                                                      |
+                                               SMC (return)
+                    |                                 |
+      &lt;-------------+---------------------------------+
+      |
+      +-- save the secure context
+      +-- SCR_EL3.NS = 1
+      +-- restore the NS context
+      +-- ERET to Non-secure EL1
+      |
+      v
+   Linux resumes at the instruction after its SMC,
+   with results in X0..X3</pre>
+
+<div class="note">
+<b>The monitor is a context switcher, not a service</b>
+<p>Almost everything EL3 does is save-and-restore. The interesting work happens in the trusted OS at S-EL1;
+EL3's job is to make sure that when it starts running, none of the normal world's state is visible to it
+and vice versa. This is why EL3 code is measured in tens of kilobytes, and why the design goal is to keep
+it that way (<a href="sec-09-two-worlds.html">chapter 09</a>).</p>
+</div>
+
+<h2 id="cost">What the switch costs</h2>
+
+<p>A world switch is measured in microseconds, not nanoseconds. That figure is what should decide whether an operation belongs behind an SMC at all, or whether it should be batched.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Step</th><th>Rough cost</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>SMC exception entry</td><td>~30–60 cycles</td><td>Pipeline flush, same as any exception</td></tr>
+<tr><td>Save NS context</td><td>~200–500 cycles</td><td>~40 system registers; <code>MSR</code>/<code>MRS</code> are not cheap and some serialise</td></tr>
+<tr><td>Restore secure context</td><td>~200–500 cycles</td><td>Same again, the other way</td></tr>
+<tr><td><code>ERET</code></td><td>~20–40 cycles</td><td>Another pipeline flush</td></tr>
+<tr><td>FP/SIMD save and restore</td><td>+~100 cycles</td><td>Skipped if <code>CPACR</code> shows it unused; SVE is far worse</td></tr>
+<tr><td>Cold caches and TLBs in the other world</td><td>Highly variable</td><td>The real cost, and the one nobody measures</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Round trip: roughly 1000-4000 cycles for a trivial call, plus
+   whatever the trusted OS does, plus the cache effects on both
+   sides.
+
+   At 1.5 GHz that is a few microseconds of pure overhead. Fine
+   at 100 calls per second. Ruinous at 100,000.
+
+   DESIGN CONSEQUENCE: batch. A TEE interface that asks the
+   secure world to encrypt one 16-byte block per SMC will be
+   dominated entirely by switching. Pass a buffer of a megabyte
+   and the overhead disappears into the noise.
+
+   The same shape of argument as syscall batching (OS chapter 3)
+   and as MMIO round trips (ARM chapter 25) - crossing a
+   boundary is expensive, so cross it with as much work as you
+   can carry.                                                */</code></pre>
+
+<h2 id="interrupt">Interrupting a long secure call</h2>
+
+<p>An interrupt arriving while the secure world is executing raises an awkward question about who handles it and when. The answer involves routing rules neither world can subvert.</p>
+
+<pre class="diagram">Problem: the trusted OS is halfway through a 50 ms operation and
+a normal-world timer interrupt fires. Only one world runs at a
+time, so the normal world is FROZEN. Miss enough ticks and Linux
+notices - RCU stalls, softlockup warnings, dropped audio.
+
+Solution: the Non-secure interrupt is routed to EL3
+(SCR_EL3.IRQ = 1 while in the secure world), which returns to
+the normal world with a "please call me back" status.
+
+   Linux                EL3              Trusted OS
+   -----                ---              ----------
+   SMC(op) ---------&gt;  switch  -------&gt;  starts work
+                                            ...
+                       &lt;-- NS IRQ arrives, taken to EL3
+   &lt;-- X0 = INTERRUPTED, with a resume token
+   handles the IRQ
+   scheduler runs, other tasks run
+   SMC(RESUME, token) -&gt;  switch -----&gt;  continues where it
+                                         left off
+   &lt;-- X0 = SUCCESS ------------------- done
+
+  In OP-TEE this is OPTEE_SMC_RETURN_RPC_* and RETURN_FROM_RPC.
+  In FF-A it is FFA_INTERRUPT and FFA_RUN.
+
+  The secure world must therefore be written so it CAN be
+  suspended mid-operation: no unbounded critical sections, and
+  state kept in the session rather than on a stack it assumes
+  will still be there.
+
+  This is also why YIELDING calls exist as a category. A Fast
+  call promises it is short enough that this machinery is
+  unnecessary.</pre>
+
+<h2 id="rpc">RPC — the secure world calling back</h2>
+
+<p>Secure-world code sometimes needs something only the normal world can do — reading a file, allocating memory. That inversion is a deliberate part of the design and a carefully constrained one, since it lets untrusted code influence trusted execution.</p>
+
+<pre><code>/* The trusted OS has no drivers. It cannot read a file, allocate
+   from the kernel, or talk to storage. When it needs any of
+   that it returns to the normal world with a REQUEST.       */
+
+   Trusted OS needs to load a TA from disk
+        |
+        v
+   returns X0 = RPC_LOAD_TA, X1 = uuid...
+        |
+        v
+   EL3 switches to the normal world
+        |
+        v
+   tee-supplicant (a userspace daemon) reads the file
+        |
+        v
+   places it in shared memory, SMC(RETURN_FROM_RPC)
+        |
+        v
+   Trusted OS resumes, now with the data
+
+/* Common RPC types: allocate shared memory, free it, load a TA,
+   read or write secure storage, get the wall-clock time,
+   perform a network request to a provisioning server.       */
+
+/* SECURITY CONSEQUENCE, and it is a big one:
+
+   Everything obtained by RPC comes from an untrusted source.
+   The normal world can:
+        - return a DIFFERENT TA binary  -&gt; VERIFY THE SIGNATURE
+        - return stale secure storage   -&gt; ANTI-ROLLBACK COUNTER
+        - lie about the time            -&gt; never trust it for expiry
+        - refuse to answer at all       -&gt; handle the failure
+        - answer differently each read  -&gt; COPY IN, then validate
+
+   The trusted OS depends on the normal world for AVAILABILITY -
+   which is fine, since a normal world that refuses to cooperate
+   has only denied itself service. It must never depend on it
+   for INTEGRITY.                                            */</code></pre>
+
+<h2 id="psci">PSCI: the SMC interface everyone uses</h2>
+
+<p>The most common SMC most systems make has nothing to do with a trusted OS: power management is handled by firmware at EL3, which is why turning a CPU off is a call into the monitor.</p>
+
+<pre><code>/* Most SMCs on a running Linux system never reach a trusted OS at
+   all. They are PSCI - Power State Coordination Interface -
+   handled entirely inside EL3.                              */
+
+   PSCI_VERSION            0x84000000
+   CPU_SUSPEND             0xC4000001
+   CPU_OFF                 0x84000002
+   CPU_ON                  0xC4000003
+   AFFINITY_INFO           0xC4000004
+   SYSTEM_OFF              0x84000008
+   SYSTEM_RESET            0x84000009
+   PSCI_FEATURES           0x8400000A
+   SYSTEM_RESET2           0xC4000012
+
+/* Linux brings up a secondary core: */
+
+static int psci_cpu_on(unsigned long cpuid, unsigned long entry)
+{
+        return invoke_psci_fn(PSCI_FN_NATIVE(0_2, CPU_ON),
+                              cpuid, entry, 0);
+}
+
+/* invoke_psci_fn is arm_smccc_smc() or arm_smccc_hvc() depending
+   on the CONDUIT, which is read from the device tree:
+
+        psci {
+                compatible = "arm,psci-1.0";
+                method     = "smc";
+        };
+
+   Under a hypervisor the method is "hvc" instead, and the
+   hypervisor either handles the call or forwards it. A wrong
+   conduit is a classic bring-up failure: SMC from a guest traps
+   to EL2 (HCR_EL2.TSC) or is simply undefined, and the
+   secondary CPUs never come up.                             */
+
+/* Which is why "only CPU0 is online" is almost always a PSCI
+   problem, not a scheduler problem (ARM chapter 33).        */</code></pre>
+
+<h2 id="linux">Issuing an SMC from Linux</h2>
+
+<p>From a driver's point of view all of this is hidden behind a small helper, and raw SMCs in driver code are a portability red flag rather than a normal thing to write.</p>
+
+<pre><code>#include &lt;linux/arm-smccc.h&gt;
+
+static int my_sip_call(u32 arg)
+{
+        struct arm_smccc_res res;
+
+        arm_smccc_smc(MY_SIP_FUNC_ID,   /* X0 */
+                      arg,              /* X1 */
+                      0, 0, 0, 0, 0, 0, /* X2..X7 */
+                      &amp;res);
+
+        if ((long)res.a0 &lt; 0)
+                return -EINVAL;
+
+        return res.a1;                  /* X1 came back here */
+}
+
+/* res holds a0..a3 = X0..X3.
+
+   arm_smccc_smc() emits SMC; arm_smccc_hvc() emits HVC. Use
+   arm_smccc_1_1_invoke() to pick automatically based on the
+   detected conduit - that is what generic code should do.   */
+
+/* CONSTRAINTS on the caller:
+     - the call may take a long time; do not hold a spinlock
+     - it does not sleep in the Linux sense, but it does BLOCK
+       the CPU, so a Yielding call has no place in a truly
+       atomic context
+     - arguments passed by pointer must be PHYSICAL addresses in
+       memory the secure world can reach - a kmalloc'd buffer's
+       virtual address is meaningless there
+     - that memory must be non-secure and inside the region the
+       secure world will accept (chapter 08)
+     - and it must be flushed to the point of coherency if the
+       two worlds' mappings differ in cacheability           */</code></pre>
+
+<div class="tip">
+<b>Watching SMC traffic</b>
+<p>Build TF-A with <code>DEBUG=1 LOG_LEVEL=40</code> and it prints every call it handles on the UART. On a
+QEMU virt machine with OP-TEE this is the fastest way to see the real sequence: PSCI during boot, then the
+OP-TEE calls once <code>tee-supplicant</code> starts, then the RPC round trips inside each one.</p>
+</div>
+
+<h2 id="ffa">FF-A: the newer shape</h2>
+
+<p>As secure worlds grew to hold several mutually distrusting partitions, a richer interface than raw SMC numbering became necessary. This is the standard that replaces ad-hoc conventions.</p>
+
+<pre><code>/* The Firmware Framework for Arm A-profile replaces "one trusted
+   OS reached by vendor-specific SMCs" with a message-passing
+   model between PARTITIONS.                                 */
+
+   FFA_VERSION               negotiate
+   FFA_ID_GET                who am I
+   FFA_PARTITION_INFO_GET    who else is here
+   FFA_MSG_SEND_DIRECT_REQ   send a message, block for the reply
+   FFA_MSG_SEND_DIRECT_RESP  the reply
+   FFA_MEM_SHARE             share pages with a partition
+   FFA_MEM_LEND / DONATE     transfer them
+   FFA_MEM_RECLAIM           take them back
+   FFA_RUN                   resume a partition
+   FFA_INTERRUPT             it was preempted
+
+/* WHY IT MATTERS:
+     - several mutually distrusting secure partitions can coexist
+       under a Secure EL2 hypervisor (chapter 09), instead of one
+       monolithic trusted OS
+     - memory sharing is EXPLICIT and revocable, with the manager
+       tracking who has what - not an ad hoc agreed region
+     - the same interface works for normal-world VMs, so a
+       hypervisor can broker access rather than passing SMCs
+       through blind
+
+   OP-TEE can run as an FF-A secure partition, and new designs
+   generally should. But the older direct-SMC interface is what
+   you will meet on most shipping hardware.                  */</code></pre>
+
+<h2 id="design">Designing an SMC interface</h2>
+
+<div class="key">
+<b>Rules that keep the boundary safe</b>
+<ul>
+<li><strong>Validate every argument, every time.</strong> The caller is the attacker. Ranges, sizes,
+alignment, handles, enum values.</li>
+<li><strong>Copy shared-memory arguments in before validating.</strong> The other world can rewrite them
+between your check and your use (<a href="sec-09-two-worlds.html">chapter 09</a>).</li>
+<li><strong>Never return a secure pointer.</strong> Return an opaque handle indexed into a table you own.</li>
+<li><strong>Make calls idempotent or explicitly sequenced.</strong> The normal world can retry, replay, or
+call from two CPUs at once.</li>
+<li><strong>Assume concurrency.</strong> Every core can be inside the same call simultaneously; the trusted OS
+needs real locking.</li>
+<li><strong>Bound the work.</strong> No operation may run for an unbounded time, because it stalls the normal
+world.</li>
+<li><strong>Return <code>NOT_SUPPORTED</code> for unknown IDs</strong> — discovery depends on it.</li>
+<li><strong>Version the interface</strong> from the first release, and negotiate.</li>
+<li><strong>Keep the surface small.</strong> Every function ID is an entry point into the most privileged
+code on the SoC.</li>
+</ul>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>SMC</code> is an undefined instruction</td><td><code>SCR_EL3.SMD = 1</code>, or no EL3 implemented</td></tr>
+<tr><td>SMC lands in the hypervisor instead of firmware</td><td><code>HCR_EL2.TSC = 1</code></td></tr>
+<tr><td>Returns <code>-1</code> for a call you implemented</td><td>Function ID mismatch, or the SMC32/SMC64 bit is wrong</td></tr>
+<tr><td>Only CPU0 comes online</td><td>PSCI conduit wrong in DT, or <code>CPU_ON</code> failing — check the TF-A log</td></tr>
+<tr><td>Secure world reads garbage from your buffer</td><td>Virtual address passed instead of physical, or cache not flushed</td></tr>
+<tr><td>Works once, fails on retry</td><td>Non-idempotent call, or session state not reset</td></tr>
+<tr><td>RCU stalls and softlockups during TEE use</td><td>A long secure operation that never yields to normal-world interrupts</td></tr>
+<tr><td>Random corruption under load</td><td>Trusted OS not locking against concurrent calls from multiple cores</td></tr>
+<tr><td>Hang inside <code>arm_smccc_smc</code></td><td>Firmware never returned — a secure-world crash or deadlock</td></tr>
+<tr><td>Callee-saved registers corrupted after the call</td><td>Firmware violating the SMCCC — a real firmware bug</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Place <code>SMC</code> alongside <code>SVC</code> and <code>HVC</code>, and say what each targets.</li>
+  <li>Decode an SMCCC function ID: type, convention, owning entity, number.</li>
+  <li>Explain the difference between a Fast and a Yielding call.</li>
+  <li>List what EL3 saves and restores on a world switch, and estimate the cost.</li>
+  <li>Explain why a TEE interface should batch work.</li>
+  <li>Describe how a long secure operation is interrupted and resumed.</li>
+  <li>Explain what RPC is and why nothing returned by it may be trusted for integrity.</li>
+  <li>Name five PSCI functions and say why a wrong conduit stops secondary CPUs booting.</li>
+  <li>Write a Linux SMC call and state the constraints on any pointer you pass.</li>
+  <li>Give five rules for designing a safe SMC interface.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

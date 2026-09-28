@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FFI: calling C and being called by C | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>FFI: calling C and being called by C</h1>
+<p class="lead">Every real embedded Rust project sits on a C vendor SDK. This chapter is the boundary: how
+to call C safely, how to be called from C, and the layout, ownership and panic rules that make the seam
+sound rather than merely working.</p>
+
+<h2 id="declaring">Calling C</h2>
+
+<p>Calling C from Rust is deliberately unceremonious. The ceremony that does exist is all about making the declaration match the C side exactly, because nothing checks that for you.</p>
+
+<pre><code>    // declare what the C side provides
+    extern "C" {
+        fn HAL_GPIO_WritePin(port: *mut GPIO_TypeDef,
+                             pin: u16, state: u32);
+        fn HAL_Delay(ms: u32);
+        fn malloc(size: usize) -> *mut core::ffi::c_void;
+    }
+
+    // every call is unsafe - the compiler cannot check
+    // anything about C
+    unsafe { HAL_Delay(100); }
+
+    // Rust 2024: `unsafe extern` makes the declaration itself
+    // an unsafe act, which is more honest
+    unsafe extern "C" {
+        safe fn abs(x: i32) -> i32;     // and individual
+                                        // functions may be
+                                        // marked safe
+        unsafe fn free(p: *mut c_void);
+    }
+
+/* THE C TYPES, from core::ffi: */
+    c_char  c_schar  c_uchar
+    c_short c_ushort c_int  c_uint
+    c_long  c_ulong  c_longlong c_ulonglong
+    c_float c_double
+    c_void
+    CStr    CString  (CString needs alloc)
+
+/* USE THESE, not u8/i32 - c_char is i8 on x86 and u8 on ARM,
+   and c_long is 32 bits on Windows and 64 on Linux
+   (compilers chapter 10). Getting it wrong compiles and then
+   misbehaves.
+
+/* LINKING: */
+    #[link(name = "vendorhal")]         // -lvendorhal
+    extern "C" { ... }
+
+    #[link(name = "m")]
+    #[link(name = "static_thing", kind = "static")]
+
+    // or from build.rs (chapter 11):
+    println!("cargo:rustc-link-lib=static=vendorhal");
+    println!("cargo:rustc-link-search=native=vendor/lib");</code></pre>
+
+<h2 id="layout">Layout</h2>
+
+<p>Rust's default struct layout is unspecified, which is a feature until you need to hand a struct to C. One attribute fixes it, and forgetting it produces silent corruption rather than an error.</p>
+
+<pre><code>/* RUST REORDERS STRUCT FIELDS BY DEFAULT to minimise
+   padding. For anything crossing the boundary, say
+   #[repr(C)].                                             */
+
+    #[repr(C)]
+    pub struct Message {
+        pub id: u32,
+        pub length: u16,
+        pub flags: u8,
+        pub _pad: u8,               // explicit, so both sides
+                                    // agree
+        pub payload: [u8; 64],
+    }
+    const _: () = assert!(core::mem::size_of::&lt;Message&gt;() == 72);
+    const _: () = assert!(core::mem::offset_of!(Message,
+                                                payload) == 8);
+
+/* THE `const _: () = assert!(...)` IDIOM is a compile-time
+   check in a const context - the Rust equivalent of
+   static_assert, and it should be on every FFI struct
+   (C++ chapter 16 makes the same argument).
+
+/* THE repr ATTRIBUTES: */
+    #[repr(C)]              C-compatible layout
+    #[repr(transparent)]    exactly like the single field -
+                            for newtypes crossing FFI
+    #[repr(packed)]         no padding. DANGEROUS - taking a
+                            reference to a misaligned field is
+                            UB (chapter 14)
+    #[repr(align(64))]      minimum alignment
+    #[repr(u8)] / #[repr(i32)]      a fixed enum
+                                    discriminant
+    #[repr(C, packed)]      combined
+
+/* ENUMS ACROSS FFI: */
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Status { Ok = 0, Error = 1, Timeout = 2 }
+
+/* BUT RECEIVING one from C is unsound if C can send a value
+   outside the set - a Rust enum with an invalid discriminant
+   is immediate UB. So take an integer and convert: */
+    #[no_mangle]
+    pub extern "C" fn handle(raw: u32) -> i32 {
+        match Status::try_from(raw) {
+            Ok(s) => process(s),
+            Err(_) => -1,
+        }
+    }
+
+/* AND NEWTYPES with repr(transparent), which cost nothing: */
+    #[repr(transparent)]
+    pub struct Handle(*mut c_void);
+/* Passed in a register exactly like the raw pointer, but a
+   distinct type on the Rust side.
+
+/* AUTOMATE IT: bindgen generates all of this from the C
+   headers (below), and it gets the platform-dependent types
+   right.                                                  */</code></pre>
+
+<h2 id="strings">Strings and slices</h2>
+
+<p>String conversion is where most FFI bugs live, because the two languages disagree about what a string fundamentally is. <a href="rs-20-strings-bytes.html">Chapter 09</a> covers the type zoo; this is the FFI-specific part.</p>
+
+<pre><code>/* RUST STRINGS ARE UTF-8 AND NOT NUL-TERMINATED. C strings
+   are NUL-terminated and of no particular encoding. The
+   conversion is not free and can fail.                    */
+
+    use core::ffi::{CStr, c_char};
+
+/* --- C -> Rust --- */
+    // SAFETY: `p` points to a NUL-terminated string that
+    // remains valid for the duration of this call
+    let s: &amp;CStr = unsafe { CStr::from_ptr(p) };
+    let bytes: &amp;[u8] = s.to_bytes();
+    let text: &amp;str = s.to_str()?;       // FAILS on invalid
+                                        // UTF-8
+
+/* --- Rust -> C --- */
+    // a literal, NUL-terminated at compile time:
+    let s = c"hello";                   // Rust 1.77 - &amp;CStr
+    unsafe { c_puts(s.as_ptr()); }
+
+    // or, with alloc:
+    let owned = CString::new("hello")?; // fails if it
+                                        // contains a NUL
+    unsafe { c_puts(owned.as_ptr()); }
+    // `owned` MUST outlive the call - this is wrong:
+    unsafe { c_puts(CString::new("x")?.as_ptr()); }
+                                // the CString is dropped at
+                                // the end of the statement,
+                                // leaving a dangling pointer
+
+/* --- SLICES --- */
+    // C -> Rust
+    #[no_mangle]
+    pub extern "C" fn process(data: *const u8, len: usize)
+            -> i32
+    {
+        if data.is_null() { return -1; }
+        // SAFETY: the caller guarantees `data` points to
+        // `len` initialised bytes that are not mutated for
+        // the duration of this call
+        let s = unsafe { core::slice::from_raw_parts(data,
+                                                     len) };
+        do_work(s)
+    }
+
+    // Rust -> C
+    let v = [1u8, 2, 3];
+    unsafe { c_send(v.as_ptr(), v.len()); }
+
+/* THE THREE THINGS TO CHECK on every incoming pointer:
+     1. is it null?
+     2. is the length plausible? (a bound, not just non-zero)
+     3. is the alignment right for the element type?
+   And then state in the SAFETY comment what you are trusting
+   the caller for - because you cannot check the rest.    */</code></pre>
+
+<div class="key">
+<b>The FFI boundary is a trust boundary</b>
+<p>Everything arriving from C is unvalidated: pointers may be null or dangling, lengths may be wrong, enum
+values may be out of range, strings may not be NUL-terminated. This is exactly the position a kernel driver
+is in with respect to userspace (<a href="lx-21-ioctl.html">Linux chapter 23</a>), and it deserves the same
+discipline: check what you can, document what you cannot, and keep the unchecked surface small.</p>
+</div>
+
+<h2 id="exported">Being called from C</h2>
+
+<p>The other direction — a Rust library a C program links against — has its own set of requirements, and one of them is a hard rule about what must never cross the boundary.</p>
+
+<pre><code>    #[no_mangle]
+    pub extern "C" fn rust_process(data: *const u8,
+                                   len: usize) -> i32
+    {
+        // 1. VALIDATE
+        if data.is_null() || len == 0 || len &gt; MAX_LEN {
+            return -1;
+        }
+
+        // 2. CONVERT
+        // SAFETY: checked non-null; the caller guarantees
+        // `len` valid bytes
+        let s = unsafe { core::slice::from_raw_parts(data,
+                                                     len) };
+
+        // 3. CATCH PANICS - unwinding into C is UB
+        let result = core::panic::catch_unwind(|| {
+            do_work(s)
+        });
+
+        match result {
+            Ok(Ok(v))  => v as i32,
+            Ok(Err(_)) => -2,
+            Err(_)     => -3,       // it panicked
+        }
+    }
+
+/* `#[no_mangle]` gives it a plain symbol name.
+   `extern "C"` gives it the C calling convention.
+   BOTH are required.
+
+/* THE PANIC RULE: a panic that unwinds across an FFI boundary
+   is UNDEFINED BEHAVIOUR, exactly like a C++ exception
+   escaping into C (C++ chapter 16). Three ways to prevent
+   it:
+     1. panic = "abort" in the profile - the embedded answer
+     2. catch_unwind at every entry point - needs std
+     3. extern "C-unwind" if you WANT unwinding to propagate,
+        and the C side is built to handle it
+
+/* --- HANDING OWNERSHIP TO C, and getting it back --- */
+    #[no_mangle]
+    pub extern "C" fn device_create(base: usize)
+            -> *mut Device
+    {
+        match Device::new(base) {
+            Ok(d) => Box::into_raw(Box::new(d)),    // LEAKS,
+                                                    // deliberately
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn device_destroy(d: *mut Device) {
+        if !d.is_null() {
+            // SAFETY: `d` came from device_create and has not
+            // been destroyed
+            drop(unsafe { Box::from_raw(d) });
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn device_read(d: *mut Device,
+                                         out: *mut u16) -> i32
+    {
+        if d.is_null() || out.is_null() { return -1; }
+        // SAFETY: as above
+        let dev = unsafe { &amp;mut *d };
+        match dev.read() {
+            Ok(v) => { unsafe { out.write(v) }; 0 }
+            Err(_) => -1,
+        }
+    }
+
+/* THE OPAQUE-HANDLE PATTERN, identical to the C++ one
+   (C++ chapter 16): create returns a pointer, operations
+   take it, destroy frees it. `Box::into_raw` and
+   `from_raw` are the ownership transfer, and forgetting the
+   destroy is a leak while calling it twice is a
+   double-free.
+
+/* GENERATE THE C HEADER automatically: */
+    # cbindgen.toml + build.rs
+    cbindgen --config cbindgen.toml --crate my_crate \
+             --output include/my_crate.h
+/* So the header cannot drift from the Rust definitions.  */</code></pre>
+
+<h2 id="callbacks">Callbacks</h2>
+
+<p>Function pointers across the boundary work, with two complications that are easy to get wrong and unpleasant to debug.</p>
+
+<pre><code>/* --- REGISTERING A RUST FUNCTION AS A C CALLBACK --- */
+
+    type Callback = unsafe extern "C" fn(ctx: *mut c_void,
+                                         event: u32);
+
+    extern "C" {
+        fn register_handler(cb: Callback, ctx: *mut c_void);
+    }
+
+    struct Handler { count: u32 }
+
+    unsafe extern "C" fn trampoline(ctx: *mut c_void,
+                                    event: u32)
+    {
+        if ctx.is_null() { return; }
+        // SAFETY: `ctx` is the Handler pointer we registered,
+        // it is still alive (we unregister in Drop), and this
+        // callback is not re-entrant
+        let h = unsafe { &amp;mut *(ctx as *mut Handler) };
+        h.count += 1;
+        h.on_event(event);
+    }
+
+    impl Handler {
+        fn install(&amp;mut self) {
+            unsafe {
+                register_handler(trampoline,
+                                 self as *mut _ as *mut c_void);
+            }
+        }
+    }
+    impl Drop for Handler {
+        fn drop(&amp;mut self) {
+            unsafe { unregister_handler(trampoline); }
+        }
+    }
+
+/* THE THREE RULES, the same as C++ chapter 16's:
+     1. no panic may escape
+     2. the context must outlive the registration - hence the
+        Drop impl
+     3. a capturing closure cannot be a C function pointer;
+        put the state in the context
+
+/* A CAPTURELESS CLOSURE does coerce: */
+    let f: extern "C" fn(u32) = |x| handle(x);
+
+/* AND THE PINNING PROBLEM: `self as *mut _` is only valid
+   while the Handler does not MOVE. If it might, use
+   Box::into_raw so the address is stable, or Pin.       */</code></pre>
+
+<h2 id="bindgen">bindgen and cc</h2>
+
+<p>Writing declarations by hand does not scale past a small header. These two tools automate the two halves of the problem.</p>
+
+<pre><code># --- bindgen: generate Rust declarations from C headers ---
+    # build.rs
+    let bindings = bindgen::Builder::default()
+        .header("vendor/hal.h")
+        .clang_arg("-Ivendor/include")
+        .clang_arg("--target=thumbv7em-none-eabihf")
+        .use_core()                     // no_std
+        .ctypes_prefix("core::ffi")
+        .derive_default(true)
+        .derive_debug(true)
+        .allowlist_function("HAL_.*")   // do not import the
+        .allowlist_type("GPIO_.*")      // whole SDK
+        .blocklist_type("__va_list")
+        .parse_callbacks(Box::new(
+            bindgen::CargoCallbacks::new()))
+        .generate()?;
+
+    bindings.write_to_file(out.join("bindings.rs"))?;
+
+    // in lib.rs
+    #[allow(non_upper_case_globals, non_camel_case_types,
+            non_snake_case, dead_code)]
+    mod bindings {
+        include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    }
+
+# ALLOWLISTING MATTERS: without it, bindgen imports the
+# entire transitive header closure - thousands of items,
+# a slow build, and name collisions.
+
+# --- cc: compile C sources into the crate ---
+    cc::Build::new()
+        .file("vendor/hal.c")
+        .include("vendor/include")
+        .define("STM32F411xE", None)
+        .flag("-mcpu=cortex-m4")
+        .compile("vendorhal");
+
+# --- THE RESULTING PROJECT SHAPE, which is what a real
+#     embedded Rust project on a vendor SDK looks like:
+
+    my-hal-sys/         raw bindgen output. unsafe, ugly,
+                        generated. Nobody reads it.
+      build.rs
+      vendor/           the C SDK
+    my-hal/             a SAFE wrapper. Hand-written, small,
+                        every unsafe documented (chapter 14).
+    firmware/           the application. NO unsafe at all.
+
+/* THE `-sys` CRATE CONVENTION is universal in the Rust
+   ecosystem: `foo-sys` is the raw bindings, `foo` is the
+   safe wrapper. Following it makes your crate legible to
+   everyone else.                                          */</code></pre>
+
+<h2 id="pitfalls">The pitfalls</h2>
+
+<p>The failures that recur in real FFI code, each with the specific mistake that causes it.</p>
+
+<pre><code>/* --- 1. UNWINDING ACROSS FFI: UB. panic = "abort", or
+       catch_unwind at every entry.
+
+/* --- 2. LAYOUT MISMATCH: silent corruption. Always
+       #[repr(C)], and assert sizes and offsets.
+
+/* --- 3. INVALID VALUES FROM C: */
+    #[no_mangle] pub extern "C" fn f(b: bool) { }
+/* If C passes 2, that is instant UB - a bool must be 0 or 1.
+   Take u8 and convert. Same for char, enums, references and
+   NonNull.
+
+/* --- 4. NULL WHERE A REFERENCE IS EXPECTED: */
+    #[no_mangle] pub extern "C" fn f(p: &amp;Device) { }   // UB if
+                                                       // C
+                                                       // passes
+                                                       // NULL
+    #[no_mangle] pub extern "C" fn f(p: *const Device) { }
+/* Take a raw pointer and check. Or Option&lt;&amp;Device&gt;, which is
+   FFI-safe and represents null as None (chapter 05's niche
+   optimisation) - that is the elegant answer.
+
+/* --- 5. LIFETIME ASSUMPTIONS: C gives you a pointer with no
+       lifetime. Copy the data, or document precisely how long
+       the caller must keep it valid.
+
+/* --- 6. THREAD SAFETY: C code may call your function from
+       any thread or interrupt. Nothing in the type system
+       tells you. Assume the worst.
+
+/* --- 7. `static mut` IN GENERATED BINDINGS: bindgen emits
+       these for C globals. Wrap access, or use an atomic.
+
+/* --- 8. ALIGNMENT: a *const u8 from C may not be aligned for
+       a wider type. read_unaligned, or from_le_bytes.
+
+/* --- 9. VARIADIC FUNCTIONS: printf-style functions can be
+       declared but are awkward and easy to misuse. Prefer a
+       fixed-argument wrapper on the C side.
+
+/* --- 10. THE ONE THAT COSTS MOST TIME: a C header that
+       differs from the compiled library. bindgen reads the
+       header; the linker uses the binary. If they disagree,
+       everything compiles and the layout is wrong. Rebuild
+       both from the same source.                        */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>"undefined reference" at link time</td><td>Missing <code>#[no_mangle]</code>, or the library is not linked</td></tr>
+<tr><td>Struct fields wrong across the boundary</td><td>Missing <code>#[repr(C)]</code> — Rust reordered them</td></tr>
+<tr><td>Works on x86, wrong on ARM</td><td><code>c_char</code> signedness, or <code>c_long</code> width</td></tr>
+<tr><td>Crash in <code>CStr::from_ptr</code></td><td>Not NUL-terminated, or the pointer is dangling</td></tr>
+<tr><td>Dangling pointer from a <code>CString</code></td><td>The temporary was dropped at the end of the statement</td></tr>
+<tr><td>UB with no obvious cause</td><td>An invalid <code>bool</code>, <code>char</code> or enum from C</td></tr>
+<tr><td>Abort inside a C caller</td><td>A panic unwound across FFI</td></tr>
+<tr><td>Double free</td><td><code>Box::from_raw</code> called twice, or on a pointer not from <code>into_raw</code></td></tr>
+<tr><td>Memory grows</td><td><code>into_raw</code> with no matching destroy</td></tr>
+<tr><td>Callback crashes after the object moved</td><td>The context pointer was to a stack value — box it</td></tr>
+<tr><td>bindgen output is enormous</td><td>No allowlist</td></tr>
+<tr><td>Everything compiles, layout is silently wrong</td><td>Header and library built from different sources</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Declare and call a C function, using the correct <code>core::ffi</code> types.</li>
+  <li>Explain why <code>c_char</code> and <code>c_long</code> matter.</li>
+  <li>Write an FFI struct with <code>#[repr(C)]</code> and compile-time size assertions.</li>
+  <li>Convert strings and slices in both directions, and name the three checks on an incoming
+  pointer.</li>
+  <li>Export a Rust function with validation, conversion and panic handling.</li>
+  <li>Implement the opaque-handle ownership pattern with <code>into_raw</code>/<code>from_raw</code>.</li>
+  <li>Register a Rust callback with a C library and state the three rules.</li>
+  <li>Configure bindgen with an allowlist and explain the <code>-sys</code> crate convention.</li>
+  <li>List ten FFI pitfalls and the fix for each.</li>
+  <li>Explain why <code>Option&lt;&amp;T&gt;</code> is the elegant answer to nullable parameters.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

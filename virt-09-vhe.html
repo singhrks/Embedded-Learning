@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VHE: running the host at EL2 | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>VHE: running the host at EL2</h1>
+<p class="lead">The original EL2 design assumed a hypervisor written from scratch. Linux is not that, and
+KVM paid for the mismatch on every single exit. ARMv8.1's Virtualization Host Extensions fix it by making
+EL2 look like EL1 to software that runs there — an unusually elegant piece of architecture, and the reason
+modern arm64 virtualisation is fast.</p>
+
+<h2 id="problem">The problem VHE solves</h2>
+
+<p>VHE exists because running a general-purpose OS kernel at EL2 was originally painful in a specific, identifiable way. The fix is elegant once the problem is clear.</p>
+
+<pre class="diagram">   nVHE - the original design
+
+   EL0   host processes            guest userspace
+   EL1   HOST KERNEL  &lt;--------+   guest kernel
+                               |
+   EL2   a small stub of KVM   |
+         "the hyp stub"        |
+                               |
+   The host kernel runs at EL1. So does the guest kernel.
+   They both want SCTLR_EL1, TTBR0_EL1, VBAR_EL1, TPIDR_EL1...
+   and there is only ONE set of those registers.
+
+   Therefore EVERY entry to the guest must:
+       save the host's ~25 EL1 system registers
+       restore the guest's ~25 EL1 system registers
+   and every exit must do the reverse.
+
+   Worse: KVM's own logic lives at EL1, but only EL2 can do the
+   switch. So the code is SPLIT - a "hyp" half compiled
+   separately, with its own tiny address space, that cannot call
+   ordinary kernel functions, cannot take a lock, cannot print.
+   Two worlds inside one kernel source tree.</pre>
+
+<pre class="diagram">   VHE - ARMv8.1
+
+   EL0   host processes            guest userspace
+   EL1                             guest kernel
+   EL2   HOST KERNEL + KVM
+
+   The host kernel runs AT EL2. The guest kernel keeps EL1 to
+   itself. Nothing is shared, so nothing must be swapped.
+
+   Entering the guest becomes:
+       restore the guest's EL1 registers     (they were not in
+                                              use by anyone)
+       write VTTBR_EL2, HCR_EL2
+       ERET
+
+   No host save. No host restore. And KVM is ordinary kernel
+   code running at the level that can do the switch, so the
+   split disappears.</pre>
+
+<h2 id="trick">The trick: register redirection</h2>
+
+<p>A kernel written for EL1 is full of <code>msr sctlr_el1, x0</code> and <code>mrs x0, ttbr1_el1</code>. You
+cannot rewrite all of it, and you should not have to. VHE's insight is to make those instructions
+<em>mean something different</em> when executed at EL2 with <code>HCR_EL2.E2H</code> set.</p>
+
+<pre class="diagram">   With HCR_EL2.E2H = 1, executing AT EL2:
+
+     the instruction        actually accesses
+     ----------------       -----------------
+     MSR SCTLR_EL1, x0  ->  SCTLR_EL2
+     MRS x0, TTBR0_EL1  ->  TTBR0_EL2
+     MSR TTBR1_EL1, x0  ->  TTBR1_EL2   (new in VHE - EL2 gained
+                                         a second TTBR precisely
+                                         so a host kernel with a
+                                         high half can live here)
+     MSR VBAR_EL1, x0   ->  VBAR_EL2
+     MSR TCR_EL1, x0    ->  TCR_EL2     (whose format changed to
+                                         match TCR_EL1's)
+     MRS x0, CNTV_CTL_EL0 -> CNTHV_CTL_EL2
+
+   And when EL2 genuinely needs the real EL1 register - which
+   KVM does, to load guest state - there is a new suffix:
+
+     MSR SCTLR_EL12, x0 ->  the REAL SCTLR_EL1  (the guest's)
+     MSR TTBR0_EL12, x0 ->  the REAL TTBR0_EL1
+     MSR VBAR_EL12, x0  ->  the REAL VBAR_EL1
+
+   So: an unmodified EL1 kernel runs unmodified at EL2, and the
+   hypervisor uses the _EL12 forms to touch guest state
+   explicitly. Two hundred lines of KVM change; the other
+   twenty million lines of Linux do not.</pre>
+
+<div class="key">
+<b>Why <code>TTBR1_EL2</code> had to be invented</b>
+<p>Original EL2 had only <code>TTBR0_EL2</code> — one translation base, because a purpose-built hypervisor
+uses a single flat address space. Linux splits its address space in half: user mappings via
+<code>TTBR0</code>, kernel mappings via <code>TTBR1</code>. Without a second base register, Linux simply
+could not run at EL2. VHE adds it, and reformats <code>TCR_EL2</code> to match <code>TCR_EL1</code> so the
+existing kernel code that programs it still works.</p>
+</div>
+
+<h2 id="tge">TGE: whose EL0 is it?</h2>
+
+<p>With the host at EL2, a question appears that did not exist before: when an application traps, does it
+belong to the host or to a guest? <code>HCR_EL2.TGE</code> — Trap General Exceptions — is the answer, and it
+is flipped on every guest entry and exit.</p>
+
+<pre class="diagram">   TGE = 1   "EL0 is the HOST's"
+             - EL0 exceptions route to EL2
+             - EL0 uses the EL2 translation regime
+               (TTBR0_EL2, via the E2H remap)
+             - stage 2 is effectively disabled for EL0/EL1
+             - the virtual timer is not offset
+
+             This is the state while the host is running its
+             own processes. An ordinary syscall from an ordinary
+             host process arrives at EL2, where the host kernel
+             lives, and everything is normal.
+
+   TGE = 0   "EL0/EL1 belong to a GUEST"
+             - EL0 and EL1 exceptions route to EL1 (the guest
+               kernel handles its own syscalls - no exit!)
+             - stage 2 applies
+             - CNTVOFF_EL2 applies
+
+   The sequence around KVM_RUN:
+
+     ... host running, E2H=1, TGE=1 ...
+     restore guest EL1 state via _EL12 registers
+     HCR_EL2: TGE=0, VM=1, IMO/FMO/AMO=1, ...
+     write VTTBR_EL2
+     ERET  -> guest at EL1
+     ... guest runs; its own syscalls never leave EL1 ...
+     trap -> EL2
+     HCR_EL2: TGE=1, VM=0
+     ... host running again ...
+
+   That single bit is the whole context switch, conceptually.
+   Everything else is bookkeeping.</pre>
+
+<h2 id="numbers">What it is worth</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Operation</th><th>nVHE</th><th>VHE</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Save/restore host EL1 sysregs per exit</td><td>~25 registers each way</td><td><strong>zero</strong></td><td>Host
+uses EL2 registers; nothing collides</td></tr>
+<tr><td>Trap handled entirely in EL2</td><td>Must bounce to EL1 for anything non-trivial</td><td>Handled in
+place</td><td>KVM's real code is already at EL2</td></tr>
+<tr><td>Round-trip cost (relative)</td><td>1.0</td><td>~0.4–0.6</td><td>Roughly halved on most
+implementations</td></tr>
+<tr><td>KVM code structure</td><td>Split into hyp and kernel halves</td><td>Ordinary kernel code</td><td>No
+separate address space, no <code>__hyp_text</code> restrictions</td></tr>
+<tr><td>Debuggability of the hypervisor</td><td>Very poor — no printk in hyp</td><td>Normal</td><td>It is just
+the kernel</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check-it">Finding out which mode you are in</h2>
+
+<p>Code frequently needs to know which mode it is running in, and there are a few direct ways to find out from both sides.</p>
+
+<pre><code>$ dmesg | grep -i kvm
+[    0.512430] kvm [1]: Hyp mode initialized successfully
+[    0.512461] kvm [1]: VHE mode initialized successfully      &lt;-- VHE
+[    0.512480] kvm [1]: vgic interrupt IRQ9
+[    0.512501] kvm [1]: Timer IRQ4
+
+# The other possibilities:
+#   "Hyp mode initialized successfully"  alone          -> nVHE
+#   "Protected nVHE mode initialized successfully"      -> pKVM
+#   "HYP mode not available"                            -> booted at EL1
+
+# Is the hardware capable at all?  ID_AA64MMFR1_EL1.VH != 0
+$ sudo dd if=/dev/mem 2>/dev/null   # no - use the kernel's view:
+$ dmesg | grep -i 'CPU features'
+
+# Force nVHE on a VHE-capable machine, for comparison:
+$ sudo grubby --update-kernel=ALL --args="kvm-arm.mode=nvhe"
+# or on the command line:   kvm-arm.mode=nvhe
+# Valid values: none, nvhe, protected, nested
+
+# Then measure the same workload both ways. The difference is
+# almost entirely in exit-heavy workloads - I/O and interrupts -
+# and nearly invisible in a CPU-bound guest.</code></pre>
+
+<h2 id="pkvm">Protected KVM, which needs nVHE</h2>
+
+<p>One important configuration deliberately declines VHE, for a reason that is about trust rather than performance — and it is the design that shows up on phones.</p>
+
+<pre class="diagram">   pKVM inverts the trust relationship:
+
+     normal KVM   the host kernel can read all guest memory.
+                  It must - it emulates devices, migrates VMs,
+                  and swaps guest pages.
+
+     pKVM         a small, auditable hypervisor at EL2 owns
+                  stage 2. The HOST is itself constrained:
+                  guest memory is unmapped from the host unless
+                  the guest explicitly shares it.
+
+   Threat model: protect a guest from a compromised host kernel.
+   Used on Android for the Android Virtualization Framework.
+
+   And it deliberately uses the nVHE split, because that split
+   is exactly what you want when the EL2 component must be
+   small enough to audit:
+
+     EL2   pKVM hypervisor    ~10k lines, no dynamic memory,
+                              its own page tables, owns stage 2
+     EL1   host Linux         large, untrusted, asks EL2 for
+                              permission to do things
+     EL1   guest Linux        protected from the host
+
+   So VHE is not universally "better". It is better for the
+   common case of a trusted host. When the host is part of the
+   threat model, the separation nVHE forces is the point.</pre>
+
+<div class="note">
+<b>Nested virtualisation needs both</b>
+<p>Running a hypervisor <em>inside</em> a guest means emulating EL2 for that guest — including its
+<code>E2H</code> and <code>TGE</code> bits, and the register redirection they imply.
+<a href="virt-20-nested.html">Chapter 22</a> covers it; the short version is that VHE makes nested
+virtualisation harder to implement and much faster when it works.</p>
+</div>
+
+<h2 id="write">Writing code that runs at either level</h2>
+
+<p>Supporting both modes from one source base is a real constraint on hypervisor code, and there are established patterns for it.</p>
+
+<pre><code>/* Linux has to cope with running at EL1 or EL2 from the same
+   binary. It does this with alternatives patched at boot.   */
+
+/* arch/arm64/include/asm/kvm_hyp.h, simplified: */
+
+#define read_sysreg_el1(r)   read_sysreg_elx(r, _EL1, _EL12)
+#define write_sysreg_el1(v,r) write_sysreg_elx(v, r, _EL1, _EL12)
+
+/* which expands, via an ALTERNATIVE, to either
+
+     mrs x0, sctlr_el1     when running nVHE  (we are at EL2,
+                                               EL1 regs are real)
+   or
+     mrs x0, sctlr_el12    when running VHE   (we are at EL2 with
+                                               E2H=1, so _EL1
+                                               would hit EL2)
+
+   patched once at boot by the alternatives framework based on
+   ARM64_HAS_VIRT_HOST_EXTN.                                  */
+
+/* The lesson for your own EL2 code: NEVER write a bare
+   `msr sctlr_el1, x0` in code that might run under VHE. It
+   will silently configure the hypervisor instead of the guest,
+   and the failure looks like the guest ignoring your writes. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest ignores system-register state you set</td><td>Wrote <code>*_EL1</code> from EL2 under VHE — it
+went to the EL2 register instead of the guest's</td></tr>
+<tr><td>Host kernel corrupts itself when a VM starts</td><td>Same bug in reverse: wrote <code>*_EL12</code>
+believing it targeted EL2, or clobbered <code>TTBR1_EL2</code></td></tr>
+<tr><td>Host processes stop working while a VM runs</td><td><code>TGE</code> not restored to 1 on exit — host
+EL0 exceptions are routing to the guest's EL1</td></tr>
+<tr><td>Exit costs double on new hardware after a kernel change</td><td>Fell back to nVHE — check for
+<code>kvm-arm.mode=nvhe</code> on the command line</td></tr>
+<tr><td><code>VHE mode initialized</code> absent on capable silicon</td><td>Booted at EL1, or firmware left
+<code>HCR_EL2.E2H</code> in a state the kernel rejected</td></tr>
+<tr><td>Guest timer runs at the host's rate</td><td><code>CNTVOFF_EL2</code> only applies with
+<code>TGE=0</code>; the bit was left set</td></tr>
+<tr><td>pKVM refuses to initialise</td><td>pKVM requires the nVHE code path plus firmware support; it is not
+available in every configuration</td></tr>
+<tr><td>Hypervisor code faults only under VHE</td><td>An <code>__hyp_text</code> assumption about a separate
+EL2 address space that no longer holds</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the register collision that makes nVHE expensive, and count the registers involved.</li>
+  <li>Explain what <code>HCR_EL2.E2H</code> does to an <code>MSR SCTLR_EL1</code> executed at EL2.</li>
+  <li>Say why <code>TTBR1_EL2</code> had to be added to the architecture.</li>
+  <li>Explain the <code>_EL12</code> register suffix and when a hypervisor uses it.</li>
+  <li>Describe what <code>TGE</code> selects and where in the run loop it is toggled.</li>
+  <li>Give three things VHE improves besides raw speed.</li>
+  <li>Determine from a running system whether it is in VHE, nVHE or pKVM mode.</li>
+  <li>Explain why pKVM deliberately uses nVHE, and what threat that addresses.</li>
+  <li>Describe the failure mode of writing a bare <code>msr sctlr_el1</code> in EL2 code under VHE.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

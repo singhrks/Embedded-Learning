@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Writing a platform driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Writing a platform driver</h1>
+<p class="lead">Everything from the last two chapters, assembled into one complete, correct driver. This is
+the skeleton you will start from every time — read it once carefully and you have the shape of most of
+<code>drivers/</code>.</p>
+
+<h2 id="what">What a platform device is</h2>
+
+<p>A platform device is the kernel's category for hardware that cannot announce itself — memory-mapped blocks inside an SoC, described by the device tree rather than discovered. It is the most common kind of driver in embedded work, and the template every other bus driver follows.</p>
+
+<pre><code>/* A device that is NOT on a discoverable bus. It exists
+   because the device tree says so.
+
+     · memory-mapped registers at a fixed address
+     · one or more interrupts
+     · clocks, resets, regulators, GPIOs, DMA channels
+     · no vendor/product ID to enumerate
+
+   That describes most of an SoC: UARTs, timers, watchdogs,
+   crypto engines, DMA controllers, display pipelines, custom
+   accelerators.
+
+   IF YOUR DEVICE IS ON I2C, SPI OR PCI, use that bus's driver
+   type instead - i2c_driver, spi_driver, pci_driver. The
+   shape is identical; only the resource acquisition and the
+   register access differ.                                  */</code></pre>
+
+<h2 id="skeleton">The complete driver</h2>
+
+<p>This is a complete, working driver with nothing omitted. Read it once end to end to see the shape, then use the sections after it to understand each piece — every driver you write later will be a variation on exactly this.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * Vendor MyDevice driver
+ *
+ * Locking:
+ *      d->lock protects d->state and the register block.
+ *      Never held across a sleep other than the regmap I/O
+ *      it wraps.
+ */
+
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/mod_devicetable.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/pm_runtime.h&gt;
+#include &lt;linux/property.h&gt;
+#include &lt;linux/regulator/consumer.h&gt;
+#include &lt;linux/reset.h&gt;
+
+#define MYDEV_REG_ID            0x00
+#define MYDEV_REG_CTRL          0x04
+#define  MYDEV_CTRL_ENABLE      BIT(0)
+#define  MYDEV_CTRL_RESET       BIT(1)
+#define MYDEV_REG_STATUS        0x08
+#define  MYDEV_STATUS_IRQ       BIT(0)
+#define  MYDEV_STATUS_BUSY      BIT(1)
+#define MYDEV_REG_DATA          0x0c
+#define MYDEV_REG_INT_EN        0x10
+
+#define MYDEV_EXPECTED_ID       0x4d594445
+
+/* Per-variant differences, selected by compatible string */
+struct mydev_config {
+        unsigned int nr_channels;
+        unsigned int fifo_depth;
+        bool         has_dma;
+};
+
+struct mydev {
+        struct device           *dev;
+        void __iomem            *base;
+        struct clk              *clk;
+        struct reset_control    *rst;
+        struct regulator        *vdd;
+        int                      irq;
+
+        const struct mydev_config *cfg;
+        u32                      fifo_depth;
+
+        struct mutex             lock;      /* see header */
+        wait_queue_head_t        wq;
+        bool                     done;
+        u32                      last_status;
+};
+
+/* ---- register helpers ---------------------------------- */
+
+static inline u32 mydev_rd(struct mydev *d, u32 reg)
+{
+        return readl(d-&gt;base + reg);
+}
+
+static inline void mydev_wr(struct mydev *d, u32 reg, u32 val)
+{
+        writel(val, d-&gt;base + reg);
+}
+
+/* ---- interrupt ----------------------------------------- */
+
+static irqreturn_t mydev_isr(int irq, void *dev_id)
+{
+        struct mydev *d = dev_id;
+        u32 status;
+
+        status = mydev_rd(d, MYDEV_REG_STATUS);
+        if (!(status &amp; MYDEV_STATUS_IRQ))
+                return IRQ_NONE;        /* shared line */
+
+        mydev_wr(d, MYDEV_REG_STATUS, MYDEV_STATUS_IRQ);  /* ack */
+
+        d-&gt;last_status = status;
+        d-&gt;done = true;
+        wake_up_interruptible(&amp;d-&gt;wq);
+
+        return IRQ_HANDLED;
+}
+
+/* ---- hardware ------------------------------------------ */
+
+static int mydev_hw_init(struct mydev *d)
+{
+        u32 id;
+
+        /* IDENTITY CHECK - catches a wrong address, an
+           unclocked block, or an access-control denial
+           (isolation ch. 20) immediately, at probe, instead
+           of as mysterious behaviour later.               */
+        id = mydev_rd(d, MYDEV_REG_ID);
+        if (id != MYDEV_EXPECTED_ID) {
+                dev_err(d-&gt;dev, "bad ID 0x%08x (expected 0x%08x)\n",
+                        id, MYDEV_EXPECTED_ID);
+                return -ENODEV;
+        }
+
+        /* reset, then wait for it to clear */
+        mydev_wr(d, MYDEV_REG_CTRL, MYDEV_CTRL_RESET);
+        udelay(10);
+        mydev_wr(d, MYDEV_REG_CTRL, 0);
+
+        mydev_wr(d, MYDEV_REG_INT_EN, MYDEV_STATUS_IRQ);
+        mydev_wr(d, MYDEV_REG_CTRL, MYDEV_CTRL_ENABLE);
+
+        return 0;
+}
+
+static void mydev_hw_shutdown(struct mydev *d)
+{
+        mydev_wr(d, MYDEV_REG_INT_EN, 0);
+        mydev_wr(d, MYDEV_REG_CTRL, 0);
+}
+
+/* ---- probe --------------------------------------------- */
+
+static int mydev_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct mydev *d;
+        int ret;
+
+        d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        d-&gt;dev = dev;
+        mutex_init(&amp;d-&gt;lock);
+        init_waitqueue_head(&amp;d-&gt;wq);
+
+        d-&gt;cfg = of_device_get_match_data(dev);
+        if (!d-&gt;cfg)
+                return -EINVAL;
+
+        /* --- resources --- */
+
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(d-&gt;base))
+                return PTR_ERR(d-&gt;base);
+
+        d-&gt;vdd = devm_regulator_get(dev, "vdd");
+        if (IS_ERR(d-&gt;vdd))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;vdd),
+                                     "no vdd supply\n");
+
+        d-&gt;clk = devm_clk_get(dev, NULL);
+        if (IS_ERR(d-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;clk),
+                                     "no clock\n");
+
+        d-&gt;rst = devm_reset_control_get_optional_exclusive(dev,
+                                                           NULL);
+        if (IS_ERR(d-&gt;rst))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;rst),
+                                     "no reset control\n");
+
+        d-&gt;irq = platform_get_irq(pdev, 0);
+        if (d-&gt;irq &lt; 0)
+                return d-&gt;irq;
+
+        /* --- optional DT properties --- */
+
+        ret = device_property_read_u32(dev, "vendor,fifo-depth",
+                                       &amp;d-&gt;fifo_depth);
+        if (ret)
+                d-&gt;fifo_depth = d-&gt;cfg-&gt;fifo_depth;
+
+        /* --- power on, in order --- */
+
+        ret = regulator_enable(d-&gt;vdd);
+        if (ret)
+                return dev_err_probe(dev, ret,
+                                     "cannot enable vdd\n");
+
+        ret = clk_prepare_enable(d-&gt;clk);
+        if (ret) {
+                dev_err(dev, "cannot enable clock: %d\n", ret);
+                goto err_reg;
+        }
+
+        ret = reset_control_deassert(d-&gt;rst);
+        if (ret) {
+                dev_err(dev, "cannot deassert reset: %d\n", ret);
+                goto err_clk;
+        }
+
+        ret = mydev_hw_init(d);
+        if (ret)
+                goto err_rst;
+
+        /* --- interrupt: after the hardware is quiet --- */
+
+        ret = devm_request_irq(dev, d-&gt;irq, mydev_isr,
+                               IRQF_SHARED, dev_name(dev), d);
+        if (ret) {
+                dev_err(dev, "cannot request irq %d: %d\n",
+                        d-&gt;irq, ret);
+                goto err_hw;
+        }
+
+        platform_set_drvdata(pdev, d);
+
+        dev_info(dev, "ready: %u channels, fifo %u\n",
+                 d-&gt;cfg-&gt;nr_channels, d-&gt;fifo_depth);
+        return 0;
+
+err_hw:
+        mydev_hw_shutdown(d);
+err_rst:
+        reset_control_assert(d-&gt;rst);
+err_clk:
+        clk_disable_unprepare(d-&gt;clk);
+err_reg:
+        regulator_disable(d-&gt;vdd);
+        return ret;
+}
+
+/* ---- remove: the exact mirror -------------------------- */
+
+static void mydev_remove(struct platform_device *pdev)
+{
+        struct mydev *d = platform_get_drvdata(pdev);
+
+        mydev_hw_shutdown(d);           /* stop interrupts
+                                           BEFORE devm frees
+                                           the handler       */
+        reset_control_assert(d-&gt;rst);
+        clk_disable_unprepare(d-&gt;clk);
+        regulator_disable(d-&gt;vdd);
+}
+
+/* ---- match --------------------------------------------- */
+
+static const struct mydev_config mydev_v1_cfg = {
+        .nr_channels = 4,
+        .fifo_depth  = 16,
+        .has_dma     = false,
+};
+
+static const struct mydev_config mydev_v2_cfg = {
+        .nr_channels = 8,
+        .fifo_depth  = 64,
+        .has_dma     = true,
+};
+
+static const struct of_device_id mydev_of_match[] = {
+        { .compatible = "vendor,my-device-v2",
+          .data = &amp;mydev_v2_cfg },
+        { .compatible = "vendor,my-device",
+          .data = &amp;mydev_v1_cfg },
+        { }
+};
+MODULE_DEVICE_TABLE(of, mydev_of_match);
+
+static struct platform_driver mydev_driver = {
+        .driver = {
+                .name           = "my-device",
+                .of_match_table = mydev_of_match,
+                .pm             = pm_ptr(&amp;mydev_pm_ops),
+        },
+        .probe  = mydev_probe,
+        .remove = mydev_remove,
+};
+module_platform_driver(mydev_driver);
+
+MODULE_DESCRIPTION("Vendor MyDevice driver");
+MODULE_AUTHOR("Your Name &lt;you@example.com&gt;");
+MODULE_LICENSE("GPL");</code></pre>
+
+<div class="key">
+<b>Read the error path</b>
+<p>The <code>goto</code> ladder unwinds in exactly the reverse order of setup, each label undoing one step.
+This is idiomatic kernel C, not a code smell — it is the only structure that stays correct when you add a
+step in the middle. <a href="lx-26-error-handling.html">Chapter 33</a> shows how <code>devm_</code> removes
+most of it, and why some of it always remains.</p>
+</div>
+
+<h2 id="resources">Acquiring the common resources</h2>
+
+<p>Almost every device needs the same handful of things before it can work: registers, a clock, power, a reset line, an interrupt. Each has a standard accessor that reads the device tree for you, and each can fail in the same way if the provider has not probed yet.</p>
+
+<pre><code>/* --- MMIO ------------------------------------------------ */
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        /* by name, better when there are several: */
+        d-&gt;base = devm_platform_ioremap_resource_byname(pdev,
+                                                        "ctrl");
+        /* the long form, if you need the resource itself: */
+        struct resource *res;
+        res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+        d-&gt;base = devm_ioremap_resource(dev, res);
+        d-&gt;phys = res-&gt;start;
+
+/* --- CLOCKS ---------------------------------------------- */
+        d-&gt;clk = devm_clk_get(dev, "core");     /* by name */
+        d-&gt;clk = devm_clk_get(dev, NULL);       /* the only one */
+        clk_prepare_enable(d-&gt;clk);
+        clk_disable_unprepare(d-&gt;clk);
+
+        /* the modern one-liner - gets AND enables, and
+           disables automatically on unbind: */
+        d-&gt;clk = devm_clk_get_enabled(dev, "core");
+
+        /* several at once: */
+        struct clk_bulk_data clks[] = {
+                { .id = "core" }, { .id = "bus" },
+        };
+        devm_clk_bulk_get(dev, ARRAY_SIZE(clks), clks);
+        clk_bulk_prepare_enable(ARRAY_SIZE(clks), clks);
+
+        rate = clk_get_rate(d-&gt;clk);
+        clk_set_rate(d-&gt;clk, 100000000);
+
+/* --- OPTIONAL resources: use the _optional variants ------ */
+        d-&gt;rst = devm_reset_control_get_optional_exclusive(dev,
+                                                           NULL);
+        /* returns NULL, not an error, if absent - and the
+           reset_control_* calls accept NULL harmlessly. So
+           optional resources need no `if` at every use.    */
+
+        d-&gt;gpio = devm_gpiod_get_optional(dev, "reset",
+                                          GPIOD_OUT_HIGH);
+        gpiod_set_value_cansleep(d-&gt;gpio, 0);
+
+/* --- REGULATORS ------------------------------------------ */
+        d-&gt;vdd = devm_regulator_get(dev, "vdd");
+        regulator_enable(d-&gt;vdd);
+        /* several: */
+        devm_regulator_bulk_get(dev, n, supplies);
+
+/* --- DMA channels (chapter 30) --------------------------- */
+        d-&gt;rxchan = dma_request_chan(dev, "rx");
+        if (IS_ERR(d-&gt;rxchan))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;rxchan),
+                                     "no rx dma\n");
+
+/* --- FIRMWARE -------------------------------------------- */
+        const struct firmware *fw;
+
+        ret = request_firmware(&amp;fw, "vendor/mydev-v2.bin", dev);
+        if (ret)
+                return dev_err_probe(dev, ret,
+                                     "firmware not found\n");
+        /* fw-&gt;data / fw-&gt;size - push it to the device, then: */
+        release_firmware(fw);           /* ALWAYS - the buffer is
+                                           not devm-managed      */
+
+/* The file is looked up under /lib/firmware. The blob is NOT
+   part of your module: it is loaded from the filesystem, which
+   means it may not exist yet when a built-in driver probes at
+   boot. Two ways out:
+
+     request_firmware_nowait()   asynchronous - probe returns
+                                 immediately, a callback runs
+                                 when the file is available.
+                                 THE RIGHT DEFAULT for anything
+                                 that might probe before the
+                                 root filesystem is mounted.
+     firmware in the initramfs   if the device must work early
+
+   Firmware also has licensing implications: the blob usually
+   is not GPL, lives in the separate linux-firmware repository,
+   and cannot simply be committed alongside your driver.     */</code></pre>
+
+<h2 id="order">Power-on ordering</h2>
+
+<p>Hardware usually has to be brought up in a specific order — power before clock, clock before reset release — and the datasheet will say so. Getting this wrong produces a device that works on one board and not another, or works only after a warm reboot.</p>
+
+<pre class="diagram">Hardware has a sequence, and the datasheet's timing diagram is
+the specification. The usual shape:
+
+   1. REGULATORS on          (the device has power)
+   2. wait the specified settling time
+   3. CLOCKS enabled         (it has a clock to run on)
+   4. RESET deasserted       (it starts)
+   5. wait for it to be ready
+   6. verify the ID register
+   7. configure
+   8. enable interrupts LAST
+
+  AND EXACTLY THE REVERSE ON THE WAY DOWN.
+
+  GETTING IT WRONG produces some of the most confusing
+  symptoms in embedded work:
+
+    reset released before the clock runs
+        -> the block latches garbage; often works at room
+           temperature and fails cold
+    register written before power is stable
+        -> the write is lost, silently
+    clock enabled before the regulator
+        -> in-rush current, a brownout, or a latch-up
+    interrupts enabled before the handler is registered
+        -> "nobody cared", or a crash in an unregistered
+           handler
+    no settling delay
+        -> intermittent, temperature- and part-dependent
+
+  READ THE POWER-UP SEQUENCE in the datasheet and implement it
+  literally, including the delays. This is one of the few
+  places in software where "it works on my board" is
+  genuinely not evidence of correctness.</pre>
+
+<h2 id="test">Testing it</h2>
+
+<p>Once it builds, you need to confirm the kernel actually bound it to your device rather than silently ignoring it. These checks take a few seconds and distinguish "my driver is broken" from "my driver never ran."</p>
+
+<pre><code># 1. Does it bind?
+    dmesg | grep my-device
+    ls -l /sys/bus/platform/drivers/my-device/
+
+# 2. Are the registers reachable?
+    dmesg      # the ID check tells you immediately
+
+# 3. Does probe fail cleanly?
+#    Force each failure and confirm no leak and no crash:
+#      - remove the clock from the DT
+#      - point reg at a wrong address
+#      - make the ID check fail
+#    Each should log one clear error and unwind fully.
+
+# 4. Unbind and rebind, repeatedly, under KASAN:
+    for i in $(seq 50); do
+      echo 1c000000.my-device > .../my-device/unbind
+      echo 1c000000.my-device > .../my-device/bind
+    done
+    dmesg | grep -i -e kasan -e warn -e bug
+
+# 5. Load and unload as a module, 100 times (chapter 17).
+
+# 6. Check for leaked resources after unbind:
+    cat /proc/iomem | grep 1c000000     # should be gone
+    cat /proc/interrupts | grep my-device
+    cat /proc/vmallocinfo | grep my_probe
+
+# ALL FIVE of these find real bugs in code that "works".</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Probe never called</td><td>Compatible mismatch, or <code>status = "disabled"</code></td></tr>
+<tr><td>ID register reads 0 or 0xFFFFFFFF</td><td>Clock off, in reset, wrong address, or an access-control denial</td></tr>
+<tr><td><code>devm_platform_ioremap_resource</code> fails with <code>-EBUSY</code></td><td>Another driver already claimed the region — check <code>/proc/iomem</code></td></tr>
+<tr><td>Probe returns <code>-517</code> repeatedly</td><td>Deferred on a supplier — check <code>devices_deferred</code></td></tr>
+<tr><td>Works cold, fails warm (or the reverse)</td><td>Missing settling delay in the power-up sequence</td></tr>
+<tr><td>Interrupt storm at probe</td><td>Interrupts enabled before the handler was registered</td></tr>
+<tr><td>Crash on unbind</td><td>Hardware not quiesced before <code>devm</code> freed the IRQ</td></tr>
+<tr><td>Resources leak across bind cycles</td><td>Something enabled by hand and not disabled in remove</td></tr>
+<tr><td>Second probe fails after a successful unbind</td><td>State left in the hardware, or a regulator refcount imbalance</td></tr>
+<tr><td>Works on v1 silicon, wrong on v2</td><td>Match data not used — values hard-coded</td></tr>
+<tr><td>Optional resource treated as fatal</td><td>Used the non-<code>_optional</code> getter</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say what makes a device a platform device, and when to use another bus type.</li>
+  <li>Write a complete driver from memory: match table, probe, remove, module boilerplate.</li>
+  <li>Explain why the error path is a <code>goto</code> ladder in reverse order.</li>
+  <li>Acquire MMIO, clocks, resets, regulators and GPIOs, using the optional variants correctly.</li>
+  <li>Explain what <code>devm_clk_get_enabled</code> saves you.</li>
+  <li>Give the power-on ordering and four symptoms of getting it wrong.</li>
+  <li>Explain why an ID-register check belongs in probe.</li>
+  <li>Explain why interrupts are requested last and quiesced first.</li>
+  <li>Use match data to support two silicon variants with one driver.</li>
+  <li>Run all five tests and fix what they find.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

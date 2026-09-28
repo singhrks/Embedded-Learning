@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creating, joining and cancelling threads | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Creating, joining and cancelling threads</h1>
+<p class="lead">Starting a thread is three lines in any language. Ending one correctly is where the bodies
+are buried: lifetimes that outlive the data they point at, detached threads still running during static
+destruction, and cancellation, which is almost always the wrong tool.</p>
+
+<h2 id="apis">The same idea, four spellings</h2>
+
+<p>Three interfaces, one underlying mechanism. Which you use is mostly a matter of language and portability, and the differences that matter are in error handling and in what happens if you forget to clean up.</p>
+
+<pre><code>/* POSIX */
+#include &lt;pthread.h&gt;
+
+static void *worker(void *arg)
+{
+        int id = *(int *)arg;
+        printf("worker %d\n", id);
+        return (void *)(intptr_t)(id * 2);      /* the result  */
+}
+
+int main(void)
+{
+        pthread_t t;
+        int id = 7;
+
+        /* &amp;id is a pointer to a LOCAL. Safe only because we
+           join before main's frame goes away. See below.     */
+        if (pthread_create(&amp;t, NULL, worker, &amp;id) != 0)
+                return 1;      /* returns errno, does NOT set it */
+
+        void *ret;
+        pthread_join(t, &amp;ret);
+        printf("result %d\n", (int)(intptr_t)ret);
+        return 0;
+}</code></pre>
+
+<pre><code>// C++11 and later - the same thing, with types and RAII
+#include &lt;thread&gt;
+#include &lt;future&gt;
+
+int worker(int id) { return id * 2; }
+
+int main()
+{
+    std::thread t(worker, 7);   // arguments are COPIED by value
+    t.join();                   // or t.detach() - one or the
+                                // other, or std::terminate
+
+    // When you want a result, do not hand-roll it:
+    std::future&lt;int&gt; f = std::async(std::launch::async, worker, 7);
+    int result = f.get();       // blocks, and rethrows any
+                                // exception the worker threw
+}
+
+// std::jthread (C++20) joins in its destructor and carries a
+// stop_token. It is what std::thread should have been.
+#include &lt;stop_token&gt;
+std::jthread jt([](std::stop_token st) {
+    while (!st.stop_requested()) { /* work */ }
+});
+// no join needed: the destructor requests stop, then joins.</code></pre>
+
+<pre><code>// Rust - the lifetime problem solved by the type system
+use std::thread;
+
+let data = vec![1, 2, 3];
+let h = thread::spawn(move || {          // `move` transfers
+    data.iter().sum::&lt;i32&gt;()             // ownership in
+});                                      // -- no dangling
+let total: i32 = h.join().unwrap();      // possible
+
+// Borrowing across threads needs a SCOPE, which guarantees
+// the threads end before the borrow does (Rust 1.63+):
+let v = vec![1, 2, 3];
+thread::scope(|s| {
+    s.spawn(|| println!("{:?}", &amp;v));    // borrow is fine:
+    s.spawn(|| println!("{}", v.len())); // scope joins all
+});                                      // before returning</code></pre>
+
+<pre><code>/* Windows */
+#include &lt;windows.h&gt;
+#include &lt;process.h&gt;
+
+static unsigned __stdcall worker(void *arg)
+{
+        return (unsigned)(uintptr_t)arg * 2;
+}
+
+int main(void)
+{
+        /* _beginthreadex, NOT CreateThread, for anything that
+           touches the CRT: it allocates the per-thread CRT
+           state that errno, strtok and friends need.         */
+        uintptr_t h = _beginthreadex(NULL, 0, worker,
+                                     (void *)(uintptr_t)7, 0, NULL);
+        WaitForSingleObject((HANDLE)h, INFINITE);
+
+        DWORD code = 0;
+        GetExitCodeThread((HANDLE)h, &amp;code);
+        CloseHandle((HANDLE)h);        /* a HANDLE is a resource;
+                                          leaking it leaks the
+                                          thread object          */
+        return 0;
+}</code></pre>
+
+<div class="key">
+<b>Join or detach — there is no third option</b>
+<p>Every thread you create holds resources until someone collects it. <code>join</code> waits and collects;
+<code>detach</code> says "collect yourself when you finish". Do neither and you leak a thread control block
+per thread, which on a long-running server is a slow death. C++ chose to make this loud:
+<code>~std::thread</code> on a joinable thread calls <code>std::terminate</code>, deliberately, so the bug is
+a crash rather than a leak.</p>
+</div>
+
+<h2 id="lifetime">The lifetime bug</h2>
+
+<p>A thread outliving the data it refers to is the most common source of crashes in threaded programs, and it happens because the creating function returned while the thread was still running.</p>
+
+<pre class="diagram">   THE MISTAKE
+
+     void start(void)
+     {
+             int id = 7;                     // on start's stack
+             pthread_t t;
+             pthread_create(&amp;t, NULL, worker, &amp;id);
+             pthread_detach(t);
+     }                                       // frame destroyed
+                                             // HERE
+     worker() now reads &amp;id -> whatever the next call put there
+
+   The window is tiny and the value is often still correct,
+   which is what makes it survive testing.
+
+   THREE FIXES
+
+   1. JOIN before the frame ends.
+        pthread_join(t, NULL);   // id is alive until here
+
+   2. HEAP-ALLOCATE the argument, worker frees it.
+        struct arg *a = malloc(sizeof *a);
+        a->id = 7;
+        pthread_create(&amp;t, NULL, worker, a);
+        // worker: ... free(a);
+        // and if pthread_create FAILS, free it yourself
+
+   3. PASS BY VALUE where the API allows.
+        pthread_create takes void*, so you can smuggle an int:
+        pthread_create(&amp;t, NULL, worker, (void *)(intptr_t)7);
+        Legal, ugly, and it does not scale past one small value.
+
+   C++ picks fix 3 by default - std::thread COPIES its
+   arguments - which is why passing a reference needs the
+   explicit std::ref(), and why doing so reintroduces the bug.
+
+   Rust picks fix 1 and 2 and makes the compiler check, which
+   is the entire point of `move` and thread::scope.</pre>
+
+<h2 id="cancel">Cancellation, and why you should not</h2>
+
+<p>Stopping a thread from outside is far harder than starting one, because it may be holding a lock or halfway through modifying shared state. The mechanisms reflect that, and the safest approach avoids them entirely.</p>
+
+<pre><code>/* POSIX cancellation exists. Almost every use of it is wrong. */
+
+    pthread_cancel(t);          /* politely ask                */
+
+/* What actually happens depends on two per-thread settings:
+
+     PTHREAD_CANCEL_DEFERRED   (default)
+       the thread dies at the next CANCELLATION POINT - a list
+       of ~100 functions including read, write, sleep, wait,
+       printf, malloc-sometimes. Between them it is immune.
+
+     PTHREAD_CANCEL_ASYNCHRONOUS
+       the thread dies at literally any instruction. Which
+       means it can die holding a mutex, halfway through a
+       malloc, with a file half-written. Almost nothing is
+       async-cancel-safe. Do not use this.
+
+   Even deferred cancellation leaves you needing cleanup
+   handlers for every resource:                              */
+
+static void *worker(void *arg)
+{
+        char *buf = malloc(1024);
+        pthread_cleanup_push(free, buf);       /* runs on cancel */
+
+        pthread_mutex_lock(&amp;m);
+        pthread_cleanup_push(unlock_helper, &amp;m);
+
+        read(fd, buf, 1024);                   /* cancellation
+                                                  point         */
+        pthread_cleanup_pop(1);                /* unlock         */
+        pthread_cleanup_pop(1);                /* free           */
+        return NULL;
+}
+
+/* And in C++ this is worse than it looks: on glibc, cancellation
+   is implemented by throwing a special exception through your
+   frames. A `catch (...)` that does not rethrow swallows it and
+   the thread refuses to die.                                 */</code></pre>
+
+<div class="danger">
+<b>Use a stop flag instead. Always.</b>
+<p>Cooperative cancellation is simpler, portable, testable and correct: an atomic flag the worker checks at
+points <em>it</em> chooses, so it is never interrupted mid-invariant. Every modern design does this —
+<code>std::stop_token</code>, Rust channels, Go's <code>context</code>, .NET's
+<code>CancellationToken</code>. The only thing <code>pthread_cancel</code> gives you is the ability to
+interrupt a blocking syscall, and the right answer there is a self-pipe, an
+<code>eventfd</code>, or a timeout.</p>
+</div>
+
+<pre><code>/* The pattern to use, in full. */
+
+struct worker {
+        atomic_bool     stop;
+        int             wake_fd[2];   /* self-pipe            */
+        pthread_t       tid;
+};
+
+static void *run(void *arg)
+{
+        struct worker *w = arg;
+        struct pollfd fds[2] = {
+                { .fd = w-&gt;sock,        .events = POLLIN },
+                { .fd = w-&gt;wake_fd[0],  .events = POLLIN },
+        };
+
+        while (!atomic_load_explicit(&amp;w-&gt;stop, memory_order_relaxed)) {
+                if (poll(fds, 2, -1) &lt; 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                }
+                if (fds[1].revents)      /* woken to stop      */
+                        break;
+                handle(w-&gt;sock);         /* never interrupted
+                                            mid-operation       */
+        }
+        cleanup(w);                      /* ordinary code, no
+                                            cleanup handlers    */
+        return NULL;
+}
+
+void worker_stop(struct worker *w)
+{
+        atomic_store_explicit(&amp;w-&gt;stop, true, memory_order_relaxed);
+        write(w-&gt;wake_fd[1], "x", 1);    /* break the poll     */
+        pthread_join(w-&gt;tid, NULL);      /* and WAIT for it    */
+}
+
+/* The join at the end is not optional. "I set the flag" is not
+   "it has stopped", and shutting down while a worker still
+   touches your data is the commonest shutdown crash there is. */</code></pre>
+
+<h2 id="shutdown">Shutdown order</h2>
+
+<p>Getting threads to stop cleanly at program exit is rarely designed and usually discovered as a crash during teardown. A deliberate shutdown protocol is much simpler than debugging the alternative.</p>
+
+<pre class="diagram">   The rule: a thread must not outlive anything it points at.
+
+   BAD, and extremely common:
+
+     main() returns
+       -> static destructors run
+       -> a detached worker wakes up
+       -> touches a logger that no longer exists
+       -> crash during exit, in a stack trace that makes no
+          sense because the frames are gone
+
+   THE ORDER THAT WORKS
+
+     1. tell every worker to stop        (set flags, wake them)
+     2. JOIN every worker                (now none are running)
+     3. tear down what they used         (queues, loggers, pools)
+     4. return from main
+
+   Steps 1 and 2 are separate for a reason: signalling all of
+   them before joining any of them means shutdown takes as long
+   as the slowest worker, not the sum of all of them.
+
+   AND NOTE: detached threads cannot be joined, so a design
+   with detached threads has NO correct shutdown. That is the
+   real argument against detach - not the leak.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Worker sees a garbage argument, occasionally</td><td>Pointer to a caller's local; the frame is
+gone</td></tr>
+<tr><td><code>std::terminate</code> at a scope exit</td><td>A joinable <code>std::thread</code>
+destroyed</td></tr>
+<tr><td>Thread count grows until the process dies</td><td>Threads neither joined nor detached</td></tr>
+<tr><td><code>pthread_create</code> returns 11 (EAGAIN)</td><td>Out of threads or address space — check
+<code>ulimit -u</code> and the stack size</td></tr>
+<tr><td>Crash during process exit, in destructor code</td><td>A detached thread still running past static
+destruction</td></tr>
+<tr><td>Cancelled thread never dies</td><td>It never reaches a cancellation point, or a
+<code>catch(...)</code> swallowed the unwind</td></tr>
+<tr><td>Deadlock after cancelling a thread</td><td>It died holding a mutex</td></tr>
+<tr><td><code>errno</code> or <code>strtok</code> misbehaves on Windows</td><td><code>CreateThread</code>
+instead of <code>_beginthreadex</code> — no CRT state</td></tr>
+<tr><td>Shutdown takes N × the worker timeout</td><td>Signalling and joining one worker at a time instead of
+all, then all</td></tr>
+<tr><td>Handle leak on Windows</td><td><code>CloseHandle</code> not called on the thread handle</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write thread creation and join in POSIX, C++ and Rust from memory.</li>
+  <li>Explain why every thread must be joined or detached, and what C++ does if you do neither.</li>
+  <li>Show the argument-lifetime bug and give three fixes, saying which language picks which.</li>
+  <li>Explain what <code>std::jthread</code> adds over <code>std::thread</code>.</li>
+  <li>Say why <code>_beginthreadex</code> is preferred to <code>CreateThread</code>.</li>
+  <li>Describe deferred versus asynchronous cancellation and why the latter is unusable.</li>
+  <li>Write the stop-flag-plus-self-pipe pattern and say why the join at the end is required.</li>
+  <li>Give the four-step shutdown order and explain why signalling and joining are separate phases.</li>
+  <li>Explain why a design built on detached threads has no correct shutdown.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

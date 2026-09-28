@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IOCTLs and DeviceIoControl | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>IOCTLs and <code>DeviceIoControl</code></h1>
+<p class="lead">The control interface between your driver and user mode. The control code encodes the
+device type, the access required and the buffering method — and because it is a permanent ABI reachable by
+whoever can open your device, it is where driver security is won or lost.</p>
+
+<h2 id="ctlcode">The control code</h2>
+
+<p>An IOCTL code is not an arbitrary number. It packs the device type, the access required, the buffering method and your function number into one value — which is what lets the I/O manager validate a request before your driver ever sees it.</p>
+
+<pre><code>#define CTL_CODE(DeviceType, Function, Method, Access) ( \
+        ((DeviceType) &lt;&lt; 16) | ((Access) &lt;&lt; 14) |         \
+        ((Function) &lt;&lt; 2)    | (Method) )
+
+/* 32 bits, four fields:
+
+     31..16  DeviceType   FILE_DEVICE_UNKNOWN (0x22) for a
+                          custom device
+     15..14  Access       FILE_ANY_ACCESS
+                          FILE_READ_ACCESS
+                          FILE_WRITE_ACCESS
+                          FILE_READ_ACCESS|FILE_WRITE_ACCESS
+     13..2   Function     YOURS. 0x800-0xFFF is the range
+                          reserved for third parties.
+                          Below 0x800 is Microsoft's.
+      1..0   Method       METHOD_BUFFERED     0
+                          METHOD_IN_DIRECT    1
+                          METHOD_OUT_DIRECT   2
+                          METHOD_NEITHER      3   */
+
+/* A realistic set: */
+
+#define MY_DEVICE_TYPE  0x8000    /* &gt;= 0x8000 for vendors */
+
+#define IOCTL_MY_GET_VERSION \
+    CTL_CODE(MY_DEVICE_TYPE, 0x800, METHOD_BUFFERED, \
+             FILE_ANY_ACCESS)
+
+#define IOCTL_MY_GET_CONFIG \
+    CTL_CODE(MY_DEVICE_TYPE, 0x801, METHOD_BUFFERED, \
+             FILE_READ_ACCESS)
+
+#define IOCTL_MY_SET_CONFIG \
+    CTL_CODE(MY_DEVICE_TYPE, 0x802, METHOD_BUFFERED, \
+             FILE_WRITE_ACCESS)
+
+#define IOCTL_MY_READ_BULK \
+    CTL_CODE(MY_DEVICE_TYPE, 0x803, METHOD_OUT_DIRECT, \
+             FILE_READ_ACCESS)
+
+#define IOCTL_MY_RESET \
+    CTL_CODE(MY_DEVICE_TYPE, 0x804, METHOD_BUFFERED, \
+             FILE_WRITE_ACCESS)</code></pre>
+
+<div class="key">
+<b>The Access field is enforced by the I/O manager</b>
+<p>An IOCTL declared <code>FILE_WRITE_ACCESS</code> is <strong>rejected before your driver sees it</strong>
+if the handle was not opened with write access. This is free, automatic, correct access control — and it is
+why <code>FILE_ANY_ACCESS</code> should be reserved for genuinely harmless queries. Marking a
+"reconfigure the device" IOCTL as <code>FILE_ANY_ACCESS</code> means any process that can open the device
+read-only can reconfigure it, which is precisely the bug <a href="lx-21-ioctl.html">Linux chapter 23</a>
+warns about — except here the platform would have prevented it for free.</p>
+</div>
+
+<h2 id="handler">The handler</h2>
+
+<p>The handler is a switch statement, and everything interesting is around it: validating lengths, retrieving buffers safely, and setting the number of bytes returned so the application knows how much is valid.</p>
+
+<pre><code>VOID
+MyEvtIoDeviceControl(_In_ WDFQUEUE Queue,
+                     _In_ WDFREQUEST Request,
+                     _In_ size_t OutputBufferLength,
+                     _In_ size_t InputBufferLength,
+                     _In_ ULONG IoControlCode)
+{
+        WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+        PMY_CONTEXT ctx = MyGetContext(device);
+        NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+        size_t info = 0;
+        PVOID inBuf, outBuf;
+        size_t inLen, outLen;
+
+        switch (IoControlCode) {
+
+        case IOCTL_MY_GET_VERSION: {
+                PMY_VERSION ver;
+
+                status = WdfRequestRetrieveOutputBuffer(Request,
+                                sizeof(MY_VERSION),
+                                (PVOID *)&amp;ver, &amp;outLen);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                ver-&gt;Major = MY_VERSION_MAJOR;
+                ver-&gt;Minor = MY_VERSION_MINOR;
+                info = sizeof(MY_VERSION);
+                status = STATUS_SUCCESS;
+                break;
+        }
+
+        case IOCTL_MY_SET_CONFIG: {
+                PMY_CONFIG cfg;
+                MY_CONFIG local;
+
+                status = WdfRequestRetrieveInputBuffer(Request,
+                                sizeof(MY_CONFIG),
+                                (PVOID *)&amp;cfg, &amp;inLen);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                /* COPY IN before validating. With
+                   METHOD_BUFFERED this is already a kernel
+                   copy, but copying to a local also protects
+                   against the shared input/output buffer
+                   overwriting your input (chapter 08).    */
+                RtlCopyMemory(&amp;local, cfg, sizeof(local));
+
+                /* VALIDATE EVERY FIELD */
+                if (local.SampleRate == 0 ||
+                    local.SampleRate &gt; MY_MAX_RATE) {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+                if (local.ChannelMask &amp; ~MY_VALID_CHANNELS) {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+                if (local.Gain &gt; MY_MAX_GAIN) {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+
+                status = MyApplyConfig(ctx, &amp;local);
+                break;
+        }
+
+        case IOCTL_MY_READ_BULK: {
+                PMDL mdl;
+
+                status = WdfRequestRetrieveOutputWdmMdl(Request,
+                                                        &amp;mdl);
+                if (!NT_SUCCESS(status))
+                        break;
+
+                /* start a DMA transfer into it (chapter 19),
+                   and complete the request in the DPC.
+                   Forward to the manual queue and return. */
+                status = WdfRequestForwardToIoQueue(Request,
+                                ctx-&gt;PendingQueue);
+                if (NT_SUCCESS(status))
+                        return;      /* do NOT complete here */
+                break;
+        }
+
+        default:
+                status = STATUS_INVALID_DEVICE_REQUEST;
+                break;
+        }
+
+        WdfRequestCompleteWithInformation(Request, status, info);
+}
+
+/* NOTE the early `return` in the bulk case: a request that
+   has been forwarded is no longer yours to complete
+   (chapter 16). Falling through to the completion call would
+   be a double completion and a bugcheck.               */</code></pre>
+
+<h2 id="internal">Internal IOCTLs</h2>
+
+<p>Some interfaces are meant for other drivers rather than for applications. Internal IOCTLs are exactly that — unreachable from user mode by design, which changes what you must validate and what you may trust.</p>
+
+<pre><code>/* IRP_MJ_INTERNAL_DEVICE_CONTROL is reachable ONLY from
+   kernel mode. Use it for driver-to-driver interfaces.    */
+
+        queueConfig.EvtIoInternalDeviceControl =
+                        MyEvtIoInternalDeviceControl;
+
+/* WHY IT MATTERS FOR SECURITY: an internal IOCTL cannot be
+   invoked by a user-mode program at all - the I/O manager
+   refuses. So a privileged operation exposed only as an
+   internal IOCTL has no user-mode attack surface.
+
+   USE IT for anything a peer driver needs but userspace must
+   never reach: raw register access, firmware update entry
+   points, diagnostic modes.
+
+/* AND THE TRAP: an internal IOCTL's buffers come from a
+   kernel caller, so RequestorMode is KernelMode and probing
+   is skipped. That is correct - but it means you are
+   trusting the calling driver completely. Do not expose an
+   internal IOCTL that a user-mode-reachable driver simply
+   forwards, because you have then re-opened the surface you
+   were closing.                                          */</code></pre>
+
+<h2 id="user">The user-mode side</h2>
+
+<p>The application side is short, and the important part is the shared header: the same definitions must be used by both sides, because a mismatch produces a silent misinterpretation rather than a compile error.</p>
+
+<pre><code>#include &lt;windows.h&gt;
+#include &lt;setupapi.h&gt;
+#include &lt;cfgmgr32.h&gt;
+#include "mydevice.h"      /* the shared header */
+
+/* --- find the device by interface GUID (chapter 06) ------ */
+static HANDLE OpenMyDevice(void)
+{
+        HDEVINFO info;
+        SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail = NULL;
+        DWORD needed = 0;
+        HANDLE h = INVALID_HANDLE_VALUE;
+
+        info = SetupDiGetClassDevsW(&amp;GUID_DEVINTERFACE_MYDEVICE,
+                        NULL, NULL,
+                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (info == INVALID_HANDLE_VALUE)
+                return INVALID_HANDLE_VALUE;
+
+        if (SetupDiEnumDeviceInterfaces(info, NULL,
+                        &amp;GUID_DEVINTERFACE_MYDEVICE, 0,
+                        &amp;ifData)) {
+
+                SetupDiGetDeviceInterfaceDetailW(info, &amp;ifData,
+                                NULL, 0, &amp;needed, NULL);
+                detail = malloc(needed);
+                if (detail) {
+                        detail-&gt;cbSize = sizeof(*detail);
+                        if (SetupDiGetDeviceInterfaceDetailW(
+                                info, &amp;ifData, detail, needed,
+                                &amp;needed, NULL)) {
+                                h = CreateFileW(detail-&gt;DevicePath,
+                                        GENERIC_READ | GENERIC_WRITE,
+                                        0, NULL, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, NULL);
+                        }
+                        free(detail);
+                }
+        }
+
+        SetupDiDestroyDeviceInfoList(info);
+        return h;
+}
+
+/* --- a synchronous IOCTL -------------------------------- */
+        MY_CONFIG cfg = { .SampleRate = 48000,
+                          .ChannelMask = 0x0F, .Gain = 3 };
+        DWORD returned;
+
+        if (!DeviceIoControl(h, IOCTL_MY_SET_CONFIG,
+                             &amp;cfg, sizeof(cfg),     /* in  */
+                             NULL, 0,               /* out */
+                             &amp;returned, NULL)) {
+                printf("SET_CONFIG failed: %lu\n",
+                       GetLastError());
+        }
+
+/* --- an asynchronous one -------------------------------- */
+        HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                        0, NULL, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED,    /* &lt;-- async */
+                        NULL);
+
+        OVERLAPPED ov = {0};
+        ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        BYTE buffer[4096];
+
+        if (!DeviceIoControl(h, IOCTL_MY_READ_BULK,
+                             NULL, 0,
+                             buffer, sizeof(buffer),
+                             NULL, &amp;ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) {
+                        /* a real error */
+                }
+        }
+
+        /* do other work, then: */
+        WaitForSingleObject(ov.hEvent, INFINITE);
+
+        DWORD transferred;
+        if (GetOverlappedResult(h, &amp;ov, &amp;transferred, FALSE))
+                printf("read %lu bytes\n", transferred);
+
+        CloseHandle(ov.hEvent);
+
+/* THE PENDING CONVENTION: DeviceIoControl returns FALSE with
+   GetLastError() == ERROR_IO_PENDING when the driver returned
+   STATUS_PENDING. That is SUCCESS, not failure - a mistake
+   almost every first async client makes.                */</code></pre>
+
+<h2 id="design">Designing the interface</h2>
+
+<div class="key">
+<b>Rules, in order of how much damage breaking them causes</b>
+<ol>
+<li><strong>Validate every field of every input.</strong> The caller is untrusted, always, even if today
+only your own application calls it.</li>
+<li><strong>Use the Access field.</strong> Free enforcement; use it rather than checking by hand.</li>
+<li><strong>Fixed-width types, explicit padding.</strong> <code>UINT32</code>, not <code>ULONG</code> or
+<code>int</code>; pad so the layout is identical for 32- and 64-bit callers.</li>
+<li><strong>Version the interface</strong> from day one, with a <code>GET_VERSION</code> IOCTL that never
+changes.</li>
+<li><strong>Reserved fields, required to be zero.</strong> They cost nothing and are the only way to extend
+a struct later.</li>
+<li><strong>Never embed a pointer</strong> in a buffer. It breaks 32-on-64 and it is a confused-deputy
+invitation.</li>
+<li><strong>Bound every length.</strong> A size field that drives an allocation is a denial-of-service
+vector.</li>
+<li><strong>Return <code>STATUS_INVALID_DEVICE_REQUEST</code></strong> for unknown codes, so callers can
+probe for support.</li>
+<li><strong>Keep the surface small.</strong> Every IOCTL is an entry point into kernel mode from whoever
+can open the device.</li>
+</ol>
+</div>
+
+<pre><code>/* THE 32-ON-64 PROBLEM, and why fixed-width types matter: */
+
+/* WRONG - different layout for a 32-bit caller: */
+typedef struct {
+        ULONG   Count;
+        PVOID   Buffer;     /* 4 bytes on Win32, 8 on Win64 */
+        SIZE_T  Length;     /* same problem                 */
+} BAD_REQUEST;
+
+/* RIGHT: */
+typedef struct {
+        UINT32  Count;
+        UINT32  Reserved;   /* explicit padding */
+        UINT64  BufferOffset;   /* an OFFSET, not a pointer */
+        UINT32  Length;
+        UINT32  Reserved2[3];
+} GOOD_REQUEST;
+
+/* AND IF YOU MUST support both layouts, detect the caller: */
+        if (IoIs32bitProcess(NULL)) {
+                /* the request came from a 32-bit process -
+                   parse the 32-bit layout                  */
+        }
+
+/* THE BETTER ANSWER: design so there is only one layout.
+   Fixed-width types and no pointers achieves it, exactly as
+   in Linux chapter 23.                                     */</code></pre>
+
+<h2 id="test">Testing</h2>
+
+<p>An IOCTL interface is worth exercising deliberately — including with the wrong sizes and invalid values — because those are precisely the paths an attacker will take and the ones your normal client never will.</p>
+
+<pre><code># NEGATIVE TESTS - these find the bugs:
+    · an unknown control code       -&gt; STATUS_INVALID_DEVICE_REQUEST
+    · a zero-length input buffer     -&gt; STATUS_BUFFER_TOO_SMALL
+    · an input buffer one byte short -&gt; same
+    · a NULL output buffer           -&gt; handled, not a crash
+    · out-of-range field values      -&gt; STATUS_INVALID_PARAMETER
+    · a huge length field            -&gt; refused, not a hang
+    · SET_CONFIG on a read-only handle -&gt; refused by the I/O
+                                          manager
+    · concurrent calls from many threads -&gt; no corruption
+    · a 32-bit client, if you support one
+
+# TOOLS:
+    devcon.exe                  install, enable, disable
+    Device Fundamentals tests   in the WDK - includes
+                                fuzzing of your IOCTL
+                                interface. REQUIRED for
+                                certification anyway, so run
+                                them early (chapter 22).
+    IoSpy / IoAttack            the WDK's IOCTL fuzzer
+
+# IoAttack sends malformed buffers, wrong lengths and random
+# control codes at your device. With Driver Verifier enabled
+# it finds unvalidated input in minutes. Run it before anyone
+# else does.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>DeviceIoControl</code> fails with ERROR_ACCESS_DENIED</td><td>Handle lacks the access the control code requires — usually correct</td></tr>
+<tr><td>Fails with ERROR_INVALID_FUNCTION</td><td>Control code mismatch between client and driver headers</td></tr>
+<tr><td>Fails with ERROR_IO_PENDING</td><td>Not a failure — asynchronous completion</td></tr>
+<tr><td>Output buffer unchanged</td><td><code>Information</code> not set on completion</td></tr>
+<tr><td>Input corrupted mid-handler</td><td>METHOD_BUFFERED shares one buffer — copy input to a local first</td></tr>
+<tr><td>Bugcheck from a user-mode call</td><td>Unvalidated field — a security bug, not just a crash</td></tr>
+<tr><td>Works from a 64-bit client, garbage from 32-bit</td><td>Pointer or <code>SIZE_T</code> in the struct</td></tr>
+<tr><td>Double-completion bugcheck</td><td>Completed a request already forwarded to another queue</td></tr>
+<tr><td>Read-only handle reconfigures the device</td><td><code>FILE_ANY_ACCESS</code> on a privileged operation</td></tr>
+<tr><td>Kernel memory exhausted by a user program</td><td>Unbounded length field</td></tr>
+<tr><td>Cannot extend the struct in v2</td><td>No reserved fields in v1</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Decode a control code into its four fields.</li>
+  <li>Explain what the Access field enforces and who enforces it.</li>
+  <li>Write a handler with correct validation, completion and forwarding.</li>
+  <li>Explain why a forwarded request must not be completed.</li>
+  <li>Say what internal IOCTLs are for and the trap they carry.</li>
+  <li>Open a device by interface GUID from user mode.</li>
+  <li>Issue a synchronous and an asynchronous IOCTL, handling <code>ERROR_IO_PENDING</code>
+  correctly.</li>
+  <li>List the nine interface design rules.</li>
+  <li>Explain the 32-on-64 layout problem and design a struct that avoids it.</li>
+  <li>Run the negative test list and the WDK's IOCTL fuzzer.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

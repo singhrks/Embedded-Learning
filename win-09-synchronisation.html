@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synchronisation primitives | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Synchronisation primitives</h1>
+<p class="lead">Windows offers a dozen locks, and choosing between them is decided almost entirely by one
+question: what IRQL will touch this data? Get that right and the rest follows mechanically.</p>
+
+<h2 id="decide">The decision</h2>
+
+<p>Windows offers a dozen synchronisation primitives and the wrong choice is a bugcheck rather than merely slower code. Fortunately the decision reduces to two questions with definite answers, which is what this section captures.</p>
+
+<pre class="diagram">   What is the HIGHEST IRQL at which this data is touched?
+        |
+        +-- DIRQL (an ISR touches it)
+        |      -&gt; the INTERRUPT SPINLOCK
+        |         WdfInterruptAcquireLock / KeAcquireInterruptSpinLock
+        |
+        +-- DISPATCH_LEVEL (a DPC or timer touches it)
+        |      -&gt; SPINLOCK
+        |         KeAcquireSpinLock / WdfSpinLockAcquire
+        |
+        +-- PASSIVE / APC only
+               |
+               +-- do I need to WAIT for something?
+               |      -&gt; KEVENT
+               |
+               +-- many readers, rare writers, long holds?
+               |      -&gt; ERESOURCE
+               |
+               +-- just mutual exclusion, short?
+               |      -&gt; FAST MUTEX
+               |
+               +-- a single counter or flag?
+                      -&gt; INTERLOCKED operations, no lock at all
+
+  AND THE OVERRIDING RULE: everything forbidden at
+  DISPATCH_LEVEL (chapter 03) is forbidden INSIDE A SPINLOCK,
+  because acquiring one raises you to DISPATCH_LEVEL. No
+  paged memory, no blocking, no paged-pool allocation, no
+  waiting.
+
+  This is the same shape as the Linux decision
+  (Linux ch. 12), with IRQL replacing "context".</pre>
+
+<h2 id="spinlock">Spinlocks</h2>
+
+<p>A spinlock does not block; it spins, and acquiring one raises the processor to <code>DISPATCH_LEVEL</code>. That side effect is the important part: everything inside a spinlock is subject to the high-IRQL rules, whether you were thinking about IRQL or not.</p>
+
+<pre><code>#include &lt;ntddk.h&gt;
+
+        KSPIN_LOCK Lock;
+        KeInitializeSpinLock(&amp;Lock);
+
+/* From PASSIVE or APC level - raises IRQL and saves the old */
+        KIRQL oldIrql;
+
+        KeAcquireSpinLock(&amp;Lock, &amp;oldIrql);
+        /* ... at DISPATCH_LEVEL now ... */
+        KeReleaseSpinLock(&amp;Lock, oldIrql);
+
+/* When you KNOW you are already at DISPATCH_LEVEL - in a DPC,
+   a timer callback, or nested inside another spinlock: */
+        KeAcquireSpinLockAtDpcLevel(&amp;Lock);
+        ...
+        KeReleaseSpinLockFromDpcLevel(&amp;Lock);
+/* Cheaper: no IRQL change. Calling it below DISPATCH_LEVEL is
+   a bug Driver Verifier catches immediately.              */
+
+/* IN-STACK QUEUED - fairer under contention, and preferred
+   on many-core systems because it avoids the cacheline
+   stampede of a plain spinlock: */
+        KLOCK_QUEUE_HANDLE handle;
+
+        KeAcquireInStackQueuedSpinLock(&amp;Lock, &amp;handle);
+        ...
+        KeReleaseInStackQueuedSpinLock(&amp;handle);
+
+/* THE RULES:
+     · SHORT. Microseconds. Other CPUs are spinning.
+     · `oldIrql` must be a LOCAL variable. Sharing one between
+       CPUs corrupts the IRQL restore - a subtle, devastating
+       bug.
+     · never acquire a lower-IRQL lock while holding a
+       higher-IRQL one
+     · define and document a lock ORDER, exactly as on Linux
+     · a spinlock protects against OTHER CPUs; raising IRQL
+       protects against PREEMPTION on THIS one. You almost
+       always need both, which is why Windows combines them. */
+
+/* IN WDF, an object with proper lifetime management: */
+        WDFSPINLOCK lock;
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = device;      /* freed with it */
+        status = WdfSpinLockCreate(&amp;attr, &amp;lock);
+
+        WdfSpinLockAcquire(lock);
+        ...
+        WdfSpinLockRelease(lock);</code></pre>
+
+<h2 id="interrupt">Interrupt spinlocks</h2>
+
+<p>Data shared with your interrupt service routine needs more than an ordinary spinlock, because the ISR runs above <code>DISPATCH_LEVEL</code> and would not be excluded by one. The framework provides a lock that raises to the right level for you.</p>
+
+<pre><code>/* Data shared with an ISR needs a lock acquired at the
+   DEVICE's IRQL - otherwise the ISR can interrupt you while
+   you hold it, and spin forever waiting for code that cannot
+   resume. Exactly the Linux self-deadlock (ch. 12).       */
+
+/* WDM: */
+        KIRQL oldIrql;
+
+        KeAcquireInterruptSpinLock(interruptObject, &amp;oldIrql);
+        /* now at DIRQL - the ISR cannot run on this CPU */
+        ...
+        KeReleaseInterruptSpinLock(interruptObject, oldIrql);
+
+/* WDF - simpler, and it knows the right IRQL: */
+        WdfInterruptAcquireLock(interrupt);
+        ...
+        WdfInterruptReleaseLock(interrupt);
+
+/* INSIDE the ISR itself, you already hold it - WDF acquires
+   it before calling EvtInterruptIsr. Do not re-acquire.
+
+/* OR, AVOID THE PROBLEM: use
+   WdfInterruptSynchronize to run a small function AT DIRQL
+   with the lock held, rather than holding it around a longer
+   section:                                                 */
+
+static BOOLEAN
+MySyncRoutine(_In_ WDFINTERRUPT Interrupt, _In_ WDFCONTEXT Ctx)
+{
+        PMY_CONTEXT c = (PMY_CONTEXT)Ctx;
+
+        /* runs at DIRQL with the interrupt lock held */
+        c-&gt;Enabled = TRUE;
+        WRITE_REGISTER_ULONG(c-&gt;Base + REG_INT_EN, 1);
+        return TRUE;
+}
+
+        WdfInterruptSynchronize(interrupt, MySyncRoutine, ctx);
+
+/* This is the idiomatic way to touch ISR-shared state from a
+   normal path: a tiny function, at DIRQL, for the shortest
+   possible time.                                          */</code></pre>
+
+<h2 id="events">Events</h2>
+
+<p>When one piece of code must wait for another to finish, an event is the standard signal. The choice between the two kinds — and the rule about where you may wait — matters more than the API itself.</p>
+
+<pre><code>/* KEVENT is the "wait for something to happen" primitive -
+   the analogue of a Linux completion or wait queue.       */
+
+        KEVENT Event;
+
+        KeInitializeEvent(&amp;Event,
+                          NotificationEvent,  /* or Synchronization */
+                          FALSE);             /* initial state */
+
+/* NotificationEvent    stays signalled until manually reset.
+                        ALL waiters wake. ("manual reset")
+   SynchronizationEvent auto-resets when ONE waiter wakes.
+                        ("auto reset")                       */
+
+/* WAITING - at PASSIVE_LEVEL only: */
+        LARGE_INTEGER timeout;
+        NTSTATUS status;
+
+        timeout.QuadPart = -10LL * 1000 * 1000 * 5;  /* 5 s */
+        /* NEGATIVE = relative. POSITIVE = an absolute time in
+           1601-epoch 100ns units. Getting the sign wrong
+           gives you either an instant return or a wait until
+           the far future - both common bugs.            */
+
+        status = KeWaitForSingleObject(&amp;Event,
+                                       Executive,
+                                       KernelMode,
+                                       FALSE,     /* alertable */
+                                       &amp;timeout);
+        if (status == STATUS_TIMEOUT)
+                return STATUS_IO_TIMEOUT;
+
+/* SIGNALLING - legal at any IRQL <= DISPATCH_LEVEL, which is
+   why a DPC can wake a waiting thread: */
+        KeSetEvent(&amp;Event, IO_NO_INCREMENT, FALSE);
+        KeClearEvent(&amp;Event);
+        KeResetEvent(&amp;Event);        /* clear, return old state */
+
+/* WAITING ON SEVERAL: */
+        PVOID objects[2] = { &amp;EventA, &amp;EventB };
+
+        status = KeWaitForMultipleObjects(2, objects,
+                        WaitAny,        /* or WaitAll */
+                        Executive, KernelMode, FALSE,
+                        &amp;timeout, NULL);
+        /* returns STATUS_WAIT_0 or STATUS_WAIT_1 for WaitAny */
+
+/* ALWAYS USE A TIMEOUT in a driver. An infinite wait on
+   hardware that has stopped responding hangs the thread
+   permanently, and if it is a system thread, it hangs
+   shutdown. Same argument as the Linux
+   wait_for_completion_timeout rule (ch. 12).             */</code></pre>
+
+<h2 id="mutex">Fast mutexes and ERESOURCE</h2>
+
+<p>When the code holding a lock needs to block — to allocate paged memory, or to wait on I/O — a spinlock is illegal and you need something that sleeps. These are the two options, and they differ mainly in whether readers need to exclude each other.</p>
+
+<pre><code>/* FAST MUTEX - simple exclusion at PASSIVE_LEVEL: */
+        FAST_MUTEX Mutex;
+
+        ExInitializeFastMutex(&amp;Mutex);
+
+        ExAcquireFastMutex(&amp;Mutex);
+        /* raises IRQL to APC_LEVEL - so APCs are blocked,
+           which is what makes it "fast"                    */
+        ...
+        ExReleaseFastMutex(&amp;Mutex);
+
+        if (ExTryToAcquireFastMutex(&amp;Mutex)) { ... }
+
+/* NOT RECURSIVE. Acquiring twice on one thread deadlocks.
+   NOT usable above APC_LEVEL.
+   You MAY sleep while holding one - which is the whole point
+   compared to a spinlock.                                */
+
+/* ERESOURCE - reader/writer, recursive, PASSIVE only: */
+        ERESOURCE Resource;
+
+        ExInitializeResourceLite(&amp;Resource);
+
+        KeEnterCriticalRegion();     /* disable normal APCs -
+                                        REQUIRED, and forgetting
+                                        it is the classic bug */
+        ExAcquireResourceSharedLite(&amp;Resource, TRUE);
+        /* ... many readers concurrently ... */
+        ExReleaseResourceLite(&amp;Resource);
+        KeLeaveCriticalRegion();
+
+        KeEnterCriticalRegion();
+        ExAcquireResourceExclusiveLite(&amp;Resource, TRUE);
+        /* ... one writer ... */
+        ExReleaseResourceLite(&amp;Resource);
+        KeLeaveCriticalRegion();
+
+        ExDeleteResourceLite(&amp;Resource);
+
+/* The TRUE argument means "wait". FALSE means "try", and
+   returns FALSE if it would block.
+
+   THE CRITICAL REGION requirement exists because a normal
+   kernel APC could suspend the thread while it holds the
+   resource, blocking every other waiter indefinitely. The
+   Ex*ResourceLite functions ASSERT you are in one on checked
+   builds.
+
+   USE ERESOURCE when reads genuinely dominate AND the hold
+   time is long. Otherwise a fast mutex is cheaper - the same
+   advice as Linux's on rw_semaphores (ch. 12).           */
+
+/* WDF WAIT LOCK - the framework's PASSIVE-level lock, and the
+   one to reach for in WDF code: */
+        WDFWAITLOCK lock;
+
+        WdfWaitLockCreate(&amp;attr, &amp;lock);
+        WdfWaitLockAcquire(lock, NULL);   /* NULL = wait
+                                             forever; or a
+                                             timeout          */
+        ...
+        WdfWaitLockRelease(lock);</code></pre>
+
+<h2 id="interlocked">Interlocked operations</h2>
+
+<p>If all you are protecting is a single counter or flag, a lock is heavier than the job requires. These operations are indivisible at the hardware level, usable at any IRQL, and are the right answer far more often than people expect.</p>
+
+<pre><code>/* No lock at all, for a single value. */
+
+        LONG counter = 0;
+
+        InterlockedIncrement(&amp;counter);
+        InterlockedDecrement(&amp;counter);
+        InterlockedExchange(&amp;counter, 5);
+        InterlockedExchangeAdd(&amp;counter, 10);
+        old = InterlockedCompareExchange(&amp;counter, newVal,
+                                         expected);
+
+        /* 64-bit and pointer-sized variants: */
+        InterlockedIncrement64(&amp;counter64);
+        InterlockedExchangePointer(&amp;ptr, newPtr);
+        InterlockedCompareExchangePointer(&amp;ptr, new, expected);
+
+        /* bit operations: */
+        InterlockedBitTestAndSet(&amp;flags, 3);
+        InterlockedOr(&amp;flags, MY_FLAG);
+        InterlockedAnd(&amp;flags, ~MY_FLAG);
+
+/* INTERLOCKED LISTS - a lock-free singly linked stack, used
+   heavily for free lists: */
+        SLIST_HEADER ListHead;
+
+        ExInitializeSListHead(&amp;ListHead);
+        ExInterlockedPushEntrySList(&amp;ListHead, &amp;entry-&gt;Link,
+                                    NULL);
+        entry = ExInterlockedPopEntrySList(&amp;ListHead, NULL);
+
+/* USABLE AT ANY IRQL. No lock ordering to worry about.
+
+   THE LIMIT, same as Linux atomics: they protect ONE
+   variable. If your invariant spans two - "the count matches
+   the list length" - interlocked operations give you nothing.
+   You need a lock.                                        */
+
+/* REFERENCE COUNTING done right: */
+        if (InterlockedDecrement(&amp;obj-&gt;RefCount) == 0)
+                FreeObject(obj);
+/* And the acquire side must never increment from zero -
+   that is a use-after-free. Structure the code so a
+   reference can only be taken from something that already
+   holds one.                                             */</code></pre>
+
+<div class="key">
+<b>The comparison table</b>
+<table>
+<thead><tr><th>Primitive</th><th>Max IRQL</th><th>Can wait</th><th>Recursive</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td>Interlocked</td><td>Any</td><td>—</td><td>—</td><td>One counter or flag</td></tr>
+<tr><td>Interrupt spinlock</td><td>DIRQL</td><td>No</td><td>No</td><td>Data shared with an ISR</td></tr>
+<tr><td>Spinlock</td><td>DISPATCH</td><td>No</td><td>No</td><td>Data shared with a DPC</td></tr>
+<tr><td>Fast mutex</td><td>APC</td><td>Yes</td><td><strong>No</strong></td><td>General PASSIVE exclusion</td></tr>
+<tr><td>WDFWAITLOCK</td><td>PASSIVE</td><td>Yes</td><td>No</td><td>The WDF default</td></tr>
+<tr><td>ERESOURCE</td><td>PASSIVE</td><td>Yes</td><td><strong>Yes</strong></td><td>Long reads, rare writes</td></tr>
+<tr><td>KEVENT</td><td>Wait: PASSIVE<br>Set: DISPATCH</td><td>Yes</td><td>—</td><td>"Wait until this happens"</td></tr>
+<tr><td>KSEMAPHORE</td><td>Same</td><td>Yes</td><td>—</td><td>Counted resources</td></tr>
+<tr><td>Rundown protection</td><td>DISPATCH</td><td>Yes</td><td>—</td><td>"Wait for all users to leave"</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="rundown">Rundown protection</h2>
+
+<p>Tearing down an object while other threads may still be using it is a genuinely hard problem: you must stop new users arriving and wait for existing ones to finish. Rundown protection is the system's purpose-built answer.</p>
+
+<pre><code>/* The problem: you are tearing down an object, and other
+   threads may be using it right now. You must wait for them
+   all to finish, and prevent new ones from starting.
+   Doing this with a refcount and an event is subtly racy;
+   EX_RUNDOWN_REF does it correctly.                       */
+
+        EX_RUNDOWN_REF RunRef;
+
+        ExInitializeRundownProtection(&amp;RunRef);
+
+/* Every user, before touching the object: */
+        if (!ExAcquireRundownProtection(&amp;RunRef))
+                return STATUS_DEVICE_REMOVED;   /* rundown has
+                                                   started    */
+        ... use the object ...
+        ExReleaseRundownProtection(&amp;RunRef);
+
+/* The teardown path, once: */
+        ExWaitForRundownProtectionRelease(&amp;RunRef);
+        /* returns when every acquirer has released, AND all
+           future acquires fail. NOW it is safe to free.    */
+
+        ... free the object ...
+
+/* THIS IS EXACTLY the problem Linux solves with module
+   refcounts and _sync cancellation (ch. 14/15). Windows gives
+   it a name and a correct implementation.
+
+   USE IT for anything with a lifetime shorter than the
+   driver: a per-file context, a session, a queued operation
+   the user can cancel.                                    */</code></pre>
+
+<h2 id="deadlock">Deadlock and how it is found</h2>
+
+<p>Deadlocks rarely reproduce on demand — the machine simply stops, usually only under load. Windows therefore ships a checker that watches lock acquisition order and reports a dangerous pattern the first time it sees it, long before it ever actually deadlocks.</p>
+
+<pre><code>/* THE FOUR CLASSIC WAYS, same as Linux (ch. 12):
+     1. AB-BA lock ordering
+     2. self-deadlock on a non-recursive lock
+     3. an ISR taking a lock its interrupted code holds
+     4. waiting at DISPATCH_LEVEL
+
+/* THE FIX FOR (1) IS ALWAYS THE SAME: a documented order. */
+
+/*
+ * Lock order:
+ *      device->ConfigLock  (WDFWAITLOCK)
+ *        -> device->QueueLock  (WDFSPINLOCK)
+ *          -> interrupt lock
+ * Never acquire in the reverse direction.
+ */
+
+/* AND LET DRIVER VERIFIER CHECK IT: */
+        verifier /flags 0x20 /driver mydriver.sys
+        /* 0x20 = deadlock detection */
+
+/* Verifier's deadlock detector builds a lock ORDER GRAPH at
+   runtime and bugchecks with 0xC4 (subcode 0x1000-series) the
+   first time it sees an inconsistent acquisition - even if no
+   deadlock actually occurred. This is the direct equivalent
+   of Linux's lockdep (ch. 12), and it finds the same class of
+   latent bug.
+
+   ENABLE IT DURING DEVELOPMENT, ALWAYS. It is the single most
+   valuable verifier flag for concurrency.               */
+
+/* DEBUGGING A HANG in WinDbg (chapter 23): */
+        !locks                  /* every ERESOURCE and its
+                                   owner                     */
+        !deadlock               /* verifier's graph */
+        !stacks 2               /* every thread's stack */
+        !thread ffff8a0c...     /* what is this one waiting on */
+        !process 0 7            /* everything, verbose */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0xA in a spinlock section</td><td>Touched paged memory at DISPATCH_LEVEL</td></tr>
+<tr><td>One CPU spins forever</td><td>ISR took a lock held by the code it interrupted — use the interrupt spinlock</td></tr>
+<tr><td>Whole system hangs</td><td>AB-BA deadlock, or waiting while holding a spinlock</td></tr>
+<tr><td>Bugcheck 0xC4 with a deadlock subcode</td><td>Verifier found an inconsistent lock order — a real bug</td></tr>
+<tr><td>Random corruption after a lock release</td><td><code>oldIrql</code> shared rather than local</td></tr>
+<tr><td>Thread waits forever</td><td>Infinite timeout on hardware that stopped responding</td></tr>
+<tr><td>Wait returns immediately</td><td>Timeout sign wrong — negative is relative</td></tr>
+<tr><td>Deadlock on a fast mutex</td><td>Acquired recursively; it is not recursive</td></tr>
+<tr><td>ERESOURCE assertion on a checked build</td><td>Missing <code>KeEnterCriticalRegion</code></td></tr>
+<tr><td>Counter drifts under load</td><td>Non-interlocked read-modify-write</td></tr>
+<tr><td>Use-after-free during teardown</td><td>No rundown protection — a user was still inside</td></tr>
+<tr><td>Works on one core, fails on many</td><td>It was always racy; low core count hid it</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Walk the decision tree for four different pieces of driver data.</li>
+  <li>Explain why acquiring a spinlock imposes every DISPATCH_LEVEL restriction.</li>
+  <li>Say why data shared with an ISR needs an interrupt spinlock, and what
+  <code>WdfInterruptSynchronize</code> is for.</li>
+  <li>Distinguish notification from synchronisation events.</li>
+  <li>Explain the sign convention for timeouts and why every driver wait needs one.</li>
+  <li>Say why a fast mutex must not be acquired recursively.</li>
+  <li>Explain what <code>KeEnterCriticalRegion</code> protects against.</li>
+  <li>Use interlocked operations correctly, and state their limit.</li>
+  <li>Explain what rundown protection solves and when to use it.</li>
+  <li>Enable Verifier's deadlock detection and explain what it corresponds to on Linux.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

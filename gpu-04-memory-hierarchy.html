@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The GPU memory hierarchy | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The GPU memory hierarchy</h1>
+<p class="lead">Most GPU kernels are limited by memory, not arithmetic. The hierarchy has more levels than a
+CPU's, several of them are explicitly managed by you, and the single most important rule — coalescing — has no
+CPU equivalent at all.</p>
+
+<h2 id="levels">The levels</h2>
+
+<pre class="diagram">                                   latency   bandwidth   scope
+   REGISTERS                        ~1 cyc   ~20 TB/s    thread
+     256 KB per SM. Private per thread. The fastest storage in
+     the machine, and the budget that caps occupancy.
+        |
+   SHARED MEMORY / LDS             ~20-30    ~10 TB/s    block
+     up to 164 KB per SM, split with L1. SOFTWARE MANAGED -
+     you decide what lives here. Banked (see below).
+        |
+   L1 / TEXTURE CACHE              ~30       ~10 TB/s    SM
+     automatic. Small per thread once you divide by occupancy.
+        |
+   L2 CACHE                        ~200      ~2 TB/s     device
+     2-100 MB. Shared by all SMs. Where atomics resolve.
+        |
+   GLOBAL MEMORY (VRAM/HBM)        ~400-800  0.5-3 TB/s  device
+     GB. Everything else lives here. THE BOTTLENECK.
+        |
+   HOST MEMORY over PCIe           ~1-2 us   ~25 GB/s    system
+     100x less bandwidth than VRAM. Avoid crossing it.
+
+   PLUS TWO READ-ONLY PATHS:
+     CONSTANT MEMORY   64 KB, broadcast-optimised. One value
+                       to all lanes in a cycle; serialised if
+                       lanes read different addresses.
+     TEXTURE/__ldg     read-only path with its own cache,
+                       spatial (2D) locality, free filtering
+                       and border handling.
+
+   THE RATIO THAT MATTERS: registers are ~40x the bandwidth of
+   global memory. Every byte you keep in registers or shared
+   memory instead of re-reading is the highest-value
+   optimisation available.</pre>
+
+<h2 id="coalescing">Coalescing: the rule with no CPU analogue</h2>
+
+<pre class="diagram">   Memory is served in 32-byte SECTORS (four per 128-byte
+   line). A warp issues 32 addresses AT ONCE, and the hardware
+   merges them into as few transactions as it can.
+
+   PERFECT - consecutive lanes, consecutive floats
+
+     lane:   0  1  2  3  ...            31
+     addr: 000 004 008 012 ...         124
+                                     -> ONE 128-byte transaction
+                                        128 bytes requested,
+                                        128 used. 100%.
+
+   STRIDED BY 2 - c[i*2]
+
+     lane:   0    1    2   ...           31
+     addr: 000  008  016  ...           248
+                                     -> TWO transactions
+                                        256 fetched, 128 used.
+                                        50% of bandwidth wasted.
+
+   STRIDED BY 32 - a column of a row-major matrix
+
+     lane:   0     1     2  ...          31
+     addr: 000   128   256  ...        3968
+                                     -> 32 SEPARATE transactions
+                                        4096 fetched, 128 used.
+                                        3% efficiency.
+                                        THIRTY-TWO TIMES SLOWER
+                                        than the perfect case,
+                                        for the same code.
+
+   RANDOM - a gather
+
+     32 transactions, and no prefetcher can help.
+
+   THE RULE: adjacent THREADS should touch adjacent MEMORY.
+   Not adjacent iterations - adjacent threads. Getting this
+   backwards is the single most common GPU performance bug.</pre>
+
+<pre><code>/* THE CLASSIC MISTAKE - each thread handles a contiguous
+   chunk, "like a CPU would". */
+
+__global__ void bad(float *a, int n, int per_thread)
+{
+        int t = blockIdx.x * blockDim.x + threadIdx.x;
+        int base = t * per_thread;                 /* lane 0 -> 0
+                                                      lane 1 -> 64
+                                                      lane 2 -> 128 */
+        for (int i = 0; i &lt; per_thread; i++)
+                a[base + i] *= 2.0f;               /* stride 64
+                                                      between
+                                                      lanes!    */
+}
+
+/* THE FIX - grid-stride loop. Lanes stay adjacent; the WHOLE
+   GRID strides. */
+__global__ void good(float *a, int n)
+{
+        int stride = blockDim.x * gridDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+             i &lt; n; i += stride)
+                a[i] *= 2.0f;              /* lanes 0..31 touch
+                                              adjacent floats,
+                                              every iteration   */
+}
+/* Same work, same instruction count, typically 5-20x faster.
+   And the grid-stride form is independent of grid size, so
+   the same kernel is correct for any launch configuration. */</code></pre>
+
+<div class="key">
+<b>Structure of arrays, not array of structures</b>
+<p>An AoS layout (<code>struct Particle { float x, y, z; }; Particle p[N];</code>) means lane 0 reads offset
+0 and lane 1 reads offset 12 — a stride of 12 bytes, so reading just <code>x</code> wastes two-thirds of every
+transaction. SoA (<code>float px[N], py[N], pz[N];</code>) makes each field perfectly coalesced. This is the
+same transformation that helps SIMD on a CPU, but on a GPU the penalty for getting it wrong is far
+larger.</p>
+</div>
+
+<h2 id="shared">Shared memory and bank conflicts</h2>
+
+<pre><code>/* Shared memory is divided into 32 BANKS, 4 bytes wide,
+   interleaved. Bank = (address / 4) % 32.
+
+   The 32 lanes of a warp can each access a DIFFERENT bank in
+   one cycle. Two lanes hitting the SAME bank at DIFFERENT
+   addresses serialise.                                     */
+
+__shared__ float tile[32][32];
+
+/* CONFLICT-FREE - row access. Lane i reads tile[k][i], which
+   is bank i. All 32 banks, one cycle.                       */
+        float v = tile[k][threadIdx.x];
+
+/* 32-WAY CONFLICT - column access. Lane i reads tile[i][k],
+   at address (i*32 + k)*4, so bank = (i*32 + k) % 32 = k for
+   EVERY lane. All 32 lanes hit bank k. 32x serialisation. */
+        float v = tile[threadIdx.x][k];
+
+/* THE FIX - PAD THE ROW. One extra column shifts each row by
+   one bank. */
+__shared__ float tile[32][33];      /* &lt;-- 33, not 32          */
+        float v = tile[threadIdx.x][k];
+        /* address = (i*33 + k)*4, bank = (i*33 + k) % 32
+                                       = (i + k) % 32
+           every lane a different bank. Conflict-free.        */
+
+/* Four bytes of waste per row buys a 32x speed-up on the
+   transpose. It is the best-known trick in GPU programming
+   and it is one character.
+
+   BROADCAST IS FREE: if every lane reads the SAME address,
+   the hardware broadcasts in one cycle. Same-bank same-address
+   is not a conflict; same-bank different-address is.       */</code></pre>
+
+<h2 id="tiling">Tiling: the reason shared memory exists</h2>
+
+<pre><code>/* Naive matrix multiply: every thread reads a whole row and a
+   whole column from global memory. Each element of A is read
+   N times.                                                 */
+
+__global__ void matmul_naive(float *C, const float *A,
+                             const float *B, int N)
+{
+        int r = blockIdx.y * blockDim.y + threadIdx.y;
+        int c = blockIdx.x * blockDim.x + threadIdx.x;
+        float sum = 0;
+        for (int k = 0; k &lt; N; k++)
+                sum += A[r * N + k] * B[k * N + c];   /* B is
+                                                         strided! */
+        C[r * N + c] = sum;
+}
+/* Global traffic: 2 * N^3 * 4 bytes. Bandwidth-bound, and B's
+   access pattern is a column walk. Perhaps 5% of peak.     */
+
+#define T 32
+__global__ void matmul_tiled(float *C, const float *A,
+                             const float *B, int N)
+{
+        __shared__ float As[T][T + 1];      /* +1: no conflicts */
+        __shared__ float Bs[T][T + 1];
+
+        int r = blockIdx.y * T + threadIdx.y;
+        int c = blockIdx.x * T + threadIdx.x;
+        float sum = 0;
+
+        for (int t = 0; t &lt; N / T; t++) {
+                /* COALESCED loads: adjacent lanes (threadIdx.x)
+                   read adjacent floats. */
+                As[threadIdx.y][threadIdx.x] =
+                        A[r * N + t * T + threadIdx.x];
+                Bs[threadIdx.y][threadIdx.x] =
+                        B[(t * T + threadIdx.y) * N + c];
+
+                __syncthreads();            /* tile is loaded   */
+
+                for (int k = 0; k &lt; T; k++)
+                        sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+
+                __syncthreads();            /* before OVERWRITING
+                                               the tile - this
+                                               second barrier is
+                                               the one people
+                                               forget           */
+        }
+        C[r * N + c] = sum;
+}
+/* Global traffic: 2 * N^3 / T * 4 bytes - THIRTY-TWO TIMES
+   LESS. Each element is loaded once per tile instead of once
+   per output. Typically 10-20x faster.
+
+   THE PRINCIPLE: load a tile cooperatively into fast memory,
+   reuse it many times, move on. It is the same blocking
+   transformation as a cache-oblivious CPU algorithm, except
+   you write it explicitly.                                  */</code></pre>
+
+<div class="warn">
+<b>Both <code>__syncthreads()</code> are load-bearing</b>
+<p>The first ensures the tile is fully written before anyone reads it. The second ensures everyone has
+finished reading before the next iteration overwrites it. Omitting the second is a classic bug: it works at
+small sizes where warps happen to stay in step, and corrupts results once the block spans enough warps that
+they drift apart. Also note <code>__syncthreads()</code> must be reached by <em>every</em> thread in the block
+— putting one inside a divergent branch hangs the block.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Kernel achieves 3% of peak bandwidth</td><td>Uncoalesced access — check the stride between adjacent
+lanes</td></tr>
+<tr><td>Transpose is 30× slower than a copy</td><td>Bank conflicts; pad the shared tile</td></tr>
+<tr><td>Reading one field of a struct is slow</td><td>AoS layout; switch to SoA</td></tr>
+<tr><td>Matrix multiply far below peak</td><td>Not tiled — every element re-read from global</td></tr>
+<tr><td>Results wrong only for large blocks</td><td>Missing the second <code>__syncthreads()</code></td></tr>
+<tr><td>Kernel hangs</td><td><code>__syncthreads()</code> inside a divergent branch</td></tr>
+<tr><td>Occupancy drops when you add shared memory</td><td>Shared memory per block limits resident blocks per
+SM</td></tr>
+<tr><td>Constant memory is slow</td><td>Lanes reading different addresses — it serialises, it only broadcasts
+well</td></tr>
+<tr><td>Most of the profile is <code>cudaMemcpy</code></td><td>Crossing PCIe every iteration; keep data
+resident</td></tr>
+<tr><td>Atomics are the bottleneck</td><td>They serialise at L2; use warp aggregation or a per-block
+partial</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the memory levels with their scope and rough latency.</li>
+  <li>State the coalescing rule and explain why stride 32 is thirty-two times worse.</li>
+  <li>Explain why "each thread takes a contiguous chunk" is wrong on a GPU.</li>
+  <li>Write a grid-stride loop and say why it is launch-configuration independent.</li>
+  <li>Explain AoS versus SoA and why the GPU penalty exceeds the CPU one.</li>
+  <li>Compute the bank for a shared-memory address and construct a 32-way conflict.</li>
+  <li>Explain why <code>[32][33]</code> removes the conflict.</li>
+  <li>Say when same-bank access is free.</li>
+  <li>Explain what tiling saves in matrix multiply, quantitatively.</li>
+  <li>Justify both <code>__syncthreads()</code> calls and describe the bug from omitting the second.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

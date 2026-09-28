@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UART in practice: flow control, DMA and ring buffers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>UART in practice: flow control, DMA and ring buffers</h1>
+<p class="lead">The frame from the previous chapter is the easy part. Making a UART link that does not drop
+bytes under load, recovers from a peer that disappears, and finds message boundaries in a byte stream is the
+engineering — and it is the same work for every stream protocol you will meet.</p>
+
+<h2 id="overrun">Why bytes get lost</h2>
+
+<pre class="diagram">   A UART has ONE receive holding register (or a shallow
+   FIFO). At 115200 baud a byte arrives every 87 us. If your
+   software has not read the previous byte by then, it is
+   OVERWRITTEN and the OVERRUN flag sets.
+
+   87 us is a long time - about 14,000 cycles at 168 MHz -
+   which is why interrupt-per-byte works fine at this rate.
+
+   At 3 Mbaud a byte arrives every 3.3 us: 550 cycles. An
+   ISR with a 12-cycle entry, a prologue, a ring-buffer
+   write and an exit is perhaps 40 cycles, so it still fits
+   - until something disables interrupts for 10 us. Then you
+   lose three bytes and the protocol desynchronises.
+
+   WHAT DISABLES INTERRUPTS LONG ENOUGH TO HURT:
+     - a flash write or erase (can stall the bus for MS)
+     - a long critical section in another driver
+     - a higher-priority ISR doing too much
+     - a debugger halting the core
+
+   THE FIX IS NOT "OPTIMISE THE ISR". It is DMA, which
+   removes software from the per-byte path entirely. Once
+   the DMA controller is writing to memory, an interrupt
+   disabled for 10 us costs you nothing at all.</pre>
+
+<h2 id="ring">The ring buffer, done right</h2>
+
+<pre><code>/* Single producer (ISR), single consumer (task). Power-of-
+   two size so the mask is free. No lock needed - the
+   argument is in the mcu track, chapter 17.               */
+
+#define RXSZ 512                       /* MUST be 2^n       */
+typedef struct {
+    uint8_t  buf[RXSZ];
+    volatile uint16_t head;            /* written by ISR    */
+    volatile uint16_t tail;            /* written by task   */
+    volatile uint32_t dropped;
+} ring_t;
+
+static inline int ring_put(ring_t *r, uint8_t c)
+{
+    uint16_t next = (uint16_t)((r-&gt;head + 1u) &amp; (RXSZ - 1u));
+    if (next == r-&gt;tail) {
+        r-&gt;dropped++;                  /* COUNT it          */
+        return -1;
+    }
+    r-&gt;buf[r-&gt;head] = c;
+    r-&gt;head = next;                    /* publish AFTER     */
+    return 0;
+}
+
+static inline int ring_get(ring_t *r, uint8_t *c)
+{
+    if (r-&gt;tail == r-&gt;head) { return -1; }
+    *c = r-&gt;buf[r-&gt;tail];
+    r-&gt;tail = (uint16_t)((r-&gt;tail + 1u) &amp; (RXSZ - 1u));
+    return 0;
+}
+
+/* THREE THINGS THAT MAKE THIS CORRECT:
+
+   1. head is published AFTER the data byte is stored. The
+      consumer therefore never sees an index for a byte not
+      yet written.
+
+   2. The buffer is full when next == tail, which wastes one
+      slot but avoids the ambiguity of head == tail meaning
+      both empty and full. The alternative - a separate
+      count - is a variable BOTH sides write, and needs a
+      lock.
+
+   3. dropped is counted, not ignored. A link that silently
+      discards data under load is unbudgetable; one that
+      reports it tells you exactly how much bigger the
+      buffer needs to be.
+
+   SIZING: buffer must cover the longest time the consumer
+   can be delayed, times the byte rate.
+     115200 baud = 11.5 bytes/ms
+     consumer delayed up to 20 ms
+     -> 230 bytes minimum. Round up to 512.               */
+</code></pre>
+
+<h2 id="dmaidle">Circular DMA plus IDLE: the design worth memorising</h2>
+
+<pre><code>/* This combination receives continuously, at any rate, with
+   no per-byte software, AND tells you where messages end.
+   It is the standard answer for a serious UART link.      */
+
+static uint8_t dma_buf[512];
+static uint16_t last_pos;
+
+void uart_dma_rx_init(void)
+{
+    /* Circular DMA: NDTR reloads and the address wraps. */
+    DMA1_Stream5-&gt;PAR  = (uint32_t) &amp;USART2-&gt;RDR;
+    DMA1_Stream5-&gt;M0AR = (uint32_t) dma_buf;
+    DMA1_Stream5-&gt;NDTR = sizeof(dma_buf);
+    DMA1_Stream5-&gt;CR   = (4u &lt;&lt; 25) | DMA_SxCR_MINC
+                       | DMA_SxCR_CIRC | DMA_SxCR_TCIE
+                       | DMA_SxCR_HTIE;
+    DMA1_Stream5-&gt;CR  |= DMA_SxCR_EN;
+
+    USART2-&gt;CR3 |= USART_CR3_DMAR;
+    USART2-&gt;CR1 |= USART_CR1_IDLEIE;   /* THE KEY PIECE     */
+}
+
+/* IDLE fires when the line has been quiet for one full
+   character time after data. That is exactly "the message
+   ended", for any protocol with gaps between messages.   */
+void USART2_IRQHandler(void)
+{
+    if (USART2-&gt;ISR &amp; USART_ISR_IDLE) {
+        USART2-&gt;ICR = USART_ICR_IDLECF;
+        uart_process_upto(sizeof(dma_buf) - DMA1_Stream5-&gt;NDTR);
+    }
+}
+
+/* NDTR counts DOWN from the buffer size, so
+     bytes_written_so_far = size - NDTR
+   and the new data is everything between last_pos and that
+   position, handling the wrap.                            */
+static void uart_process_upto(uint16_t pos)
+{
+    if (pos == last_pos) { return; }
+
+    if (pos &gt; last_pos) {
+        parse(&amp;dma_buf[last_pos], pos - last_pos);
+    } else {                                  /* wrapped    */
+        parse(&amp;dma_buf[last_pos], sizeof(dma_buf) - last_pos);
+        if (pos &gt; 0) { parse(&amp;dma_buf[0], pos); }
+    }
+    last_pos = pos;
+}
+
+/* Also call uart_process_upto from the DMA half-transfer
+   and transfer-complete interrupts, so a message longer
+   than half the buffer is processed before it is
+   overwritten. Three interrupt sources, one function.
+
+   RESULT: zero per-byte CPU, message boundaries detected in
+   hardware, and a link that survives the CPU being busy for
+   milliseconds. This handles 3 Mbaud comfortably on a part
+   that could not manage 921600 with per-byte interrupts.  */
+</code></pre>
+
+<div class="key">
+<b>IDLE detection is the answer to "how do I know the message ended?"</b>
+<p>A UART is a byte stream with no framing above the character. Every protocol on top must delimit messages
+somehow, and there are only four options: a fixed length, a length field near the start, a terminator byte, or
+a timing gap. IDLE detection implements the last of these in hardware, for free, and it is why Modbus RTU
+(<a href="bus-14-industrial-serial.html">chapter 14</a>) specifies a 3.5-character silent interval as its
+frame delimiter — it was designed for exactly this mechanism.</p>
+</div>
+
+<h2 id="flow">Flow control</h2>
+
+<pre class="diagram">   HARDWARE (RTS/CTS) - two extra wires, and the only kind
+   that works reliably.
+
+     Device A                    Device B
+     RTS (out) ----------------&gt; CTS (in)
+     CTS (in)  &lt;---------------- RTS (out)
+
+     "RTS" now means "I am Ready To Receive" (the name is
+     historical and misleading). A drives RTS low when its
+     buffer has room; B's UART checks CTS before starting
+     each character and pauses if it is high.
+
+     ENTIRELY IN HARDWARE once enabled:
+       USART1-&gt;CR3 |= USART_CR3_RTSE | USART_CR3_CTSE;
+
+     The peripheral asserts RTS from its own FIFO level, so
+     it works even if your software is completely stalled.
+     This is the only flow control that survives a
+     millisecond-long interrupt lockout.
+
+   SOFTWARE (XON/XOFF) - in-band, no extra wires.
+     Receiver sends 0x13 (XOFF) to pause, 0x11 (XON) to
+     resume. Problems:
+       - those two byte values can never appear in your data,
+         so it is unusable for binary
+       - the XOFF itself takes a character time to send and
+         another to be noticed, so several bytes still
+         arrive after it
+       - if XON is lost, the link deadlocks permanently
+     Use only with legacy equipment that requires it.
+
+   NONE - the default, and correct when the receiver is
+     always faster than the sender, or the protocol has its
+     own acknowledgement and retry at a higher layer.</pre>
+
+<h2 id="robust">Making the link survive reality</h2>
+
+<pre><code>/* Four things that separate a driver that works on the
+   bench from one that works in a cabinet for five years. */
+
+/* 1. NEVER BLOCK FOREVER. */
+int uart_send(const uint8_t *p, size_t n, uint32_t timeout_ms)
+{
+    uint32_t deadline = g_ms + timeout_ms;
+    while (n--) {
+        while (!(USART2-&gt;ISR &amp; USART_ISR_TXE)) {
+            if ((int32_t)(g_ms - deadline) &gt;= 0) { return -ETIMEDOUT; }
+        }
+        USART2-&gt;TDR = *p++;
+    }
+    return 0;
+}
+
+/* 2. RECOVER FROM ERRORS, DO NOT JUST COUNT THEM.
+      An overrun on some parts BLOCKS further reception
+      until cleared. If your error path forgets to clear it,
+      the link dies permanently after the first burst.     */
+static void uart_error_recover(void)
+{
+    uint32_t isr = USART2-&gt;ISR;
+    if (isr &amp; (USART_ISR_ORE|USART_ISR_FE|USART_ISR_NE|USART_ISR_PE)) {
+        USART2-&gt;ICR = USART_ICR_ORECF | USART_ICR_FECF
+                    | USART_ICR_NECF  | USART_ICR_PECF;
+        (void) USART2-&gt;RDR;
+        stats.resyncs++;
+        parser_reset();          /* the stream is desynced  */
+    }
+}
+
+/* 3. RESYNCHRONISE THE PARSER. After any error the byte
+      stream has lost alignment. A parser that keeps its
+      state machine across an error will mis-frame every
+      subsequent message. Reset to hunting-for-header.     */
+
+/* 4. TIME OUT A PARTIAL MESSAGE. If a header arrives and
+      the rest never does, the parser must not wait
+      indefinitely holding a buffer.                       */
+if (parser.state != HUNTING &amp;&amp;
+    (int32_t)(g_ms - parser.started_ms - 100) &gt;= 0) {
+    stats.partial_timeouts++;
+    parser_reset();
+}
+
+/* Every one of these four is learned the hard way. A UART
+   link with no timeout, no error recovery, no resync and
+   no partial-message timeout will work perfectly until the
+   day a connector is jostled, and then stay broken until
+   someone power-cycles it.                                */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Link dies permanently after a burst</td><td>Overrun flag never cleared — it blocks further
+reception</td></tr>
+<tr><td>Bytes lost only when writing to flash</td><td>Flash operations stall the bus; use DMA for
+receive</td></tr>
+<tr><td>Every message after an error is mis-framed</td><td>Parser state not reset on error</td></tr>
+<tr><td>Task blocks forever holding a lock</td><td>A send with no timeout and a peer that stopped
+reading</td></tr>
+<tr><td>Ring buffer occasionally corrupt</td><td>Head published before the data, or two producers</td></tr>
+<tr><td>Buffer never reports full but data is missing</td><td>Drops not counted — add the counter</td></tr>
+<tr><td>Messages merge together</td><td>No delimiter; use IDLE detection or a length field</td></tr>
+<tr><td>DMA works but long messages corrupt</td><td>Half-transfer interrupt not handled — data overwritten
+before processing</td></tr>
+<tr><td>XON/XOFF corrupts binary data</td><td>0x11 and 0x13 appearing in the payload</td></tr>
+<tr><td>Flow control enabled but bytes still lost</td><td>RTS/CTS wired straight through instead of
+crossed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compute the inter-byte time at 3 Mbaud and say why DMA becomes necessary.</li>
+  <li>Explain why DMA makes a 10 µs interrupt lockout harmless.</li>
+  <li>Give the three properties that make the single-producer ring buffer correct.</li>
+  <li>Explain why the buffer wastes one slot rather than using a count.</li>
+  <li>Size a receive buffer from baud rate and worst-case consumer delay.</li>
+  <li>Write the expression for bytes received so far from <code>NDTR</code>.</li>
+  <li>Explain what IDLE detection does and name the four ways to delimit messages.</li>
+  <li>Explain why RTS/CTS works when software flow control does not.</li>
+  <li>Say why XON/XOFF cannot carry binary data.</li>
+  <li>List the four robustness measures a shipping UART driver needs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

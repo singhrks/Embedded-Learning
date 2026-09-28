@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V4L2: capture and memory-to-memory | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>V4L2: capture and memory-to-memory</h1>
+<p class="lead">Video4Linux2 is how Linux talks to cameras, capture cards, and — through the memory-to-memory
+extension — hardware codecs and scalers. It is an ioctl-based API with a buffer-queue model, and once you have
+internalised that model, every V4L2 device works the same way.</p>
+
+<h2 id="model">The buffer queue model</h2>
+
+<pre class="diagram">   V4L2 is built on TWO QUEUES per stream. You never allocate
+   and free per frame; you hand buffers to the driver and get
+   them back.
+
+     userspace                      driver
+        |                              |
+        |  VIDIOC_QBUF  ------------>  | INPUT QUEUE
+        |  "here is an empty buffer"   |   driver fills it
+        |                              |     from the sensor
+        |                              v
+        |                          [ hardware DMA ]
+        |                              |
+        |  VIDIOC_DQBUF <------------  | DONE QUEUE
+        |  "here is a full one"        |
+        v
+     process it, then QBUF it again
+
+   THE LIFECYCLE, and every V4L2 program is these seven steps:
+
+     1. open("/dev/video0")
+     2. VIDIOC_QUERYCAP     what can this device do?
+     3. VIDIOC_S_FMT        set resolution and pixel format
+     4. VIDIOC_REQBUFS      ask the driver to allocate N
+                            buffers (or accept yours)
+     5. VIDIOC_QUERYBUF + mmap    map them into your address
+                            space
+     6. VIDIOC_QBUF x N     hand them all over
+        VIDIOC_STREAMON     go
+     7. loop: poll() -> VIDIOC_DQBUF -> use -> VIDIOC_QBUF
+
+   THE THREE MEMORY MODELS
+
+     V4L2_MEMORY_MMAP     the DRIVER allocates; you mmap.
+                          The default, and what most devices
+                          support.
+     V4L2_MEMORY_USERPTR  YOU allocate; you pass a pointer.
+                          Needs an IOMMU or contiguous memory,
+                          and many drivers refuse it.
+     V4L2_MEMORY_DMABUF   you pass an fd for a buffer another
+                          driver allocated.
+                          THIS IS THE ZERO-COPY ONE
+                          (chapter 16), and it is what you
+                          want for anything real.</pre>
+
+<pre><code>/* A minimal capture loop. This is the whole API. */
+
+#include &lt;linux/videodev2.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+
+/* EVERY ioctl must be retried on EINTR. A signal - including
+   the one your profiler sends - will otherwise look like a
+   device failure. */
+static int xioctl(int fd, unsigned long req, void *arg)
+{
+        int r;
+        do { r = ioctl(fd, req, arg); }
+        while (r == -1 &amp;&amp; errno == EINTR);
+        return r;
+}
+
+#define NBUF 4
+struct buffer { void *start; size_t length; };
+static struct buffer bufs[NBUF];
+
+int capture_init(const char *dev, int w, int h, uint32_t fourcc)
+{
+        int fd = open(dev, O_RDWR | O_NONBLOCK);
+        if (fd &lt; 0) return -1;
+
+        /* 2. What is this? */
+        struct v4l2_capability cap = {0};
+        if (xioctl(fd, VIDIOC_QUERYCAP, &amp;cap) &lt; 0) return -1;
+        if (!(cap.capabilities &amp; V4L2_CAP_VIDEO_CAPTURE)) return -1;
+        if (!(cap.capabilities &amp; V4L2_CAP_STREAMING))     return -1;
+
+        /* 3. Set the format. THE DRIVER MAY CHANGE IT - always
+              read back what you actually got. Asking for
+              1920x1080 NV12 and getting 1280x720 YUYV without
+              noticing is the classic V4L2 mistake. */
+        struct v4l2_format fmt = {0};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width       = w;
+        fmt.fmt.pix.height      = h;
+        fmt.fmt.pix.pixelformat = fourcc;
+        fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+        if (xioctl(fd, VIDIOC_S_FMT, &amp;fmt) &lt; 0) return -1;
+
+        if (fmt.fmt.pix.pixelformat != fourcc)
+                fprintf(stderr, "driver chose a different format\n");
+        /* AND KEEP THE STRIDE the driver reports - it is not
+           width * bpp (chapter 1). */
+        int stride = fmt.fmt.pix.bytesperline;
+
+        /* 4. Buffers. */
+        struct v4l2_requestbuffers req = {0};
+        req.count  = NBUF;
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd, VIDIOC_REQBUFS, &amp;req) &lt; 0) return -1;
+        /* req.count may come back SMALLER than you asked. */
+
+        /* 5. Map them. */
+        for (unsigned i = 0; i &lt; req.count; i++) {
+                struct v4l2_buffer b = {0};
+                b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                b.memory = V4L2_MEMORY_MMAP;
+                b.index  = i;
+                if (xioctl(fd, VIDIOC_QUERYBUF, &amp;b) &lt; 0) return -1;
+
+                bufs[i].length = b.length;
+                bufs[i].start  = mmap(NULL, b.length,
+                                      PROT_READ | PROT_WRITE,
+                                      MAP_SHARED, fd, b.m.offset);
+                if (bufs[i].start == MAP_FAILED) return -1;
+        }
+
+        /* 6. Queue them all, then start. */
+        for (unsigned i = 0; i &lt; req.count; i++) {
+                struct v4l2_buffer b = {0};
+                b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                b.memory = V4L2_MEMORY_MMAP;
+                b.index  = i;
+                if (xioctl(fd, VIDIOC_QBUF, &amp;b) &lt; 0) return -1;
+        }
+        enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(fd, VIDIOC_STREAMON, &amp;t) &lt; 0) return -1;
+
+        return fd;
+}
+
+/* 7. The loop. */
+int capture_frame(int fd, void (*use)(void *, size_t, struct timeval))
+{
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        if (poll(&amp;p, 1, 2000) &lt;= 0) return -1;   /* timeout */
+
+        struct v4l2_buffer b = {0};
+        b.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd, VIDIOC_DQBUF, &amp;b) &lt; 0) return -1;
+
+        /* b.timestamp is the CAPTURE time, from the driver.
+           Use it - do not stamp frames when your code happens
+           to run, or you build jitter into every downstream
+           timestamp (chapter 15). */
+        use(bufs[b.index].start, b.bytesused, b.timestamp);
+
+        /* GIVE IT BACK IMMEDIATELY. Holding buffers starves
+           the driver: with 4 buffers, holding 4 means the
+           hardware has nowhere to write and DROPS FRAMES. */
+        return xioctl(fd, VIDIOC_QBUF, &amp;b);
+}</code></pre>
+
+<div class="key">
+<b>Buffer count is a latency-versus-drops dial</b>
+<p>Too few and the driver has nowhere to write while you are processing, so frames are dropped. Too many and
+you add latency — each queued frame is one frame period of delay before yours is displayed. Four to six is the
+usual range for capture; a real-time pipeline uses the minimum that never drops. Check
+<code>v4l2_buffer.sequence</code> for gaps: a jump means frames were lost, and the driver will not tell you
+any other way.</p>
+</div>
+
+<h2 id="m2m">Memory-to-memory: codecs and scalers</h2>
+
+<pre class="diagram">   The same queue model, but with TWO streams on ONE device:
+
+     OUTPUT queue   what you send TO the device
+                    (confusingly named - "output" is from the
+                     APPLICATION's point of view)
+                    V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
+
+     CAPTURE queue  what you get back
+                    V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+
+   FOR A DECODER
+     OUTPUT  = compressed bitstream in
+     CAPTURE = decoded NV12 frames out
+
+   FOR AN ENCODER
+     OUTPUT  = raw NV12 frames in
+     CAPTURE = compressed bitstream out
+
+   Same device, same ioctls, both queues streaming
+   simultaneously. You poll for both.
+
+   TWO KINDS OF M2M CODEC, and the difference is fundamental:
+
+     STATEFUL   the driver parses the bitstream itself, finds
+                the headers, manages the DPB, handles
+                resolution changes. You feed it bytes and get
+                frames. Most vendor drivers.
+
+     STATELESS  the driver does ONE frame at a time and you
+                supply ALL the parsed state - SPS, PPS, slice
+                parameters, the reference list - through
+                V4L2 request-API controls. The hardware is
+                dumber and the kernel driver is far smaller;
+                userspace (ffmpeg, GStreamer, Chromium) does
+                the parsing.
+                Used by Rockchip, Allwinner, RPi and the newer
+                mainline drivers. It is where the kernel is
+                heading, because it keeps codec-specific
+                complexity out of the kernel.</pre>
+
+<pre><code>/* The decoder sequence, stateful. The asymmetry in step 4 is
+   the part people get wrong. */
+
+  1. open the m2m device, VIDIOC_QUERYCAP
+       -> V4L2_CAP_VIDEO_M2M_MPLANE
+
+  2. S_FMT on OUTPUT: the compressed format
+       fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
+       fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264
+       fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 1024*1024
+       /* you must size the bitstream buffer yourself */
+
+  3. REQBUFS + QBUF on OUTPUT, STREAMON, and feed the first
+     chunk of bitstream - INCLUDING SPS/PPS.
+
+  4. WAIT FOR THE SOURCE CHANGE EVENT.
+       VIDIOC_SUBSCRIBE_EVENT V4L2_EVENT_SOURCE_CHANGE
+       The driver parses the headers and only THEN knows the
+       real resolution. You cannot set the CAPTURE format
+       before this - you do not know it yet.
+
+       On the event:
+         G_FMT on CAPTURE     -> the real resolution
+         G_SELECTION          -> the CROP rectangle
+                                 (the 1080-vs-1088 problem,
+                                  chapter 16)
+         REQBUFS on CAPTURE   -> now you can allocate
+         STREAMON on CAPTURE
+
+  5. Now both queues stream. Poll for both:
+       POLLOUT -> an OUTPUT buffer is free, feed more bitstream
+       POLLIN  -> a CAPTURE buffer holds a decoded frame
+
+  6. Resolution can change MID-STREAM. You get another
+     SOURCE_CHANGE event, and must:
+       STREAMOFF capture, REQBUFS(0), reallocate, STREAMON.
+     Handling this is what separates a demo from a product.
+
+  7. Draining at end of stream:
+       VIDIOC_DECODER_CMD with V4L2_DEC_CMD_STOP
+       keep dequeuing CAPTURE until you get a buffer with
+       V4L2_BUF_FLAG_LAST set.
+     Skip this and you lose the last few frames - the pipeline
+     is deep (chapter 16).</code></pre>
+
+<div class="warn">
+<b>The multiplanar API is not optional</b>
+<p>Formats with separate planes — NV12, I420 — need <code>V4L2_BUF_TYPE_*_MPLANE</code> and the
+<code>v4l2_pix_format_mplane</code> structures, where each plane has its own length, stride and DMABUF fd.
+Most codec drivers accept <em>only</em> the multiplanar variants. Code written against the single-planar API
+works for a YUYV webcam and fails immediately on a hardware codec, with an error that just says
+<code>EINVAL</code>.</p>
+</div>
+
+<h2 id="tools">The tools</h2>
+
+<pre><code># Everything about a device:
+$ v4l2-ctl -d /dev/video0 --all
+Driver Info:
+        Driver name      : uvcvideo
+        Card type        : Integrated Camera
+        Capabilities     : 0x84a00001
+                Video Capture
+                Streaming
+Format Video Capture:
+        Width/Height     : 1920/1080
+        Pixel Format     : 'YUYV'
+        Bytes per Line   : 3840
+        Size Image       : 4147200
+
+# What formats, sizes and rates does it support?
+$ v4l2-ctl -d /dev/video0 --list-formats-ext
+
+# Capture frames straight to a file:
+$ v4l2-ctl -d /dev/video0 \
+    --set-fmt-video=width=1920,height=1080,pixelformat=NV12 \
+    --stream-mmap --stream-count=100 --stream-to=out.nv12
+
+# Controls - exposure, gain, focus:
+$ v4l2-ctl -d /dev/video0 --list-ctrls
+$ v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1
+$ v4l2-ctl -d /dev/video0 --set-ctrl=exposure_absolute=300
+
+# THE MEDIA CONTROLLER. On an embedded SoC the camera is not
+# one device but a GRAPH: sensor -> CSI receiver -> ISP ->
+# several /dev/video nodes. You must configure the LINKS and
+# the format at EVERY pad, or streaming fails with EPIPE.
+$ media-ctl -d /dev/media0 -p          # print the graph
+$ media-ctl -d /dev/media0 \
+    -V "'ov5640 1-003c':0 [fmt:UYVY8_2X8/1920x1080]"
+$ media-ctl -d /dev/media0 -l "'csi':1 -> 'isp':0 [1]"
+
+# EPIPE from STREAMON on an embedded platform almost always
+# means a pad format mismatch somewhere in that graph - the
+# formats must agree link by link.
+
+# ffmpeg through V4L2:
+$ ffmpeg -f v4l2 -input_format nv12 -video_size 1920x1080 \
+    -i /dev/video0 -c:v h264_v4l2m2m -b:v 4M out.mp4
+
+# Kernel-side tracing when nothing works:
+$ echo 0x1f | sudo tee /sys/class/video4linux/video0/dev_debug
+$ dmesg -w</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Frames come out at the wrong size or format</td><td>Did not read back what <code>S_FMT</code> actually
+set</td></tr>
+<tr><td>Image sheared diagonally</td><td><code>bytesperline</code> ignored (<a href="vid-01-image-representation.html">chapter
+1</a>)</td></tr>
+<tr><td>Frames dropped under load</td><td>Buffers held too long — requeue immediately; check
+<code>sequence</code> for gaps</td></tr>
+<tr><td>Latency of several frames</td><td>Too many buffers queued</td></tr>
+<tr><td><code>EINVAL</code> from every codec ioctl</td><td>Single-planar API against a multiplanar
+device</td></tr>
+<tr><td><code>EPIPE</code> from <code>STREAMON</code> on embedded</td><td>Media-controller pad formats do not
+match link by link</td></tr>
+<tr><td>Decoder produces nothing</td><td>Waiting for frames before handling
+<code>SOURCE_CHANGE</code></td></tr>
+<tr><td>Last few frames missing</td><td>No drain — send <code>DEC_CMD_STOP</code> and wait for
+<code>BUF_FLAG_LAST</code></td></tr>
+<tr><td>8 rows of garbage at the bottom</td><td><code>G_SELECTION</code> crop rectangle ignored</td></tr>
+<tr><td>Random <code>EINTR</code> failures</td><td>ioctls not retried</td></tr>
+<tr><td>Stream breaks when resolution changes mid-file</td><td>Second <code>SOURCE_CHANGE</code> not
+handled</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the V4L2 queue model and the seven steps of a capture program.</li>
+  <li>Name the three memory models and say which enables zero-copy.</li>
+  <li>Explain why every ioctl must be retried on <code>EINTR</code>.</li>
+  <li>Say why you must read back the format after <code>S_FMT</code>.</li>
+  <li>Explain the buffer-count trade and how to detect dropped frames.</li>
+  <li>Explain what OUTPUT and CAPTURE mean on an m2m device, for both a decoder and an encoder.</li>
+  <li>Distinguish stateful from stateless codec drivers and say which direction the kernel is
+  taking.</li>
+  <li>Explain why the CAPTURE format cannot be set before <code>SOURCE_CHANGE</code>.</li>
+  <li>Describe the drain sequence and what is lost without it.</li>
+  <li>Say what the media controller configures and what <code>EPIPE</code> usually means.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

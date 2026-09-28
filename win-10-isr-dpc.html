@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISRs, DPCs and work items | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>ISRs, DPCs and work items</h1>
+<p class="lead">Windows splits interrupt handling into three tiers by IRQL: a tiny ISR at device level, a
+DPC at dispatch level, and a work item at passive level. Knowing which tier each piece of work belongs to is
+the core skill of interrupt-driven driver design.</p>
+
+<h2 id="tiers">The three tiers</h2>
+
+<p>Interrupt handling is split across three levels of urgency, and the split exists for one reason: the time spent in your interrupt handler is added directly to the worst-case latency of the entire machine. Each tier trades immediacy for freedom.</p>
+
+<pre class="diagram">   device raises its interrupt
+        |
+        v
+   ISR                              at DIRQL
+     · acknowledge the hardware, stop it re-asserting
+     · read the minimum state you need
+     · queue a DPC
+     · RETURN. Target: under a few microseconds.
+     · CANNOT: touch paged memory, allocate paged pool,
+       wait, block, call most APIs
+        |
+        v
+   DPC                              at DISPATCH_LEVEL
+     · the real work: parse data, complete requests, start
+       the next transfer
+     · CAN: complete IRPs, use spinlocks, allocate non-paged
+       pool, queue work items
+     · CANNOT: touch paged memory, wait, block
+     · Target: tens of microseconds. Over ~100us and you are
+       hurting system latency; the DPC watchdog fires at
+       around 20ms.
+        |
+        v
+   WORK ITEM                        at PASSIVE_LEVEL
+     · anything that must sleep: registry access, file I/O,
+       waiting on an event, sending a request to another
+       driver, allocating paged pool
+     · runs on a system worker thread, so it may be delayed
+        |
+        v
+   done
+
+  COMPARE LINUX (ch. 13):
+     ISR        = the hard IRQ handler
+     DPC        = a tasklet or softirq
+     work item  = a workqueue item
+     and WDF's passive-level interrupts = a threaded IRQ
+
+  THE SAME DESIGN PRESSURE produces the same three tiers in
+  both systems: something must be fast and constrained,
+  something must be deferred but prompt, and something must be
+  able to sleep.</pre>
+
+<h2 id="isr">The ISR</h2>
+
+<p>The interrupt service routine runs at device IRQL with interrupts of equal or lower priority masked on that processor. It should do the least possible work — and the list of things it may not do is longer than the list of things it may.</p>
+
+<pre><code>BOOLEAN
+MyEvtInterruptIsr(_In_ WDFINTERRUPT Interrupt,
+                  _In_ ULONG MessageID)
+{
+        PMY_CONTEXT ctx = MyInterruptGetContext(Interrupt);
+        ULONG status;
+
+        UNREFERENCED_PARAMETER(MessageID);
+
+        /* WDF has ALREADY acquired the interrupt spinlock
+           before calling us (chapter 10).                  */
+
+        status = READ_REGISTER_ULONG(
+                        (PULONG)(ctx-&gt;RegBase + REG_INT_STATUS));
+
+        /* IS IT OURS? On a shared line this is mandatory -
+           returning TRUE for someone else's interrupt breaks
+           their driver.                                     */
+        if ((status &amp; INT_PENDING) == 0)
+                return FALSE;
+
+        /* ACKNOWLEDGE FIRST, so the device stops asserting */
+        WRITE_REGISTER_ULONG(
+                (PULONG)(ctx-&gt;RegBase + REG_INT_CLEAR), status);
+
+        /* hand the minimum state to the DPC */
+        ctx-&gt;LastStatus = status;
+
+        /* queue the DPC and return */
+        WdfInterruptQueueDpcForIsr(Interrupt);
+
+        return TRUE;
+}
+
+/* THE RETURN VALUE:
+     TRUE   this interrupt was mine and I handled it
+     FALSE  not mine - let the next handler on the shared
+            line try
+
+   IF EVERY HANDLER RETURNS FALSE repeatedly, Windows
+   eventually declares the interrupt unhandled and the system
+   may bugcheck with 0x7A or hang in an interrupt storm - the
+   equivalent of Linux's "nobody cared" (ch. 16).
+
+/* WHAT NOT TO DO IN AN ISR:
+     · a slow MMIO read (a PCIe config read can take
+       microseconds - do it in the DPC)
+     · a loop of unknown length
+     · DbgPrint on a serial console (milliseconds!)
+     · anything touching paged memory
+     · acquiring any lock other than the interrupt lock     */</code></pre>
+
+<h2 id="dpc">The DPC</h2>
+
+<p>The DPC is where the real work of an interrupt happens. It runs soon afterwards at <code>DISPATCH_LEVEL</code>, which buys you far more freedom than the ISR had while still forbidding anything that blocks.</p>
+
+<pre><code>VOID
+MyEvtInterruptDpc(_In_ WDFINTERRUPT Interrupt,
+                  _In_ WDFOBJECT AssociatedObject)
+{
+        PMY_CONTEXT ctx = MyInterruptGetContext(Interrupt);
+        WDFREQUEST request;
+        ULONG status;
+        NTSTATUS s;
+
+        UNREFERENCED_PARAMETER(AssociatedObject);
+
+        /* read the state the ISR captured, under the
+           interrupt lock (chapter 10) */
+        WdfInterruptAcquireLock(Interrupt);
+        status = ctx-&gt;LastStatus;
+        ctx-&gt;LastStatus = 0;
+        WdfInterruptReleaseLock(Interrupt);
+
+        if (status &amp; INT_ERROR) {
+                ctx-&gt;Errors++;
+                MyHandleError(ctx, status);
+        }
+
+        if (status &amp; INT_DATA_READY) {
+                /* complete a pending request (chapter 16) */
+                s = WdfIoQueueRetrieveNextRequest(ctx-&gt;ReadQueue,
+                                                  &amp;request);
+                if (NT_SUCCESS(s)) {
+                        MyFillRequest(ctx, request);
+                        WdfRequestCompleteWithInformation(
+                                request, STATUS_SUCCESS, len);
+                }
+        }
+
+        /* need PASSIVE_LEVEL? queue a work item */
+        if (status &amp; INT_NEEDS_RESET)
+                WdfWorkItemEnqueue(ctx-&gt;ResetWorkItem);
+}
+
+/* DPC PROPERTIES worth knowing:
+
+   · ONE DPC OBJECT runs at most once at a time, system-wide.
+     Queueing it again while it is queued is a no-op - so a
+     burst of interrupts produces ONE DPC run, not N. Your DPC
+     must therefore handle "several things happened" in one
+     pass, not assume a one-to-one mapping with interrupts.
+
+   · It runs on the CPU that queued it, by default.
+     WdfDpcCreate lets you request otherwise; on a
+     multi-queue device, spreading DPCs across CPUs is how you
+     scale.
+
+   · It can be interrupted by any DIRQL interrupt, including
+     your own ISR - so shared state still needs the interrupt
+     lock.
+
+   · DPCs from all drivers share one per-CPU queue. A long DPC
+     delays everyone's. This is the single biggest source of
+     system-wide latency spikes on Windows, and it is the
+     direct analogue of the Linux argument for keeping
+     softirqs short (ch. 11).                             */
+
+/* A STANDALONE DPC, not tied to an interrupt: */
+        WDF_DPC_CONFIG dpcConfig;
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_DPC_CONFIG_INIT(&amp;dpcConfig, MyDpcFunc);
+        dpcConfig.AutomaticSerialization = TRUE;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = device;
+
+        status = WdfDpcCreate(&amp;dpcConfig, &amp;attr, &amp;ctx-&gt;Dpc);
+        ...
+        WdfDpcEnqueue(ctx-&gt;Dpc);
+
+        /* teardown - WAIT for it, like Linux's _sync forms */
+        WdfDpcCancel(ctx-&gt;Dpc, TRUE);   /* TRUE = wait */</code></pre>
+
+<div class="key">
+<b>The DPC watchdog</b>
+<p>Bugcheck <code>0x133 DPC_WATCHDOG_VIOLATION</code> fires when a single DPC runs for roughly 20 ms, or
+when the system stays at DISPATCH_LEVEL for around 10 seconds. It exists because a long DPC is invisible in
+normal testing but destroys interactive latency in the field. If you hit it, the fix is never to raise the
+timeout — it is to move work into a work item or split it across several DPC invocations.</p>
+</div>
+
+<h2 id="workitem">Work items</h2>
+
+<p>When the work genuinely must block — allocate paged memory, wait on an event, touch a file — even a DPC is too restrictive. A work item runs your code at <code>PASSIVE_LEVEL</code> on a system thread, where everything is permitted.</p>
+
+<pre><code>/* For anything needing PASSIVE_LEVEL. */
+
+VOID
+MyEvtWorkItem(_In_ WDFWORKITEM WorkItem)
+{
+        PMY_WORKITEM_CONTEXT wc = MyWorkItemGetContext(WorkItem);
+        PMY_CONTEXT ctx = wc-&gt;DeviceContext;
+
+        PAGED_CODE();     /* asserts PASSIVE_LEVEL */
+
+        /* we may sleep here: registry, files, waiting */
+        MyResetHardwareSlowly(ctx);
+        MyReadConfigFromRegistry(ctx);
+}
+
+/* creating one, in EvtDeviceAdd: */
+        WDF_WORKITEM_CONFIG workConfig;
+        WDF_OBJECT_ATTRIBUTES attr;
+
+        WDF_WORKITEM_CONFIG_INIT(&amp;workConfig, MyEvtWorkItem);
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attr,
+                        MY_WORKITEM_CONTEXT);
+        attr.ParentObject = device;
+
+        status = WdfWorkItemCreate(&amp;workConfig, &amp;attr,
+                                   &amp;ctx-&gt;WorkItem);
+
+        wc = MyWorkItemGetContext(ctx-&gt;WorkItem);
+        wc-&gt;DeviceContext = ctx;
+
+/* enqueue from a DPC or anywhere: */
+        WdfWorkItemEnqueue(ctx-&gt;WorkItem);
+
+/* teardown: */
+        WdfWorkItemFlush(ctx-&gt;WorkItem);   /* WAIT for it */
+
+/* THE SAME COALESCING RULE as DPCs: enqueueing an already
+   queued work item is a no-op. If each event needs its own
+   handling, either create several work items, or maintain
+   your own queue of pending events and have one work item
+   drain it.
+
+   THAT SECOND PATTERN is usually the right one:
+        DPC: push an event onto a list, enqueue the work item
+        work item: drain the list until empty
+   It handles bursts correctly and needs only one work item. */
+
+/* SYSTEM WORKER THREADS are a shared, limited resource. A
+   work item that blocks for a long time occupies one. Do not
+   use work items for long-running loops - create a dedicated
+   system thread instead (chapter 12).                    */</code></pre>
+
+<h2 id="passive">Passive-level interrupts</h2>
+
+<p>Some buses cannot be serviced at high IRQL at all, because reading the interrupt status itself requires a slow, blocking transaction. For those, the framework can run the whole interrupt handler at passive level.</p>
+
+<pre><code>/* Some devices are on a slow bus - I2C, SPI, or behind a
+   USB transfer - where you CANNOT read the interrupt status
+   register without sleeping. A DIRQL ISR cannot do that.
+
+   WDF's answer: a passive-level interrupt.                */
+
+        WDF_INTERRUPT_CONFIG config;
+
+        WDF_INTERRUPT_CONFIG_INIT(&amp;config,
+                                  MyEvtInterruptIsr,
+                                  MyEvtInterruptDpc);
+
+        config.PassiveHandling = TRUE;    /* &lt;-- the ISR runs
+                                             at PASSIVE_LEVEL */
+        config.AutomaticSerialization = FALSE;   /* required
+                                                    with
+                                                    passive   */
+
+        status = WdfInterruptCreate(device, &amp;config, &amp;attr,
+                                    &amp;ctx-&gt;Interrupt);
+
+/* NOW EvtInterruptIsr runs at PASSIVE_LEVEL, on a dedicated
+   thread, and may sleep - so it can do an I2C read to find
+   out what happened.
+
+   This is EXACTLY Linux's threaded IRQ (ch. 15), including
+   the reason it exists.
+
+   CONSEQUENCES:
+     · higher latency - a thread must be scheduled
+     · the interrupt stays masked until your handler returns,
+       so it is inherently one-shot
+     · use WdfInterruptAcquireLock, which becomes a
+       passive-level lock, not a spinlock
+     · you may not need a DPC at all - do the work in the ISR
+
+   USE IT for I2C/SPI/GPIO-connected devices, which on modern
+   ARM64 Windows systems is most of them.                 */</code></pre>
+
+<h2 id="timers">Timers</h2>
+
+<p>Sometimes the trigger is time rather than an event: poll again shortly, or give up if the device has not answered. Windows offers timers at both levels, and the one you pick determines what the callback may do.</p>
+
+<pre><code>/* WDFTIMER - the callback runs at DISPATCH_LEVEL by default. */
+
+        WDF_TIMER_CONFIG timerConfig;
+
+        WDF_TIMER_CONFIG_INIT_PERIODIC(&amp;timerConfig,
+                                       MyEvtTimer,
+                                       100);   /* ms period */
+        /* or one-shot: */
+        WDF_TIMER_CONFIG_INIT(&amp;timerConfig, MyEvtTimer);
+
+        timerConfig.AutomaticSerialization = TRUE;
+        timerConfig.TolerableDelay = 50;   /* ms - lets the
+                                              system coalesce
+                                              timers and save
+                                              power           */
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ParentObject = device;
+
+        status = WdfTimerCreate(&amp;timerConfig, &amp;attr,
+                                &amp;ctx-&gt;Timer);
+
+        WdfTimerStart(ctx-&gt;Timer,
+                      WDF_REL_TIMEOUT_IN_MS(100));
+
+        WdfTimerStop(ctx-&gt;Timer, TRUE);   /* TRUE = WAIT for
+                                             any running
+                                             callback         */
+
+VOID
+MyEvtTimer(_In_ WDFTIMER Timer)
+{
+        WDFDEVICE device = WdfTimerGetParentObject(Timer);
+        PMY_CONTEXT ctx = MyGetContext(device);
+
+        /* DISPATCH_LEVEL - cannot sleep, cannot touch paged
+           memory                                            */
+        MyPollHardware(ctx);
+}
+
+/* FOR A PASSIVE-LEVEL TIMER CALLBACK: */
+        WDF_OBJECT_ATTRIBUTES_INIT(&amp;attr);
+        attr.ExecutionLevel = WdfExecutionLevelPassive;
+
+/* SHORT DELAYS without a timer: */
+        KeStallExecutionProcessor(50);    /* BUSY-WAITS, in
+                                             microseconds. Any
+                                             IRQL. Keep it
+                                             under ~50us.    */
+
+        LARGE_INTEGER interval;
+        interval.QuadPart = -10LL * 1000 * 20;   /* 20 ms */
+        KeDelayExecutionThread(KernelMode, FALSE, &amp;interval);
+        /* SLEEPS. PASSIVE_LEVEL only. */
+
+/* KeStallExecutionProcessor is Linux's udelay(); the delay
+   thread is msleep(). The same advice applies: never busy-wait
+   for milliseconds.                                        */</code></pre>
+
+<h2 id="teardown">Teardown ordering</h2>
+
+<p>Interrupts, DPCs and work items can all be in flight when the device goes away. Stopping them in the right order is what separates a clean unload from a bugcheck seconds after the device is removed.</p>
+
+<pre><code>/* THE SAME RULE AS LINUX (ch. 13): stop the source first,
+   then wait for what is already in flight.                */
+
+NTSTATUS
+MyD0Exit(_In_ WDFDEVICE Device,
+         _In_ WDF_POWER_DEVICE_STATE TargetState)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        /* 1. stop the hardware generating interrupts.
+              WDF disconnects the interrupt for us AFTER this
+              callback, but the device must stop asserting
+              first or we take a spurious one.             */
+        WRITE_REGISTER_ULONG(
+                (PULONG)(ctx-&gt;RegBase + REG_INT_ENABLE), 0);
+
+        /* 2. wait for anything already queued */
+        WdfDpcCancel(ctx-&gt;Dpc, TRUE);        /* TRUE = wait */
+        WdfWorkItemFlush(ctx-&gt;WorkItem);
+        WdfTimerStop(ctx-&gt;Timer, TRUE);      /* TRUE = wait */
+
+        /* 3. now nothing can touch our state */
+        return STATUS_SUCCESS;
+}
+
+/* THE "TRUE" ARGUMENTS ARE NOT OPTIONAL. Without them these
+   calls return immediately, the callback may still be
+   running, and it will touch your context after
+   EvtDeviceReleaseHardware has unmapped the registers -
+   producing a bugcheck at an address that no longer maps.
+
+   This is the exact Windows counterpart of forgetting
+   cancel_work_sync() on Linux, with the same symptom and the
+   same fix.                                              */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0x133 DPC_WATCHDOG_VIOLATION</td><td>A DPC doing far too much — move work to a work item</td></tr>
+<tr><td>Bugcheck 0xA inside a DPC</td><td>Paged memory or paged pool at DISPATCH_LEVEL</td></tr>
+<tr><td>Interrupt storm, system unresponsive</td><td>ISR not acknowledging the device</td></tr>
+<tr><td>Another device stops working</td><td>Your ISR returned TRUE for an interrupt that was not yours</td></tr>
+<tr><td>Bugcheck 0x7A or a hang</td><td>Nobody claimed the interrupt</td></tr>
+<tr><td>Events lost during a burst</td><td>Assumed one DPC per interrupt — DPCs coalesce</td></tr>
+<tr><td>Work items lost during a burst</td><td>Same coalescing rule — use a list plus one drainer</td></tr>
+<tr><td>Bugcheck on device removal or sleep</td><td>DPC, timer or work item not cancelled with wait</td></tr>
+<tr><td>System-wide latency spikes</td><td>A long DPC delaying everyone's</td></tr>
+<tr><td>Cannot read the status register in the ISR</td><td>Slow bus — use <code>PassiveHandling</code></td></tr>
+<tr><td>Work item never runs</td><td>Enqueued while already queued, or the worker pool is exhausted</td></tr>
+<tr><td>High CPU with nothing happening</td><td><code>KeStallExecutionProcessor</code> for too long</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three tiers, their IRQLs, and what each may and may not do.</li>
+  <li>Map them onto Linux's equivalents.</li>
+  <li>Write an ISR and explain both return values.</li>
+  <li>Explain what happens if every handler on a shared line returns FALSE.</li>
+  <li>Explain DPC coalescing and how to write a DPC that handles bursts.</li>
+  <li>Say what bugcheck 0x133 means and what the correct fix is.</li>
+  <li>Explain why a long DPC harms the whole system.</li>
+  <li>Use a work item, and give the pattern for handling many events with one.</li>
+  <li>Say when a passive-level interrupt is needed and what it costs.</li>
+  <li>Write the teardown sequence and explain why the wait arguments are mandatory.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

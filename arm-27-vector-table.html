@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exception types and the vector table | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Exception types and the vector table</h1>
+<p class="lead">Sixteen entries of 128 bytes each, indexed by where the exception came from and what kind it
+was. The layout looks arbitrary until you see what it is optimising for — and then it explains why kernel
+entry code is structured the way it is.</p>
+
+<h2 id="taxonomy">What counts as an exception</h2>
+
+<p>"Exception" in ARM terminology covers far more than errors: system calls, interrupts, faults and debug events are all exceptions, and they are all delivered by the same mechanism.</p>
+
+<pre class="diagram">ARM uses "exception" as the umbrella term for anything that
+diverts execution to a handler. Two families:
+
+  SYNCHRONOUS — caused by the current instruction, reported
+                PRECISELY. You know exactly which instruction.
+
+     SVC / HVC / SMC        deliberate calls to EL1 / EL2 / EL3
+     Data abort             a load or store failed translation
+                            or permission checks
+     Instruction abort      the FETCH itself failed
+     Undefined instruction  bad encoding, or disabled at this EL
+     Alignment fault        unaligned Device access, or SCTLR.A
+     Trapped register access a higher EL configured a trap
+     PC alignment fault     the PC was not 4-byte aligned
+     SP alignment fault     SP was not 16-byte aligned
+     Breakpoint / watchpoint / software step
+
+  ASYNCHRONOUS — caused by something outside the instruction
+                 stream, taken BETWEEN instructions.
+
+     IRQ      normal interrupt.  Masked by PSTATE.I
+     FIQ      fast interrupt.    Masked by PSTATE.F
+     SError   System Error — typically an IMPRECISE external
+              abort: an ECC failure, or a bus error from a write
+              posted long ago. Masked by PSTATE.A.
+
+  SError is the awkward one: the reported PC has NOTHING to do
+  with the cause, because the failing transaction retired long
+  before the error came back (chapter 25).</pre>
+
+<h2 id="layout">The vector table</h2>
+
+<p>The table is not a simple list. It is organised by where the exception came from and what state that code was in, which is why it has sixteen entries rather than four.</p>
+
+<pre class="diagram">VBAR_ELx holds the base address. 16 entries, 128 bytes each,
+2 KB total.
+
+VBAR + offset    source of the exception              type
+
+  0x000   Synchronous  ┐
+  0x080   IRQ / vIRQ   │  CURRENT EL, using SP_EL0
+  0x100   FIQ / vFIQ   │  (SPSel = 0, "EL1t")
+  0x180   SError       ┘
+
+  0x200   Synchronous  ┐
+  0x280   IRQ / vIRQ   │  CURRENT EL, using SP_ELx
+  0x300   FIQ / vFIQ   │  (SPSel = 1, "EL1h")   ← the normal
+  0x380   SError       ┘                          kernel case
+
+  0x400   Synchronous  ┐
+  0x480   IRQ / vIRQ   │  LOWER EL, AArch64
+  0x500   FIQ / vFIQ   │  ← syscalls and user faults land here
+  0x580   SError       ┘
+
+  0x600   Synchronous  ┐
+  0x680   IRQ / vIRQ   │  LOWER EL, AArch32
+  0x700   FIQ / vFIQ   │  (32-bit compatibility)
+  0x780   SError       ┘</pre>
+
+<div class="key">
+<b>Why split by source</b>
+<p>The handler needs to know immediately whether it must switch stacks and save user state, or whether this is
+a nested exception already on the kernel stack. Encoding that in the <em>vector address</em> means the answer
+costs zero instructions — no test, no branch, no register read. On a path taken millions of times a second,
+that matters.</p>
+<p>The AArch32 split exists for the same reason: a 32-bit process's register layout differs, so it needs a
+different save path.</p>
+</div>
+
+<h2 id="entries">Each entry is code, not an address</h2>
+
+<p>This is the detail that surprises people coming from other architectures: an entry is not a pointer to a handler, it is the handler's first instructions, sitting directly in the table.</p>
+
+<pre><code>/* Unlike Cortex-M, where the vector table holds ADDRESSES, on
+   A-profile each entry is 128 bytes of actual CODE — 32
+   instructions. You either handle it there or branch out.  */
+
+.macro VECTOR_ENTRY label
+        .align 7                        /* 128 bytes = 2^7 */
+        b       \label
+.endm
+
+        .align 11                       /* the table must be 2 KB
+                                           aligned */
+        .global vector_table
+vector_table:
+        /* current EL, SP_EL0 — should never happen in a normal
+           kernel, so these are error handlers */
+        VECTOR_ENTRY  invalid_sync_el1t
+        VECTOR_ENTRY  invalid_irq_el1t
+        VECTOR_ENTRY  invalid_fiq_el1t
+        VECTOR_ENTRY  invalid_err_el1t
+
+        /* current EL, SP_ELx — kernel-mode exceptions */
+        VECTOR_ENTRY  el1_sync
+        VECTOR_ENTRY  el1_irq
+        VECTOR_ENTRY  el1_fiq
+        VECTOR_ENTRY  el1_error
+
+        /* lower EL, AArch64 — user-mode exceptions and syscalls */
+        VECTOR_ENTRY  el0_sync
+        VECTOR_ENTRY  el0_irq
+        VECTOR_ENTRY  el0_fiq
+        VECTOR_ENTRY  el0_error
+
+        /* lower EL, AArch32 */
+        VECTOR_ENTRY  el0_sync_compat
+        VECTOR_ENTRY  el0_irq_compat
+        VECTOR_ENTRY  el0_fiq_compat
+        VECTOR_ENTRY  el0_error_compat
+
+/* Installing it: */
+        adr     x0, vector_table
+        msr     vbar_el1, x0
+        isb                             /* REQUIRED — chapter 06 */</code></pre>
+
+<div class="danger">
+<b>Alignment is not advisory</b>
+<p><code>VBAR_ELx</code> requires <strong>2 KB alignment</strong> — the low 11 bits are RES0 and writing a
+misaligned address silently ignores them. Each entry must be exactly 128 bytes apart. Get either wrong and
+exceptions dispatch to the wrong handler, or into the middle of an instruction.</p>
+<p>The symptom is spectacular and unhelpful: the machine takes an exception and immediately takes another,
+usually ending in an unrecoverable loop before anything can be printed. Use <code>.align 11</code> for the
+table and <code>.align 7</code> per entry, and verify with <code>readelf -s | grep vector</code>.</p>
+</div>
+
+<h2 id="128-bytes">Why 128 bytes matters</h2>
+
+<p>Each entry gets exactly 128 bytes, which is enough for a handful of instructions and no more. That constraint shapes how every real entry stub is written.</p>
+
+<pre><code>/* 32 instructions is enough to do real work before branching,
+   which several important techniques exploit:               */
+
+/* 1. Linux's KPTI trampoline. When kernel page-table isolation
+      is active, the entry code must switch TTBR1 before it can
+      touch kernel memory — and that switch has to happen in the
+      vector itself, using only registers.                   */
+
+/* 2. Spectre-BHB mitigations. Some cores need a loop of branches
+      or a specific instruction sequence at the very start of the
+      vector to flush the branch history buffer before any
+      speculation on kernel addresses can occur. Linux patches
+      the vectors at boot to insert exactly the sequence that
+      core requires.                                          */
+
+/* 3. Fast paths. A hypervisor can handle a trivial trap
+      entirely within the vector entry and ERET without ever
+      building a full context save.                          */
+
+/* Which is why Linux's vectors are generated by a macro with
+   several variants, and why `objdump -d` of the vector region
+   shows more than a single branch on modern kernels.       */</code></pre>
+
+<h2 id="virtual">Virtual interrupts</h2>
+
+<p>A hypervisor needs to deliver interrupts to a guest without the real interrupt controller being involved. Virtual interrupts are that mechanism, and they appear to the guest exactly like real ones.</p>
+
+<pre><code>/* When HCR_EL2.{IMO,FMO,AMO} are set, physical IRQ/FIQ/SError go
+   to EL2, and the entries at EL1 receive VIRTUAL interrupts
+   instead — injected by the hypervisor through the GIC list
+   registers (chapter 23).                                   */
+
+   HCR_EL2.IMO = 1   physical IRQ    → EL2
+                     virtual vIRQ    → EL1
+   HCR_EL2.VI  = 1   assert a virtual IRQ to the guest
+
+/* From the guest's point of view nothing is different: it takes
+   an exception at VBAR_EL1 + 0x480 exactly as it would on bare
+   metal. It cannot tell the interrupt was injected.
+
+   This is what makes guest interrupt handling fast: no
+   hypervisor trap is needed for the guest to acknowledge and
+   EOI, because the GIC's virtual CPU interface handles it.  */</code></pre>
+
+<h2 id="masking">What hardware does on entry</h2>
+
+<p>Taking an exception changes processor state automatically, before any of your code runs. Knowing exactly what the hardware did is essential, because your stub must not repeat it and must eventually undo it.</p>
+
+<pre class="diagram">Before your first instruction runs, the hardware has ALREADY:
+
+   1. ELR_ELx   ← the address to return to
+   2. SPSR_ELx  ← the entire PSTATE at the moment of the exception
+   3. ESR_ELx   ← the syndrome: exception class and details
+   4. FAR_ELx   ← the faulting address (aborts and watchpoints)
+   5. PSTATE    → EL raised, SPSel = 1, and D, A, I, F ALL MASKED
+   6. PC        ← VBAR_ELx + the vector offset
+
+  Step 5's masking is not optional and not configurable. The
+  reason: ELR_ELx and SPSR_ELx are single registers, not a stack.
+  A second exception before your handler saved them would
+  overwrite the return address, and you could never get back.
+
+  Your handler saves them to the kernel stack FIRST, and only
+  then may unmask to allow nesting. Chapter 28 covers the full
+  sequence.
+
+  Note what is NOT saved: X0-X30. Nothing is banked in AArch64
+  (chapter 04). Software saves everything.</pre>
+
+<h2 id="invalid">The "impossible" entries</h2>
+
+<p>Several table entries correspond to situations that should never occur in a correctly configured system. Filling them with something that reports loudly rather than falling through is what turns a mysterious hang into a diagnosable fault.</p>
+
+<pre><code>/* The four "current EL with SP_EL0" entries should never be taken
+   in a correctly configured kernel, which runs with SPSel = 1.
+   Reaching one means something is badly wrong — and that is
+   exactly why they are worth implementing properly.        */
+
+invalid_sync_el1t:
+        /* We cannot trust SP. Switch to a known-good emergency
+           stack before doing anything.                       */
+        adr_this_cpu x0, emergency_stack, x1
+        mov     sp, x0
+        bl      panic_bad_mode
+
+/* Common causes of landing here:
+     · SPSel accidentally cleared
+     · a corrupted SP that faulted during the save sequence
+     · a fault in early boot before SP_EL1 was established
+     · stack overflow — the guard page faulted, and the fault
+       handler could not push a frame
+
+   Linux handles the stack-overflow case specially with an
+   OVERFLOW STACK per CPU, so a kernel stack overflow produces a
+   readable oops instead of an infinite fault loop. That is worth
+   copying in any serious bare-metal system.               */</code></pre>
+
+<h2 id="cortexm">Contrast: Cortex-M</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>A-profile</th><th>M-profile</th></tr></thead>
+<tbody>
+<tr><td>Table contains</td><td><strong>Code</strong> — 128 bytes per entry</td><td><strong>Addresses</strong> — 4 bytes per entry</td></tr>
+<tr><td>Entry 0</td><td>A handler</td><td>The initial <strong>stack pointer</strong></td></tr>
+<tr><td>Register saving</td><td>Entirely software</td><td>Hardware stacks R0–R3, R12, LR, PC, xPSR</td></tr>
+<tr><td>ISR form</td><td>Assembly stub, then C</td><td><strong>A plain C function</strong></td></tr>
+<tr><td>Entries</td><td>16, by source and type</td><td>One per interrupt, hundreds</td></tr>
+<tr><td>Base register</td><td><code>VBAR_ELx</code></td><td><code>VTOR</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The M-profile design costs a fixed ~12 cycles of hardware stacking on every interrupt but removes the
+software prologue entirely, which is why M-profile interrupt latency is both lower and far more
+deterministic. A-profile trades that for flexibility and for not paying the cost on exceptions that do not
+need it.</p>
+
+<h2 id="debug">Inspecting the vectors</h2>
+
+<p>The vector base address is a register, so you can always find the active table and check that it is the one you think it is — a useful sanity check during bring-up.</p>
+
+<pre><code># where is the table?
+sudo cat /proc/kallsyms | grep vectors
+#   ffff800008011000 T vectors
+
+# in gdb on a kernel or bare-metal target
+p/x $VBAR_EL1
+x/16i $VBAR_EL1              # the first entry
+x/4i  $VBAR_EL1 + 0x400      # lower EL, synchronous — the syscall path
+
+# check alignment
+readelf -s vmlinux | grep -w vectors
+#   the address must end in 0x?800 or 0x?000 — 2 KB aligned
+
+# see what Linux patched in
+sudo objdump -d --start-address=0x... vmlinux | head -60
+#   on a mitigated kernel you will see BHB-flush sequences
+#   before the branch</code></pre>
+
+<div class="tip">
+<b>Debugging a machine that resets immediately</b>
+<p>A misaligned or uninstalled vector table produces a system that appears to die instantly with no output.
+The diagnostic sequence: halt with JTAG at reset, single-step to the point where <code>VBAR</code> is written,
+read it back, and confirm the low 11 bits are zero. Then set a hardware breakpoint on
+<code>VBAR + 0x200</code> and <code>VBAR + 0x400</code> — whichever is hit first tells you whether the fault
+came from kernel or user context, which usually identifies the bug immediately.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Machine resets immediately, no output</td><td>Vector table misaligned or <code>VBAR</code> never written</td></tr>
+<tr><td>Exceptions dispatch to the wrong handler</td><td>Entries not exactly 128 bytes apart</td></tr>
+<tr><td>Syscalls work but interrupts crash</td><td>Only some vector entries implemented</td></tr>
+<tr><td>Kernel-mode faults land in the user-mode handler</td><td>Confused the 0x200 and 0x400 groups</td></tr>
+<tr><td>Landing in an "invalid mode" handler</td><td><code>SPSel</code> wrong, or a corrupted SP</td></tr>
+<tr><td>Infinite fault loop on stack overflow</td><td>No separate overflow stack; the handler cannot push a frame</td></tr>
+<tr><td>32-bit process crashes, 64-bit works</td><td>AArch32 vector entries not implemented</td></tr>
+<tr><td>Guest interrupts never arrive</td><td><code>HCR_EL2.IMO</code> set but no virtual interrupt injected</td></tr>
+<tr><td>Configuration change has no effect</td><td>Missing <code>ISB</code> after writing <code>VBAR</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the synchronous and asynchronous exception types.</li>
+  <li>Explain why SError is harder to attribute than a data abort.</li>
+  <li>Draw the 16-entry table and say what each group of four is for.</li>
+  <li>Explain why the table is split by exception <em>source</em>.</li>
+  <li>State the two alignment requirements and the symptom of getting them wrong.</li>
+  <li>Give two things that exploit having 128 bytes per entry.</li>
+  <li>List the six things hardware does before your handler runs.</li>
+  <li>Explain why DAIF is masked on entry and when you may unmask.</li>
+  <li>Give three differences between A-profile and M-profile vectoring.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

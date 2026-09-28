@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time, counters and rollback protection | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Time, counters and rollback protection</h1>
+<p class="lead">Two things the secure world cannot get for itself: what time it is, and whether the state it
+just read is the newest one. Both are supplied by an adversary. Everything in this chapter is about designing
+around that, because no amount of cryptography fixes a system that believes an old, correctly signed
+answer.</p>
+
+<h2 id="time">Three clocks, three trust levels</h2>
+
+<p>A trusted application has access to several clocks with very different trust properties, and using the convenient one where the trustworthy one was needed is a common and serious error.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Source</th><th>What it is</th><th>Trust</th></tr></thead>
+<tbody>
+<tr><td><code>TEE_GetSystemTime</code></td><td>Monotonic since boot, from the secure timer</td><td><strong>Trusted
+for intervals.</strong> Resets on reboot; not wall clock</td></tr>
+<tr><td><code>TEE_GetREETime</code></td><td>Wall-clock time from the normal world</td><td><strong>Untrusted.</strong>
+The attacker sets it to whatever they like</td></tr>
+<tr><td><code>TEE_GetTAPersistentTime</code></td><td>A per-TA time that survives reboot, kept in secure
+storage</td><td><strong>Conditionally trusted</strong> — and it tells you which condition applies</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Persistent time is the interesting one, because it reports
+   its own reliability.                                       */
+
+    TEE_Time t;
+    TEE_Result res = TEE_GetTAPersistentTime(&amp;t);
+
+    switch (res) {
+    case TEE_SUCCESS:
+            /* Set, and OP-TEE believes it has not been
+               tampered with. Usable.                        */
+            break;
+    case TEE_ERROR_TIME_NOT_SET:
+            /* Never initialised on this device. First run.  */
+            break;
+    case TEE_ERROR_TIME_NEEDS_RESET:
+            /* It was set, but something happened - a battery
+               loss, a storage inconsistency. DO NOT TRUST IT.*/
+            break;
+    case TEE_ERROR_OVERFLOW:
+            /* Ran past its representable range. */
+            break;
+    }
+
+    /* Setting it - the value comes from somewhere you trust,
+       which usually means a signed timestamp from a server,
+       not from TEE_GetREETime.                              */
+    TEE_SetTAPersistentTime(&amp;t);
+
+/* THE ANTI-PATTERN, and it is everywhere:
+
+       TEE_Time now;
+       TEE_GetREETime(&amp;now);
+       if (now.seconds &gt; licence_expiry)
+               return TEE_ERROR_ACCESS_DENIED;
+
+   Defeated with `date -s 2020-01-01`. The check is not weak;
+   it is absent, because the attacker supplies the input.  */</code></pre>
+
+<div class="key">
+<b>The general principle</b>
+<p>Anything an attacker supplies is not a security input, however carefully you compare it. To bound
+<em>something</em> in time you need a counter you control (below), a signed timestamp from a party you trust,
+or an online check. If none of those is available, the honest answer is that you cannot enforce expiry
+offline — and it is better to say so at design time than to ship a check that looks like one.</p>
+</div>
+
+<h2 id="rollback">The rollback problem</h2>
+
+<p>Verifying a signature proves authenticity, never freshness. An attacker replaying old but genuine state is the attack this chapter exists to address.</p>
+
+<pre class="diagram">   Encryption and authentication answer: "is this data
+   genuine?"
+
+   They do not answer: "is this the LATEST genuine data?"
+
+   Attack, step by step:
+
+     1. TA writes state v1: failed_attempts = 0
+        Encrypted, MACed, stored.
+     2. Attacker COPIES the file.  (It is in /data/tee - the
+        normal world owns that filesystem.)
+     3. Legitimate use: 3 failed attempts. TA writes v2, v3, v4.
+        After 5 the TA locks out for ever.
+     4. Attacker restores their copy of v1.
+     5. TA opens it. Decrypts: correct. MAC: correct. Reads
+        failed_attempts = 0.
+
+   Nothing was forged. The TA has no way to know that a newer
+   version ever existed - it has no memory outside the storage
+   it just read.
+
+   AFFECTED BY THIS: anything counted, revoked, or versioned.
+       PIN attempt counters
+       firmware anti-rollback versions
+       one-time-use tokens
+       licence consumption
+       revoked certificate lists
+       monotonic nonces
+
+   NOT AFFECTED: things where an old value is as good as a new
+   one.
+       a long-lived signing key
+       a device certificate
+       a configuration blob that never changes</pre>
+
+<h2 id="counters">Monotonic counters</h2>
+
+<p>Defeating rollback requires something that only moves forward and that the normal world cannot reset. What is available for that varies by platform and is worth establishing early.</p>
+
+<pre><code>/* The fix: a counter that hardware guarantees can only go up.
+   Then every stored blob carries the counter value it was
+   written at, and a replayed blob is detectable.            */
+
+/* --- Source 1: RPMB (chapter 15) --- */
+/* The eMMC maintains a write counter it will never decrement,
+   and authenticates every access with a key the normal world
+   does not have. Restore an old RPMB frame and the device
+   rejects it: the counter is stale.
+
+   With CFG_RPMB_FS=y, storing to TEE_STORAGE_PRIVATE_RPMB
+   gives you rollback protection for free - this is the
+   simplest correct answer where the hardware exists.       */
+
+/* --- Source 2: TA persistent time --- */
+/* TEE_GetTAPersistentTime is itself backed by secure storage,
+   so it inherits whatever protection that storage has. On an
+   RPMB-backed system it is monotonic; on REE FS it is not.  */
+
+/* --- Source 3: a fuse or OTP counter --- */
+/* Some SoCs have burnable counters. Genuinely monotonic,
+   genuinely limited - typically tens of increments in total.
+   Reserve them for irreversible events: "firmware version 3
+   has been installed, never accept version 2 again."       */
+
+/* --- Source 4: an external secure element --- */
+/* An SE05x, an ATECC, a TPM. A separate chip with its own
+   monotonic counters and its own tamper resistance. This is
+   what you use when the SoC has nothing and the requirement
+   is real.                                                 */
+
+/* --- Source 5: an online server --- */
+/* The counter lives elsewhere. Correct and simple, and it
+   requires connectivity, which is usually why it is
+   rejected.                                                */</code></pre>
+
+<pre><code>/* Using a counter, concretely: */
+
+struct protected_state {
+        uint32_t counter;          /* the value it was written
+                                      at                       */
+        uint32_t failed_attempts;
+        uint8_t  data[64];
+};
+
+static TEE_Result read_state(struct protected_state *st)
+{
+        uint32_t hw_counter;
+        TEE_Result res;
+
+        res = read_monotonic_counter(&amp;hw_counter);   /* RPMB, SE */
+        if (res) return res;
+
+        res = read_object("state", st, sizeof *st);
+        if (res) return res;
+
+        /* THE CHECK. A restored old blob has a lower counter. */
+        if (st-&gt;counter != hw_counter) {
+                EMSG("rollback detected: blob %u, hw %u",
+                     st-&gt;counter, hw_counter);
+                return TEE_ERROR_SECURITY;
+        }
+        return TEE_SUCCESS;
+}
+
+static TEE_Result write_state(struct protected_state *st)
+{
+        uint32_t hw_counter;
+        TEE_Result res;
+
+        /* Increment FIRST, then write. If we crash between the
+           two, the counter is ahead of the blob and the next
+           read fails safe - it refuses rather than accepting
+           an old state.                                      */
+        res = increment_monotonic_counter(&amp;hw_counter);
+        if (res) return res;
+
+        st-&gt;counter = hw_counter;
+        return write_object("state", st, sizeof *st);
+}
+
+/* The ordering matters and the failure mode must be chosen
+   deliberately. "Increment then write" fails CLOSED: a crash
+   makes the state unreadable, which for a PIN counter is the
+   safe direction. "Write then increment" fails OPEN: a crash
+   leaves a valid old state that the attacker can trigger on
+   purpose.                                                 */</code></pre>
+
+<div class="warn">
+<b>Counters are a finite resource</b>
+<p>RPMB's write counter is 32 bits and the partition wears out. Fuse counters have tens of increments, total.
+Do not increment on every operation — increment when the <em>protected state</em> changes, and cache reads
+in the session context. A PIN counter that increments on every successful login as well as every failure
+burns through its budget for no security benefit.</p>
+</div>
+
+<h2 id="firmware">Firmware anti-rollback</h2>
+
+<p>The same problem applies to firmware images: an old signed version is still validly signed, so version enforcement must be separate from signature checking.</p>
+
+<pre class="diagram">   The most important use, and the one with a standard shape.
+
+   Problem: version 1.0 has a known vulnerability. 1.1 fixes
+   it. An attacker installs 1.0 again and exploits it.
+   The 1.0 image is genuine and correctly signed, so signature
+   verification does not help at all.
+
+   Solution: a version counter in fuses or RPMB.
+
+     each image carries a MONOTONIC VERSION NUMBER, distinct
+     from its marketing version:
+         v1.0 -> nv_counter 1
+         v1.1 -> nv_counter 2      (security fix)
+         v1.2 -> nv_counter 2      (features only - no bump)
+         v2.0 -> nv_counter 3      (another security fix)
+
+     at boot, BL2 checks:
+         if (image.nv_counter &lt; fuse.nv_counter) REFUSE
+     after a successful boot of a newer image:
+         fuse.nv_counter = image.nv_counter    (irreversible)
+
+   Bump the counter only for security-relevant fixes: every
+   bump permanently burns a fuse and permanently forecloses a
+   downgrade path, including a downgrade you might one day
+   want because a release was bad.
+
+   In TF-A this is TRUSTED_BOARD_BOOT with the
+   trusted/non-trusted NV counters, and the platform hooks
+   plat_get_nv_ctr() / plat_set_nv_ctr().</pre>
+
+<h2 id="nonce">Replay of messages, not just storage</h2>
+
+<p>For protocols rather than stored state, freshness is established with a challenge rather than a counter — which shifts the requirement onto the randomness quality.</p>
+
+<pre><code>/* The same problem appears in protocols. A client replays a
+   previously valid request; the TA cannot tell.            */
+
+/* WRONG: */
+    /* client sends {command, signature} */
+    if (verify(sig, command)) do_it();
+    /* replayable for ever */
+
+/* RIGHT - a challenge the TA chooses: */
+
+    /* 1. client asks for a challenge */
+    case CMD_GET_CHALLENGE:
+            TEE_GenerateRandom(sess-&gt;challenge,
+                               sizeof sess-&gt;challenge);
+            sess-&gt;challenge_valid = true;
+            memcpy(out, sess-&gt;challenge, sizeof sess-&gt;challenge);
+            return TEE_SUCCESS;
+
+    /* 2. client signs {challenge || command} */
+    case CMD_EXECUTE:
+            if (!sess-&gt;challenge_valid)
+                    return TEE_ERROR_BAD_STATE;
+            sess-&gt;challenge_valid = false;   /* ONE USE. Clear
+                                                it BEFORE doing
+                                                the work.      */
+            if (!verify_over(sess-&gt;challenge, cmd, sig))
+                    return TEE_ERROR_SECURITY;
+            return do_it();
+
+/* The challenge is per-session state (chapter 13), so it dies
+   with the session and cannot be replayed across one. Clearing
+   it before the work - not after - means an error path cannot
+   leave it usable.                                          */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Attempt counter resettable by restoring a file</td><td>REE FS with no monotonic counter</td></tr>
+<tr><td>Licence expiry bypassed by changing the date</td><td><code>TEE_GetREETime</code> used as a security
+input</td></tr>
+<tr><td>Old vulnerable firmware reinstallable</td><td>No NV counter check in the boot chain</td></tr>
+<tr><td><code>TEE_ERROR_TIME_NEEDS_RESET</code></td><td>Persistent time was tampered with or lost — treat it as
+unusable, do not paper over it</td></tr>
+<tr><td>RPMB writes start failing after long service</td><td>Counter or wear budget exhausted — you are
+incrementing too often</td></tr>
+<tr><td>State unreadable after a power cut</td><td>Counter incremented but the write did not complete — the
+fail-closed design working</td></tr>
+<tr><td>Same request accepted twice</td><td>No challenge, or the challenge not cleared after use</td></tr>
+<tr><td>Rollback protection works on hardware, not on QEMU</td><td>Emulated RPMB is a file the normal world can
+restore</td></tr>
+<tr><td>Cannot downgrade a bad release</td><td>NV counter bumped for a non-security change. This is
+permanent</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three time sources and rank them by trustworthiness.</li>
+  <li>Explain the four return values of <code>TEE_GetTAPersistentTime</code>.</li>
+  <li>Show why an expiry check against <code>TEE_GetREETime</code> is not a check at all.</li>
+  <li>Describe the rollback attack in five steps and say what cryptography does not prevent.</li>
+  <li>Classify five kinds of data by whether rollback matters.</li>
+  <li>Name five sources of monotonic counters and their limitations.</li>
+  <li>Write a read/write pair that detects rollback, and justify the ordering.</li>
+  <li>Explain the difference between failing closed and failing open here.</li>
+  <li>Describe firmware anti-rollback and say when to bump the counter.</li>
+  <li>Design a challenge-response that prevents request replay, and say when to clear the
+  challenge.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

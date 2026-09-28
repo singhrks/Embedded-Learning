@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The device stack and Plug and Play | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The device stack and Plug and Play</h1>
+<p class="lead">Windows layers several drivers over one piece of hardware, and the PnP manager orchestrates
+their lifecycle. Understanding the stack explains filter drivers, why devices appear with a yellow bang,
+and what WDF is doing for you when it "just works".</p>
+
+<h2 id="stack">One device, several drivers</h2>
+
+<p>A single piece of hardware is almost never served by a single driver. Several cooperate in a stack, each responsible for one layer of the problem, and knowing which role yours plays determines nearly everything else about it.</p>
+
+<pre class="diagram">   For a single physical device:
+
+   +------------------------------------+
+   |  UPPER FILTER   (optional, several)|  encryption, tracing,
+   |     e.g. a monitoring filter       |  policy
+   +------------------------------------+
+   |  FUNCTION DRIVER (FDO)             |  &lt;-- YOURS. Knows
+   |     the driver that knows the      |      how the hardware
+   |     hardware                       |      works.
+   +------------------------------------+
+   |  LOWER FILTER   (optional, several)|
+   +------------------------------------+
+   |  BUS DRIVER (PDO)                  |  pci.sys, acpi.sys,
+   |     enumerated this device,        |  usbhub.sys
+   |     owns its resources             |
+   +------------------------------------+
+
+   NAMES YOU MUST KNOW:
+
+     PDO   Physical Device Object. Created by the BUS driver
+           to say "a device exists here". One per child.
+     FDO   Functional Device Object. Created by YOUR driver
+           and attached above the PDO.
+     FiDO  Filter Device Object.
+
+   An IRP enters at the TOP and travels down (chapter 05).
+   Each layer may handle it, modify it, or pass it on.
+
+   WHY THIS EXISTS: it makes filtering universal. A disk
+   encryption filter, a keyboard logger, a USB analyser and a
+   power policy owner all attach the same way, to any device,
+   without the function driver knowing. Linux has no direct
+   equivalent - filtering there is per-subsystem or done with
+   stacked block devices.
+
+   SEE A REAL ONE:
+        WinDbg:  !devstack ffff8a0c12345678
+        Device Manager -&gt; device -&gt; Details -&gt; "Upper filters"</pre>
+
+<h2 id="pnp">The PnP state machine</h2>
+
+<p>Plug and Play is a state machine, and your driver is expected to respond correctly at each transition. It is more elaborate than Linux's probe-and-remove pair because it must also handle a device being removed without warning while in use.</p>
+
+<pre class="diagram">   BUS DRIVER enumerates hardware
+        |  reports a new child in
+        |  IRP_MN_QUERY_DEVICE_RELATIONS (BusRelations)
+        v
+   PnP MANAGER creates a PDO, reads its HARDWARE IDs
+        |     PCI\VEN_1234&amp;DEV_5678&amp;SUBSYS_...&amp;REV_01
+        |     ACPI\VEN0001
+        v
+   matches against installed INFs (chapter 20)
+        |
+        v
+   loads the driver, calls DriverEntry (once per driver)
+        |
+        v
+   calls EvtDriverDeviceAdd / AddDevice (once PER DEVICE)
+        |     you create the FDO and attach it to the stack
+        v
+   IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+        |     "what does this device need?"
+        v
+   PnP manager ASSIGNS resources (memory ranges, interrupts,
+   DMA channels) - arbitrating between all devices
+        |
+        v
+   IRP_MN_START_DEVICE                &lt;-- the big one
+        |     WDF: EvtDevicePrepareHardware  (map registers)
+        |          EvtDeviceD0Entry          (power it up)
+        |          interrupts connected
+        v
+   ===== DEVICE IS RUNNING; I/O flows =====
+        |
+        v
+   IRP_MN_QUERY_REMOVE_DEVICE     "may I remove it?"
+        |     you may VETO this if you are busy
+        v
+   IRP_MN_REMOVE_DEVICE
+        |     WDF: EvtDeviceD0Exit
+        |          EvtDeviceReleaseHardware
+        |          EvtDeviceSelfManagedIoCleanup
+        v
+   device object deleted
+
+   OTHER TRANSITIONS you must handle:
+     IRP_MN_CANCEL_REMOVE_DEVICE   the remove was vetoed
+     IRP_MN_QUERY_STOP / STOP      resource rebalance
+     IRP_MN_SURPRISE_REMOVAL       the user yanked it out
+     IRP_MN_QUERY_CAPABILITIES
+     IRP_MN_QUERY_ID / QUERY_DEVICE_TEXT</pre>
+
+<div class="key">
+<b>Surprise removal is not an edge case</b>
+<p>For anything on USB, PCIe hot-plug, or a removable bus, <code>SURPRISE_REMOVAL</code> is the
+<em>normal</em> path — the hardware is already gone when you are told. Every register read now returns
+<code>0xFFFFFFFF</code>, every pending request must be completed with an error, and any code that waits for
+the hardware to respond will hang forever. Write the driver so that "the device vanished mid-operation" is a
+handled case from the first day, not something retrofitted after a bug report.</p>
+</div>
+
+<h2 id="wdm">Doing it in raw WDM</h2>
+
+<p>Here is what the above costs in raw WDM. It is worth reading once, not because you should write it, but because it shows exactly how much work the framework in the next chapters is doing for you.</p>
+
+<pre><code>/* Shown so you can read legacy drivers and understand what
+   WDF replaces. Do not write new code this way.           */
+
+NTSTATUS
+MyAddDevice(_In_ PDRIVER_OBJECT DriverObject,
+            _In_ PDEVICE_OBJECT PhysicalDeviceObject)
+{
+        PDEVICE_OBJECT fdo;
+        PMY_EXT ext;
+        NTSTATUS status;
+
+        status = IoCreateDevice(DriverObject, sizeof(MY_EXT),
+                                NULL,      /* unnamed - PnP
+                                              devices use
+                                              interfaces     */
+                                FILE_DEVICE_UNKNOWN,
+                                FILE_DEVICE_SECURE_OPEN,
+                                FALSE, &amp;fdo);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        ext = fdo-&gt;DeviceExtension;
+        RtlZeroMemory(ext, sizeof(*ext));
+        ext-&gt;Self = fdo;
+        ext-&gt;Pdo  = PhysicalDeviceObject;
+
+        /* ATTACH to the stack - this returns the device
+           DIRECTLY BELOW us, which may be a lower filter, not
+           the PDO.                                          */
+        ext-&gt;LowerDevice = IoAttachDeviceToDeviceStack(
+                                fdo, PhysicalDeviceObject);
+        if (!ext-&gt;LowerDevice) {
+                IoDeleteDevice(fdo);
+                return STATUS_DEVICE_REMOVED;
+        }
+
+        /* inherit the buffering method and power flags from
+           below - getting this wrong breaks I/O in ways that
+           are hard to trace (chapter 08)                    */
+        fdo-&gt;Flags |= ext-&gt;LowerDevice-&gt;Flags &amp;
+                      (DO_BUFFERED_IO | DO_DIRECT_IO |
+                       DO_POWER_PAGABLE);
+
+        fdo-&gt;Flags &amp;= ~DO_DEVICE_INITIALIZING;   /* LAST */
+
+        return STATUS_SUCCESS;
+}
+
+/* AND THE PNP DISPATCH, which is where the real work is: */
+NTSTATUS
+MyPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_EXT ext = DeviceObject-&gt;DeviceExtension;
+        PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+
+        switch (sp-&gt;MinorFunction) {
+        case IRP_MN_START_DEVICE:
+                /* MUST send it down FIRST and WAIT: the lower
+                   drivers must start before we touch the
+                   hardware. This synchronous-forward pattern
+                   is 40 lines of event and completion routine
+                   in real code.                            */
+                status = MyForwardAndWait(ext, Irp);
+                if (NT_SUCCESS(status))
+                        status = MyStartDevice(ext,
+                                sp-&gt;Parameters.StartDevice.
+                                   AllocatedResourcesTranslated);
+                Irp-&gt;IoStatus.Status = status;
+                IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                return status;
+
+        case IRP_MN_REMOVE_DEVICE:
+                MyStopDevice(ext);
+                IoSkipCurrentIrpStackLocation(Irp);
+                status = IoCallDriver(ext-&gt;LowerDevice, Irp);
+                IoDetachDevice(ext-&gt;LowerDevice);
+                IoDeleteDevice(DeviceObject);
+                return status;
+                /* NOTE: for REMOVE you forward it down and do
+                   NOT complete it, then delete yourself. For
+                   START you complete it. The rules differ per
+                   minor function, and there are a dozen.   */
+
+        default:
+                IoSkipCurrentIrpStackLocation(Irp);
+                return IoCallDriver(ext-&gt;LowerDevice, Irp);
+        }
+}
+
+/* THERE ARE ROUGHLY 25 PNP MINOR FUNCTIONS, each with its own
+   forwarding and completion rules, plus a state machine with
+   about 15 states that you must implement correctly to pass
+   certification. WDF implements all of it (chapter 15).
+
+   THAT is why KMDF exists, and why a KMDF driver is typically
+   a third the size of the WDM equivalent.               */</code></pre>
+
+<h2 id="wdf">The same thing in KMDF</h2>
+
+<p>The same device, the same state machine, in KMDF. Compare the two directly — the framework handles the sequencing and leaves you with only the callbacks that are genuinely specific to your hardware.</p>
+
+<pre><code>NTSTATUS
+MyEvtDeviceAdd(_In_ WDFDRIVER Driver,
+               _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+        WDF_PNPPOWER_EVENT_CALLBACKS pnpPower;
+        WDF_OBJECT_ATTRIBUTES attributes;
+        WDFDEVICE device;
+        PMY_CONTEXT ctx;
+        NTSTATUS status;
+
+        UNREFERENCED_PARAMETER(Driver);
+        PAGED_CODE();
+
+        WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&amp;pnpPower);
+        pnpPower.EvtDevicePrepareHardware = MyPrepareHardware;
+        pnpPower.EvtDeviceReleaseHardware = MyReleaseHardware;
+        pnpPower.EvtDeviceD0Entry         = MyD0Entry;
+        pnpPower.EvtDeviceD0Exit          = MyD0Exit;
+        WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit,
+                                               &amp;pnpPower);
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attributes,
+                                                MY_CONTEXT);
+
+        status = WdfDeviceCreate(&amp;DeviceInit, &amp;attributes,
+                                 &amp;device);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        ctx = MyGetContext(device);
+        ctx-&gt;Device = device;
+
+        /* publish a device interface, so user mode can find
+           us without a hard-coded name (below)             */
+        status = WdfDeviceCreateDeviceInterface(device,
+                        &amp;GUID_DEVINTERFACE_MYDEVICE, NULL);
+        if (!NT_SUCCESS(status))
+                return status;
+
+        return MyQueueInitialize(device);
+}
+
+/* THAT IS THE WHOLE PNP IMPLEMENTATION. The framework:
+     · creates the FDO and attaches it
+     · implements every PnP minor function correctly
+     · runs the state machine, including surprise removal,
+       query-remove veto, and resource rebalance
+     · calls your callbacks at the right time, at the right
+       IRQL, in the right order
+     · stops and restarts your queues around power transitions
+
+   YOUR JOB reduces to four callbacks (chapter 15).      */</code></pre>
+
+<h2 id="callbacks">The four callbacks that matter</h2>
+
+<p>These four exist because "the device is present" and "the device is powered and usable" are separate
+events that WDF tracks independently — a laptop can suspend and resume the same device many times without ever
+revoking its resources, and Plug and Play can surprise-remove a device without ever powering it down cleanly
+first. <code>PrepareHardware</code>/<code>ReleaseHardware</code> bracket the period during which the device's
+memory-mapped registers and interrupt are validly assigned to you at all; <code>D0Entry</code>/<code>D0Exit</code>
+bracket the much more frequent power transitions that happen inside that period. The warning on
+<code>ReleaseHardware</code> is the one to take seriously: by the time it runs, the hardware may already be
+physically gone — a USB device unplugged, a PCIe card hot-removed — so any register access there risks
+touching memory that no longer maps to anything.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Callback</th><th>When</th><th>Do</th><th>IRQL</th></tr></thead>
+<tbody>
+<tr><td><code>EvtDevicePrepareHardware</code></td><td>Resources assigned</td><td>Map registers, get the interrupt's resource descriptor</td><td>PASSIVE</td></tr>
+<tr><td><code>EvtDeviceD0Entry</code></td><td>Powering up</td><td>Initialise the hardware, restore state</td><td>PASSIVE</td></tr>
+<tr><td><code>EvtDeviceD0Exit</code></td><td>Powering down</td><td>Quiesce, save state</td><td>PASSIVE</td></tr>
+<tr><td><code>EvtDeviceReleaseHardware</code></td><td>Resources revoked</td><td>Unmap. <strong>Do not touch the hardware</strong> — it may be gone</td><td>PASSIVE</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>NTSTATUS
+MyPrepareHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesRaw,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        ULONG i;
+
+        PAGED_CODE();
+        UNREFERENCED_PARAMETER(ResourcesRaw);
+
+        /* Walk the TRANSLATED list - the raw one holds bus
+           addresses, the translated one holds addresses the
+           CPU can actually use (chapter 18).              */
+        for (i = 0; i &lt; WdfCmResourceListGetCount(ResourcesTranslated);
+             i++) {
+                PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
+                        WdfCmResourceListGetDescriptor(
+                                ResourcesTranslated, i);
+
+                switch (desc-&gt;Type) {
+                case CmResourceTypeMemory:
+                        ctx-&gt;RegBase = MmMapIoSpaceEx(
+                                desc-&gt;u.Memory.Start,
+                                desc-&gt;u.Memory.Length,
+                                PAGE_READWRITE | PAGE_NOCACHE);
+                        if (!ctx-&gt;RegBase)
+                                return STATUS_INSUFFICIENT_RESOURCES;
+                        ctx-&gt;RegLength = desc-&gt;u.Memory.Length;
+                        break;
+
+                case CmResourceTypeInterrupt:
+                        /* WDF connects it for you if you
+                           created a WDFINTERRUPT object
+                           (chapter 18) - nothing to do here  */
+                        break;
+                }
+        }
+
+        if (!ctx-&gt;RegBase)
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyReleaseHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        PAGED_CODE();
+        UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+        /* DO NOT touch the hardware here. On surprise removal
+           it is physically gone, and a register write may
+           bugcheck or hang the bus. Quiesce in D0Exit, which
+           runs while the device is still present.         */
+
+        if (ctx-&gt;RegBase) {
+                MmUnmapIoSpace(ctx-&gt;RegBase, ctx-&gt;RegLength);
+                ctx-&gt;RegBase = NULL;
+        }
+        return STATUS_SUCCESS;
+}</code></pre>
+
+<h2 id="interfaces">Device interfaces</h2>
+
+<p>A device needs a name that applications can find it by. Windows does this with a GUID rather than a fixed path, so that a program can enumerate every device of a given kind without knowing how many exist or what they are called.</p>
+
+<pre><code>/* A PnP device should NOT have a fixed name and symbolic link
+   (chapter 04) - there may be several of them, and the name
+   would collide. Instead it publishes a device INTERFACE: a
+   GUID that says "I provide this kind of service".        */
+
+/* 1. define a GUID, in a header shared with user mode: */
+        // {A1B2C3D4-1234-5678-9ABC-DEF012345678}
+        DEFINE_GUID(GUID_DEVINTERFACE_MYDEVICE,
+                0xa1b2c3d4, 0x1234, 0x5678, 0x9a, 0xbc,
+                0xde, 0xf0, 0x12, 0x34, 0x56, 0x78);
+
+/* 2. publish it, in EvtDeviceAdd: */
+        WdfDeviceCreateDeviceInterface(device,
+                        &amp;GUID_DEVINTERFACE_MYDEVICE,
+                        NULL);   /* an optional reference
+                                    string, to distinguish
+                                    several interfaces on one
+                                    device                   */
+
+/* 3. USER MODE FINDS IT by GUID, not by name: */
+
+        HDEVINFO info;
+        SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail;
+        DWORD needed;
+        HANDLE h;
+
+        info = SetupDiGetClassDevsW(&amp;GUID_DEVINTERFACE_MYDEVICE,
+                        NULL, NULL,
+                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
+        SetupDiEnumDeviceInterfaces(info, NULL,
+                        &amp;GUID_DEVINTERFACE_MYDEVICE, 0, &amp;ifData);
+
+        SetupDiGetDeviceInterfaceDetailW(info, &amp;ifData, NULL, 0,
+                                         &amp;needed, NULL);
+        detail = malloc(needed);
+        detail-&gt;cbSize = sizeof(*detail);
+        SetupDiGetDeviceInterfaceDetailW(info, &amp;ifData, detail,
+                                         needed, &amp;needed, NULL);
+
+        h = CreateFileW(detail-&gt;DevicePath, GENERIC_READ |
+                        GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+
+/* THE PATH looks like:
+     \\?\pci#ven_1234&amp;dev_5678#4&amp;1a2b3c4d&amp;0&amp;00e0#{a1b2c3d4-...}
+
+   WHY THIS IS BETTER than a symbolic link:
+     · several identical devices coexist, each with its own
+       path
+     · user mode can enumerate ALL of them
+     · arrival and removal can be watched with
+       CM_Register_Notification / RegisterDeviceNotification,
+       so an application reacts to hot-plug
+     · no name collisions between vendors            */</code></pre>
+
+<h2 id="debug">Debugging the stack</h2>
+
+<p>When a device does not start, the debugger will tell you how far it got and which driver is where in the stack — which usually identifies the failing step immediately.</p>
+
+<pre><code># --- Device Manager, first ---
+#   View -> Show hidden devices
+#   The device's Properties -> Details tab:
+#       Hardware Ids           what the INF must match
+#       Device Instance Path
+#       Upper/Lower filters
+#       "Problem code"         &lt;-- the yellow bang's meaning
+#
+#   COMMON PROBLEM CODES:
+#     Code 10  the driver failed IRP_MN_START_DEVICE
+#     Code 12  resource conflict - PnP could not assign
+#     Code 18  reinstall required
+#     Code 28  no driver installed
+#     Code 31  the driver failed to load
+#     Code 39  driver corrupt or missing
+#     Code 43  the driver reported a failure
+#     Code 52  signature verification failed (chapter 21)
+
+# --- WinDbg ---
+    !devnode 0 1                    the whole PnP tree
+    !devnode 0 1 mydriver           just yours
+    !devstack ffff8a0c12345678      one device's stack
+    !devobj  ffff8a0c12345678
+    !drvobj \Driver\MyDriver 7
+
+# --- The setup log, for install-time problems ---
+    C:\Windows\INF\setupapi.dev.log
+# It records every INF match attempt, every rank, and exactly
+# why a driver was or was not selected. This is the file to
+# read when a device shows Code 28.
+
+# --- Live PnP tracing ---
+    tracelog -start pnp -guid #B3A7...  -f pnp.etl
+    # or use Windows Performance Recorder with the
+    # "Device I/O" profile</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Yellow bang, Code 28</td><td>No matching INF — check the hardware IDs against the INF</td></tr>
+<tr><td>Code 10, "device cannot start"</td><td><code>START_DEVICE</code> failed — usually <code>PrepareHardware</code> or <code>D0Entry</code> returned an error</td></tr>
+<tr><td>Code 12</td><td>Resource conflict; the device asked for something unavailable</td></tr>
+<tr><td>Code 52</td><td>Signing (<a href="win-20-signing.html">ch. 21</a>)</td></tr>
+<tr><td>Bugcheck on device removal</td><td>Touched the hardware in <code>ReleaseHardware</code> after surprise removal</td></tr>
+<tr><td>Hang when unplugging</td><td>Waiting for hardware that is gone; no timeout</td></tr>
+<tr><td>Registers read <code>0xFFFFFFFF</code></td><td>The device was surprise-removed — detect and fail fast</td></tr>
+<tr><td>Device stops working after sleep</td><td>State not restored in <code>D0Entry</code></td></tr>
+<tr><td>Two devices, only one works</td><td>Used a fixed symbolic link instead of a device interface</td></tr>
+<tr><td>Buffering behaves oddly in a filter</td><td>Flags not inherited from the lower device (<a href="win-07-buffering.html">ch. 08</a>)</td></tr>
+<tr><td>Random bugcheck in a filter driver</td><td>PnP IRP forwarded with the wrong rules for that minor function</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw a device stack and name PDO, FDO and filter DOs.</li>
+  <li>Explain what filters make possible and why Linux has no direct equivalent.</li>
+  <li>Walk the PnP sequence from enumeration to <code>START_DEVICE</code>.</li>
+  <li>Explain why surprise removal is a normal path, not an edge case.</li>
+  <li>Say what WDM's PnP dispatch has to do and why WDF replaces it.</li>
+  <li>Name the four PnP/power callbacks and what belongs in each.</li>
+  <li>Explain why you must not touch hardware in <code>ReleaseHardware</code>.</li>
+  <li>Distinguish raw from translated resources.</li>
+  <li>Publish a device interface and open it from user mode by GUID.</li>
+  <li>Decode five Device Manager problem codes and know which log explains Code 28.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

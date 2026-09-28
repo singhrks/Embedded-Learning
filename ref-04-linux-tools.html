@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Linux debugging toolkit | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The Linux debugging toolkit</h1>
+<p class="lead">A reference for the tools that actually get used, organised by the question you are trying
+to answer rather than by tool name.</p>
+
+<h2 id="map">Which tool for which question</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Tool</th></tr></thead>
+<tbody>
+<tr><td>Why did it crash?</td><td><code>gdb</code> on the core dump, <code>dmesg</code>, <code>decode_stacktrace.sh</code></td></tr>
+<tr><td>Is it a memory bug?</td><td>ASan, UBSan, Valgrind, KASAN</td></tr>
+<tr><td>Where is the time going?</td><td><code>perf</code>, flame graphs</td></tr>
+<tr><td>What syscalls is it making?</td><td><code>strace</code></td></tr>
+<tr><td>What library calls?</td><td><code>ltrace</code></td></tr>
+<tr><td>What is the kernel doing?</td><td><code>ftrace</code>, <code>bpftrace</code>, <code>/proc</code></td></tr>
+<tr><td>Why is it stuck?</td><td><code>gdb</code> attach, <code>/proc/PID/stack</code>, <code>wchan</code></td></tr>
+<tr><td>What is on the wire?</td><td><code>tcpdump</code>, <code>wireshark</code></td></tr>
+<tr><td>What files is it touching?</td><td><code>lsof</code>, <code>fatrace</code>, <code>inotifywait</code></td></tr>
+<tr><td>Is the device present?</td><td><code>lspci</code>, <code>lsusb</code>, <code>/sys</code>, <code>udevadm</code></td></tr>
+<tr><td>Where is the memory going?</td><td><code>/proc/meminfo</code>, <code>smem</code>, <code>heaptrack</code></td></tr>
+<tr><td>Is it a race?</td><td>TSan, lockdep, <code>KCSAN</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="crash">Crashes</h2>
+
+<pre><code># ---- ENABLE CORE DUMPS (they are usually off) ----
+$ ulimit -c unlimited
+$ cat /proc/sys/kernel/core_pattern
+$ sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p.%t
+# systemd systems: coredumpctl list; coredumpctl gdb PID
+
+$ gdb ./myapp /tmp/core.myapp.1234.1699
+(gdb) bt full          # backtrace with locals
+(gdb) info registers
+(gdb) frame 3
+(gdb) print *ptr
+(gdb) info sharedlibrary
+(gdb) thread apply all bt      # ALL threads - and for a
+                               # deadlock this is the
+                               # first thing to run
+
+# ---- BUILD FOR DEBUGGABILITY ----
+CFLAGS += -g3 -Og -fno-omit-frame-pointer
+# -g3   includes macro definitions
+# -Og   optimised but debuggable. NOT -O0, which changes
+#       timing and hides optimiser-dependent bugs, and NOT
+#       -O2, which optimises away the variables you want.
+# -fno-omit-frame-pointer   makes perf and backtraces work.
+#       Costs ~1% and is worth it in production too.
+
+# KEEP THE UNSTRIPPED BINARY for every release you ship.
+# A stripped binary plus a core dump is nearly useless, and
+# the matching .debug file is the difference between a
+# five-minute diagnosis and a week.
+
+# ---- KERNEL OOPS ----
+$ dmesg -T | tail -50
+$ journalctl -k -b -1        # PREVIOUS boot - after a
+                             # crash this is where it is
+
+# decode a raw oops:
+$ ./scripts/decode_stacktrace.sh vmlinux &lt; oops.txt
+
+# READING AN OOPS - the fields that matter:
+#   "BUG: kernel NULL pointer dereference at 0000000000000018"
+#        -> a null struct pointer; 0x18 is the field offset
+#   "RIP: 0010:my_driver_probe+0x42/0x120"
+#        -> the FUNCTION, the OFFSET INTO IT, and its SIZE
+#   "Call Trace:"  -> who called whom
+#   "Tainted: G  O"  -> an out-of-tree module is loaded
+#
+# $ addr2line -e mydriver.ko -f 0x42     # offset -> line
+
+# ---- PANIC / HANG CONFIGURATION ----
+$ sudo sysctl -w kernel.panic_on_oops=1
+$ sudo sysctl -w kernel.hung_task_timeout_secs=60
+# SysRq, when the console still responds:
+#   Alt+SysRq+t   all task stacks
+#   Alt+SysRq+w   BLOCKED tasks - the fastest way to find a
+#                 deadlock
+#   Alt+SysRq+l   all CPU backtraces
+#   Alt+SysRq+c   deliberate crash, to test your crash dump
+#                 path
+# $ echo t &gt; /proc/sysrq-trigger      # same, from a shell</code></pre>
+
+<h2 id="memory">Memory bugs</h2>
+
+<pre><code># ---- SANITISERS: use these first, always ----
+$ gcc -fsanitize=address,undefined -g -Og prog.c
+$ ./a.out
+# =================================================
+# ERROR: AddressSanitizer: heap-use-after-free
+#   READ of size 4 at 0x602000000010 thread T0
+#     #0 0x4008f1 in main prog.c:12
+#   freed by thread T0 here:
+#     #0 0x7f... in free
+#     #1 0x4008d5 in main prog.c:10
+#   previously allocated by thread T0 here: ...
+
+# ASAN GIVES YOU THREE STACKS: where the bad access
+# happened, where it was freed, and where it was allocated.
+# That is usually the entire diagnosis.
+
+# WHAT EACH CATCHES:
+#   ASan   buffer overflow, use-after-free, double free,
+#          use-after-return, leaks. ~2x slowdown, ~3x memory.
+#   UBSan  signed overflow, null deref, misaligned access,
+#          shifts out of range, bad enum values. Near-free.
+#          (see the C track on undefined behaviour)
+#   TSan   DATA RACES. ~10x slowdown, and worth every cycle.
+#   MSan   reads of UNINITIALISED memory. Needs ALL code
+#          instrumented, including libraries.
+#
+# ASan and TSan CANNOT be combined. Run separately.
+# RUN THE SANITISERS IN CI. They find bugs that have not
+# manifested yet, which is the only cheap time to find them.
+
+# ---- VALGRIND: no rebuild needed ----
+$ valgrind --leak-check=full --show-leak-kinds=all \
+           --track-origins=yes ./myapp
+# 20-50x slower than ASan but requires no recompilation -
+# which matters when you have a binary and no source, or a
+# build system you cannot change.
+$ valgrind --tool=helgrind ./myapp     # races
+$ valgrind --tool=massif ./myapp       # heap profile
+
+# ---- WHERE IS THE MEMORY GOING ----
+$ cat /proc/meminfo
+$ cat /proc/PID/status | grep -E 'VmRSS|VmSize|Threads'
+$ cat /proc/PID/smaps_rollup      # per-process summary
+$ smem -tk                        # PSS - the honest
+                                  # shared-memory number
+$ heaptrack ./myapp && heaptrack_gui heaptrack.myapp.*
+
+# ---- KERNEL-SIDE ----
+# CONFIG_KASAN     ASan for the kernel. Use it on any
+#                  driver you write.
+# CONFIG_KMEMLEAK  kernel leak detector:
+$ echo scan &gt; /sys/kernel/debug/kmemleak
+$ cat /sys/kernel/debug/kmemleak
+# CONFIG_DEBUG_KMEMLEAK, CONFIG_SLUB_DEBUG=FZPU
+# CONFIG_KCSAN     kernel race detector
+$ cat /proc/slabinfo               # kernel object caches
+$ cat /proc/vmallocinfo</code></pre>
+
+<h2 id="perf">Performance</h2>
+
+<pre><code># ---- THE ONE COMMAND TO KNOW ----
+$ perf record -g --call-graph dwarf -F 999 ./myapp
+$ perf report --stdio
+
+# -g / --call-graph   capture stacks. dwarf works without
+#                     frame pointers; fp is cheaper if you
+#                     built with -fno-omit-frame-pointer
+# -F 999              999 Hz, deliberately not 1000, to
+#                     avoid aliasing with periodic activity
+
+$ perf top                      # live, system-wide
+$ perf stat ./myapp             # counters: IPC, cache
+                                # misses, branch misses
+$ perf stat -e cache-misses,cache-references,\
+instructions,cycles ./myapp
+
+# READING perf stat:
+#   IPC below ~1.0        stalling - memory or branches
+#   high cache-miss ratio poor locality (see the computer
+#                         architecture track)
+#   high branch-misses    unpredictable control flow
+
+# ---- FLAME GRAPHS: the best way to read a profile ----
+$ perf record -F 99 -g -p PID -- sleep 30
+$ perf script | stackcollapse-perf.pl | flamegraph.pl \
+    &gt; out.svg
+# WIDTH = time spent. Look for wide plateaus, not tall
+# towers. Height is just stack depth and means nothing.
+
+# ---- WHAT IS IT DOING RIGHT NOW ----
+$ strace -f -T -tt -p PID          # syscalls, with timing
+$ strace -c ./myapp                # SUMMARY - start here
+$ strace -e trace=openat,read ./myapp
+$ ltrace ./myapp                   # library calls
+
+# strace -c IS THE FASTEST WAY TO ANSWER "why is this
+# slow?" for anything I/O bound. If 90% of the time is in
+# one syscall, you are done.
+
+# ---- KERNEL TRACING ----
+$ cd /sys/kernel/tracing
+# echo function_graph &gt; current_tracer
+# echo my_driver_probe &gt; set_graph_function
+# echo 1 &gt; tracing_on ; cat trace_pipe
+
+$ trace-cmd record -p function_graph -g my_func ./app
+$ kernelshark trace.dat
+
+# ---- bpftrace: the modern answer ----
+$ bpftrace -e 'tracepoint:syscalls:sys_enter_openat {
+                 printf("%s %s\n", comm, str(args-&gt;filename));
+               }'
+$ bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'
+$ bpftrace -e 'kretprobe:vfs_read /pid == 1234/ {
+                 @bytes = hist(retval); }'
+
+# ARBITRARY INSTRUMENTATION OF A RUNNING PRODUCTION KERNEL,
+# safely, with no rebuild and no reboot. This is the single
+# biggest advance in Linux debugging in fifteen years, and
+# the bcc tools (execsnoop, opensnoop, biolatency,
+# runqlat, tcpconnect) are ready-made scripts worth
+# knowing.
+
+# ---- LATENCY AND SCHEDULING ----
+$ cyclictest -t4 -p 80 -n -i 200 -l 100000   # RT latency
+$ perf sched record -- sleep 5 ; perf sched latency
+$ chrt -f 80 ./myapp                          # run at RT
+                                              # priority
+$ taskset -c 2 ./myapp                        # pin to a
+                                              # CPU</code></pre>
+
+<div class="key">
+<b>The order to reach for these</b>
+<pre>1. dmesg / journalctl — did the kernel already tell
+   you?
+2. strace -c — is it syscall bound?
+3. perf stat — is it compute or memory bound?
+4. perf record + flame graph — where exactly?
+5. sanitisers — is it a latent memory or race bug?
+6. bpftrace — a question none of the above answered.</pre>
+<p>Most investigations end at step 1 or 2. Reaching for a profiler before checking whether the kernel
+logged the answer is the most common wasted hour.</p>
+</div>
+
+<h2 id="system">Devices, drivers and the system</h2>
+
+<pre><code># ---- IS THE DEVICE THERE ----
+$ lspci -nnk                  # -k shows the bound DRIVER
+$ lsusb -t                    # tree view, with drivers
+$ ls /sys/bus/i2c/devices/
+$ ls /sys/bus/platform/drivers/mydriver/
+$ udevadm info -a -n /dev/ttyUSB0   # full attribute chain
+$ udevadm monitor --property        # live hotplug events
+$ cat /proc/device-tree/soc/i2c@40005400/status  # DT
+$ dtc -I fs -O dts /proc/device-tree | less      # decompile
+                                                 # the live
+                                                 # DT
+
+# "THE DRIVER DOESN'T LOAD" - THE CHECKLIST:
+#   1. is the module present?        lsmod | grep mydrv
+#   2. does the ID table match?      modinfo mydrv | grep alias
+#   3. did probe run?                dmesg | grep mydrv
+#   4. is the device in the DT/ACPI, and status = "okay"?
+#   5. is its clock enabled?         /sys/kernel/debug/clk/clk_summary
+#   6. is its regulator on?          /sys/kernel/debug/regulator/
+#   7. did another driver claim it?  lspci -k, /proc/iomem
+#   8. what did probe return?        dev_err messages, or
+#                                    -EPROBE_DEFER (which is
+#                                    normal - it will retry)
+
+# ---- INTERRUPTS AND RESOURCES ----
+$ cat /proc/interrupts             # WATCH THE COUNT CHANGE.
+                                   # Not incrementing means
+                                   # the IRQ never fires.
+$ cat /proc/iomem
+$ cat /proc/ioports
+$ cat /proc/dma
+
+# ---- LOCKING AND DEADLOCK ----
+# CONFIG_PROVE_LOCKING (lockdep) - reports a potential
+# deadlock the FIRST TIME an inconsistent lock order is
+# observed, even if it never actually deadlocks. Enable it
+# in any kernel you are developing against.
+$ cat /proc/lockdep_stats
+$ cat /proc/PID/stack             # kernel stack of a stuck
+                                  # task
+$ cat /proc/PID/wchan             # what it is waiting on
+
+# ---- NETWORK ----
+$ tcpdump -i eth0 -w cap.pcap 'port 443'
+$ ss -tulpn                        # sockets and owning
+                                   # processes
+$ ip -s link ; ethtool -S eth0     # error counters
+
+# ---- FILES AND I/O ----
+$ lsof -p PID
+$ ls -l /proc/PID/fd/
+$ iostat -x 1 ; iotop
+$ fatrace                          # every file access,
+                                   # system-wide
+
+# ---- USEFUL /proc AND /sys ENTRIES ----
+/proc/PID/maps       memory map - find which library an
+                     address is in
+/proc/PID/smaps      per-mapping detail
+/proc/PID/limits     the limits actually in effect
+/proc/PID/environ    the environment it actually got
+/proc/cmdline        kernel boot arguments
+/proc/config.gz      the running kernel's config
+/sys/kernel/debug/   debugfs - drivers expose their state
+                     here, and yours should too</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause / tool</th></tr></thead>
+<tbody>
+<tr><td>No core dump after a crash</td><td><code>ulimit -c</code> is 0, or <code>core_pattern</code> pipes elsewhere</td></tr>
+<tr><td>Backtrace shows only <code>??</code></td><td>Stripped binary — keep the unstripped one</td></tr>
+<tr><td>Variables <code>&lt;optimized out&gt;</code></td><td>Rebuild with <code>-Og -g3</code></td></tr>
+<tr><td>perf shows no call graph</td><td>Frame pointers omitted — use <code>--call-graph dwarf</code></td></tr>
+<tr><td>Crash only in release builds</td><td>Undefined behaviour — run UBSan</td></tr>
+<tr><td>Intermittent corruption under load</td><td>Data race — run TSan or enable KCSAN</td></tr>
+<tr><td>Driver never probes</td><td>Work the eight-step checklist; often an ID or device-tree mismatch</td></tr>
+<tr><td><code>-EPROBE_DEFER</code> in dmesg</td><td>Normal — a dependency is not ready; it will retry</td></tr>
+<tr><td>IRQ count never increments</td><td>Wrong IRQ number, wrong trigger type, or the pin is not muxed</td></tr>
+<tr><td>Peripheral registers read as zero</td><td>Clock or regulator not enabled — check the debugfs summaries</td></tr>
+<tr><td>Task stuck forever</td><td><code>/proc/PID/stack</code> and SysRq-w</td></tr>
+<tr><td>Memory grows without bound</td><td><code>heaptrack</code>, or kmemleak for kernel allocations</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Match each of the twelve questions to its tool.</li>
+  <li>Enable core dumps and open one in GDB.</li>
+  <li>Explain why <code>-Og</code> is preferred over both <code>-O0</code> and <code>-O2</code>.</li>
+  <li>Read a kernel oops and identify the function, offset and cause.</li>
+  <li>Say what each of ASan, UBSan, TSan and MSan catches, and which cannot be combined.</li>
+  <li>Explain what Valgrind offers that ASan does not.</li>
+  <li>Record a profile and read a flame graph correctly.</li>
+  <li>Interpret <code>perf stat</code>'s IPC and cache-miss figures.</li>
+  <li>Write a <code>bpftrace</code> one-liner and say why it is safe on production.</li>
+  <li>Work the eight-step "driver does not load" checklist.</li>
+  <li>Explain what lockdep detects that a deadlock test would not.</li>
+  <li>Give the six-step escalation order and say where most investigations end.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

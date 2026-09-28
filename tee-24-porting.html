@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Porting OP-TEE to new hardware | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Porting OP-TEE to new hardware</h1>
+<p class="lead">Everything so far ran on QEMU, where the platform port already existed and the secure memory
+was imaginary. Bringing OP-TEE up on real silicon is a different kind of work: a few hundred lines of
+platform code, one console, one memory carve-out that must be enforced by hardware, and a long list of
+questions only the SoC's security manual can answer.</p>
+
+<h2 id="shape">What a port actually is</h2>
+
+<p>Bringing OP-TEE to a new SoC is a defined piece of work rather than an open-ended one, and knowing its shape up front makes it tractable.</p>
+
+<pre class="diagram">   OP-TEE is mostly platform-independent. A port is a
+   directory:
+
+     core/arch/arm/plat-&lt;yours&gt;/
+       conf.mk            what the platform has and wants
+       main.c             console, early init, hardware setup
+       platform_config.h  addresses and sizes
+       sub.mk             which files to build
+       kern.ld.S          only if your layout is unusual
+
+   Plus decisions made OUTSIDE OP-TEE, which are the hard part:
+
+     TF-A            must load OP-TEE as BL32 and pass a
+                     correct boot argument (chapter 2)
+     TZASC / XPU     must actually FENCE the secure DRAM
+                     (chapter 6) - firmware's job, not
+                     OP-TEE's
+     device tree     Linux must be told OP-TEE is there
+     fuses / keys    the HUK, the TA signing key, secure boot
+
+   Rough effort on a well-supported SoC whose vendor already
+   ships TF-A:
+
+     console up ................ half a day
+     first TA runs ............. two days
+     xtest passing ............. one to two weeks
+     RPMB, HUK, secure boot .... weeks, and mostly paperwork
+
+   The middle number is small and the last one is not. Budget
+   accordingly: the port is easy, the PLATFORM SECURITY is
+   not.</pre>
+
+<div class="key">
+<b>The question that decides everything</b>
+<p>Can the hardware make a region of DRAM inaccessible to the non-secure world, and can that configuration be
+locked before non-secure code runs? If yes, a port is worth doing. If no — no TZASC, no XPU, no lockable
+firewall — then OP-TEE will run and provide <em>no isolation at all</em>, because normal-world Linux can read
+secure DRAM directly. Answer this before writing a line of code.</p>
+</div>
+
+<h2 id="checklist">The information you need first</h2>
+
+<p>Most porting difficulty comes from missing information rather than difficult code. This is what to obtain from the silicon vendor before starting.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Where the answer lives</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>Is there a TZASC/TZC-400, or a vendor XPU?</td><td>SoC security manual</td><td>Without it there is no
+secure memory (<a href="tee-06-secure-memory.html">chapter 6</a>)</td></tr>
+<tr><td>Which DRAM range can be made secure, at what granularity?</td><td>Memory map + TZC region
+docs</td><td>Sets <code>TZDRAM_BASE</code>/<code>SIZE</code> and their alignment</td></tr>
+<tr><td>Is there secure on-chip SRAM, and how much?</td><td>Memory map</td><td>Decides whether you can run
+without a DRAM carve-out, and where <code>TEE_SHMEM</code> lives</td></tr>
+<tr><td>Which UART can be made secure-only?</td><td>Peripheral firewall docs</td><td>The secure console. Sharing
+one with Linux works but interleaves badly</td></tr>
+<tr><td>GICv2 or GICv3? Which interrupts are Group 0?</td><td>GIC integration section</td><td>OP-TEE's
+notification and its own timer</td></tr>
+<tr><td>Is the CPU count and cluster topology known at build time?</td><td>TRM</td><td><code>CFG_TEE_CORE_NB_CORE</code></td></tr>
+<tr><td>Does the vendor ship TF-A, and which version?</td><td>Vendor BSP</td><td>Determines the handover
+mechanism you must match</td></tr>
+<tr><td>Is there an eMMC with RPMB, and is the RPMB key programmed?</td><td>Board schematic +
+manufacturing</td><td>Rollback protection (<a href="tee-17-time-rollback.html">chapter 17</a>)</td></tr>
+<tr><td>Where does the HUK come from?</td><td>Security manual: fuses, key ladder, or crypto
+accelerator</td><td>All of secure storage depends on it</td></tr>
+<tr><td>Is there a hardware TRNG?</td><td>Peripheral list</td><td>Otherwise entropy is a real problem</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="files">The four files</h2>
+
+<p>A port is a small set of platform files, and knowing which does what tells you where each piece of board-specific knowledge belongs.</p>
+
+<pre><code># core/arch/arm/plat-acme/conf.mk
+
+PLATFORM_FLAVOR ?= acme_evk
+
+include core/arch/arm/cpu/cortex-armv8-0.mk
+
+$(call force,CFG_TEE_CORE_NB_CORE,4)
+$(call force,CFG_ARM64_core,y)          # 64-bit TEE core
+$(call force,CFG_GIC,y)
+$(call force,CFG_ARM_GICV3,y)
+$(call force,CFG_PL011,y)               # console driver
+$(call force,CFG_SECURE_TIME_SOURCE_CNTPCT,y)
+$(call force,CFG_WITH_ARM_TRUSTED_FW,y) # TF-A loads us as BL32
+
+CFG_TZDRAM_START  ?= 0x0e100000
+CFG_TZDRAM_SIZE   ?= 0x00f00000         # 15 MB
+CFG_SHMEM_START   ?= 0x0f000000
+CFG_SHMEM_SIZE    ?= 0x00200000         # 2 MB
+
+CFG_DRAM0_BASE    ?= 0x00000000
+CFG_DRAM0_SIZE    ?= 0x80000000
+
+CFG_CORE_DYN_SHM      ?= y   # dynamic shared memory (ch. 7)
+CFG_CORE_ASLR         ?= y
+CFG_TEE_CORE_LOG_LEVEL ?= 2
+
+# Turn these on only once the basics work:
+# CFG_RPMB_FS         ?= y
+# CFG_RPMB_WRITE_KEY  ?= n     # NEVER y in production images
+# CFG_WITH_PAGER      ?= y     # if secure RAM is tight
+# CFG_CORE_SEL2_SPMC  ?= n</code></pre>
+
+<pre><code>/* core/arch/arm/plat-acme/platform_config.h */
+
+#ifndef PLATFORM_CONFIG_H
+#define PLATFORM_CONFIG_H
+
+#include &lt;mm/generic_ram_layout.h&gt;
+
+/* Cache line size - wrong value here corrupts data silently
+   through partial cache maintenance.                       */
+#define CACHELINE_LEN           64
+#define STACK_ALIGNMENT         64
+
+/* GIC */
+#define GICD_BASE               0x2f000000
+#define GICR_BASE               0x2f100000
+
+/* Console: the UART OP-TEE owns. Must be firewalled to the
+   secure world, or normal-world Linux will also drive it and
+   the output interleaves into nonsense.                    */
+#define CONSOLE_UART_BASE       0x1c090000
+#define CONSOLE_BAUDRATE        115200
+#define CONSOLE_UART_CLK_IN_HZ  24000000
+
+#endif /* PLATFORM_CONFIG_H */</code></pre>
+
+<pre><code>/* core/arch/arm/plat-acme/main.c - the whole platform port. */
+
+#include &lt;console.h&gt;
+#include &lt;drivers/gic.h&gt;
+#include &lt;drivers/pl011.h&gt;
+#include &lt;kernel/boot.h&gt;
+#include &lt;kernel/panic.h&gt;
+#include &lt;mm/core_memprot.h&gt;
+#include &lt;platform_config.h&gt;
+
+static struct pl011_data console_data;
+
+/* Tell the memory manager these physical ranges exist and how
+   they may be mapped. MISSING ONE OF THESE IS THE COMMONEST
+   PORTING BUG: the driver writes to an address that was never
+   mapped and the core panics with a translation fault.     */
+register_phys_mem_pgdir(MEM_AREA_IO_SEC,
+                        CONSOLE_UART_BASE, PL011_REG_SIZE);
+register_phys_mem_pgdir(MEM_AREA_IO_SEC, GICD_BASE, GIC_DIST_REG_SIZE);
+register_phys_mem_pgdir(MEM_AREA_IO_SEC, GICR_BASE, GIC_RDIST_REG_SIZE);
+
+/* Normal-world DRAM: OP-TEE must know which memory is NOT
+   secure, so it can refuse a TA that hands it a pointer into
+   secure RAM (chapter 20).                                 */
+register_ddr(CFG_DRAM0_BASE, CFG_DRAM0_SIZE);
+
+void console_init(void)
+{
+        pl011_init(&amp;console_data, CONSOLE_UART_BASE,
+                   CONSOLE_UART_CLK_IN_HZ, CONSOLE_BAUDRATE);
+        register_serial_console(&amp;console_data.chip);
+}
+
+void boot_primary_init_intc(void)
+{
+        gic_init(GICD_BASE, GICR_BASE);
+}
+
+void boot_secondary_init_intc(void)
+{
+        gic_init_per_cpu();
+}
+
+/* Optional: platform-specific early setup - clocks, a crypto
+   accelerator, the fuse controller that supplies the HUK.  */
+static TEE_Result acme_late_init(void)
+{
+        IMSG("ACME platform init");
+        return TEE_SUCCESS;
+}
+service_init(acme_late_init);</code></pre>
+
+<pre><code># core/arch/arm/plat-acme/sub.mk
+global-incdirs-y += .
+srcs-y += main.c
+
+# And register the platform so `make PLATFORM=acme` works -
+# the directory name is the platform name; no central list to
+# edit.
+
+$ make PLATFORM=acme CROSS_COMPILE64=aarch64-linux-gnu- \
+       CFG_ARM64_core=y -j$(nproc)
+$ ls out/arm-plat-acme/core/
+tee.bin  tee.elf  tee-header_v2.bin  tee-pager_v2.bin
+tee-pageable_v2.bin</code></pre>
+
+<h2 id="tfa">The TF-A side</h2>
+
+<p>The secure world does not boot itself; EL3 firmware must load and dispatch it. That integration is a separate piece of work from the OS port.</p>
+
+<pre><code>/* OP-TEE cannot load itself. TF-A's BL2 loads it as BL32 and
+   BL31 hands control over. Two things must agree.        */
+
+/* 1. TF-A must be built to know about it: */
+$ make -C arm-trusted-firmware \
+      PLAT=acme \
+      SPD=opteed \                    # the OP-TEE dispatcher
+      BL32=~/optee_os/out/arm-plat-acme/core/tee-header_v2.bin \
+      BL32_EXTRA1=.../tee-pager_v2.bin \
+      BL32_EXTRA2=.../tee-pageable_v2.bin \
+      BL33=u-boot.bin \
+      ARM_TSP_RAM_LOCATION=dram \
+      all fip
+
+/* 2. The boot argument. TF-A passes OP-TEE a device tree
+   pointer (or a legacy argument) in x0/x2 at entry. Getting
+   this wrong gives you a hang with no output at all, which
+   is the single most demoralising failure in this chapter.
+
+   Debug it by putting a character out of the UART as the
+   VERY FIRST instruction of OP-TEE's entry point:
+
+       core/arch/arm/kernel/entry_a64.S, at _start:
+
+           mov  x20, x0            // save the real arg first!
+           ldr  x1, =0x1c090000    // UART DR
+           mov  w2, #'0'
+           str  w2, [x1]
+
+   If '0' appears, TF-A reached you and the problem is later.
+   If it does not, the problem is the load address, the
+   entry point, or the TZASC fencing you off from your own
+   code.                                                   */</code></pre>
+
+<h2 id="fence">The part that is not software</h2>
+
+<p>The memory partition between the worlds must be established by hardware, and on a new platform that means configuring the specific enforcement blocks that chip provides.</p>
+
+<pre><code>/* The carve-out must be enforced by HARDWARE, before any
+   non-secure code runs, and the configuration must be
+   LOCKED. This is TF-A's BL2/BL31 job.                    */
+
+/* TZC-400 example, from a platform's BL2:                  */
+
+void plat_acme_security_setup(void)
+{
+        tzc400_init(TZC400_BASE);
+        tzc400_disable_filters();
+
+        /* Region 0 is the background: everything not covered
+           by another region. Make it NON-SECURE by default,
+           so a region you forget to configure is at least not
+           silently secure.                                 */
+        tzc400_configure_region0(TZC_REGION_S_NS_RDWR, 0);
+
+        /* Region 1: the OP-TEE carve-out. SECURE ONLY.
+           No non-secure master - CPU or DMA - may touch it. */
+        tzc400_configure_region(TZC_FILTERS_ALL, 1,
+                TZDRAM_BASE,
+                TZDRAM_BASE + TZDRAM_SIZE - 1,
+                TZC_REGION_S_RDWR,      /* secure only       */
+                0);                     /* no NSAID access   */
+
+        tzc400_set_action(TZC_ACTION_ERR);  /* fault, do not
+                                               silently drop */
+        tzc400_enable_filters();
+
+        /* And lock it, if the hardware supports locking.
+           An unlocked TZASC can be reprogrammed by the
+           normal world later, which defeats the whole
+           exercise.                                        */
+}
+
+/* VERIFY IT. Do not assume. From Linux, as root:          */
+
+$ devmem2 0x0e100000 w
+/dev/mem opened.
+Memory mapped at address 0xffff...
+Bus error                      &lt;-- CORRECT. The fence works.
+
+# If instead you see:
+Value at address 0x0E100000: 0x14000000
+# then you are reading OP-TEE's own code from the normal
+# world, and there is no isolation. Everything else in this
+# track is theatre until this reads "Bus error".
+
+# Also check DMA, which is the harder half: program a DMA
+# engine to read the same address. The TZASC must block the
+# device too, and on some SoCs devices are governed by a
+# DIFFERENT firewall (an XPU) that you must configure
+# separately.</code></pre>
+
+<div class="danger">
+<b>The two mistakes that void the whole port</b>
+<p>First: configuring the TZASC but never locking it, so normal-world firmware can widen the window later.
+Second: fencing the CPU but not the DMA masters — the SMMU and the peripheral firewall are separate blocks
+with separate configuration, and a passthrough-capable DMA engine that is not covered can read secure DRAM
+on the guest's behalf. Test both paths explicitly; a passing <code>xtest</code> proves neither.</p>
+</div>
+
+<h2 id="dt">Telling Linux</h2>
+
+<p>The normal world has to be told a TEE exists, which is a device-tree change — and one of the more common reasons a fresh port appears to do nothing.</p>
+
+<pre><code>/ {
+        firmware {
+                optee {
+                        compatible = "linaro,optee-tz";
+                        method = "smc";
+                };
+        };
+
+        reserved-memory {
+                #address-cells = &lt;2&gt;;
+                #size-cells = &lt;2&gt;;
+                ranges;
+
+                /* The carve-out, so Linux never allocates
+                   here. The TZASC would fault it anyway, but
+                   a fault at a random later moment is far
+                   worse than never touching it.           */
+                optee@0e100000 {
+                        reg = &lt;0x0 0x0e100000 0x0 0x00f00000&gt;;
+                        no-map;
+                };
+        };
+};
+
+# Then in the guest:
+$ dmesg | grep -i optee
+optee: probing for conduit method.
+optee: revision 4.1 (4a5b6c7d)
+optee: dynamic shared memory is enabled
+optee: initialized driver
+
+$ ls -l /dev/tee*
+crw------- 1 root root 234, 0 /dev/tee0
+crw------- 1 root root 234, 16 /dev/teepriv0</code></pre>
+
+<h2 id="bringup">Bring-up order that works</h2>
+
+<p>An order that works, because bringing everything up at once gives you no way to tell which layer is broken.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Step</th><th>Success looks like</th><th>If it fails</th></tr></thead>
+<tbody>
+<tr><td>1. TF-A boots to BL33 <em>without</em> OP-TEE</td><td>U-Boot prompt</td><td>Not an OP-TEE problem
+yet</td></tr>
+<tr><td>2. Add BL32, get one character out</td><td>Your debug character on the secure UART</td><td>Load
+address, entry point, or the carve-out is fencing OP-TEE from itself</td></tr>
+<tr><td>3. OP-TEE banner</td><td><code>OP-TEE version: 4.1</code></td><td>Console clock or base address
+wrong</td></tr>
+<tr><td>4. Secondary cores</td><td><code>Secondary CPU 1 initializing</code></td><td>PSCI or GIC per-CPU
+init</td></tr>
+<tr><td>5. Linux probes the driver</td><td><code>optee: initialized driver</code></td><td>Device tree node,
+or the SMC conduit</td></tr>
+<tr><td>6. <code>tee-supplicant</code> runs</td><td>No errors in its log</td><td>Missing
+<code>/data/tee</code>, or permissions</td></tr>
+<tr><td>7. <code>optee_example_hello_world</code></td><td>An incrementing value</td><td>TA not installed, or
+signature key mismatch</td></tr>
+<tr><td>8. <code>xtest -l 0</code></td><td>All pass</td><td>Read the secure console; failures are usually
+crypto or storage</td></tr>
+<tr><td>9. <code>xtest</code> full</td><td>All pass</td><td>Now it is a real port</td></tr>
+<tr><td>10. <code>devmem2</code> on the carve-out</td><td><strong>Bus error</strong></td><td>You have no
+isolation. Stop and fix the firewall</td></tr>
+<tr><td>11. RPMB, HUK, secure boot, signing keys</td><td>Product-ready</td><td>Mostly manufacturing
+process</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="production">What separates a port from a product</h2>
+
+<p>A development port is not a shippable one. These are the things that must change before a device goes out, and each is easy to forget precisely because nothing fails without it.</p>
+
+<pre><code>/* A port that passes xtest is a development port. Shipping
+   requires all of the following, and none of them is code you
+   write in OP-TEE.                                         */
+
+  1. A REAL HUK.
+     The default is often zeros or a build-time constant. Then
+     every device derives the same storage key and secure
+     storage protects nothing (chapter 16). Wire
+     tee_otp_get_hw_unique_key() to fuses or a key ladder,
+     and prove two boards produce different values.
+
+  2. A REAL TA SIGNING KEY.
+     The default key ships in the source tree. Anyone can sign
+     a TA for your device. Generate one, keep the private half
+     in an HSM, and pass TA_SIGN_KEY= at build time
+     (chapter 14).
+
+  3. SECURE BOOT, enabled and fused.
+     A verified boot chain that is not enforced by fuses is a
+     boot chain an attacker replaces.
+
+  4. RPMB, with the key programmed at manufacture.
+     CFG_RPMB_WRITE_KEY=y is a development convenience that
+     programs a one-time-writable key. Shipping it lets the
+     first attacker claim the RPMB.
+
+  5. LOGGING TURNED DOWN.
+     CFG_TEE_CORE_LOG_LEVEL=1, CFG_TEE_TA_LOG_LEVEL=0. Debug
+     output from the secure world is an information leak, and
+     DMSG in a hot path is a timing side channel.
+
+  6. CFG_CORE_ASLR=y, and no CFG_TEE_CORE_DEBUG.
+
+  7. A DOCUMENTED THREAT MODEL.
+     Which attacks is this defending against? Bus probing?
+     A malicious app? A compromised kernel? Physical
+     decapping? The answer decides whether the port is
+     adequate, and it is the question an auditor asks first.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Total silence after TF-A hands over</td><td>Wrong load address or entry point, or the TZASC is fencing
+OP-TEE out of its own memory</td></tr>
+<tr><td>Garbage on the secure console</td><td><code>CONSOLE_UART_CLK_IN_HZ</code> wrong</td></tr>
+<tr><td>Interleaved secure and normal output</td><td>Both worlds driving one UART; firewall it or accept the
+mess in development only</td></tr>
+<tr><td>Panic with a translation fault in a driver</td><td>Missing
+<code>register_phys_mem_pgdir()</code> for that MMIO range</td></tr>
+<tr><td>Boots on one core, hangs on SMP</td><td><code>CFG_TEE_CORE_NB_CORE</code> wrong, or per-CPU GIC init
+missing</td></tr>
+<tr><td>Random corruption under load</td><td><code>CACHELINE_LEN</code> wrong</td></tr>
+<tr><td>Linux never probes the driver</td><td>Device tree <code>firmware/optee</code> node missing or
+<code>method</code> wrong</td></tr>
+<tr><td>Everything works and <code>devmem2</code> reads the carve-out</td><td>No hardware fencing. The port
+provides zero isolation</td></tr>
+<tr><td>Secure storage readable on another board</td><td>HUK is a constant</td></tr>
+<tr><td>A TA signed by someone else loads</td><td>Default signing key still in use</td></tr>
+<tr><td>Works on the EVK, fails on production silicon</td><td>Different fuse configuration, or a firewall the
+EVK left open</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four files in a platform port and what each contributes.</li>
+  <li>State the one hardware question that decides whether a port is worth doing.</li>
+  <li>Explain what <code>register_phys_mem_pgdir()</code> does and the failure when it is missing.</li>
+  <li>Explain why <code>register_ddr()</code> matters for TA parameter validation.</li>
+  <li>Describe how TF-A loads OP-TEE and name the build variables involved.</li>
+  <li>Give the first-character debug technique and say what each outcome tells you.</li>
+  <li>Write the TZASC configuration for a secure carve-out and say why region 0 defaults to
+  non-secure.</li>
+  <li>Prove from Linux that the carve-out is genuinely fenced, and say what a successful read means.</li>
+  <li>Explain why fencing the CPU is not sufficient, and what else must be configured.</li>
+  <li>List the bring-up steps in order and give the success signal for each.</li>
+  <li>Name five things that separate a working port from a shippable one.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

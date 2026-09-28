@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reader-writer locks, seqlocks and RCU | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Reader-writer locks, seqlocks and RCU</h1>
+<p class="lead">Most shared data is read far more often than it is written. Three primitives exploit that,
+each trading a different thing away — and the first one, the obvious one, is usually the worst of the
+three.</p>
+
+<h2 id="rwlock">Reader-writer locks, and why they disappoint</h2>
+
+<p>When reads vastly outnumber writes, forcing readers to exclude each other wastes the parallelism you have. Reader-writer locks let them proceed together — and are a worse answer more often than their description suggests.</p>
+
+<pre><code>/* The idea: many readers OR one writer. */
+
+pthread_rwlock_t l = PTHREAD_RWLOCK_INITIALIZER;
+
+pthread_rwlock_rdlock(&amp;l);      /* shared                     */
+        read_things();
+pthread_rwlock_unlock(&amp;l);
+
+pthread_rwlock_wrlock(&amp;l);      /* exclusive                  */
+        write_things();
+pthread_rwlock_unlock(&amp;l);
+
+/* C++17: */
+std::shared_mutex m;
+{ std::shared_lock  g(m);  read_things();  }   /* many         */
+{ std::unique_lock  g(m);  write_things(); }   /* one          */
+
+/* WHY IT OFTEN LOSES TO A PLAIN MUTEX:
+
+   1. Taking a read lock is a WRITE to the lock's state - the
+      reader count. So every reader dirties the same cache
+      line, and 16 readers "reading in parallel" bounce one
+      line 16 ways. Under load a shared_mutex read lock can be
+      SLOWER than an exclusive mutex, because a mutex at least
+      only bounces the line once per holder.
+
+   2. It is bigger and its uncontended path is longer: more
+      state to update, more branches.
+
+   3. Fairness is a policy you did not choose. Reader-preferring
+      implementations starve writers indefinitely under a steady
+      read load. Writer-preferring ones make readers queue
+      behind a writer that has not started yet.
+
+   4. There is no atomic upgrade. read -> write means unlock,
+      relock, and RE-VALIDATE everything you read, because the
+      world changed in the gap. Implementations that offer
+      upgrade usually deadlock if two readers try at once.
+
+   USE IT WHEN: read critical sections are LONG (microseconds,
+   not nanoseconds) and writes are genuinely rare. Below that,
+   measure against a plain mutex before believing it helps. */</code></pre>
+
+<div class="key">
+<b>The rule of thumb</b>
+<p>If the read critical section is shorter than about a microsecond, a plain mutex usually wins. The
+reader-writer lock only starts paying when the work under the read lock is long enough to dwarf the cost of
+the reader-count update — and by then you should ask whether you could copy the data out under a mutex
+instead.</p>
+</div>
+
+<h2 id="seqlock">Seqlocks: readers that never write</h2>
+
+<p>A sequence lock inverts the usual trade: readers never block and never write shared state, at the cost of occasionally having to retry. That makes it excellent for small, frequently-read data and unusable for anything a reader might act on mid-read.</p>
+
+<pre class="diagram">   The insight: let readers do NOTHING to shared state, and
+   detect afterwards whether they were interfered with.
+
+   A counter, incremented on entry and exit of every write.
+
+     even  = stable
+     odd   = a write is in progress
+
+   WRITER                        READER
+     seq++            (odd)        do {
+     write the data                    s1 = seq;
+     seq++            (even)           if (s1 &amp; 1) continue;
+                                       ... read the data ...
+                                       s2 = seq;
+                                   } while (s1 != s2);
+
+   If seq changed, or was odd, the read was torn - so retry.
+
+   WHAT YOU GAIN
+     readers issue ZERO writes. No cache line is dirtied, so
+     N readers genuinely scale. This is why Linux uses it for
+     the system time (gettimeofday) - read constantly by every
+     core, written once per tick.
+
+   WHAT YOU GIVE UP
+     * readers may retry, so a reader can starve under a
+       constant write load
+     * the data being read MUST be safe to read while torn -
+       no pointer chasing, no unbounded loops on a value that
+       might be garbage mid-write
+     * writers still need a mutex among themselves; a seqlock
+       does not order writers
+     * it is not a general-purpose lock. It suits small,
+       fixed-size, self-contained records.</pre>
+
+<pre><code>/* A seqlock in C11 atomics. */
+
+typedef struct { atomic_uint seq; struct data d; pthread_mutex_t wm; } seqlock;
+
+void seq_write(seqlock *l, const struct data *src)
+{
+        pthread_mutex_lock(&amp;l-&gt;wm);            /* writers only */
+        atomic_fetch_add_explicit(&amp;l-&gt;seq, 1, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);   /* odd BEFORE
+                                                        the data */
+        l-&gt;d = *src;
+        atomic_thread_fence(memory_order_release);   /* data BEFORE
+                                                        even     */
+        atomic_fetch_add_explicit(&amp;l-&gt;seq, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&amp;l-&gt;wm);
+}
+
+struct data seq_read(seqlock *l)
+{
+        struct data out;
+        unsigned s1, s2;
+        do {
+                s1 = atomic_load_explicit(&amp;l-&gt;seq, memory_order_acquire);
+                if (s1 &amp; 1u)
+                        continue;               /* write in flight */
+                out = l-&gt;d;                     /* may be torn     */
+                atomic_thread_fence(memory_order_acquire);
+                s2 = atomic_load_explicit(&amp;l-&gt;seq, memory_order_relaxed);
+        } while (s1 != s2);
+        return out;
+}
+
+/* Note: strictly, reading l->d while a writer writes it is a
+   data race by the letter of the C standard, and TSan will say
+   so. Real implementations use atomic loads per field or
+   compiler-specific escape hatches. This is one of the few
+   places where the model and the practice diverge, and the
+   kernel's read_seqcount_begin/retry is the reference. */</code></pre>
+
+<h2 id="rcu">RCU: readers that do not even check</h2>
+
+<p>The most extreme point on this spectrum: readers cost literally nothing — no atomic, no write, no wait. The price is a discipline about how updates are published and a deferred, sometimes lengthy, reclamation of old versions.</p>
+
+<pre class="diagram">   Read-Copy-Update. The most extreme point on the curve:
+   readers pay LITERALLY NOTHING - no atomic, no branch, in
+   the classic kernel build not a single instruction.
+
+   THE IDEA
+     Never modify data in place. Instead:
+       1. COPY the object
+       2. modify the copy
+       3. publish the new pointer atomically
+       4. WAIT until every reader that might still hold the
+          old pointer has finished
+       5. free the old one
+
+   Step 4 is the whole trick, and it is called the GRACE
+   PERIOD.
+
+     writer:  new = copy(old)
+              modify(new)
+              rcu_assign_pointer(p, new)     ; release store
+              synchronize_rcu()              ; wait for readers
+              kfree(old)
+
+     reader:  rcu_read_lock()                ; often a no-op
+              q = rcu_dereference(p)
+              use(q)                         ; q stays valid
+              rcu_read_unlock()              ; often a no-op
+
+   HOW THE GRACE PERIOD IS DETECTED
+     In the kernel's classic RCU, a reader may not sleep or be
+     preempted inside a read-side section. So once every CPU
+     has passed through a context switch, no reader from
+     before the update can still be running. That is a
+     QUIESCENT STATE, and observing one per CPU ends the
+     grace period. No reference counts, no atomics, no
+     communication from readers at all.
+
+   THE COSTS
+     * writers are expensive and must wait, possibly
+       milliseconds
+     * memory is freed late, so usage spikes under write load
+     * readers may see stale data - RCU gives you a consistent
+       SNAPSHOT, not the latest value
+     * read sections have hard rules (no sleeping in classic
+       RCU) that the compiler cannot check
+
+   WHERE IT WINS: routing tables, module lists, security
+   policy, the dcache - anything read on every operation by
+   every core and updated rarely.</pre>
+
+<pre><code>/* Userspace RCU (liburcu) - the same API outside the kernel. */
+#include &lt;urcu.h&gt;
+
+struct config *global_cfg;
+
+/* reader - the hot path */
+void handle_request(void)
+{
+        rcu_read_lock();
+        struct config *c = rcu_dereference(global_cfg);
+        use(c-&gt;timeout, c-&gt;retries);
+        rcu_read_unlock();
+}
+
+/* writer - rare */
+void update_config(int timeout)
+{
+        struct config *old, *new = malloc(sizeof *new);
+
+        pthread_mutex_lock(&amp;writer_lock);      /* writers still
+                                                  serialise      */
+        old = global_cfg;
+        *new = *old;                            /* COPY          */
+        new-&gt;timeout = timeout;                 /* UPDATE        */
+        rcu_assign_pointer(global_cfg, new);    /* PUBLISH       */
+        pthread_mutex_unlock(&amp;writer_lock);
+
+        synchronize_rcu();                      /* WAIT          */
+        free(old);                              /* now safe      */
+}
+
+/* call_rcu(&amp;old->head, free_cb) defers the free instead of
+   blocking the writer - what you use when the writer is on a
+   latency-sensitive path.                                     */</code></pre>
+
+<h2 id="compare">Choosing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Mutex</th><th>RW lock</th><th>Seqlock</th><th>RCU</th></tr></thead>
+<tbody>
+<tr><td>Reader cost</td><td>One atomic</td><td>One atomic, contended</td><td>Two plain loads</td><td>≈
+nothing</td></tr>
+<tr><td>Readers scale?</td><td>No</td><td>Poorly</td><td>Yes</td><td>Perfectly</td></tr>
+<tr><td>Writer cost</td><td>Low</td><td>Low</td><td>Low</td><td>High — grace period</td></tr>
+<tr><td>Readers can starve?</td><td>No</td><td>Possible</td><td><strong>Yes</strong>, under write
+load</td><td>No</td></tr>
+<tr><td>Readers see</td><td>Latest</td><td>Latest</td><td>Latest, or retry</td><td>A recent
+snapshot</td></tr>
+<tr><td>Read section may sleep</td><td>Yes</td><td>Yes</td><td>No</td><td>No (classic RCU)</td></tr>
+<tr><td>Memory freed</td><td>Immediately</td><td>Immediately</td><td>Immediately</td><td>Late</td></tr>
+<tr><td>Good for</td><td>Almost everything</td><td>Long reads, rare writes</td><td>Small fixed
+records</td><td>Pointer-published structures read by every core</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Try the boring answer first</b>
+<p>The order to reach for these is: plain mutex → copy the data out under a mutex → RW lock → seqlock → RCU.
+Each step buys read scalability and costs correctness margin. Most code that reaches for RCU would have been
+fine copying a small struct under a mutex, and would have been far easier to review. Move down the list only
+when a profile says the read path is the bottleneck.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>RW lock is slower than the mutex it replaced</td><td>Short read sections; the reader-count line is the
+bottleneck</td></tr>
+<tr><td>Writers never get in</td><td>Reader-preferring RW lock under continuous read load</td></tr>
+<tr><td>Deadlock upgrading read to write</td><td>Two readers both trying to upgrade</td></tr>
+<tr><td>Stale data after a documented update</td><td>RCU is working as designed — readers see a
+snapshot</td></tr>
+<tr><td>Memory usage spikes under write load</td><td>RCU frees late; use <code>call_rcu</code> and rate-limit
+writers</td></tr>
+<tr><td>Reader crashes dereferencing a freed pointer</td><td>Missing <code>rcu_read_lock</code>, or the writer
+freed before the grace period</td></tr>
+<tr><td>Kernel hang in <code>synchronize_rcu</code></td><td>A read-side section that slept or never
+ended</td></tr>
+<tr><td>Seqlock reader spins for ever</td><td>Writers never stop; the reader is starved</td></tr>
+<tr><td>Seqlock reader crashes</td><td>It followed a pointer read from torn data</td></tr>
+<tr><td>TSan reports a race on a seqlock</td><td>Genuine, by the letter of the standard — this is a known
+model/practice gap</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why taking a read lock is a write, and what that costs.</li>
+  <li>Give four reasons a reader-writer lock can lose to a plain mutex.</li>
+  <li>Explain why there is no safe atomic read-to-write upgrade.</li>
+  <li>Describe the seqlock protocol and say what readers give up.</li>
+  <li>Explain why seqlock data must be safe to read while torn.</li>
+  <li>State the five steps of an RCU update and name the one that is the trick.</li>
+  <li>Explain how a grace period is detected without readers signalling anything.</li>
+  <li>Give three costs of RCU.</li>
+  <li>Order the four primitives by reader cost and by review difficulty.</li>
+  <li>Say which primitive you would use for a routing table, for the system clock, and for a config struct
+  read once per request.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

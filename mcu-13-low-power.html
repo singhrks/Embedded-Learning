@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Low-power modes and the current budget | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Low-power modes and the current budget</h1>
+<p class="lead">Battery life is arithmetic, not craft. This chapter covers the sleep modes a Cortex-M offers,
+the duty-cycle calculation that decides whether your product lasts a year or a fortnight, and the handful of
+mistakes that account for nearly every "why is it drawing 3 mA" question.</p>
+
+<h2 id="modes">The modes</h2>
+
+<pre class="diagram">   Typical STM32L4-class figures. Every vendor names these
+   differently; the STRUCTURE is universal.
+
+   MODE        CPU   RAM   PERIPH  WAKE     CURRENT  WAKE TIME
+   ---------------------------------------------------------
+   RUN         on    on    on      -        10 mA    -
+   SLEEP       off   on    on      any IRQ   2 mA    ~0 cycles
+   STOP        off   on    few     EXTI,RTC  2 uA    ~5 us
+   STANDBY     off   LOST  none    pin,RTC   0.3 uA  ~250 us
+                     (few                             + full
+                      backup                          reboot
+                      regs                            from
+                      survive)                        reset
+
+   THE TWO THINGS THAT CHANGE BETWEEN ROWS:
+
+   1. What still has a CLOCK. In SLEEP the core clock stops
+      but peripherals run, so a UART keeps receiving and a
+      DMA transfer keeps going. That is why SLEEP + DMA is
+      such a powerful combination.
+
+   2. Whether SRAM keeps its CONTENT. STANDBY loses it.
+      Waking from STANDBY re-runs Reset_Handler and your
+      program starts from the top - it is a reboot, not a
+      resume. Anything you must remember goes in backup
+      registers or the RTC's domain.
+
+   The jump from SLEEP to STOP is a factor of a thousand.
+   That is the decision that matters; everything else is
+   refinement.</pre>
+
+<h2 id="entering">Entering a mode</h2>
+
+<pre><code>/* WFI - wait for interrupt. The core halts until an
+   interrupt arrives. This is the whole mechanism.         */
+
+__WFI();
+
+/* SLEEP-ON-EXIT: an elegant pattern for a purely
+   event-driven device. The core re-enters sleep
+   automatically when an ISR returns, so main() never runs
+   again after setup and there is no idle loop at all.     */
+SCB-&gt;SCR |= SCB_SCR_SLEEPONEXIT_Msk;
+
+/* Deeper modes set SLEEPDEEP and then WFI. */
+static void enter_stop_mode(void)
+{
+    /* Select STOP with the regulator in low-power mode. */
+    PWR-&gt;CR1 &amp;= ~PWR_CR1_LPMS;
+    PWR-&gt;CR1 |=  PWR_CR1_LPMS_STOP2;
+
+    SCB-&gt;SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    __DSB();                       /* drain writes first   */
+    __WFI();
+    SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;
+
+    /* CRITICAL: STOP mode usually switches SYSCLK back to
+       the internal oscillator on wake. Your 168 MHz PLL is
+       off and every timing assumption is wrong until you
+       restore it.                                          */
+    clock_init_168mhz();
+}
+</code></pre>
+
+<div class="danger">
+<b>The WFI race, and the standard fix</b>
+<pre class="diagram">   THE BUG
+
+     while (!work_pending) {
+         __WFI();          &lt;-- interrupt fires HERE, between
+     }                         the test and the WFI. The ISR
+                               sets work_pending and returns.
+                               WFI then sleeps anyway, and
+                               nothing will wake us until the
+                               NEXT interrupt - which may
+                               never come.
+
+   Symptom: the device hangs roughly once a day, in a way
+   that never reproduces on the bench.
+
+   THE FIX: disable interrupts around the test. WFI wakes on
+   a pending interrupt even when PRIMASK masks it - that is
+   an architectural guarantee, and it exists precisely for
+   this pattern.
+
+     __disable_irq();
+     if (!work_pending) {
+         __WFI();          /* wakes on pending IRQ even    */
+     }                     /* though PRIMASK blocks entry  */
+     __enable_irq();       /* NOW the ISR actually runs    */
+
+   The interrupt is taken immediately after the enable. No
+   window, no lost wakeup.</pre>
+</div>
+
+<h2 id="budget">The arithmetic that decides the product</h2>
+
+<pre><code>/* A sensor that wakes every 10 s, measures for 20 ms, and
+   transmits for 100 ms once a minute.
+
+   AVERAGE CURRENT = sum of (current * time) / period
+
+   Per minute:
+     6 wakes  x 20 ms x 10 mA  = 1200 mA-ms  measuring
+     1 TX     x 100 ms x 30 mA = 3000 mA-ms  radio
+     remainder: 60000 - 220 ms x 2 uA
+                = 59780 ms x 0.002 mA = 120 mA-ms  sleeping
+     ----------------------------------------------------
+     total = 4320 mA-ms per 60000 ms
+     average = 0.072 mA = 72 uA
+
+   A 220 mAh coin cell / 0.072 mA = 3055 hours = 127 days.
+
+   NOW RAISE SLEEP CURRENT FROM 2 uA TO 50 uA - one pin left
+   floating, say:
+     sleep contribution = 59780 x 0.050 = 2989 mA-ms
+     total = 7189, average = 0.120 mA
+     battery life = 76 days.
+
+   A single floating pin cost 40% of the product's life. It
+   would never be noticed in testing, because the device
+   works perfectly.
+
+   THE LESSON: in a duty-cycled design the sleep current
+   dominates the total even though it is the smallest
+   number, because it is multiplied by the largest time.
+   Optimise the term with the biggest product, which is
+   almost never the one that feels slow.                   */
+</code></pre>
+
+<h2 id="leaks">Where the microamps actually go</h2>
+
+<pre class="diagram">   IN ROUGH ORDER OF HOW OFTEN THEY ARE THE CULPRIT:
+
+   1. THE DEBUGGER IS ATTACHED.
+      SWD keeps clocks alive. Measurements with a debugger
+      connected are meaningless - often 100x too high.
+      Measure on battery, detached, always.
+
+   2. A FLOATING INPUT PIN.
+      An unconnected CMOS input drifts near the switching
+      threshold and both transistors conduct. Microamps to
+      milliamps, per pin. EVERY unused pin must be an
+      output, or an input with a pull enabled, or analog.
+      Analog mode is the lowest of the three because it
+      disconnects the Schmitt trigger entirely.
+
+   3. A PULL-UP FIGHTING A DRIVEN LOW.
+      A 4.7 kO pull-up to 3.3 V held low is 700 uA,
+      continuously. I2C buses idle high for this reason; if
+      you sleep with SDA held low you pay for it all night.
+
+   4. A PERIPHERAL CLOCK LEFT ENABLED.
+      Gate everything you are not using (chapter 09). Some
+      peripherals also need explicit disabling, not just
+      clock gating - an ADC's analog front end draws current
+      from the reference regardless of its clock.
+
+   5. AN LED.
+      2 mA is 30x your entire sleep budget. Indicator LEDs
+      must be duty-cycled or omitted on battery products.
+
+   6. AN EXTERNAL SENSOR STILL POWERED.
+      Its datasheet's "sleep current" may exceed your MCU's
+      by an order of magnitude. Consider power-gating it
+      with a MOSFET so its current is genuinely zero.
+
+   7. THE REGULATOR'S OWN QUIESCENT CURRENT.
+      A regulator with 50 uA quiescent draw makes a 2 uA MCU
+      irrelevant. This is a schematic decision that caps
+      your achievable sleep current before firmware runs.</pre>
+
+<div class="key">
+<b>Measure, do not model</b>
+<p>Sleep-current bugs are invisible to every software tool. You need an ammeter that resolves microamps and
+milliamps in the same trace — a dedicated low-power analyser, or a sense resistor and a scope. The
+characteristic finding is a device that sleeps beautifully in one state and not in another, because one code
+path leaves a peripheral enabled. Plot current against time across a full duty cycle and the extra current
+will be a visible plateau you can align with your code.</p>
+</div>
+
+<h2 id="wake">Waking up, and RTC scheduling</h2>
+
+<pre><code>/* From STOP or STANDBY, the wake sources are limited to
+   what still has a clock: the RTC, a handful of EXTI pins,
+   and sometimes a low-power UART or comparator.           */
+
+static void sleep_for_seconds(uint32_t s)
+{
+    RTC-&gt;WPR = 0xCA; RTC-&gt;WPR = 0x53;     /* unlock         */
+    RTC-&gt;CR &amp;= ~RTC_CR_WUTE;
+    while (!(RTC-&gt;ISR &amp; RTC_ISR_WUTWF)) { }
+
+    RTC-&gt;WUTR = s - 1;                    /* 1 Hz clock     */
+    RTC-&gt;CR |= RTC_CR_WUCKSEL_2;
+    RTC-&gt;CR |= RTC_CR_WUTE | RTC_CR_WUTIE;
+    RTC-&gt;WPR = 0xFF;                      /* relock         */
+
+    EXTI-&gt;IMR  |= EXTI_IMR_MR22;          /* RTC wakeup line */
+    EXTI-&gt;RTSR |= EXTI_RTSR_TR22;
+
+    enter_stop_mode();
+}
+
+/* THE 32.768 kHz CRYSTAL EARNS ITS PLACE HERE. The internal
+   low-speed RC drifts several percent with temperature, so
+   a device that wakes "every 10 seconds" wakes every 9.7 to
+   10.3. Over a day that is minutes of accumulated error -
+   fatal for a synchronised sensor network, irrelevant for a
+   thermostat. Know which you are building.
+
+   WAKE TIME COSTS ENERGY TOO. Waking from STANDBY takes
+   ~250 us at full run current before your code executes,
+   plus PLL lock time. For very short duty cycles STOP can
+   beat STANDBY despite its higher sleep current, because
+   you spend less time paying the wake penalty. Compute
+   both; the crossover is often around a 1-second period. */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Sleep current 100x the datasheet figure</td><td>Debugger attached — measure detached, on
+battery</td></tr>
+<tr><td>Current varies between identical units</td><td>Floating pins; the threshold is near the switching
+point</td></tr>
+<tr><td>Device hangs about once a day</td><td>The WFI race — test the flag with interrupts disabled</td></tr>
+<tr><td>Timing wrong after waking from STOP</td><td>Clock fell back to the internal oscillator; restore the
+PLL</td></tr>
+<tr><td>Variables lost after a deep sleep</td><td>STANDBY loses SRAM — it is a reboot, not a resume</td></tr>
+<tr><td>Battery life half the calculation</td><td>The sleep-current term dominates; find the extra
+microamps</td></tr>
+<tr><td>Steady 700 µA that appears only at night</td><td>A pull-up fighting a line left driven low</td></tr>
+<tr><td>Wake interval drifts over hours</td><td>RTC on the internal RC rather than the 32.768 kHz
+crystal</td></tr>
+<tr><td>Sleep current fine, average current poor</td><td>Wake penalty dominates — compare STOP against
+STANDBY</td></tr>
+<tr><td>Cannot get below 50 µA whatever you do</td><td>The regulator's quiescent current, not the MCU</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four sleep modes and the two properties that change between them.</li>
+  <li>Explain why SLEEP mode still allows a DMA transfer to complete.</li>
+  <li>Say what is lost entering STANDBY and what that means for your program's structure.</li>
+  <li>Describe the WFI race and write the correct pattern.</li>
+  <li>Explain why WFI wakes on an interrupt that PRIMASK is masking.</li>
+  <li>Compute average current for a device with a given duty cycle.</li>
+  <li>Explain why sleep current dominates a duty-cycled budget despite being the smallest number.</li>
+  <li>Give three reasons an unused pin costs current, and the best configuration for one.</li>
+  <li>Explain why measurements with a debugger attached are meaningless.</li>
+  <li>Say when STOP can beat STANDBY on average current.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

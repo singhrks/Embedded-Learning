@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Example: a complete SPI device driver, annotated | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Example: a complete SPI device driver, annotated</h1>
+<p class="lead">The third and last of these worked examples. Structurally this driver is the twin of
+<a href="lx-41-example-i2c-driver.html">chapter 27</a>'s — same probe shape, same regmap, same device-tree
+match — which is exactly the point: once you know the driver core, changing bus is a small delta. This chapter
+is that delta, and the handful of things about SPI that genuinely have no I2C equivalent.</p>
+
+<h2 id="target">The target, and how it is described</h2>
+
+<p>As with the I2C example, start from the chip and the board. The device tree node is worth reading carefully — one of its properties means something completely different here than it did in the previous chapter.</p>
+
+<pre class="diagram">   AN ADXL345-STYLE 3-AXIS SPI ACCELEROMETER.
+
+     register 0x00  DEVID     - read-only, always 0xE5
+     register 0x2D  POWER_CTL - write 0x08 to start measuring
+     register 0x32  DATAX0    - 6 bytes: X, Y, Z as 16-bit LE
+
+   THE SPI COMMAND BYTE (this chip's convention, and typical):
+        bit 7  R/W    1 = read, 0 = write
+        bit 6  MB     1 = multi-byte / auto-increment
+        bits 5:0      register address
+
+   THE DEVICE TREE NODE carries everything about the BOARD -
+   which chip select, how fast, and which SPI MODE:
+
+     &amp;spi0 {
+             status = "okay";
+
+             accel@0 {
+                     compatible = "adi,adxl345";
+                     reg = &lt;0&gt;;                    /* CHIP SELECT 0,
+                                                      not an address */
+                     spi-max-frequency = &lt;5000000&gt;;   /* 5 MHz     */
+                     spi-cpol;                         /* clock idles
+                                                          high      */
+                     spi-cpha;                         /* sample on
+                                                          2nd edge  */
+                     /* cpol + cpha together = SPI MODE 3          */
+             };
+     };
+
+   `reg` MEANS SOMETHING COMPLETELY DIFFERENT HERE than it did
+   in the I2C node of chapter 27. There, it was the device's
+   address ON a shared bus. Here it is which CHIP SELECT LINE
+   the device is wired to - a physical wire, not an address.</pre>
+
+<h2 id="driver">The complete driver</h2>
+
+<p>The complete driver, and deliberately close in structure to chapter 27's so the differences stand out. If you read them side by side, what changes is remarkably little.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/* adxl345-example.c - a complete SPI device driver. */
+
+#include &lt;linux/mod_devicetable.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/regmap.h&gt;
+#include &lt;linux/spi/spi.h&gt;
+
+#define ADXL_REG_DEVID      0x00
+#define ADXL_DEVID_VALUE    0xE5
+#define ADXL_REG_POWER_CTL  0x2D
+#define ADXL_POWER_MEASURE  0x08
+#define ADXL_REG_DATAX0     0x32
+
+struct adxl {
+        struct regmap *regmap;
+};
+
+/* ---------------------------------------------------------------
+   regmap over SPI
+
+   read_flag_mask is the SPI-specific piece: regmap ORs it
+   into the first byte of every READ, which is exactly this
+   chip's "bit 7 = read, bit 6 = multi-byte" convention. Writes
+   send the address unmodified. Encoding the protocol here
+   means the rest of the driver just says "read register
+   0x32" and never thinks about command bytes again.
+   --------------------------------------------------------------- */
+static const struct regmap_config adxl_regmap_config = {
+        .reg_bits        = 8,
+        .val_bits        = 8,
+        .max_register    = 0x39,
+        .read_flag_mask  = 0xC0,    /* R/W = 1, MB = 1 */
+};
+
+/* ---------------------------------------------------------------
+   Reading all three axes in ONE transaction
+
+   regmap_bulk_read issues a single command byte followed by a
+   6-byte burst, relying on the chip's auto-increment. Reading
+   the six registers individually would also "work" and would
+   be WRONG: the axes could update between reads, giving a
+   sample whose X, Y and Z came from different instants.
+   --------------------------------------------------------------- */
+static int adxl_read_xyz(struct adxl *a, s16 xyz[3])
+{
+        __le16 raw[3];
+        int ret, i;
+
+        ret = regmap_bulk_read(a-&gt;regmap, ADXL_REG_DATAX0,
+                               raw, sizeof(raw));
+        if (ret)
+                return ret;
+
+        for (i = 0; i &lt; 3; i++)
+                xyz[i] = le16_to_cpu(raw[i]);   /* chip is
+                                                   little-endian */
+        return 0;
+}
+
+static ssize_t accel_show(struct device *dev,
+                          struct device_attribute *attr, char *buf)
+{
+        struct adxl *a = dev_get_drvdata(dev);
+        s16 xyz[3];
+        int ret;
+
+        ret = adxl_read_xyz(a, xyz);
+        if (ret)
+                return ret;
+
+        return sysfs_emit(buf, "%d %d %d\n", xyz[0], xyz[1], xyz[2]);
+}
+static DEVICE_ATTR_RO(accel);
+
+static struct attribute *adxl_attrs[] = {
+        &amp;dev_attr_accel.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(adxl);
+
+/* ---------------------------------------------------------------
+   probe
+   --------------------------------------------------------------- */
+static int adxl_probe(struct spi_device *spi)
+{
+        struct device *dev = &amp;spi-&gt;dev;
+        struct adxl *a;
+        unsigned int devid;
+        int ret;
+
+        /* THE DRIVER CONFIRMS THE TRANSFER SETTINGS IT NEEDS.
+           Mode and speed came from the device tree; a driver
+           that requires a specific mode should set it and call
+           spi_setup() so a wrong DT is caught here rather than
+           producing silent garbage on the wire.              */
+        spi-&gt;mode = SPI_MODE_3;
+        spi-&gt;bits_per_word = 8;
+        ret = spi_setup(spi);
+        if (ret)
+                return dev_err_probe(dev, ret, "spi_setup failed\n");
+
+        a = devm_kzalloc(dev, sizeof(*a), GFP_KERNEL);
+        if (!a)
+                return -ENOMEM;
+
+        a-&gt;regmap = devm_regmap_init_spi(spi, &amp;adxl_regmap_config);
+        if (IS_ERR(a-&gt;regmap))
+                return dev_err_probe(dev, PTR_ERR(a-&gt;regmap),
+                                     "regmap init failed\n");
+
+        /* PROVE THE CHIP IS THERE. On SPI this matters even
+           more than on I2C: with no ACK mechanism, a missing
+           device does not fail - it silently returns 0x00 or
+           0xFF forever. Checking a known constant is the only
+           reliable presence test.                            */
+        ret = regmap_read(a-&gt;regmap, ADXL_REG_DEVID, &amp;devid);
+        if (ret)
+                return dev_err_probe(dev, ret, "DEVID read failed\n");
+
+        if (devid != ADXL_DEVID_VALUE)
+                return dev_err_probe(dev, -ENODEV,
+                                     "wrong DEVID 0x%02x (expected 0x%02x)\n",
+                                     devid, ADXL_DEVID_VALUE);
+
+        /* Take the chip out of standby. */
+        ret = regmap_write(a-&gt;regmap, ADXL_REG_POWER_CTL,
+                           ADXL_POWER_MEASURE);
+        if (ret)
+                return dev_err_probe(dev, ret, "power-on failed\n");
+
+        dev_set_drvdata(dev, a);
+        dev_info(dev, "adxl345 on %s CS%d, mode %d, %u Hz\n",
+                 dev_name(&amp;spi-&gt;controller-&gt;dev), spi-&gt;chip_select,
+                 spi-&gt;mode &amp; 0x3, spi-&gt;max_speed_hz);
+        return 0;
+}
+
+static void adxl_remove(struct spi_device *spi)
+{
+        struct adxl *a = spi_get_drvdata(spi);
+
+        /* Put the chip back in standby. devm_ frees the memory,
+           but it cannot know the HARDWARE needs quiescing -
+           anything with a physical side effect is still yours
+           to undo (chapter 33).                              */
+        regmap_write(a-&gt;regmap, ADXL_REG_POWER_CTL, 0x00);
+}
+
+static const struct of_device_id adxl_of_match[] = {
+        { .compatible = "adi,adxl345" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, adxl_of_match);
+
+/* SPI's device-id table is used for module autoloading; the
+   name must match the compatible string's part after the
+   comma, or modprobe will not find the module automatically. */
+static const struct spi_device_id adxl_spi_id[] = {
+        { "adxl345", 0 },
+        { }
+};
+MODULE_DEVICE_TABLE(spi, adxl_spi_id);
+
+static struct spi_driver adxl_driver = {
+        .driver = {
+                .name           = "adxl345-example",
+                .of_match_table = adxl_of_match,
+                .dev_groups     = adxl_groups,
+        },
+        .probe    = adxl_probe,
+        .remove   = adxl_remove,
+        .id_table = adxl_spi_id,
+};
+module_spi_driver(adxl_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Complete example SPI device driver");</code></pre>
+
+<h2 id="rawtransfer">Underneath regmap: the raw transfer API</h2>
+
+<p>regmap covers register-style devices, but plenty of SPI hardware is not a register file at all — displays and radios stream data. For those you drive the transfer API directly, and one rule about buffers catches everybody once.</p>
+
+<pre><code>/* regmap is the right default, but you will read drivers that
+   drive spi_transfer directly - and you need it for anything
+   that is not a register file, such as a display sending
+   pixel streams or a radio sending packets.               */
+
+static int adxl_read_raw(struct spi_device *spi, u8 reg,
+                         u8 *rx, size_t len)
+{
+        u8 cmd = reg | 0xC0;            /* read + multi-byte    */
+        struct spi_transfer xfers[2] = {
+                {
+                        .tx_buf = &amp;cmd,
+                        .len    = 1,
+                },
+                {
+                        .rx_buf = rx,
+                        .len    = len,
+                },
+        };
+        struct spi_message msg;
+
+        spi_message_init(&amp;msg);
+        spi_message_add_tail(&amp;xfers[0], &amp;msg);
+        spi_message_add_tail(&amp;xfers[1], &amp;msg);
+
+        /* ONE spi_message = ONE chip-select assertion covering
+           EVERY transfer in it. That is the whole reason both
+           halves go in one message: splitting them into two
+           spi_sync() calls would drop CS between the command
+           and the data, and the chip would forget which
+           register you asked for.                            */
+        return spi_sync(spi, &amp;msg);
+}
+
+/* THE BUFFER RULE, and it bites everyone once:
+     tx_buf and rx_buf may be used for DMA. A pointer into the
+     KERNEL STACK is not guaranteed DMA-able (chapter 06), so
+     `u8 cmd` above is only safe because the SPI core copies
+     small transfers into a bounce buffer. Anything larger, or
+     anything you want to be certain about, must be kmalloc'd:
+
+        u8 *buf = kmalloc(len, GFP_KERNEL);
+
+     Debug this class of bug by enabling CONFIG_DMA_API_DEBUG. */</code></pre>
+
+<h2 id="vsi2c">SPI versus I2C, from the driver's side</h2>
+
+<p>Both chapters' drivers have the same skeleton, so the differences are worth naming precisely — they are the
+places where copying an I2C driver into an SPI driver goes wrong, and each one follows directly from a
+physical difference in how the two buses are wired rather than from any kernel API choice.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>I2C (chapter 27)</th><th>SPI (this chapter)</th></tr></thead>
+<tbody>
+<tr><td>Device selected by</td><td>A 7-bit address on a shared bus</td><td>A dedicated chip-select
+<em>wire</em>; <code>reg</code> is the CS index</td></tr>
+<tr><td>Presence detection</td><td>The device ACKs, or it does not</td><td><strong>No ACK at all</strong> — a
+missing device reads as <code>0x00</code> or <code>0xFF</code>; you must check a known ID register</td></tr>
+<tr><td>Bus configuration</td><td>Clock rate, shared by every device on the bus</td><td>Per-device speed
+<em>and</em> mode (CPOL/CPHA), because CS isolates them</td></tr>
+<tr><td>Typical speed</td><td>100 kHz – 1 MHz</td><td>1 – 50 MHz, often 10× faster</td></tr>
+<tr><td>Duplex</td><td>Half — command, then turnaround, then data</td><td>Full — both directions on every clock
+edge, which is why <code>tx_buf</code> and <code>rx_buf</code> can both be set</td></tr>
+<tr><td>Atomicity boundary</td><td>One <code>i2c_msg</code> array = one bus lock</td><td>One
+<code>spi_message</code> = one CS assertion</td></tr>
+<tr><td>May sleep</td><td>Yes, always</td><td>Yes, always — same rule, same consequence</td></tr>
+<tr><td>Wiring cost</td><td>2 wires regardless of device count</td><td>3 shared + 1 CS <em>per device</em></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Mode mismatch is the failure that wastes the most time</b>
+<p>If CPOL or CPHA is wrong, SPI does not report an error — there is no protocol-level acknowledgement to fail.
+The transfer completes "successfully" and returns data that is shifted by one bit, entirely zero, or entirely
+<code>0xFF</code>. Because the symptom looks like a dead or wrong chip, people replace hardware over what is a
+one-line device-tree fix. The DEVID check in <code>probe()</code> above exists precisely to convert this silent
+failure into a clear message at load time, and a scope or logic analyser on the clock and data lines
+(<a href="bus-20-debugging-a-bus.html">bus track chapter 20</a>) settles it in seconds.</p>
+</div>
+
+<h2 id="test">Testing it</h2>
+
+<p>SPI gives you no acknowledgement, so a device that is not responding looks exactly like one returning zeros. That makes the order of these checks more important than usual — particularly the last one, which proves the bus itself works before you blame your driver.</p>
+
+<pre><code># 1. Confirm the controller and chip selects exist.
+$ ls /sys/class/spi_master/
+spi0
+$ ls /dev/spidev*                 # only if spidev is bound
+/dev/spidev0.0
+
+# 2. Load and check binding.
+$ sudo insmod adxl345-example.ko
+$ dmesg | tail -1
+adxl345-example spi0.0: adxl345 on spi0 CS0, mode 3, 5000000 Hz
+
+$ ls /sys/bus/spi/drivers/adxl345-example/
+spi0.0  bind  uevent  unbind
+
+# 3. Read the axes.
+$ cat /sys/bus/spi/devices/spi0.0/accel
+-12 7 253                          # X Y Z, raw counts
+
+# 4. Watch the real traffic.
+$ sudo trace-cmd record -e spi cat /sys/bus/spi/devices/spi0.0/accel
+$ trace-cmd report
+   spi_message_start: spi0.0
+   spi_transfer_start: spi0.0 len=1     # the 0xF2 command byte
+   spi_transfer_start: spi0.0 len=6     # the 6-byte burst
+   spi_message_done: spi0.0
+
+# 5. Before blaming the driver, prove the bus works at all.
+# spidev + spidev_test does a loopback (MOSI wired to MISO):
+$ sudo ./spidev_test -D /dev/spidev0.0 -s 5000000
+# Identical TX and RX buffers = wiring, controller and clock
+# are all fine, and the problem is above them.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Every register reads <code>0x00</code> or <code>0xFF</code></td><td>No device responding: wrong chip
+select, wrong mode, or nothing wired — SPI cannot report this itself</td></tr>
+<tr><td>Data is shifted by one bit</td><td>CPHA is wrong — the controller samples on the wrong clock
+edge</td></tr>
+<tr><td>Reads work at 1 MHz and fail at 20 MHz</td><td>Signal integrity or the chip's real maximum — lower
+<code>spi-max-frequency</code></td></tr>
+<tr><td>The chip forgets which register was requested</td><td>Command and data were sent as two
+<code>spi_sync()</code> calls, dropping CS between them</td></tr>
+<tr><td>X, Y and Z are individually valid but inconsistent</td><td>The axes were read as separate transactions
+and updated in between — use one bulk read</td></tr>
+<tr><td>Intermittent corruption with larger transfers</td><td>A stack buffer was handed to a DMA-capable
+transfer — allocate it instead</td></tr>
+<tr><td><code>probe()</code> reports the wrong DEVID</td><td>Working as intended — the presence check caught a
+mode, wiring or chip-select problem at load time</td></tr>
+<tr><td>Two devices on one bus interfere</td><td>They share a chip select, or one drives MISO while
+deselected</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>reg</code> means in an SPI node and how that differs from an I2C node.</li>
+  <li>Explain why an SPI driver must verify a known ID register but an I2C driver has another option.</li>
+  <li>Explain what <code>read_flag_mask</code> does and why it is SPI-specific.</li>
+  <li>Explain why command and data belong in one <code>spi_message</code>.</li>
+  <li>Explain why the three axes must be read in a single bulk transaction.</li>
+  <li>Explain the DMA buffer rule and why a stack buffer is risky.</li>
+  <li>Name four differences between SPI and I2C that change driver code, and the physical reason for
+  each.</li>
+  <li>Diagnose an all-<code>0xFF</code> read: list the checks you would make, in order.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

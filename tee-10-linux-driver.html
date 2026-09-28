@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Linux TEE subsystem | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The Linux TEE subsystem</h1>
+<p class="lead">Linux has a generic TEE framework — <code>drivers/tee/</code> — with OP-TEE as one back end,
+AMD-TEE and Trusty as others. It gives user space a stable ioctl interface and gives kernel code a way to use
+a TA directly, which is how the fTPM driver in <a href="tee-23-project-ftpm-linux.html">chapter 23</a>
+works.</p>
+
+<h2 id="layout">The subsystem</h2>
+
+<p>The kernel side is an ordinary Linux driver, and reading it is the most direct way to see how the abstractions in this track are actually implemented.</p>
+
+<pre class="diagram">   drivers/tee/
+     tee_core.c        the generic layer: device nodes, the
+                       ioctl interface, contexts, sessions
+     tee_shm.c         shared memory objects, dmabuf export
+     tee_shm_pool.c    the allocators
+     optee/
+       core.c          probe, device registration
+       smc_abi.c       the SMC transport (chapter 8)
+       ffa_abi.c       the FF-A transport - for OP-TEE running
+                       as a secure partition under an SPM
+                       (virt chapter 19)
+       call.c          building and issuing optee_msg_arg
+       rpc.c           servicing RPC returns
+       supp.c          the tee-supplicant queue
+       device.c        enumerating TAs as kernel devices
+     amdtee/  tstee/   other back ends
+
+   Two device nodes per TEE:
+
+     /dev/tee0       for ordinary clients
+     /dev/teepriv0   privileged - tee-supplicant uses this one
+
+   Kernel config:
+     CONFIG_TEE=y
+     CONFIG_OPTEE=y
+     CONFIG_OPTEE_INSECURE_LOAD_IMAGE  (n; for loading OP-TEE
+                                        itself from Linux - a
+                                        development feature)</pre>
+
+<h2 id="ioctl">The user-space interface</h2>
+
+<p>The interface the driver exposes to user space is a small set of ioctls, and they map almost directly onto the client API calls the next chapter covers.</p>
+
+<pre><code>/* include/uapi/linux/tee.h - this is the whole ABI, and
+   libteec is a thin wrapper over it.                        */
+
+  TEE_IOC_VERSION          what implementation, what caps
+  TEE_IOC_SHM_ALLOC        allocate shared memory; returns a
+                           file descriptor you mmap
+  TEE_IOC_SHM_REGISTER     register memory you already have
+  TEE_IOC_OPEN_SESSION     open a session to a TA by UUID
+  TEE_IOC_INVOKE           invoke a command
+  TEE_IOC_CANCEL           cancel an in-flight invocation
+  TEE_IOC_CLOSE_SESSION
+  TEE_IOC_SUPPL_RECV       (privileged) wait for an RPC
+  TEE_IOC_SUPPL_SEND       (privileged) answer it
+
+/* A client without libteec, to show there is no magic: */
+
+    int fd = open("/dev/tee0", O_RDWR);
+
+    struct tee_ioctl_version_data ver;
+    ioctl(fd, TEE_IOC_VERSION, &amp;ver);
+    /* ver.impl_id  = TEE_IMPL_ID_OPTEE
+       ver.gen_caps = TEE_GEN_CAP_GP | TEE_GEN_CAP_REG_MEM   */
+
+    /* Shared memory is a file descriptor you mmap. */
+    struct tee_ioctl_shm_alloc_data shm = { .size = 4096 };
+    int shm_fd = ioctl(fd, TEE_IOC_SHM_ALLOC, &amp;shm);
+    void *buf = mmap(NULL, shm.size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, shm_fd, 0);
+
+    /* Open a session. */
+    struct {
+            struct tee_ioctl_open_session_arg arg;
+            struct tee_ioctl_param params[4];
+    } req = {0};
+    memcpy(req.arg.uuid, uuid, 16);
+    req.arg.clnt_login = TEE_IOCTL_LOGIN_PUBLIC;
+    req.arg.num_params = 4;
+
+    struct tee_ioctl_buf_data bd = {
+            .buf_ptr = (uintptr_t)&amp;req,
+            .buf_len = sizeof(req),
+    };
+    ioctl(fd, TEE_IOC_OPEN_SESSION, &amp;bd);
+    /* req.arg.session is now valid; req.arg.ret and
+       req.arg.ret_origin carry the result (chapter 8).      */
+
+/* The shm-as-a-file-descriptor design is deliberate: it makes
+   shared memory a first-class object that can be passed
+   between processes with SCM_RIGHTS, exported as a dmabuf, and
+   reclaimed automatically when the last reference goes.     */</code></pre>
+
+<h2 id="kernel">Using a TA from kernel code</h2>
+
+<p>Kernel code can be a TEE client too, which is how features like disk encryption reach a hardware-backed key without a user-space round trip.</p>
+
+<pre><code>/* The interesting capability, and the one the fTPM depends on.
+   A kernel driver can be a TEE client.                      */
+
+#include &lt;linux/tee_drv.h&gt;
+
+static const uuid_t my_ta_uuid =
+        UUID_INIT(0x12345678, 0x1234, 0x1234,
+                  0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34);
+
+/* Used to find an OP-TEE context among possibly several TEEs. */
+static int optee_match(struct tee_ioctl_version_data *ver,
+                       const void *data)
+{
+        return ver-&gt;impl_id == TEE_IMPL_ID_OPTEE;
+}
+
+struct my_private {
+        struct tee_context *ctx;
+        u32                 session;
+        struct tee_shm     *shm;
+};
+
+static int my_tee_init(struct device *dev, struct my_private *p)
+{
+        struct tee_ioctl_open_session_arg sess_arg = {0};
+        int rc;
+
+        /* 1. Get a context. */
+        p-&gt;ctx = tee_client_open_context(NULL, optee_match,
+                                         NULL, NULL);
+        if (IS_ERR(p-&gt;ctx))
+                return PTR_ERR(p-&gt;ctx);   /* -ENOENT if no TEE  */
+
+        /* 2. Open a session. */
+        export_uuid(sess_arg.uuid, &amp;my_ta_uuid);
+        sess_arg.clnt_login = TEE_IOCTL_LOGIN_REE_KERNEL;
+        sess_arg.num_params = 0;
+
+        rc = tee_client_open_session(p-&gt;ctx, &amp;sess_arg, NULL);
+        if (rc &lt; 0 || sess_arg.ret != 0) {
+                dev_err(dev, "open_session failed %d 0x%x\n",
+                        rc, sess_arg.ret);
+                tee_client_close_context(p-&gt;ctx);
+                return -EINVAL;
+        }
+        p-&gt;session = sess_arg.session;
+
+        /* 3. Allocate shared memory once, reuse it. */
+        p-&gt;shm = tee_shm_alloc_kernel_buf(p-&gt;ctx, 4096);
+        if (IS_ERR(p-&gt;shm)) {
+                tee_client_close_session(p-&gt;ctx, p-&gt;session);
+                tee_client_close_context(p-&gt;ctx);
+                return PTR_ERR(p-&gt;shm);
+        }
+        return 0;
+}
+
+static int my_tee_call(struct my_private *p, u32 cmd,
+                       const void *in, size_t inlen,
+                       void *out, size_t *outlen)
+{
+        struct tee_ioctl_invoke_arg arg = {
+                .func       = cmd,
+                .session    = p-&gt;session,
+                .num_params = 4,
+        };
+        struct tee_param param[4] = {0};
+        void *buf = tee_shm_get_va(p-&gt;shm, 0);
+        int rc;
+
+        if (IS_ERR(buf))
+                return PTR_ERR(buf);
+
+        memcpy(buf, in, inlen);
+
+        param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT;
+        param[0].u.memref.shm      = p-&gt;shm;
+        param[0].u.memref.size     = inlen;
+        param[0].u.memref.shm_offs = 0;
+
+        rc = tee_client_invoke_func(p-&gt;ctx, &amp;arg, param);
+        if (rc &lt; 0 || arg.ret != 0)
+                return -EIO;
+
+        *outlen = param[0].u.memref.size;
+        memcpy(out, buf, *outlen);
+        return 0;
+}
+
+static void my_tee_exit(struct my_private *p)
+{
+        tee_shm_free(p-&gt;shm);
+        tee_client_close_session(p-&gt;ctx, p-&gt;session);
+        tee_client_close_context(p-&gt;ctx);
+}
+
+/* This is, almost exactly, drivers/char/tpm/tpm_ftpm_tee.c.
+   Chapter 23 builds on it.                                  */</code></pre>
+
+<div class="key">
+<b>Login types matter</b>
+<p><code>TEE_IOCTL_LOGIN_REE_KERNEL</code> tells the TA that the caller is the kernel, not a user-space
+process. A TA can act on that — refusing to serve user space, or applying different policy. Other logins are
+<code>PUBLIC</code> (anyone), <code>USER</code> and <code>GROUP</code> (the client's uid/gid is hashed into the
+login identity, so a TA can bind stored data to a specific caller). This is how per-application secure
+storage works; see <a href="tee-15-secure-storage.html">chapter 15</a>.</p>
+</div>
+
+<h2 id="probe">Enumerating TAs as devices</h2>
+
+<p>The driver finds the TEE through the device tree and performs the capability handshake at probe time. When that fails, nothing above it works and the message is easy to miss.</p>
+
+<pre><code>/* drivers/tee/optee/device.c asks OP-TEE for the list of TAs
+   that want a kernel driver, and registers a device for each.
+   A kernel driver then binds by UUID, exactly like PCI.     */
+
+$ ls /sys/bus/tee/devices/
+optee-ta-be2dc9a0-02b4-4b33-ba81-9cce8a6c1e1c   # fTPM
+optee-ta-e33b0e0e-6e2a-4f3b-8f2f-3e8a5a1a2b3c
+
+$ ls /sys/bus/tee/drivers/
+optee-ta-be2dc9a0-02b4-4b33-ba81-9cce8a6c1e1c
+
+/* And a driver: */
+
+static const struct tee_client_device_id my_id_table[] = {
+        { UUID_INIT(0xbe2dc9a0, 0x02b4, 0x4b33,
+                    0xba, 0x81, 0x9c, 0xce,
+                    0x8a, 0x6c, 0x1e, 0x1c) },
+        { }
+};
+MODULE_DEVICE_TABLE(tee, my_id_table);
+
+static struct tee_client_driver my_driver = {
+        .id_table = my_id_table,
+        .driver = {
+                .name  = "my-ta-driver",
+                .bus   = &amp;tee_bus_type,
+                .probe = my_probe,
+                .remove = my_remove,
+        },
+};
+module_driver(my_driver, driver_register, driver_unregister);
+
+/* The TA must declare that it wants this, by setting
+   TA_FLAG_DEVICE_ENUM in its properties (chapter 13). Without
+   that flag it exists but no device node appears, and a kernel
+   driver has nothing to bind to. That is a common and
+   confusing failure.                                        */</code></pre>
+
+<h2 id="debug">Debugging the driver</h2>
+
+<p>Problems here look like a missing device node, a failed handshake or a stalled call, and each has a distinct signature worth recognising.</p>
+
+<pre><code># Dynamic debug across the whole subsystem:
+$ echo 'module optee +p'    | sudo tee /sys/kernel/debug/dynamic_debug/control
+$ echo 'module tee +p'      | sudo tee /sys/kernel/debug/dynamic_debug/control
+$ dmesg -w
+
+# What did probe conclude?
+$ dmesg | grep -E 'optee|tee:'
+optee: probing for conduit method.
+optee: revision 4.1 (0e3e9c9d)
+optee: dynamic shared memory is enabled
+optee: initialized driver
+
+# Who has the TEE open?
+$ sudo lsof /dev/tee0 /dev/teepriv0
+$ sudo fuser -v /dev/tee0
+
+# Where is a hung client blocked?
+$ sudo cat /proc/$(pgrep my_client)/stack
+[&lt;0&gt;] optee_do_call_with_arg+0x...
+[&lt;0&gt;] optee_invoke_func+0x...
+[&lt;0&gt;] tee_ioctl+0x...
+# In optee_do_call_with_arg = waiting on the secure world.
+# Now check tee-supplicant's stack (chapter 9).
+
+# Trace the ioctls a client makes:
+$ strace -e trace=ioctl,openat ./my_client
+
+# ftrace the driver's own functions:
+$ cd /sys/kernel/debug/tracing
+$ echo 'optee_*' | sudo tee set_ftrace_filter
+$ echo function | sudo tee current_tracer
+$ sudo cat trace_pipe</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No <code>/dev/tee0</code></td><td><code>CONFIG_OPTEE</code> off, device tree node missing, or the probe
+handshake failed (<a href="tee-08-smc-abi.html">chapter 8</a>)</td></tr>
+<tr><td><code>tee_client_open_context</code> returns <code>-ENOENT</code></td><td>No TEE registered yet — the
+driver probed after yours. Defer with <code>-EPROBE_DEFER</code></td></tr>
+<tr><td>No device under <code>/sys/bus/tee/devices/</code></td><td>TA missing
+<code>TA_FLAG_DEVICE_ENUM</code></td></tr>
+<tr><td>Kernel driver's session opens, user space's fails</td><td>The TA is checking the login type and
+refusing user space — possibly deliberately</td></tr>
+<tr><td>Client blocked in <code>optee_do_call_with_arg</code></td><td>Waiting on the secure world; look at
+<code>tee-supplicant</code> next</td></tr>
+<tr><td><code>tee_shm_alloc</code> fails</td><td>Static SHM pool exhausted; free shared memory or enable
+dynamic SHM</td></tr>
+<tr><td>Works in user space, fails from the kernel</td><td>Kernel buffers must come from
+<code>tee_shm_alloc_kernel_buf</code>, not <code>kmalloc</code></td></tr>
+<tr><td>Session leaks after a driver unload</td><td>Missing <code>tee_client_close_session</code>/
+<code>close_context</code> in the remove path</td></tr>
+<tr><td>Different behaviour under a hypervisor</td><td>The FF-A transport is in use rather than the SMC
+one</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the generic layer and three back ends, and say what the generic layer provides.</li>
+  <li>Explain the difference between <code>/dev/tee0</code> and <code>/dev/teepriv0</code>.</li>
+  <li>List the ioctls and say which two are privileged.</li>
+  <li>Explain why shared memory is exposed as a file descriptor.</li>
+  <li>Write the kernel-side sequence to open a context, open a session and invoke a command.</li>
+  <li>Explain what login types exist and what a TA can do with them.</li>
+  <li>Say what <code>TA_FLAG_DEVICE_ENUM</code> enables and what fails without it.</li>
+  <li>Bind a kernel driver to a TA by UUID.</li>
+  <li>Determine, for a hung client, whether it is blocked in the secure world.</li>
+  <li>Explain why a kernel client must not pass a <code>kmalloc</code> buffer directly.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

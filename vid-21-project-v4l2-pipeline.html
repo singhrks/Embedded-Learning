@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a capture-to-encode pipeline | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a capture-to-encode pipeline</h1>
+<p class="lead">A complete program: capture NV12 from a V4L2 camera, encode it with a hardware codec, and mux
+it to a file — with the frames never once copied by the CPU. Everything in this track appears here at
+once, and the zero-copy path is the part that makes it worth building rather than downloading.</p>
+
+<h2 id="shape">What we are building</h2>
+
+<pre class="diagram">   /dev/video0            /dev/video11           out.mp4
+   CAMERA                 HARDWARE ENCODER
+   V4L2 capture           V4L2 M2M
+        |                      |
+        |  VIDIOC_EXPBUF       |
+        |  -> dmabuf fd        |
+        +--------------------->|  OUTPUT queue
+                               |  V4L2_MEMORY_DMABUF
+                               |
+                               |  the encoder reads the
+                               |  CAMERA'S buffer directly.
+                               |  ZERO COPIES.
+                               |
+                               |  CAPTURE queue
+                               |  -> H.264 bitstream
+                               v
+                          userspace: mux to MP4
+
+   THE PROPERTY WE ARE ENFORCING
+     the CPU never touches a pixel. It moves file descriptors
+     and a few hundred bytes of bitstream per frame.
+
+   THE MEASUREMENT THAT PROVES IT
+     at 1080p30 NV12, one copy is 93 MB/s. A naive pipeline
+     does three or four (chapter 16). We will measure memory
+     bandwidth and CPU and show both are near zero.
+
+   TARGET: a Raspberry Pi 4/5, a Rockchip or i.MX board, or
+   any x86 machine with a UVC camera and VA-API. The V4L2 code
+   is identical; only the device node changes.</pre>
+
+<h2 id="abi">The shared header</h2>
+
+<pre><code>/* pipeline.h */
+
+#ifndef PIPELINE_H
+#define PIPELINE_H
+
+#include &lt;linux/videodev2.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdbool.h&gt;
+
+#define MAX_BUFS 8
+
+struct buf {
+        void    *start;      /* mmap'd, only for MMAP bufs   */
+        size_t   length;
+        int      dmabuf_fd;  /* -1 if not exported           */
+};
+
+struct stream {
+        int      fd;
+        enum v4l2_buf_type type;
+        enum v4l2_memory   memory;
+        struct buf bufs[MAX_BUFS];
+        unsigned n;
+        uint32_t fourcc;
+        int      width, height;
+        int      stride;      /* NOT width (chapter 1)        */
+};
+
+/* Every ioctl retries on EINTR (chapter 17). */
+int xioctl(int fd, unsigned long req, void *arg);
+
+#endif</code></pre>
+
+<h2 id="capture">The capture side</h2>
+
+<pre><code>/* capture.c - open the camera, export its buffers as dmabufs.
+   The EXPBUF call is what makes zero-copy possible. */
+
+#include "pipeline.h"
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+
+int xioctl(int fd, unsigned long req, void *arg)
+{
+        int r;
+        do { r = ioctl(fd, req, arg); }
+        while (r == -1 &amp;&amp; errno == EINTR);
+        return r;
+}
+
+int capture_open(struct stream *s, const char *dev,
+                 int w, int h, unsigned nbuf)
+{
+        s-&gt;fd = open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (s-&gt;fd &lt; 0) { perror(dev); return -1; }
+
+        s-&gt;type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        s-&gt;memory = V4L2_MEMORY_MMAP;   /* the DRIVER
+                                           allocates, and we
+                                           export what it gave
+                                           us                 */
+
+        struct v4l2_capability cap = {0};
+        if (xioctl(s-&gt;fd, VIDIOC_QUERYCAP, &amp;cap) &lt; 0) return -1;
+        if (!(cap.capabilities &amp; V4L2_CAP_STREAMING)) {
+                fprintf(stderr, "no streaming support\n");
+                return -1;
+        }
+
+        struct v4l2_format fmt = {0};
+        fmt.type = s-&gt;type;
+        fmt.fmt.pix.width       = w;
+        fmt.fmt.pix.height      = h;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+        fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+        if (xioctl(s-&gt;fd, VIDIOC_S_FMT, &amp;fmt) &lt; 0) return -1;
+
+        /* READ BACK WHAT YOU GOT. The driver may have chosen
+           something else entirely (chapter 17). */
+        s-&gt;width  = fmt.fmt.pix.width;
+        s-&gt;height = fmt.fmt.pix.height;
+        s-&gt;stride = fmt.fmt.pix.bytesperline;
+        s-&gt;fourcc = fmt.fmt.pix.pixelformat;
+
+        if (s-&gt;fourcc != V4L2_PIX_FMT_NV12) {
+                fprintf(stderr, "camera gave %.4s, not NV12 - "
+                        "a conversion will be needed\n",
+                        (char *)&amp;s-&gt;fourcc);
+                /* Do not silently continue. Either accept the
+                   conversion cost deliberately, or pick a
+                   camera mode that gives you NV12. */
+        }
+
+        struct v4l2_requestbuffers req = {0};
+        req.count  = nbuf;
+        req.type   = s-&gt;type;
+        req.memory = s-&gt;memory;
+        if (xioctl(s-&gt;fd, VIDIOC_REQBUFS, &amp;req) &lt; 0) return -1;
+        s-&gt;n = req.count;         /* may be fewer than asked  */
+
+        for (unsigned i = 0; i &lt; s-&gt;n; i++) {
+                struct v4l2_buffer b = {0};
+                b.type = s-&gt;type; b.memory = s-&gt;memory; b.index = i;
+                if (xioctl(s-&gt;fd, VIDIOC_QUERYBUF, &amp;b) &lt; 0) return -1;
+
+                s-&gt;bufs[i].length = b.length;
+                s-&gt;bufs[i].start  = mmap(NULL, b.length,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_SHARED, s-&gt;fd, b.m.offset);
+                /* We mmap only so we CAN look at pixels while
+                   debugging. The fast path never dereferences
+                   this pointer. */
+
+                /* THE KEY CALL: hand me a file descriptor
+                   representing this buffer, so another driver
+                   can import the same memory. */
+                struct v4l2_exportbuffer exp = {0};
+                exp.type  = s-&gt;type;
+                exp.index = i;
+                exp.flags = O_CLOEXEC | O_RDWR;
+                if (xioctl(s-&gt;fd, VIDIOC_EXPBUF, &amp;exp) &lt; 0) {
+                        perror("EXPBUF - no dmabuf export, so "
+                               "no zero-copy on this driver");
+                        return -1;
+                }
+                s-&gt;bufs[i].dmabuf_fd = exp.fd;
+        }
+        return 0;
+}
+
+int capture_start(struct stream *s)
+{
+        for (unsigned i = 0; i &lt; s-&gt;n; i++) {
+                struct v4l2_buffer b = {0};
+                b.type = s-&gt;type; b.memory = s-&gt;memory; b.index = i;
+                if (xioctl(s-&gt;fd, VIDIOC_QBUF, &amp;b) &lt; 0) return -1;
+        }
+        return xioctl(s-&gt;fd, VIDIOC_STREAMON, &amp;s-&gt;type);
+}</code></pre>
+
+<div class="key">
+<b><code>VIDIOC_EXPBUF</code> is the whole project</b>
+<p>It turns a driver-allocated buffer into a file descriptor that any other driver can import. Without it you
+must <code>mmap</code> the camera buffer, <code>memcpy</code> into an encoder buffer, and pay 93 MB/s at
+1080p30 — plus a second copy if the encoder cannot take your memory either. A driver that does not implement
+<code>EXPBUF</code> cannot participate in a zero-copy pipeline at all, and that is worth discovering at
+design time rather than after the code is written.</p>
+</div>
+
+<h2 id="encoder">The encoder side</h2>
+
+<pre><code>/* encoder.c - a V4L2 M2M encoder whose OUTPUT queue imports
+   the camera's dmabufs. */
+
+int encoder_open(struct stream *out, struct stream *cap_out,
+                 const struct stream *cam, int bitrate)
+{
+        int fd = open("/dev/video11", O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd &lt; 0) { perror("encoder"); return -1; }
+        out-&gt;fd = cap_out-&gt;fd = fd;   /* one device, two queues */
+
+        /* --- OUTPUT queue: raw frames IN.
+               "OUTPUT" is from the APPLICATION's point of view
+               (chapter 17). --- */
+        out-&gt;type   = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        out-&gt;memory = V4L2_MEMORY_DMABUF;      /* &lt;-- import   */
+
+        struct v4l2_format f = {0};
+        f.type = out-&gt;type;
+        f.fmt.pix_mp.width        = cam-&gt;width;
+        f.fmt.pix_mp.height       = cam-&gt;height;
+        f.fmt.pix_mp.pixelformat  = V4L2_PIX_FMT_NV12;
+        f.fmt.pix_mp.field        = V4L2_FIELD_NONE;
+        f.fmt.pix_mp.num_planes   = 1;   /* NV12 is often ONE
+                                            plane with the UV
+                                            after the Y - not
+                                            two. Check
+                                            num_planes after
+                                            S_FMT.            */
+        f.fmt.pix_mp.plane_fmt[0].bytesperline = cam-&gt;stride;
+        if (xioctl(fd, VIDIOC_S_FMT, &amp;f) &lt; 0) return -1;
+
+        /* --- CAPTURE queue: compressed bitstream OUT --- */
+        cap_out-&gt;type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        cap_out-&gt;memory = V4L2_MEMORY_MMAP;
+
+        struct v4l2_format g = {0};
+        g.type = cap_out-&gt;type;
+        g.fmt.pix_mp.width       = cam-&gt;width;
+        g.fmt.pix_mp.height      = cam-&gt;height;
+        g.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
+        g.fmt.pix_mp.num_planes  = 1;
+        /* YOU size the bitstream buffer. Too small and frames
+           are truncated - a keyframe is 10-20x a P-frame
+           (chapter 10), so size for the keyframe. */
+        g.fmt.pix_mp.plane_fmt[0].sizeimage = 2 * 1024 * 1024;
+        if (xioctl(fd, VIDIOC_S_FMT, &amp;g) &lt; 0) return -1;
+
+        /* --- controls: rate control and GOP (chapters 10, 13) */
+        struct v4l2_control c;
+        c.id = V4L2_CID_MPEG_VIDEO_BITRATE;        c.value = bitrate;
+        xioctl(fd, VIDIOC_S_CTRL, &amp;c);
+        c.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
+        c.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+        xioctl(fd, VIDIOC_S_CTRL, &amp;c);
+        c.id = V4L2_CID_MPEG_VIDEO_GOP_SIZE;       c.value = 30;
+        xioctl(fd, VIDIOC_S_CTRL, &amp;c);
+        c.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
+        c.value = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+        xioctl(fd, VIDIOC_S_CTRL, &amp;c);
+        /* REPEAT THE HEADERS before every keyframe, or a
+           player tuning in mid-stream has no SPS/PPS
+           (chapter 10). */
+        c.id = V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER; c.value = 1;
+        xioctl(fd, VIDIOC_S_CTRL, &amp;c);
+        /* Not every driver implements every control. Check the
+           return, and do not assume silence means success. */
+
+        /* --- buffers ---
+           OUTPUT: DMABUF, so REQBUFS allocates only the
+           bookkeeping, not memory. */
+        struct v4l2_requestbuffers r = {0};
+        r.count = cam-&gt;n; r.type = out-&gt;type; r.memory = out-&gt;memory;
+        if (xioctl(fd, VIDIOC_REQBUFS, &amp;r) &lt; 0) return -1;
+        out-&gt;n = r.count;
+
+        /* CAPTURE: MMAP, and we DO read these - they are the
+           bitstream, a few hundred KB per second, not pixels. */
+        struct v4l2_requestbuffers r2 = {0};
+        r2.count = 4; r2.type = cap_out-&gt;type; r2.memory = cap_out-&gt;memory;
+        if (xioctl(fd, VIDIOC_REQBUFS, &amp;r2) &lt; 0) return -1;
+        cap_out-&gt;n = r2.count;
+
+        for (unsigned i = 0; i &lt; cap_out-&gt;n; i++) {
+                struct v4l2_plane p = {0};
+                struct v4l2_buffer b = {0};
+                b.type = cap_out-&gt;type; b.memory = cap_out-&gt;memory;
+                b.index = i; b.m.planes = &amp;p; b.length = 1;
+                if (xioctl(fd, VIDIOC_QUERYBUF, &amp;b) &lt; 0) return -1;
+                cap_out-&gt;bufs[i].length = p.length;
+                cap_out-&gt;bufs[i].start  = mmap(NULL, p.length,
+                        PROT_READ | PROT_WRITE, MAP_SHARED,
+                        fd, p.m.mem_offset);
+                if (xioctl(fd, VIDIOC_QBUF, &amp;b) &lt; 0) return -1;
+        }
+
+        if (xioctl(fd, VIDIOC_STREAMON, &amp;out-&gt;type) &lt; 0) return -1;
+        if (xioctl(fd, VIDIOC_STREAMON, &amp;cap_out-&gt;type) &lt; 0) return -1;
+        return 0;
+}</code></pre>
+
+<h2 id="loop">The loop</h2>
+
+<pre><code>/* main.c - three file descriptors, one poll, no pixel copies. */
+
+int run(struct stream *cam, struct stream *enc_in,
+        struct stream *enc_out, FILE *sink)
+{
+        /* Map camera buffer index -> encoder buffer index.
+           They are separate index spaces; the DMABUF fd is
+           what actually links them. */
+        int cam_of_enc[MAX_BUFS];
+        for (unsigned i = 0; i &lt; MAX_BUFS; i++) cam_of_enc[i] = -1;
+
+        unsigned free_enc = enc_in-&gt;n;   /* encoder input slots */
+        uint64_t frames = 0;
+
+        for (;;) {
+                struct pollfd p[2] = {
+                        { .fd = cam-&gt;fd,     .events = POLLIN },
+                        { .fd = enc_out-&gt;fd, .events = POLLIN },
+                };
+                if (poll(p, 2, 1000) &lt;= 0) continue;
+
+                /* ---- a camera frame is ready ---- */
+                if ((p[0].revents &amp; POLLIN) &amp;&amp; free_enc &gt; 0) {
+                        struct v4l2_buffer cb = {0};
+                        cb.type = cam-&gt;type; cb.memory = cam-&gt;memory;
+                        if (xioctl(cam-&gt;fd, VIDIOC_DQBUF, &amp;cb) &lt; 0)
+                                continue;
+
+                        /* Hand the SAME MEMORY to the encoder,
+                           by file descriptor. No copy. */
+                        unsigned slot = cb.index;   /* 1:1 here */
+                        struct v4l2_plane pl = {0};
+                        struct v4l2_buffer eb = {0};
+                        eb.type      = enc_in-&gt;type;
+                        eb.memory    = V4L2_MEMORY_DMABUF;
+                        eb.index     = slot;
+                        eb.m.planes  = &amp;pl;
+                        eb.length    = 1;
+                        pl.m.fd      = cam-&gt;bufs[cb.index].dmabuf_fd;
+                        pl.bytesused = cb.bytesused;
+                        pl.length    = cam-&gt;bufs[cb.index].length;
+
+                        /* CARRY THE CAPTURE TIMESTAMP THROUGH.
+                           Do not stamp frames when your code
+                           happens to run (chapter 15). */
+                        eb.timestamp = cb.timestamp;
+                        eb.flags     = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+
+                        if (xioctl(enc_in-&gt;fd, VIDIOC_QBUF, &amp;eb) &lt; 0) {
+                                /* give the camera buffer back
+                                   even on failure, or we leak
+                                   it and the camera starves */
+                                xioctl(cam-&gt;fd, VIDIOC_QBUF, &amp;cb);
+                                continue;
+                        }
+                        cam_of_enc[slot] = cb.index;
+                        free_enc--;
+                }
+
+                /* ---- an encoded frame is ready ---- */
+                if (p[1].revents &amp; POLLIN) {
+                        struct v4l2_plane pl = {0};
+                        struct v4l2_buffer ob = {0};
+                        ob.type     = enc_out-&gt;type;
+                        ob.memory   = enc_out-&gt;memory;
+                        ob.m.planes = &amp;pl;
+                        ob.length   = 1;
+                        if (xioctl(enc_out-&gt;fd, VIDIOC_DQBUF, &amp;ob) == 0) {
+                                fwrite(enc_out-&gt;bufs[ob.index].start,
+                                       1, pl.bytesused, sink);
+                                /* pl.bytesused only - the buffer
+                                   is 2 MB and the frame is not */
+                                xioctl(enc_out-&gt;fd, VIDIOC_QBUF, &amp;ob);
+                                frames++;
+                        }
+
+                        /* Reclaim the OUTPUT buffer the encoder
+                           has finished reading, and return the
+                           camera buffer it was pointing at. */
+                        struct v4l2_plane ipl = {0};
+                        struct v4l2_buffer ib = {0};
+                        ib.type     = enc_in-&gt;type;
+                        ib.memory   = V4L2_MEMORY_DMABUF;
+                        ib.m.planes = &amp;ipl;
+                        ib.length   = 1;
+                        if (xioctl(enc_in-&gt;fd, VIDIOC_DQBUF, &amp;ib) == 0) {
+                                int ci = cam_of_enc[ib.index];
+                                if (ci &gt;= 0) {
+                                        struct v4l2_buffer cb = {0};
+                                        cb.type   = cam-&gt;type;
+                                        cb.memory = cam-&gt;memory;
+                                        cb.index  = ci;
+                                        xioctl(cam-&gt;fd, VIDIOC_QBUF, &amp;cb);
+                                        cam_of_enc[ib.index] = -1;
+                                }
+                                free_enc++;
+                        }
+                }
+        }
+}
+
+/* THE BUFFER DISCIPLINE, which is the part that goes wrong:
+
+   A camera buffer is IN USE from the moment the encoder
+   accepts it until the encoder returns the OUTPUT buffer.
+   Requeue it to the camera before that and the encoder reads
+   a frame the sensor is overwriting - producing tearing that
+   looks like a decoder bug.
+
+   And if you never requeue, the camera runs out of buffers
+   and starts dropping frames silently. Watch
+   v4l2_buffer.sequence for gaps (chapter 17).            */</code></pre>
+
+<div class="warn">
+<b>The elementary stream is not a file anyone can play</b>
+<p><code>out.h264</code> is raw Annex B — no container, no timestamps, no duration. It plays in ffmpeg because
+ffmpeg guesses a frame rate, and it will not play in most players or seek at all. Mux it. The
+<code>-r</code> below is a claim about frame rate, not a measurement; for variable-rate capture you must carry
+the real timestamps through and mux from those (<a href="vid-15-containers-sync.html">chapter 15</a>).</p>
+</div>
+
+<h2 id="run">Building and running</h2>
+
+<pre><code>$ gcc -O2 -Wall -o pipeline main.c capture.c encoder.c
+$ ./pipeline /dev/video0 /dev/video11 out.h264
+
+# Find the encoder node - it is not always video11:
+$ for d in /dev/video*; do
+    echo -n "$d: "
+    v4l2-ctl -d $d --info | grep -i 'card type' | cut -d: -f2
+  done
+/dev/video0:  Integrated Camera
+/dev/video11: bcm2835-codec-encode      &lt;-- this one
+
+$ v4l2-ctl -d /dev/video11 --list-formats-ext --all | head -30
+# Confirm it accepts NV12 in and H264 out, and check the
+# DMABUF capability:
+$ v4l2-ctl -d /dev/video11 --info | grep -i 'streaming\|m2m'
+
+# Mux the elementary stream:
+$ ffmpeg -r 30 -i out.h264 -c:v copy -movflags +faststart out.mp4
+
+# VERIFY IT IS ACTUALLY CORRECT (chapter 20):
+$ ffmpeg -v error -i out.mp4 -f null -            # silence = clean
+$ ffprobe -select_streams v -show_entries \
+    frame=pict_type,pkt_size -of csv=p=0 out.mp4 | head
+I,84213
+P,3241
+P,2988
+# I-frame 25x a P-frame. Prediction is working (chapter 9).
+
+# PROVE THE ZERO COPY - this is the point of the exercise.
+$ pidstat -p $(pidof pipeline) 1 5
+# CPU should be 1-3%. If it is 40%, something is copying.
+
+$ sudo perf stat -e uncore_imc/data_reads/,uncore_imc/data_writes/ \
+    -a -- sleep 10
+# At 1080p30 NV12 the FLOOR is:
+#   camera writes    93 MB/s
+#   encoder reads    93 MB/s
+#   encoder writes   ~0.5 MB/s (the bitstream)
+# ~190 MB/s total. If you measure 400+, there is a hidden
+# copy (chapter 16).
+
+$ sudo perf top -p $(pidof pipeline)
+# You should see poll and ioctl. If memcpy or a yuv2rgb
+# routine appears, the fast path is not being taken.</code></pre>
+
+<h2 id="extend">Extensions worth doing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Exercise</th><th>What it teaches</th></tr></thead>
+<tbody>
+<tr><td>Mux to fragmented MP4 in-process rather than writing Annex B</td><td>Timestamps, timebases and
+<code>+faststart</code> (<a href="vid-15-containers-sync.html">ch 15</a>)</td></tr>
+<tr><td>Add a preview: import the same dmabuf into a DRM plane</td><td>The full zero-copy display path
+(<a href="vid-18-drm-kms.html">ch 18</a>)</td></tr>
+<tr><td>Carry the camera's real timestamps into the container</td><td>Why VFR breaks naive
+muxers</td></tr>
+<tr><td>Handle a resolution change mid-stream</td><td><code>SOURCE_CHANGE</code>, and the reallocation dance
+(<a href="vid-17-v4l2.html">ch 17</a>)</td></tr>
+<tr><td>Implement the drain on Ctrl-C</td><td><code>ENC_CMD_STOP</code> and
+<code>BUF_FLAG_LAST</code> — without it you lose the last frames</td></tr>
+<tr><td>Force a keyframe on demand</td><td><code>V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME</code>, and why a
+streaming server needs it</td></tr>
+<tr><td>Compare hardware output with <code>x264 --preset slow</code> at equal VMAF</td><td>The 20–50% penalty,
+measured on your own hardware (<a href="vid-16-hardware-codecs.html">ch 16</a>)</td></tr>
+<tr><td>Deliberately requeue the camera buffer too early</td><td>Reproduce the tearing, so you recognise it
+later</td></tr>
+<tr><td>Set the buffer count to 2 and watch <code>sequence</code></td><td>Frame drops, and why buffer count is
+a latency dial</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>EXPBUF</code> returns <code>ENOTTY</code></td><td>Driver has no dmabuf export — zero-copy is
+impossible; you must copy</td></tr>
+<tr><td><code>QBUF</code> on the encoder returns <code>EINVAL</code></td><td>Single-planar structs against a
+multiplanar device, or a stride mismatch</td></tr>
+<tr><td>Tearing, half of two different frames</td><td>Camera buffer requeued before the encoder finished
+with it</td></tr>
+<tr><td>Frames dropped, <code>sequence</code> has gaps</td><td>Too few buffers, or buffers held too
+long</td></tr>
+<tr><td>Output file is truncated garbage</td><td><code>sizeimage</code> too small for a keyframe</td></tr>
+<tr><td>Player will not open <code>out.h264</code></td><td>Elementary stream — mux it</td></tr>
+<tr><td>Stream will not play from the middle</td><td><code>REPEAT_SEQ_HEADER</code> not set</td></tr>
+<tr><td>CPU at 40% instead of 2%</td><td>A copy somewhere — check <code>perf top</code> for
+<code>memcpy</code></td></tr>
+<tr><td>Camera gives YUYV, not NV12</td><td>The mode does not exist; a conversion is unavoidable — choose it
+deliberately</td></tr>
+<tr><td>Last second of video missing</td><td>No drain at exit</td></tr>
+<tr><td>Works at 1920×1080, fails at 1280×720</td><td>Stride assumption; read <code>bytesperline</code>
+back</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the pipeline and say where a copy would occur without <code>EXPBUF</code>.</li>
+  <li>Explain what <code>VIDIOC_EXPBUF</code> produces and why it enables zero-copy.</li>
+  <li>Say why the encoder's OUTPUT queue uses <code>V4L2_MEMORY_DMABUF</code> while its CAPTURE queue uses
+  <code>MMAP</code>.</li>
+  <li>Explain why the camera buffer must not be requeued until the encoder returns its OUTPUT
+  buffer.</li>
+  <li>Say how to detect dropped frames, and what causes them.</li>
+  <li>Explain why <code>sizeimage</code> must be sized for a keyframe.</li>
+  <li>Say why <code>REPEAT_SEQ_HEADER</code> matters for a stream someone joins late.</li>
+  <li>Compute the memory bandwidth floor for 1080p30 NV12 and say what a higher figure means.</li>
+  <li>Give two ways to prove the CPU is not touching pixels.</li>
+  <li>Explain why the raw <code>.h264</code> is not a playable file.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matrix multiplication: the core operation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Matrix multiplication: the core operation</h1>
+<p class="lead">Well over 90% of the arithmetic in training or running a neural network is matrix
+multiplication. This chapter is the one an embedded engineer will find most familiar — it is a memory
+hierarchy problem wearing a mathematics costume.</p>
+
+<h2 id="def">The definition</h2>
+
+<p>The definition looks arbitrary until you connect it to the previous chapter's view of matrices as functions — at which point it is forced rather than chosen.</p>
+
+<pre class="diagram">   A is (m, k)     B is (k, n)     C = A @ B is (m, n)
+
+        C_ij = sum over p of  A_ip * B_pj
+
+   IN WORDS: element (i, j) of the result is ROW i OF A
+   dotted with COLUMN j OF B.
+
+   THE INNER DIMENSIONS MUST MATCH. That is the only rule,
+   and it is the rule your shape errors are about:
+
+        (m, k) @ (k, n) -> (m, n)
+             ^^^^^^^ these must be equal
+        ^^^          ^^^ these survive
+
+   A WORKED 2x3 @ 3x2:
+
+     A = [1 2 3]        B = [ 7  8]
+         [4 5 6]            [ 9 10]
+                            [11 12]
+
+     C_00 = 1*7 + 2*9  + 3*11 = 7 + 18 + 33 = 58
+     C_01 = 1*8 + 2*10 + 3*12 = 8 + 20 + 36 = 64
+     C_10 = 4*7 + 5*9  + 6*11 = 28 + 45 + 66 = 139
+     C_11 = 4*8 + 5*10 + 6*12 = 32 + 50 + 72 = 154
+
+     C = [ 58  64]
+         [139 154]
+
+   DO THIS ONCE BY HAND. It is the last time you will need
+   the index formula, and it makes every shape error
+   afterwards obvious.
+
+   PROPERTIES:
+     ASSOCIATIVE     (AB)C = A(BC)   <- and the grouping
+                                        changes the COST
+                                        enormously
+     DISTRIBUTIVE    A(B+C) = AB + AC
+     NOT COMMUTATIVE AB != BA        <- usually not even the
+                                        same shape
+     TRANSPOSE       (AB)^T = B^T A^T   <- note the reversal;
+                                           this shows up
+                                           constantly in
+                                           backpropagation
+                                           (chapter 07)</pre>
+
+<h2 id="cost">What it costs</h2>
+
+<p>This is the operation your hardware spends almost all its time on, so its cost is worth knowing precisely rather than approximately. The numbers below are the ones to have in your head.</p>
+
+<pre><code>/* (m, k) @ (k, n) requires  m * n * k  multiply-accumulates.
+
+   FOR A TRANSFORMER LAYER with d_model = 4096 and a batch
+   of 1024 tokens:
+     the QKV projection:  1024 x 4096 x 12288
+                          = 51.5 GFLOP-pairs, i.e. ~103
+                            GFLOPs counting multiply and add
+
+   AND A FULL FORWARD PASS of a 70-billion-parameter model
+   on one token is roughly 2 * 70e9 = 140 GFLOPs. THE RULE
+   OF THUMB WORTH MEMORISING:
+
+     inference FLOPs  ~=  2 * (number of parameters) * tokens
+     training FLOPs   ~=  6 * (number of parameters) * tokens
+
+   The factor of 6 is: 2 for the forward pass, 4 for the
+   backward pass (which computes two gradients per weight).
+   This single formula is how every training-cost estimate
+   in every paper is produced, and it is used again in
+   chapter 23.
+
+/* --- THE NAIVE IMPLEMENTATION --- */
+    for (i = 0; i &lt; m; i++)
+      for (j = 0; j &lt; n; j++) {
+        float s = 0;
+        for (p = 0; p &lt; k; p++)
+            s += A[i*k + p] * B[p*n + j];   /* &lt;-- B IS
+                                                   STRIDED */
+        C[i*n + j] = s;
+      }
+
+/* THIS IS CORRECT AND SLOW, and the reason is entirely
+   familiar to an embedded engineer:
+
+   A[i*k + p]   walks CONTIGUOUSLY. Good: one cache miss
+                per line, then hits.
+   B[p*n + j]   jumps n floats every iteration. EVERY ACCESS
+                IS A CACHE MISS on a large matrix.
+
+   With n = 4096 and 64-byte lines, each B access pulls in a
+   line and uses 4 bytes of it. YOU ARE RUNNING AT 1/16 OF
+   MEMORY BANDWIDTH before you even count latency.
+
+/* --- FIX 1: LOOP REORDERING (ikj) --- */
+    for (i = 0; i &lt; m; i++)
+      for (p = 0; p &lt; k; p++) {
+        float a = A[i*k + p];
+        for (j = 0; j &lt; n; j++)
+            C[i*n + j] += a * B[p*n + j];  /* BOTH
+                                              CONTIGUOUS */
+      }
+    /* 2-5x faster for a one-line change, purely from access
+       pattern. Vectorises cleanly too. */
+
+/* --- FIX 2: BLOCKING / TILING --- */
+    Work on TILES that fit in cache. Load a tile of A and a
+    tile of B, compute all the products they contribute to,
+    then move on.
+
+    for (ii = 0; ii &lt; m; ii += BS)
+      for (pp = 0; pp &lt; k; pp += BS)
+        for (jj = 0; jj &lt; n; jj += BS)
+          /* multiply the BS x BS blocks */
+
+    Choose BS so three BS x BS tiles fit in L1 or L2. This
+    turns an O(m*n*k) memory-traffic problem into
+    O(m*n*k / BS), and it is THE reason a tuned BLAS is 10-50x
+    faster than the naive loop.
+
+/* --- FIX 3: SIMD --- */
+    NEON on ARM, AVX on x86. Eight or sixteen MACs per
+    instruction.
+
+    #include &lt;arm_neon.h&gt;
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (p = 0; p &lt; k; p += 4) {
+        float32x4_t va = vld1q_f32(&amp;A[i*k + p]);
+        float32x4_t vb = vld1q_f32(&amp;B[p*n + j]);
+        acc = vfmaq_f32(acc, va, vb);   /* fused
+                                           multiply-add */
+    }
+
+/* --- FIX 4: DEDICATED HARDWARE --- */
+    GPU tensor cores, ARM SME, NPU MAC arrays, systolic
+    arrays. All of them are "do a small matrix multiply as
+    one instruction". A systolic array flows data through a
+    grid of MAC units so each value loaded from memory is
+    REUSED by many multipliers - the same tiling idea,
+    implemented in silicon.
+
+/* --- AND THE POINT --- */
+    NEVER WRITE YOUR OWN MATMUL FOR PRODUCTION. Use BLAS,
+    cuBLAS, oneDNN, CMSIS-NN, or whatever your NPU vendor
+    ships. Write one once to understand it, then never
+    again.
+
+    But DO understand the cost model, because it explains
+    every performance decision in the rest of this track.  */</code></pre>
+
+<h2 id="bound">Compute bound and memory bound</h2>
+
+<p>Two workloads with identical arithmetic can differ by an order of magnitude in speed, and the reason is almost never the arithmetic. This distinction is the one that explains most performance surprises in inference.</p>
+
+<pre class="diagram">   ARITHMETIC INTENSITY = FLOPs performed / bytes moved
+
+   FOR A SQUARE (n,n) @ (n,n) MATMUL:
+     FLOPs  = 2 n^3
+     bytes  = 3 n^2 * 4      (two inputs, one output, fp32)
+     intensity = 2n / 12  ~= n / 6
+
+   SO INTENSITY GROWS WITH n. Big matmuls are COMPUTE BOUND;
+   the hardware can keep its multipliers busy.
+
+   FOR A MATRIX-VECTOR PRODUCT (n,n) @ (n,1):
+     FLOPs  = 2 n^2
+     bytes  = n^2 * 4        (the matrix dominates)
+     intensity ~= 0.5
+
+   CONSTANT, AND TINY. Matrix-vector is MEMORY BOUND: you
+   read each weight once, use it twice, and throw it away.
+
+   THE ROOFLINE:
+
+     performance
+        ^
+        |          _____________ peak compute
+        |         /
+        |        /   COMPUTE BOUND
+        |       /
+        |      /
+        |     /  MEMORY BOUND
+        |    /   (slope = memory bandwidth)
+        |   /
+        +--/------------------------> arithmetic intensity
+           ^
+           the ridge point
+
+   WHY THIS EXPLAINS LLM INFERENCE:
+
+     PREFILL (processing the prompt) does matrix-MATRIX
+       products over all prompt tokens at once. COMPUTE
+       BOUND. Fast per token.
+
+     DECODE (generating one token at a time) does
+       matrix-VECTOR products - batch of one. MEMORY BOUND.
+       Every weight in the model must be read from memory to
+       produce ONE token.
+
+   FOR A 70B MODEL IN fp16 THAT IS 140 GB READ PER TOKEN. At
+   2 TB/s of HBM bandwidth, that is ~70 ms per token, ~14
+   tokens/second - AND THE ARITHMETIC UNITS ARE MOSTLY IDLE.
+
+   THIS SINGLE FACT DRIVES:
+     · QUANTISATION (chapter 26) - int4 weights means 1/4 the
+       bytes, so ~4x the tokens per second. The speedup comes
+       from BANDWIDTH, not from faster arithmetic.
+     · BATCHING - serve 32 requests together and the weight
+       read is amortised across 32 tokens
+     · SPECULATIVE DECODING - a small model proposes several
+       tokens, the big model verifies them in ONE
+       memory-bound pass
+     · KV CACHING (chapter 25) - and why the KV cache itself
+       becomes the bandwidth bottleneck at long contexts
+
+   IF YOU REMEMBER ONE THING FROM THIS TRACK'S SYSTEMS SIDE:
+   GENERATING TEXT IS A MEMORY BANDWIDTH PROBLEM.</pre>
+
+<h2 id="patterns">Where matmuls appear</h2>
+
+<p>Almost every layer in a neural network is a matrix multiply in disguise. Seeing which is which tells you where the time goes before you have profiled anything.</p>
+
+<pre><code>import numpy as np
+
+# --- 1. A LINEAR LAYER (chapter 03) ---
+X = np.random.randn(32, 768)        # batch, d_in
+W = np.random.randn(768, 3072)      # d_in, d_out
+Y = X @ W                           # (32, 3072)
+
+# --- 2. ATTENTION SCORES (chapter 19) ---
+Q = np.random.randn(32, 128, 64)    # batch, seq, d_head
+K = np.random.randn(32, 128, 64)
+scores = Q @ K.transpose(0, 2, 1)   # (32, 128, 128)
+# BATCHED MATMUL: numpy and torch treat all leading
+# dimensions as batch and multiply the last two. This is how
+# multi-head attention runs every head in one call
+# (chapter 21).
+
+# --- 3. THE OUTPUT PROJECTION TO VOCABULARY ---
+h = np.random.randn(32, 4096)          # hidden states
+W_out = np.random.randn(4096, 50000)   # vocab
+logits = h @ W_out                     # (32, 50000)
+# 6.5 GFLOPs for a batch of 32. The vocabulary projection is
+# often the single largest matmul in a small model, which is
+# why weight tying (sharing it with the embedding table) is
+# common (chapter 17).
+
+# --- ASSOCIATIVITY IS A REAL OPTIMISATION ---
+A = np.random.randn(1000, 5)
+B = np.random.randn(5, 1000)
+C = np.random.randn(1000, 20)
+
+# (A @ B) @ C : 1000*1000*5 + 1000*20*1000 = 25,000,000
+# A @ (B @ C) : 5*20*1000   + 1000*20*5    =    200,000
+#                                            125x FEWER
+# Same answer. THIS IS EXACTLY WHY LOW-RANK METHODS ARE
+# CHEAP (chapter 03's LoRA), and why linear-attention
+# variants reorder Q(K^T V) as (QK^T)V or not depending on
+# the sequence length.
+
+# --- CHECKING YOUR SHAPES, always ---
+def linear(x, W, b):
+    assert x.shape[-1] == W.shape[0], \
+        f"{x.shape} @ {W.shape}"
+    out = x @ W + b
+    assert out.shape[-1] == W.shape[1]
+    return out</code></pre>
+
+<div class="tip">
+<b>The debugging habit</b>
+<p>When model code does not work, print shapes before printing values. Nine times in ten the bug is a
+transpose, a missing batch dimension, or a broadcast that silently produced the wrong rank. Shapes are
+cheap to check and they localise the error immediately; values tell you almost nothing until the shapes
+are right.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>shapes (a,b) and (c,d) not aligned</code></td><td><code>b != c</code> — a missing transpose</td></tr>
+<tr><td>Result has an extra dimension</td><td>Broadcasting over an unintended batch axis</td></tr>
+<tr><td>Naive matmul is 30× slower than numpy</td><td>Cache-hostile access pattern — reorder and tile</td></tr>
+<tr><td>GPU utilisation near zero during generation</td><td>Memory-bound decode — expected; batch or quantise</td></tr>
+<tr><td>Quantising to int4 gives 4× speedup but not 4× FLOPs</td><td>The gain is bandwidth, not arithmetic</td></tr>
+<tr><td>Throughput collapses at batch size 1</td><td>Matrix-vector, not matrix-matrix</td></tr>
+<tr><td>An operation is far slower than the FLOP count suggests</td><td>Low arithmetic intensity — check the roofline</td></tr>
+<tr><td>Chained matmuls are unexpectedly slow</td><td>Wrong association order — regroup</td></tr>
+<tr><td>Results differ slightly between CPU and GPU</td><td>Different summation order in floating point — expected</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Multiply a 2×3 by a 3×2 by hand.</li>
+  <li>State the shape rule and predict the output shape of any pair.</li>
+  <li>State the FLOP rules for inference and training, and explain the factor of 6.</li>
+  <li>Explain why <code>B[p*n + j]</code> is cache-hostile and what reordering fixes.</li>
+  <li>Explain blocking and how to choose the tile size.</li>
+  <li>Define arithmetic intensity and compute it for matmul and matrix-vector.</li>
+  <li>Explain why prefill is compute bound and decode is memory bound.</li>
+  <li>Compute tokens/second for a 70B fp16 model at 2 TB/s and explain the number.</li>
+  <li>Explain why int4 quantisation speeds up generation.</li>
+  <li>Give the associativity example and say why LoRA is cheap.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

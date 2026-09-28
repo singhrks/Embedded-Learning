@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synchronisation primitives | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Synchronisation primitives</h1>
+<p class="lead">Shared mutable state plus concurrency equals corruption, unless something enforces order.
+This chapter covers the primitives, what each one is actually for, and — the part that matters most in kernel
+work — which are legal in which execution context.</p>
+
+<h2 id="problem">The problem, precisely</h2>
+
+<p>Start with the failure itself. A pair of operations that look atomic in source code are not, and seeing exactly where another thread can interleave is what makes every mechanism that follows obviously necessary.</p>
+
+<pre><code>/* A shared counter, incremented by two threads. */
+counter++;
+
+/* which is really three operations (C chapter 01, CA chapter 09) */
+        ldr  w1, [x0]        /* LOAD  */
+        add  w1, w1, #1      /* MODIFY */
+        str  w1, [x0]        /* STORE */
+
+/* Interleaved:
+     T1: load  → 5
+     T2: load  → 5
+     T1: add   → 6
+     T2: add   → 6
+     T1: store → 6
+     T2: store → 6          one increment LOST                 */</code></pre>
+
+<div class="key">
+<b>Three properties you may need, and they are separate</b>
+<ul>
+<li><strong>Atomicity</strong> — the operation completes indivisibly. Nothing observes a half-done state.</li>
+<li><strong>Mutual exclusion</strong> — at most one thread in a region at a time.</li>
+<li><strong>Ordering</strong> — other threads observe operations in the intended order
+(<a href="ca-15-coherence.html">CA ch. 15</a>).</li>
+</ul>
+<p>Atomics give atomicity and, with the right memory order, ordering. Locks give all three. Neither is a
+substitute for the other, and the classic mistake is assuming that "atomic" implies "correct".</p>
+</div>
+
+<h2 id="atomics">Atomic operations</h2>
+
+<p>The hardware provides operations that cannot be interrupted partway through. Everything else in this chapter is built on them, and for simple cases they are sufficient on their own.</p>
+
+<pre><code>#include &lt;stdatomic.h&gt;
+
+atomic_int counter = 0;
+atomic_fetch_add(&amp;counter, 1);              /* indivisible */
+
+/* the primitive everything else is built from */
+int expected = old;
+if (atomic_compare_exchange_strong(&amp;v, &amp;expected, desired)) {
+        /* v was `old`, now it is `desired` */
+} else {
+        /* v was not `old`; expected now holds the actual value */
+}
+
+/* the CAS loop — the shape of every lock-free algorithm */
+int old, new;
+do {
+        old = atomic_load(&amp;v);
+        new = f(old);                       /* any computation */
+} while (!atomic_compare_exchange_weak(&amp;v, &amp;old, new));
+/* _weak may fail spuriously but is cheaper in a loop; _strong
+   does not, and is right when there is no loop.              */
+
+/* Check what is actually lock-free on your target: */
+atomic_is_lock_free(&amp;obj);
+ATOMIC_INT_LOCK_FREE            /* 2 = always, 1 = sometimes, 0 = never */
+/* A "lock-free" atomic on a large struct may be implemented with a
+   hidden mutex — which is a correctness surprise in a signal
+   handler or an interrupt context.                            */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Memory order</th><th>Guarantee</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>relaxed</code></td><td>Atomicity only</td><td>Counters and statistics nobody synchronises on</td></tr>
+<tr><td><code>acquire</code></td><td>Later accesses cannot move before it</td><td>Reading a flag that guards data</td></tr>
+<tr><td><code>release</code></td><td>Earlier accesses cannot move after it</td><td>Setting a flag after writing data</td></tr>
+<tr><td><code>acq_rel</code></td><td>Both, for read-modify-write</td><td>Lock acquire/release, reference counts that free</td></tr>
+<tr><td><code>seq_cst</code></td><td>Plus one global total order</td><td>The safe default; the most expensive</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="mutex">Mutexes</h2>
+
+<p>The default answer for protecting shared data: one holder at a time, with everyone else waiting. Its cost is not the lock itself but what happens when the lock is contended.</p>
+
+<pre><code>pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_lock(&amp;m);
+        /* critical section */
+pthread_mutex_unlock(&amp;m);
+
+/* Properties that matter:
+     · OWNERSHIP — only the locker may unlock. This is what allows
+       priority inheritance and deadlock detection.
+     · SLEEPS on contention (via futex — OS chapter 08)
+     · uncontended cost ~20 ns; contended cost ~1-5 µs        */
+
+/* Types */
+PTHREAD_MUTEX_NORMAL        /* self-deadlock on recursive lock   */
+PTHREAD_MUTEX_ERRORCHECK    /* returns EDEADLK instead — use in
+                               debug builds                      */
+PTHREAD_MUTEX_RECURSIVE     /* same thread may relock. Usually a
+                               design smell: it hides unclear
+                               ownership of the invariant.       */
+PTHREAD_MUTEX_ADAPTIVE_NP   /* spin briefly, then sleep          */</code></pre>
+
+<pre><code>/* Always release on every path. In C, the goto ladder or the
+   cleanup attribute (C chapters 11 and 14):                   */
+static inline void unlock_p(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
+#define LOCKED(mp) \
+        pthread_mutex_t *_l __attribute__((cleanup(unlock_p))) = (mp); \
+        pthread_mutex_lock(_l)
+
+void f(void)
+{
+        LOCKED(&amp;m);
+        if (error) return;          /* unlocked automatically */
+        ...
+}                                   /* unlocked automatically */
+
+/* Linux kernel 6.5+ has the same idea, type-safe: */
+guard(mutex)(&amp;lock);
+scoped_guard(spinlock_irqsave, &amp;lock) { ... }</code></pre>
+
+<h2 id="rwlock">Reader-writer locks</h2>
+
+<p>When reads vastly outnumber writes, forcing readers to exclude each other wastes parallelism. This variant lets them proceed together — and is a worse answer more often than people expect.</p>
+
+<pre><code>pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER;
+
+pthread_rwlock_rdlock(&amp;rw);     /* many readers concurrently */
+pthread_rwlock_unlock(&amp;rw);
+
+pthread_rwlock_wrlock(&amp;rw);     /* exclusive */
+pthread_rwlock_unlock(&amp;rw);</code></pre>
+
+<div class="warn">
+<b>Reader-writer locks are usually slower than you expect</b>
+<p>They are only a win when reads are both <em>frequent</em> and <em>long</em>. For short critical sections
+the extra bookkeeping — and the cache-line contention on the shared reader count, which every reader must
+write — often costs more than a plain mutex. They also introduce a writer-starvation policy question that
+the implementation answers for you, usually badly.</p>
+<p>Measure before choosing one. If reads dominate and are short, RCU or a seqlock is almost always the better
+answer.</p>
+</div>
+
+<h2 id="condvar">Condition variables</h2>
+
+<p>Waiting for a condition rather than for a lock requires a mechanism that atomically releases the lock and sleeps. The canonical usage has a loop in it, and the loop is not optional.</p>
+
+<pre><code>pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;
+bool ready = false;
+
+/* WAITER — note the loop, which is not optional */
+pthread_mutex_lock(&amp;m);
+while (!ready)                          /* while, NEVER if */
+        pthread_cond_wait(&amp;cv, &amp;m);     /* atomically unlocks m,
+                                           sleeps, relocks on wake */
+consume();
+pthread_mutex_unlock(&amp;m);
+
+/* SIGNALLER */
+pthread_mutex_lock(&amp;m);
+ready = true;
+pthread_mutex_unlock(&amp;m);
+pthread_cond_signal(&amp;cv);               /* or _broadcast for all */</code></pre>
+
+<div class="danger">
+<b>Always <code>while</code>, never <code>if</code></b>
+<p>Three independent reasons the predicate can be false after a wake-up:</p>
+<ol>
+<li><strong>Spurious wake-ups</strong> are explicitly permitted by POSIX and do occur.</li>
+<li><strong>Another waiter got there first</strong> and consumed the item — with <code>broadcast</code>, all
+waiters wake but only one can proceed.</li>
+<li><strong>The condition changed again</strong> between the signal and your reacquiring the mutex.</li>
+</ol>
+<p>Using <code>if</code> produces a bug that appears under load, months later, and is nearly impossible to
+reproduce.</p>
+</div>
+
+<pre><code>/* The three rules for condition variables:
+     1. always associated with a mutex, and the predicate is
+        protected by that mutex
+     2. wait in a while loop on the predicate
+     3. hold the mutex when changing the predicate
+
+   Signal inside or outside the lock? Either is correct.
+   Inside is simpler to reason about; outside avoids the waiter
+   waking and immediately blocking on the mutex you still hold.
+   Modern implementations optimise both cases.                */</code></pre>
+
+<h2 id="semaphore">Semaphores</h2>
+
+<p>A counter with waiting built in, which makes it the natural fit for a pool of limited resources rather than for mutual exclusion — despite being usable for both.</p>
+
+<pre><code>#include &lt;semaphore.h&gt;
+sem_t s;
+sem_init(&amp;s, 0, 3);             /* 0 = threads only, 3 permits */
+
+sem_wait(&amp;s);                   /* take a permit, or block */
+        /* at most 3 threads here */
+sem_post(&amp;s);                   /* return a permit */
+
+/* Unlike a mutex, a semaphore has NO OWNER: any thread may post.
+   That makes it the right tool for:
+     · limiting concurrency to N (a resource pool)
+     · signalling between threads (post from one, wait in another)
+     · counting available items in a producer/consumer queue
+
+   And the wrong tool for mutual exclusion — a mutex's ownership
+   is what enables priority inheritance and error checking.    */
+
+/* sem_post IS async-signal-safe, which makes semaphores the one
+   correct way to wake a thread from a signal handler.        */</code></pre>
+
+<h2 id="kernel">Kernel context: the rule that dominates</h2>
+
+<div class="danger">
+<b>Can this code sleep?</b>
+<p>Everything about kernel synchronisation follows from this one question. If you are in a context that
+cannot sleep — an interrupt handler, holding a spinlock, or above DISPATCH_LEVEL on Windows — then any
+primitive that might block is a bug. It will deadlock, or trigger "scheduling while atomic".</p>
+</div>
+
+<pre class="diagram">   Does this code need to sleep while holding the lock?
+   (kmalloc(GFP_KERNEL), copy_to_user, I/O, another mutex)
+        │
+        ├── YES ──► MUTEX  (Linux)  /  FAST_MUTEX, ERESOURCE (Windows)
+        │           process context only; never in an ISR
+        │
+        └── NO ───► is the data ALSO touched by an interrupt handler?
+                       │
+                       ├── NO ──► spin_lock()
+                       │
+                       └── YES ─► spin_lock_irqsave()
+                                  disables interrupts on THIS core, so
+                                  the handler cannot deadlock against you
+
+   Special cases:
+     read-mostly, rare writes    → RCU
+     a simple counter or flag    → atomic_t, no lock at all
+     waiting for an event        → wait_event() + wake_up()
+     one-shot completion         → struct completion
+     read-mostly, short reads    → seqlock</pre>
+
+<pre><code>/* Linux */
+spinlock_t lock;
+unsigned long flags;
+
+spin_lock_irqsave(&amp;lock, flags);        /* save, disable, lock   */
+        /* short, non-sleeping critical section ONLY */
+spin_unlock_irqrestore(&amp;lock, flags);   /* unlock, restore state */
+
+/* Why save-and-restore rather than plain disable/enable: if
+   interrupts were ALREADY disabled by an outer critical section,
+   unconditionally re-enabling them at the inner unlock is a
+   serious bug.                                                */
+
+/* Windows equivalents */
+KIRQL old;
+KeAcquireSpinLock(&amp;lock, &amp;old);          /* raises to DISPATCH_LEVEL */
+KeReleaseSpinLock(&amp;lock, old);
+KeAcquireSpinLockAtDpcLevel(&amp;lock);      /* already at DISPATCH     */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Linux</th><th>Windows</th><th>Sleeps?</th><th>Context</th></tr></thead>
+<tbody>
+<tr><td><code>spinlock_t</code></td><td><code>KSPIN_LOCK</code></td><td>No</td><td>Any</td></tr>
+<tr><td><code>mutex</code></td><td><code>FAST_MUTEX</code></td><td>Yes</td><td>Process only</td></tr>
+<tr><td><code>rw_semaphore</code></td><td><code>ERESOURCE</code></td><td>Yes</td><td>Process only</td></tr>
+<tr><td><code>completion</code></td><td><code>KEVENT</code></td><td>Yes (waiter)</td><td>Wait: process. Signal: any.</td></tr>
+<tr><td><code>atomic_t</code></td><td><code>Interlocked*</code></td><td>No</td><td>Any</td></tr>
+<tr><td>RCU</td><td>—</td><td>Readers: no</td><td>Any</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="rcu">RCU and seqlocks</h2>
+
+<p>For data read constantly and written rarely, even an uncontended lock is too expensive. This technique makes reads genuinely free by deferring cleanup until every possible reader has finished.</p>
+
+<pre><code>/* RCU: Read-Copy-Update. Readers pay ZERO synchronisation cost —
+   no atomics, no cache-line contention, no barriers on most
+   architectures. Writers do all the work.                     */
+
+/* reader */
+rcu_read_lock();                       /* just disables preemption */
+struct foo *p = rcu_dereference(gp);
+if (p) use(p-&gt;field);
+rcu_read_unlock();
+
+/* writer */
+struct foo *new = kmalloc(...);
+*new = *old;                            /* COPY */
+new-&gt;field = value;                     /* UPDATE the copy */
+rcu_assign_pointer(gp, new);            /* publish, with a release */
+synchronize_rcu();                      /* wait until every pre-existing
+                                           reader has finished       */
+kfree(old);                             /* now provably safe */
+
+/* The insight: instead of preventing readers from seeing a torn
+   update, never modify in place. Readers see either the old
+   object or the new one, both consistent. Reclamation is
+   deferred until no reader can hold a reference.
+
+   Ideal for: routing tables, module lists, configuration —
+   anything read constantly and updated rarely.
+   Bad for: frequent writes (each one allocates and waits).   */</code></pre>
+
+<pre><code>/* Seqlock: readers retry if a write occurred during their read.
+   Very cheap reads, but readers must be side-effect free.     */
+
+/* reader */
+unsigned seq;
+do {
+        seq = read_seqbegin(&amp;sl);
+        a = shared.x;  b = shared.y;    /* may read a torn pair */
+} while (read_seqretry(&amp;sl, seq));      /* ...and retry if so   */
+
+/* writer */
+write_seqlock(&amp;sl);
+shared.x = 1;  shared.y = 2;
+write_sequnlock(&amp;sl);
+
+/* Used for timekeeping: readers vastly outnumber writers and must
+   never block a writer. Note readers can starve under constant
+   writing, and must not have side effects since they may run
+   several times.                                              */</code></pre>
+
+<h2 id="rules">Rules that prevent most bugs</h2>
+
+<p>Most synchronisation bugs violate one of a short list of rules. Following them mechanically prevents far more problems than reasoning carefully about each case.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Rule</th><th>Prevents</th></tr></thead>
+<tbody>
+<tr><td>Document what each lock protects, next to its declaration</td><td>Ambiguous ownership — the root of most locking bugs</td></tr>
+<tr><td>Acquire multiple locks in one global order, always</td><td>Deadlock (<a href="os-10-deadlock.html">ch. 10</a>)</td></tr>
+<tr><td>Keep critical sections short</td><td>Contention, and latency spikes</td></tr>
+<tr><td>Never call unknown code holding a lock</td><td>Lock-order inversion via a callback</td></tr>
+<tr><td>Never sleep holding a spinlock</td><td>Deadlock, "scheduling while atomic"</td></tr>
+<tr><td>Never return from a function holding a lock it acquired</td><td>Unbalanced locking; use scope guards</td></tr>
+<tr><td>Prefer no sharing, then immutable sharing, then locks</td><td>The whole problem class</td></tr>
+<tr><td>One lock per data structure, not per function</td><td>Locks that protect nothing coherent</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="tools">Finding synchronisation bugs</h2>
+
+<p>Race conditions do not reproduce on demand. These tools find them by instrumenting every memory access and checking the rules, rather than waiting for the failure to occur naturally.</p>
+
+<pre><code># ThreadSanitizer — finds races that have not yet manifested.
+# The highest-value tool in this chapter.
+gcc -fsanitize=thread -g prog.c &amp;&amp; ./prog
+
+# lock order and race detection without rebuilding
+valgrind --tool=helgrind ./prog
+valgrind --tool=drd ./prog
+
+# contention
+perf lock record ./prog &amp;&amp; perf lock report
+mutrace ./prog
+
+# a hang: get every thread's stack
+gdb -p PID -batch -ex 'thread apply all bt'
+
+# kernel
+CONFIG_PROVE_LOCKING=y          # lockdep: proves lock ORDER correctness
+                                # across the whole kernel, and reports a
+                                # potential deadlock the FIRST time an
+                                # inconsistent order is observed —
+                                # before it ever deadlocks
+CONFIG_DEBUG_ATOMIC_SLEEP=y     # catches sleeping in atomic context
+CONFIG_KCSAN=y                  # data race detector</code></pre>
+
+<div class="tip">
+<b>lockdep is the single best thing about kernel development</b>
+<p>It builds a graph of every lock acquisition order observed at runtime and reports a cycle the first time
+one appears — even if the deadlock did not actually occur. A potential deadlock that would surface once a
+year in production becomes a splat in <code>dmesg</code> on your first test run. Always develop with it
+enabled.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Counter is occasionally wrong</td><td>Unsynchronised read-modify-write</td></tr>
+<tr><td>Works with 2 threads, fails with 16</td><td>A race whose window widened</td></tr>
+<tr><td>Wakes up but the condition is false</td><td><code>if</code> instead of <code>while</code> around <code>cond_wait</code></td></tr>
+<tr><td>Hang with all threads in <code>pthread_mutex_lock</code></td><td>Deadlock — get all backtraces</td></tr>
+<tr><td>"scheduling while atomic" / bug check 0xA</td><td>Slept in an interrupt or spinlock context</td></tr>
+<tr><td>Adding a reader-writer lock made it slower</td><td>Short critical sections; the bookkeeping dominates</td></tr>
+<tr><td>Performance collapses past N threads</td><td>Lock contention; the cliff is one context switch pair</td></tr>
+<tr><td>Interrupts stay disabled after unlock</td><td>Used <code>spin_unlock_irq</code> where <code>irqrestore</code> was needed</td></tr>
+<tr><td>Fails on ARM, passes on x86</td><td>Missing memory ordering, hidden by TSO</td></tr>
+<tr><td>Crash freeing an object another thread is reading</td><td>Missing RCU grace period or reference count</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three properties concurrent code may need and say which primitives provide each.</li>
+  <li>Write a CAS loop and explain <code>_weak</code> versus <code>_strong</code>.</li>
+  <li>Give three reasons a condition-variable predicate must be rechecked in a loop.</li>
+  <li>Explain the difference between a mutex and a semaphore, and when ownership matters.</li>
+  <li>Give the decision procedure for choosing a kernel lock.</li>
+  <li>Explain why <code>spin_lock_irqsave</code> saves the previous state.</li>
+  <li>Explain how RCU makes readers free, and what writers pay instead.</li>
+  <li>Say what lockdep proves and why it finds deadlocks that never happened.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

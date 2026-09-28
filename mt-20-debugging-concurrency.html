@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finding concurrency bugs on purpose | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Finding concurrency bugs on purpose</h1>
+<p class="lead">A test that passes tells you one interleaving worked. The discipline that finds concurrency
+bugs is not better luck — it is making the rare interleaving common, on hardware that permits it, with tools
+that see what your eyes cannot.</p>
+
+<h2 id="method">The method</h2>
+
+<p>Concurrency bugs defeat the usual debugging approach, because observing the program changes its timing and the failure may not recur. What works is a different method rather than better tools.</p>
+
+<pre class="diagram">   FIRST: WHICH BUG IS IT?  Ten seconds of observation saves
+   an afternoon.
+
+     hung, 0% CPU           -> deadlock (chapter 14)
+     hung, 100% CPU         -> livelock, or a spin/CAS loop
+     wrong answer, no crash -> race condition or lost update
+     crash in random places -> data race, or use-after-free
+     one thread never runs  -> starvation
+     slow, not wrong        -> contention or false sharing
+     fine alone, wrong in
+       parallel             -> shared state you forgot about
+
+   THEN, IN THIS ORDER:
+
+   1. Make it reproduce more often   (this chapter)
+   2. Run a sanitiser                (finds data races)
+   3. Read the code for the invariant, not the syntax
+   4. Only then, attach a debugger
+
+   Reaching for gdb first is the classic mistake: a breakpoint
+   changes the timing, and the bug you were chasing stops
+   happening.</pre>
+
+<h2 id="reproduce">Making it reproduce</h2>
+
+<p>The first problem is that the bug happens once a week. These techniques make it happen on demand — which turns an intractable investigation into an ordinary one.</p>
+
+<pre><code># 1. MORE THREADS THAN CORES. Forces constant preemption,
+#    so the interleavings you never see become normal.
+$ ./app --threads=64          # on 8 cores
+
+# 2. PIN EVERYTHING TO ONE CORE. Removes true parallelism and
+#    maximises preemption at arbitrary instructions. Finds a
+#    completely different set of bugs from (1) - run both.
+$ taskset -c 0 ./app
+
+# 3. RUN ON WEAK HARDWARE. An arm64 box exhibits reorderings
+#    x86 physically cannot (chapter 12). If you ship on ARM
+#    and test on x86, you are not testing the memory model.
+
+# 4. SLOW DOWN THE SUSPECT WINDOW. The single highest-value
+#    technique in this chapter:
+      auto it = cache.find(k);
+      if (it != cache.end()) return it->second;
++     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto v = compute(k);
+#    A gap bug that happened once a week now happens every
+#    time. Delete the sleep once you have the fix.
+
+# 5. RANDOMISE SCHEDULING. Inject a yield at every
+#    synchronisation point, under a flag:
+      #ifdef FUZZ_SCHED
+      #define SYNC_POINT() do { if (rand() % 4 == 0) \
+                                std::this_thread::yield(); } while (0)
+      #else
+      #define SYNC_POINT() ((void)0)
+      #endif
+
+# 6. STRESS IN A LOOP, and record the seed.
+$ for i in $(seq 1 100000); do ./test --seed=$i || \
+      { echo "FAILED seed=$i"; break; }; done
+
+# 7. RUN UNDER LOAD. Many races need a competitor:
+$ stress-ng --cpu 8 --vm 2 &amp; ./app</code></pre>
+
+<div class="key">
+<b>Pin to one core <em>and</em> oversubscribe — they find different bugs</b>
+<p>One core with many threads gives you frequent, arbitrary preemption: it finds check-then-act gaps, lost
+updates and non-reentrant code. Many cores give you true simultaneity and memory reordering: it finds
+publication bugs, false sharing and missing barriers. A bug found by one is often invisible to the other, so
+a stress suite should do both.</p>
+</div>
+
+<h2 id="tools">The tools</h2>
+
+<p>Several tools find concurrency bugs without needing the bug to occur naturally, by checking the rules on every access. They find different classes of problem, so knowing which to reach for matters.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Finds</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><code>-fsanitize=thread</code></td><td>Data races, and lock-order inversions</td><td>5–15× slower,
+5–10× memory</td></tr>
+<tr><td><code>-fsanitize=address</code></td><td>Use-after-free, overflow — often the visible symptom of a
+race</td><td>~2× slower</td></tr>
+<tr><td><code>valgrind --tool=helgrind</code></td><td>Races and lock-order violations, no
+rebuild</td><td>20–50× slower</td></tr>
+<tr><td><code>valgrind --tool=drd</code></td><td>Similar, better on some patterns, lower memory</td><td>Similar</td></tr>
+<tr><td><code>-Wthread-safety</code> (clang)</td><td>Missing locks — <strong>at compile
+time</strong></td><td>Free. Needs annotations</td></tr>
+<tr><td>Kernel lockdep</td><td>Potential deadlocks on runs that did not deadlock</td><td>Debug kernel
+only</td></tr>
+<tr><td><code>perf c2c</code></td><td>False sharing, by address and line</td><td>Low</td></tr>
+<tr><td><code>perf lock</code></td><td>Contention: which lock, how long</td><td>Low</td></tr>
+<tr><td>rr</td><td><strong>Deterministic record and replay</strong> — reverse-execute a captured
+failure</td><td>~2×, x86 only</td></tr>
+<tr><td>TLA+ / Spin</td><td>Design-level protocol bugs, exhaustively</td><td>Your time; finds bugs no test
+can</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># ThreadSanitizer, in practice.
+$ g++ -fsanitize=thread -g -O1 -fno-omit-frame-pointer app.cpp
+$ TSAN_OPTIONS="halt_on_error=1 history_size=7" ./app
+
+WARNING: ThreadSanitizer: data race (pid=4211)
+  Write of size 8 at 0x7b0400000f00 by thread T2:
+    #0 Cache::insert(...) cache.cpp:88
+    #1 worker(...) main.cpp:41
+  Previous read of size 8 at 0x7b0400000f00 by thread T1:
+    #0 Cache::lookup(...) cache.cpp:62
+  Location is heap block of size 96 allocated by main thread
+  Mutexes locked by thread T2: M12 (cache.cpp:20)
+  Mutexes locked by thread T1: (none)      &lt;-- THE ANSWER
+
+# That last pair of lines is what you read first: one side
+# held the mutex, the other did not.
+
+# rr, when a bug is rare but you caught it once:
+$ rr record ./app
+$ rr replay
+(rr) continue                 # runs to the crash, identically
+(rr) reverse-continue         # run BACKWARDS to the previous
+(rr) watch -l ptr             # write to that address
+# Deterministic replay of a race is close to magic: the
+# recording contains the exact interleaving that failed.</code></pre>
+
+<div class="warn">
+<b>Sanitisers do not compose, and they miss race conditions</b>
+<p>TSan and ASan cannot be enabled together — build twice. TSan needs the <em>whole</em> program instrumented;
+an uninstrumented third-party library produces false negatives and sometimes false positives. And most
+importantly: TSan finds <strong>data races</strong>, not <strong>race conditions</strong>
+(<a href="mt-05-races.html">chapter 5</a>). A clean TSan run on properly-locked code that has a gap between
+two critical sections proves nothing at all.</p>
+</div>
+
+<h2 id="design">Designing so the bug cannot happen</h2>
+
+<p>The most effective debugging is structural: some designs make whole categories of concurrency bug impossible rather than merely unlikely. These are the choices that pay off most.</p>
+
+<pre><code>/* Cheaper than any tool in the table above. */
+
+/* 1. DON'T SHARE. Per-thread state merged at the end
+      (chapter 19). No sharing, no race, nothing to test.
+
+   2. IMMUTABLE AFTER PUBLICATION. Build fully, publish with a
+      release store, never mutate. Readers need no lock at all.
+
+   3. OWNERSHIP, NOT LOCKING. One thread owns each object;
+      others send messages. Rust enforces this; in C++ you can
+      approximate it with move-only types and a queue.
+
+   4. MAKE ILLEGAL STATES UNREPRESENTABLE. Put the data inside
+      the mutex so there is no way to touch it unlocked -
+      Rust's Mutex&lt;T&gt;, or in C++:                             */
+
+template &lt;class T&gt;
+class Guarded {
+    std::mutex m_;
+    T          v_;
+public:
+    template &lt;class F&gt;
+    auto with(F f) -&gt; decltype(f(v_)) {
+        std::lock_guard&lt;std::mutex&gt; g(m_);
+        return f(v_);                 /* the ONLY way in       */
+    }
+};
+Guarded&lt;std::map&lt;int,int&gt;&gt; cache;
+cache.with([&amp;](auto &amp;m) { m[k] = v; });
+/* You cannot forget the lock, because there is no accessor
+   that does not take it. The whole class of bug is gone.    */
+
+/* 5. ANNOTATE, and let the compiler check.                  */
+class Cache {
+    std::mutex m_;
+    std::map&lt;int,int&gt; data_ GUARDED_BY(m_);
+    int hits_ GUARDED_BY(m_);
+public:
+    int hits() { return hits_; }   /* -Wthread-safety: ERROR,
+                                      reading hits_ without m_ */
+};
+
+/* 6. ONE INVARIANT PER LOCK, written down (chapter 7).      */</code></pre>
+
+<h2 id="ci">What to run in CI</h2>
+
+<p>Concurrency bugs that reach production were usually not caught because the tests were too short and too uniform. Making automated testing actually likely to find them is mostly a matter of configuration.</p>
+
+<pre><code># The realistic set, in cost order. Even the first three
+# catch most of it.
+
+  every commit:
+    -Wthread-safety                       free, compile time
+    unit tests under TSan                 slow but bounded
+    unit tests with threads=4x cores      finds gap bugs
+
+  nightly:
+    the full suite under TSan and under ASan (separate runs)
+    the full suite pinned to one core
+    the full suite on an ARM64 runner      &lt;-- the highest-value
+                                               single addition
+    a stress soak, several hours, seeds logged
+
+  before a release:
+    Helgrind on the critical paths
+    a load test measuring p99.9, not the mean
+
+# And record every intermittent failure with its seed and its
+# machine. Three occurrences of "flaky test" with the same
+# stack is not flakiness; it is a bug with a low reproduction
+# rate, and it will reach production at scale.</code></pre>
+
+<div class="key">
+<b>Never mark a concurrency test flaky</b>
+<p>A test that fails once in fifty runs is telling you the truth about a bug that will happen once in fifty
+thousand production requests — which, at a thousand requests a second, is once a minute. Retrying the test
+until it passes converts a caught bug into a shipped one. Quarantine it if you must ship, but track it as a
+defect, not as noise.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>"Cannot reproduce"</td><td>Oversubscribe, pin to one core, add a sleep in the suspect gap</td></tr>
+<tr><td>Fails in CI, never locally</td><td>Different core count or a slower machine — widening the
+window</td></tr>
+<tr><td>Fails only in release builds</td><td>The optimiser exploited undefined behaviour a data race
+permitted</td></tr>
+<tr><td>Disappears under the debugger</td><td>Timing changed. Use logging or <code>rr</code>
+instead</td></tr>
+<tr><td>Disappears when you add a <code>printf</code></td><td>The syscall is a barrier — you moved the bug,
+not fixed it</td></tr>
+<tr><td>TSan clean, bug persists</td><td>It is a race condition, not a data race</td></tr>
+<tr><td>TSan reports a race in a third-party library</td><td>Uninstrumented code, or a genuine bug —
+<code>suppressions</code> file, then investigate</td></tr>
+<tr><td>Only fails on arm64</td><td>A memory-ordering bug x86 cannot exhibit</td></tr>
+<tr><td>Only fails at high load</td><td>Contention widens every window; also check queue bounds</td></tr>
+<tr><td>Test marked flaky six months ago</td><td>Look at it. It is almost certainly your production
+incident</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Classify a hung program by CPU usage and say what each case means.</li>
+  <li>Give the four-step order for attacking a concurrency bug, and why the debugger is last.</li>
+  <li>Name seven ways to make a rare interleaving common.</li>
+  <li>Explain why pinning to one core and oversubscribing find different bugs.</li>
+  <li>Read a TSan report and identify the two lines that matter most.</li>
+  <li>State three limits of ThreadSanitizer.</li>
+  <li>Explain what <code>rr</code> gives you that a debugger cannot.</li>
+  <li>Write a <code>Guarded&lt;T&gt;</code> wrapper and explain which bug class it deletes.</li>
+  <li>Give the CI set you would actually run, and name the single highest-value addition.</li>
+  <li>Explain why a flaky concurrency test is a production incident in waiting.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

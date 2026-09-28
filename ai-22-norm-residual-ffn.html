@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Normalisation, residuals and the feed-forward block | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Normalisation, residuals and the feed-forward block</h1>
+<p class="lead">The unglamorous two thirds of a transformer. Residual connections are what make depth
+trainable, normalisation is what keeps it stable, and the feed-forward network holds most of the
+parameters and, probably, most of the knowledge.</p>
+
+<h2 id="residual">Residual connections</h2>
+
+<p>The skip connection is a single addition and it is what makes depth possible at all. Following what it does to the gradient is the clearest way to see why.</p>
+
+<pre class="diagram">        x ------------------+
+        |                   |
+        v                   |
+     [ sublayer ]           |
+        |                   |
+        v                   |
+       (+) <----------------+
+        |
+        v
+      output = x + sublayer(x)
+
+   THE GRADIENT ARGUMENT, and it is the whole reason:
+
+        d(output)/dx = 1 + d(sublayer)/dx
+                       ^
+                       THE IDENTITY PATH
+
+   Backpropagating through n layers multiplies n such terms.
+   Without the residual, the product is of n Jacobians and
+   vanishes or explodes exponentially (chapter 07). WITH IT,
+   the "1" guarantees a path along which the gradient
+   arrives essentially UNCHANGED, however deep the stack.
+
+   This is the same structural trick as the LSTM's cell
+   state (chapter 18) - give the gradient a route that does
+   not pass through a transformation.
+
+   BEFORE RESNET (2015), 20 layers was hard. AFTER, 1000+
+   layers train. IT IS THE SINGLE MOST IMPORTANT
+   ARCHITECTURAL IDEA OF THE DECADE, and it is one addition.
+
+   THE OTHER READING - THE RESIDUAL STREAM:
+
+     Think of x as a SHARED BUS of width d_model that runs
+     the full depth of the model. Each sublayer:
+        · READS from the bus (through its LayerNorm)
+        · COMPUTES something
+        · ADDS its result back
+
+     Nothing overwrites. Information written by layer 3
+     survives to layer 40 unless something explicitly
+     subtracts it. Layers can therefore communicate at a
+     distance, and interpretability work treats the residual
+     stream as the model's working memory.
+
+     A CONSEQUENCE WORTH KNOWING: THE RESIDUAL STREAM'S NORM
+     GROWS WITH DEPTH, because every layer adds to it. That
+     is why the residual projections are initialised scaled
+     down by 1/sqrt(2*n_layers) (chapter 15), and why the
+     final LayerNorm before the output head is necessary.</pre>
+
+<h2 id="norm">Normalisation</h2>
+
+<p>Normalisation keeps activations in a range where training is stable, and both <em>which</em> normaliser and <em>where</em> it sits have changed since the original architecture — for reasons that show up as training stability.</p>
+
+<pre><code>/* --- LAYERNORM --- */
+    mu    = mean(x, over the FEATURE dimension)
+    sigma = std(x,  over the FEATURE dimension)
+    y     = gamma * (x - mu) / (sigma + eps) + beta
+
+    gamma and beta are LEARNED per-feature scale and shift,
+    so the layer can undo the normalisation if that is
+    useful.
+
+    NORMALISED PER SAMPLE, PER POSITION, ACROSS FEATURES.
+    No dependence on the batch at all - which is why
+    transformers use it (chapter 15).
+
+    nn.LayerNorm(d_model)      # (B, T, d) -> normalises
+                               # over d
+
+/* --- RMSNORM: what modern models use --- */
+    y = gamma * x / sqrt(mean(x^2) + eps)
+
+    NO MEAN SUBTRACTION, NO BETA. Just rescale to unit root
+    mean square.
+
+      · ~10-15% faster (one reduction instead of two)
+      · fewer parameters
+      · EMPIRICALLY JUST AS GOOD - which suggests the
+        re-CENTRING was never the active ingredient; the
+        re-SCALING was.
+
+    Llama, Mistral, Gemma, T5 and most recent models use it.
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(d))
+            self.eps = eps
+        def forward(self, x):
+            rms = x.pow(2).mean(-1,
+                                keepdim=True).add(self.eps).rsqrt()
+            return self.weight * (x * rms)
+
+/* --- PRE-NORM VERSUS POST-NORM. THIS ONE MATTERS. --- */
+
+    POST-NORM (the 2017 paper):
+        x = LayerNorm(x + sublayer(x))
+
+        The normalisation is ON the residual path. So the
+        gradient must pass through a LayerNorm at EVERY
+        layer, and the clean identity path is destroyed.
+        RESULT: deep post-norm transformers are hard to
+        train and need careful warmup, and past ~12-18
+        layers they frequently diverge.
+
+    PRE-NORM (everything modern):
+        x = x + sublayer(LayerNorm(x))
+
+        The normalisation is INSIDE the branch. The residual
+        path is a pure addition, so the identity gradient
+        survives intact.
+        RESULT: stable training at any depth, far less
+        sensitivity to warmup and learning rate.
+
+    THIS IS A ONE-LINE DIFFERENCE THAT DETERMINES WHETHER A
+    100-LAYER MODEL TRAINS AT ALL. If you are reading old
+    code and it will not converge, check this first.
+
+    (Pre-norm's cost: the residual stream grows unnormalised
+    with depth, which is why a FINAL LayerNorm before the
+    output head is required. Some models add extra norms -
+    "sandwich" or QK-norm - for stability at very large
+    scale.)
+
+/* --- WHY NORMALISATION HELPS AT ALL --- */
+    The original claim was "reducing internal covariate
+    shift". That explanation has not held up well.
+
+    THE BETTER-SUPPORTED VIEW: it SMOOTHS THE LOSS
+    LANDSCAPE, so gradients are more predictable and larger
+    learning rates become usable. It also makes the model
+    invariant to the SCALE of the weights, which decouples
+    the effective learning rate from the weight magnitude.
+
+    THE HONEST POSITION: IT WORKS RELIABLY AND THE THEORY IS
+    STILL DEBATED. That is true of several things in this
+    chapter, and it is better to know it than to repeat a
+    tidy explanation that is probably wrong.            */</code></pre>
+
+<h2 id="ffn">The feed-forward network</h2>
+
+<p>The feed-forward block holds most of a transformer's parameters and receives the least attention in most explanations. What it is for is a genuinely interesting question.</p>
+
+<pre><code>/* THE SIMPLEST PART OF THE ARCHITECTURE AND TWO THIRDS OF
+   THE PARAMETERS (chapter 20).                          */
+
+    FFN(x) = W_2 @ activation(W_1 @ x + b_1) + b_2
+
+        W_1: (d_model, 4*d_model)     EXPAND
+        W_2: (4*d_model, d_model)     PROJECT BACK
+
+    APPLIED INDEPENDENTLY AT EVERY POSITION. There is no
+    mixing across the sequence here at all - that is
+    attention's job. The FFN is a per-token transformation.
+
+    THE DIVISION OF LABOUR IN A TRANSFORMER BLOCK:
+        ATTENTION  moves information BETWEEN positions
+        FFN        processes information AT a position
+
+/* --- SWIGLU: what modern models use --- */
+    SwiGLU(x) = (SiLU(x @ W_gate) * (x @ W_up)) @ W_down
+
+    A GATED linear unit: one branch produces values, the
+    other produces a multiplicative gate. Three matrices
+    instead of two, so d_ff is reduced from 4d to
+    (8/3)d to keep the parameter count equal.
+
+    Consistently a small quality improvement over ReLU or
+    GELU FFNs. Nobody has a fully satisfying explanation;
+    the gating presumably lets the layer suppress its own
+    output conditionally.
+
+    class SwiGLU(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.gate = nn.Linear(d, hidden, bias=False)
+            self.up   = nn.Linear(d, hidden, bias=False)
+            self.down = nn.Linear(hidden, d, bias=False)
+        def forward(self, x):
+            return self.down(F.silu(self.gate(x))
+                             * self.up(x))
+
+/* --- WHAT THE FFN IS BELIEVED TO DO --- */
+
+    THE KEY-VALUE MEMORY VIEW, which has real evidence behind
+    it:
+      · each ROW of W_1 acts as a PATTERN DETECTOR - the
+        dot product with x fires when a particular feature is
+        present
+      · the activation gates it
+      · each COLUMN of W_2 is the VALUE written back into the
+        residual stream when that pattern fires
+
+      So the FFN is a large associative memory: "when you see
+      this pattern, add this to the stream". FACTUAL RECALL
+      HAS BEEN LOCALISED TO SPECIFIC FFN NEURONS in several
+      studies - the ROME and MEMIT model-editing work
+      modifies exactly these weights to change a stored fact.
+
+    THE 4x EXPANSION gives room for many more patterns than
+    d_model dimensions - superposition again (chapter 17).
+
+/* --- MIXTURE OF EXPERTS, which is an FFN change --- */
+    Replace the single FFN with N of them plus a router:
+
+        gate   = softmax(x @ W_router)        # (N,)
+        top_k  = argtopk(gate, k=2)
+        out    = sum over the chosen experts of
+                 gate_i * Expert_i(x)
+
+      · total parameters up, ACTIVE parameters per token
+        unchanged
+      · requires a LOAD-BALANCING AUXILIARY LOSS, or the
+        router collapses onto a few favourite experts and
+        the rest never train
+      · all experts must be resident in memory even though
+        only k run - so it saves COMPUTE, not MEMORY, which
+        is exactly the wrong trade for an embedded device
+
+    NOTE THAT MoE MODIFIES THE FFN, NOT ATTENTION. That is
+    not a coincidence: the FFN is where the parameters are.
+                                                          */</code></pre>
+
+<div class="key">
+<b>The block, in one sentence each</b>
+<pre>RESIDUAL     gives the gradient an identity path, so
+             depth is trainable.
+LAYERNORM    keeps activations in a usable range and
+             smooths the landscape.
+PRE-NORM     keeps the residual path clean, so very
+             deep models train.
+ATTENTION    moves information between positions.
+FFN          transforms information at each position,
+             and stores most of what the model knows.</pre>
+</div>
+
+<h2 id="cost">The cost picture</h2>
+
+<p>Putting the per-component costs side by side shows where the compute and the memory actually go, which is frequently not where people assume.</p>
+
+<pre><code>/* PER LAYER, per token, in FLOPs (roughly, ignoring
+   constants):
+
+     ATTENTION projections   8 * d^2      (Q,K,V,O)
+     ATTENTION scores+AV     4 * n * d    (n = sequence
+                                           length)
+     FFN                    16 * d^2      (4d expansion,
+                                           two matmuls)
+     norms                   negligible
+
+   SO FOR SHORT SEQUENCES THE FFN DOMINATES COMPUTE, and
+   attention's quadratic term only takes over when
+   n is comparable to d:
+
+        4*n*d  >  24*d^2   when   n > 6d
+
+   For d = 4096 that is n > 24,576 tokens. BELOW THAT, THE
+   MODEL IS MOSTLY DOING FFN MATMULS, not attention. This
+   surprises people who assume attention is always the
+   bottleneck - it becomes one at long context, and at short
+   context the FFN is the cost.
+
+/* --- WHAT THIS MEANS FOR OPTIMISATION --- */
+     SHORT CONTEXT   optimise the FFN: quantise it
+                     (chapter 26), use MoE, prune it
+     LONG CONTEXT    optimise attention: Flash Attention,
+                     sliding windows, GQA (chapter 19)
+     GENERATION      neither - you are memory-bandwidth
+                     bound (chapters 04, 25)
+
+/* --- AND FOR EMBEDDED (chapter 27) --- */
+     · LayerNorm needs a mean, a variance and a reciprocal
+       square root per token. On a device without an FPU
+       that is expensive; RMSNorm halves it, and
+       fixed-point implementations need care with the
+       variance's dynamic range.
+     · SwiGLU needs a sigmoid per hidden unit - 11k
+       transcendental evaluations per token at d = 4096.
+       ReLU is one comparison. On an MCU, choose ReLU.
+     · the FFN's two large matmuls are where a small
+       transformer spends its time, so an NPU that only
+       accelerates dense matmul still gets you most of the
+       win.                                              */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Deep model diverges, shallow one trains</td><td>Post-norm — switch to pre-norm</td></tr>
+<tr><td>Training needs very long warmup</td><td>Post-norm, or missing residual scaling at init</td></tr>
+<tr><td>Activations grow steadily with depth</td><td>Normal for pre-norm — ensure a final LayerNorm exists</td></tr>
+<tr><td>Removing the residual breaks training entirely</td><td>Expected — the gradient loses its identity path</td></tr>
+<tr><td><code>nan</code> in LayerNorm</td><td>Zero variance, or <code>eps</code> too small in fp16</td></tr>
+<tr><td>MoE model uses only two experts</td><td>No load-balancing loss — router collapse</td></tr>
+<tr><td>MoE saves compute but not memory</td><td>By design — all experts must be resident</td></tr>
+<tr><td>Parameter count doesn't match after switching to SwiGLU</td><td><code>d_ff</code> must drop to 8/3·d for three matrices</td></tr>
+<tr><td>Attention optimisation gives little speedup</td><td>Short context — the FFN dominates</td></tr>
+<tr><td>LayerNorm is slow on an MCU</td><td>Two reductions plus rsqrt — use RMSNorm</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the gradient argument for residual connections.</li>
+  <li>Explain the residual stream as a bus, and why its norm grows with depth.</li>
+  <li>Write LayerNorm and RMSNorm, and say what RMSNorm drops.</li>
+  <li>Explain pre-norm versus post-norm and which one enables depth.</li>
+  <li>State the honest position on why normalisation helps.</li>
+  <li>Write the FFN and state the division of labour with attention.</li>
+  <li>Explain SwiGLU and why <code>d_ff</code> changes to 8/3·d.</li>
+  <li>Give the key-value memory view of the FFN and the evidence for it.</li>
+  <li>Explain mixture of experts and why it saves compute but not memory.</li>
+  <li>Compute the crossover sequence length where attention overtakes the FFN.</li>
+  <li>Say which component to optimise for short context, long context and generation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

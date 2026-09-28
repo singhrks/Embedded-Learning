@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel versus user-space programming | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Kernel versus user-space programming</h1>
+<p class="lead">You already know C. Kernel C is the same language with a different standard library, no
+safety net, and a set of rules that are not written in the compiler. This chapter is the list of everything
+that changes, so the first week costs you hours instead of days.</p>
+
+<h2 id="table">Everything that is different</h2>
+
+<p>None of these differences is arbitrary — each one follows from the same fact: kernel code runs with no
+process boundary underneath it, so nothing catches its mistakes and nothing frees its resources when it
+misbehaves. Read this table once as a reference, then again after the rest of the chapter, when each row has
+a reason attached to it rather than just a contrast.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>User space</th><th>Kernel</th></tr></thead>
+<tbody>
+<tr><td>Standard library</td><td>libc: <code>printf</code>, <code>malloc</code>, <code>strcpy</code></td><td>None. A kernel-specific subset: <code>pr_info</code>, <code>kmalloc</code>, <code>strscpy</code></td></tr>
+<tr><td>Floating point</td><td>Free</td><td><strong>Forbidden</strong> without <code>kernel_fpu_begin()</code>; on ARM64 essentially never</td></tr>
+<tr><td>Stack size</td><td>8 MB, grows</td><td><strong>16 KB total</strong>, fixed, shared with interrupts</td></tr>
+<tr><td>A bad pointer</td><td>SIGSEGV, one process dies</td><td>Oops or panic; the machine may go down</td></tr>
+<tr><td>Memory leak</td><td>Freed at exit</td><td>Leaked until reboot</td></tr>
+<tr><td>Preemption</td><td>Always</td><td>Depends on context and config; sometimes forbidden</td></tr>
+<tr><td>Sleeping</td><td>Anywhere</td><td>Only in process context, never holding a spinlock</td></tr>
+<tr><td>Concurrency</td><td>Threads you created</td><td>Every CPU, plus interrupts, plus timers — all at once</td></tr>
+<tr><td>Debugging</td><td>gdb, valgrind, ASan</td><td>printk, ftrace, KASAN, and reading dumps</td></tr>
+<tr><td>Errors</td><td><code>errno</code>, exceptions</td><td>Negative return codes: <code>-ENOMEM</code>, <code>-EINVAL</code></td></tr>
+<tr><td>ABI stability</td><td>Stable for decades</td><td><strong>None internally</strong>; the user-facing ABI is sacred</td></tr>
+<tr><td>Compiler</td><td>Your choice of flags</td><td><code>-ffreestanding</code>, no stdlib, kernel flags, strict warnings</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="stack">The stack is 16 KB</h2>
+
+<p>This is the constraint that surprises people most. In user space the stack grows to megabytes on demand; in the kernel you get a small, fixed allocation that never grows, shared with anything that interrupts you — and overflowing it corrupts whatever happens to sit next to it in memory.</p>
+
+<pre><code>/* THE most common beginner crash. On arm64, THREAD_SIZE is
+   16 KB by default - and that is the whole kernel stack for
+   the task, shared by every function on the call chain.     */
+
+/* WRONG - 8 KB of stack in one line: */
+static int my_ioctl(struct file *f, unsigned int cmd,
+                    unsigned long arg)
+{
+        char buf[8192];                 /* half the stack */
+        struct big_thing thing;         /* another 2 KB    */
+        ...
+}
+
+/* RIGHT - allocate it: */
+static int my_ioctl(struct file *f, unsigned int cmd,
+                    unsigned long arg)
+{
+        char *buf;
+        int ret;
+
+        buf = kmalloc(8192, GFP_KERNEL);
+        if (!buf)
+                return -ENOMEM;
+        ...
+        kfree(buf);
+        return ret;
+}
+
+/* THE RULE OF THUMB: keep any single frame under ~256 bytes,
+   and never put an array larger than about 128 bytes on the
+   stack. The compiler will warn above 1024 with
+   -Wframe-larger-than, and the kernel sets that. DO NOT
+   silence it.
+
+   ALSO ON THE STACK, uninvited:
+     · interrupt handlers, unless IRQ_STACKS is on
+     · deep call chains through the block or network stack
+     · recursion - which is why the kernel has almost none
+
+   OVERFLOW SYMPTOM: not a clean error. You corrupt
+   thread_info or the adjacent page and crash later,
+   somewhere else, with a nonsensical backtrace. Enable
+   CONFIG_VMAP_STACK (default on arm64) and overflow becomes a
+   clean fault with a real trace instead.                   */</code></pre>
+
+<h2 id="context">Context: the rule everything else follows</h2>
+
+<p>If you take one idea from this chapter, take this one. "Context" means the circumstances your code is running under, and it determines what you are permitted to do — most importantly whether you may sleep. Nearly every rule in the rest of this track is a consequence of it.</p>
+
+<pre class="diagram">Kernel code runs in one of three contexts, and what you may do
+depends entirely on which:
+
+  PROCESS CONTEXT (also "task context")
+     Entered via a syscall, or in a kernel thread.
+     You have a `current` task. You may SLEEP.
+     -&gt; syscalls, ioctl, read/write, probe(), workqueues
+
+  SOFTIRQ / TASKLET / BOTTOM-HALF CONTEXT
+     Deferred interrupt work. No `current` you can rely on.
+     MAY NOT SLEEP.
+     -&gt; network receive, some timers
+
+  HARDIRQ CONTEXT (interrupt handler)
+     Interrupts possibly disabled, must be FAST.
+     MAY NOT SLEEP. May not call anything that might.
+     -&gt; your request_irq() top half
+
+  AND A FOURTH STATE, orthogonal: ATOMIC.
+     Holding a spinlock, or with preemption or interrupts
+     disabled. MAY NOT SLEEP - even in process context.
+
+  "MAY NOT SLEEP" MEANS you may not call:
+       kmalloc(GFP_KERNEL)      -- may wait for reclaim
+       mutex_lock()             -- may block
+       copy_to_user()           -- may take a page fault
+       msleep(), schedule()
+       anything that says "might sleep" in its docs
+       vmalloc(), most of the filesystem API
+
+  and you MAY call:
+       kmalloc(GFP_ATOMIC)      -- fails rather than waits
+       spin_lock()
+       readl()/writel()
+       pr_info() (with care - it can be slow)
+
+  HOW TO KNOW WHICH CONTEXT YOU ARE IN:
+     read the caller. There is no runtime flag that answers it
+     reliably - which is why the kernel gives you a checker:
+
+       CONFIG_DEBUG_ATOMIC_SLEEP=y
+
+     turns every illegal sleep into a loud
+       "BUG: sleeping function called from invalid context"
+     with a backtrace. TURN IT ON. It is the single most
+     valuable debug option for a new kernel developer.</pre>
+
+<div class="key">
+<b>The question to ask before every call</b>
+<p>"What context am I in, and can this function sleep?" Nearly every kernel bug a newcomer writes is an
+answer to that question they never asked. The kernel-doc for a function says <em>Context:</em> explicitly
+for many APIs; where it does not, the convention is that <code>GFP_KERNEL</code>, <code>mutex</code> and
+<code>_interruptible</code> in a name all imply sleeping.</p>
+</div>
+
+<h2 id="lib">The library you get instead</h2>
+
+<p>There is no libc in the kernel, so the familiar functions are simply absent. What you get instead is a smaller set with similar names and deliberately different behaviour — and the differences exist because the kernel versions were designed after decades of watching the originals cause security bugs.</p>
+
+<pre><code>/* PRINTING */
+        printf("x=%d\n", x);            /* NO */
+        pr_info("x=%d\n", x);           /* yes */
+        pr_err(), pr_warn(), pr_debug()
+        dev_info(dev, "..."), dev_err(dev, "...")   /* BEST -
+                       prefixes the device name automatically */
+
+/* format specifiers differ - use the kernel's: */
+        %pK    a pointer, hashed unless privileged
+        %pa    a phys_addr_t / dma_addr_t
+        %pOF   a device_node's full path
+        %pe    an ERR_PTR, printed as "-ENOMEM"
+        %*ph   a hex dump of n bytes
+        size_t is %zu, not %lu
+
+/* MEMORY */
+        malloc(n)   -&gt;  kmalloc(n, GFP_KERNEL)
+        calloc      -&gt;  kcalloc(n, size, GFP_KERNEL)
+        realloc     -&gt;  krealloc()
+        free        -&gt;  kfree()
+        large       -&gt;  vmalloc()  (virtually contiguous only)
+        page-sized  -&gt;  alloc_pages() / __get_free_pages()
+        best        -&gt;  devm_kzalloc(dev, n, GFP_KERNEL)
+                        - freed automatically (chapter 33)
+
+/* STRINGS - and the safe variants matter */
+        strcpy      -&gt;  strscpy(dst, src, sizeof(dst))
+                        NOT strncpy, NOT strlcpy - strscpy
+                        always NUL-terminates and returns
+                        -E2BIG on truncation
+        sprintf     -&gt;  scnprintf(buf, size, ...)
+                        returns what was ACTUALLY written,
+                        unlike snprintf
+        memcpy, memset, memcmp   -- these exist, use freely
+
+/* ERRORS - negative errno, always */
+        return -ENOMEM;
+        return -EINVAL;
+        return -EIO;
+        return -EPROBE_DEFER;   /* kernel-specific: "try me
+                                   again later" (chapter 19) */
+
+/* POINTERS THAT ARE ERRORS */
+        p = some_func();                /* returns ERR_PTR */
+        if (IS_ERR(p))
+                return PTR_ERR(p);
+        /* NOT: if (!p) - a valid error pointer is non-NULL */
+
+/* NO FLOATING POINT. None. The kernel does not save FP state
+   on entry, so touching it corrupts user space's registers.
+   Use fixed-point arithmetic:                              */
+        /* instead of: temp_c = raw * 0.0625;               */
+        temp_milli_c = (raw * 625) / 10;
+
+/* DIVISION of 64-bit values on 32-bit builds needs helpers: */
+        do_div(n64, d32);               /* modifies n64 */
+        div_u64(n64, d32);
+        div64_u64(n64, d64);
+/* A plain `a / b` on two u64s can fail to link on 32-bit. */</code></pre>
+
+<h2 id="concurrency">Everything runs at once</h2>
+
+<p>In user space you reason about the threads you created. In the kernel your code can be entered simultaneously on every CPU, by an interrupt, by a timer, and by several processes, without you having started any of them — so code that is obviously single-threaded is usually not.</p>
+
+<pre><code>/* In user space you know which threads you created. In the
+   kernel, your code can be entered:
+
+     · by every CPU simultaneously
+     · re-entered by an interrupt on the same CPU
+     · by a timer, a workqueue, or an RCU callback
+     · by a different process through the same file descriptor
+     · while your module is being unloaded
+
+   ALL AT ONCE, from the first line you write.              */
+
+/* WRONG - a shared counter with no protection: */
+static int count;
+static ssize_t my_write(...)
+{
+        count++;                /* read-modify-write RACE */
+        ...
+}
+
+/* RIGHT - pick a mechanism (chapter 12): */
+static atomic_t count = ATOMIC_INIT(0);
+        atomic_inc(&amp;count);
+
+/* or, for anything more than a counter: */
+static DEFINE_MUTEX(my_lock);           /* process context   */
+static DEFINE_SPINLOCK(my_slock);       /* any context       */
+
+/* AND THE SUBTLER ONE - your module can be unloaded while a
+   callback is still queued: */
+static void my_exit(void)
+{
+        cancel_delayed_work_sync(&amp;work);  /* SYNC: wait for it */
+        del_timer_sync(&amp;timer);           /* SYNC */
+        free_irq(irq, dev);
+        /* only now is it safe for your code to disappear */
+}
+/* Get this wrong and you get "BUG: unable to handle page
+   fault" inside freed module text - a crash with a
+   backtrace pointing at addresses that no longer exist.  */</code></pre>
+
+<h2 id="ffree">The compiler is not the one you know</h2>
+
+<p>The kernel is compiled with a different set of assumptions from any user-space program: no standard library, no floating point, different optimisation rules, and warnings treated far more seriously. Some things that are legal C simply do not work here.</p>
+
+<pre><code># The kernel builds with, roughly:
+    -ffreestanding          no assumptions about libc
+    -fno-common
+    -fno-strict-aliasing    the kernel type-puns deliberately
+    -fno-delete-null-pointer-checks
+    -fno-stack-protector    (or a kernel-specific one)
+    -Wall -Wundef -Werror=implicit-function-declaration
+    -Wframe-larger-than=1024 (or 2048)
+    -std=gnu11
+    no -O0 - the kernel REQUIRES optimisation to build
+             correctly (inline assembly and __builtin
+             constant folding depend on it)
+
+# CONSEQUENCES:
+#   · no libc headers. &lt;stdio.h&gt; does not exist. Use
+#     &lt;linux/kernel.h&gt;, &lt;linux/string.h&gt;, &lt;linux/types.h&gt;.
+#   · u8/u16/u32/u64 and s8..s64 instead of stdint types
+#     (though stdint-style names exist via &lt;linux/types.h&gt;)
+#   · __le32 / __be32 for explicit endianness, with
+#     le32_to_cpu() etc. - and `sparse` checks you converted
+#   · GNU extensions are used freely: statement expressions,
+#     typeof, __attribute__, designated initialisers,
+#     case ranges
+
+# RUN SPARSE. It catches __user/__iomem/endian mistakes that
+# the compiler cannot:
+    make C=1 M=drivers/mydrv/          # check changed files
+    make C=2 M=drivers/mydrv/          # check all files</code></pre>
+
+<h2 id="abi">Two kinds of ABI, opposite rules</h2>
+
+<p>The kernel enforces two contradictory stability promises simultaneously, and confusing which one applies to
+the code you are touching is a common and avoidable mistake: internal APIs are free to change because only
+kernel code itself depends on them, while anything a user-space program can observe must never change, because
+an unknown number of programs already depend on it and cannot all be recompiled together.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Internal kernel API</th><th>User-space ABI</th></tr></thead>
+<tbody>
+<tr><td>Stability</td><td><strong>None.</strong> Functions and structs change every release</td><td><strong>Absolute.</strong> "We do not break user space"</td></tr>
+<tr><td>Includes</td><td><code>include/linux/</code></td><td><code>include/uapi/</code>, syscalls, ioctl numbers, sysfs paths, netlink messages, <code>/proc</code> formats</td></tr>
+<tr><td>Consequence</td><td>Out-of-tree modules break on every upgrade — a reason to upstream</td><td>Design your ioctl interface once, carefully (<a href="lx-21-ioctl.html">ch. 23</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The asymmetry is deliberate</b>
+<p>Internal churn is <em>allowed</em> precisely so that the kernel can be refactored to keep the external
+promise. That is why maintainers care so much about what your driver exposes to userspace and comparatively
+little about how it is structured internally: the first is forever, the second they can fix themselves.</p>
+</div>
+
+<h2 id="style">Style, and why it is enforced</h2>
+
+<p>Kernel style is unusually strict and unusually well enforced, which strikes newcomers as bureaucratic. There is a practical reason: with thousands of contributors reading each other's code, consistency is what makes a patch reviewable at all — and there is a tool that checks it for you.</p>
+
+<pre><code># Documentation/process/coding-style.rst. Non-negotiable in
+# review, and mechanically checkable:
+
+    ./scripts/checkpatch.pl --strict -f drivers/mydrv/mydrv.c
+
+# The rules that trip people up:
+#   tabs, 8 wide. Not spaces.
+#   ~80 columns (100 tolerated, but aim for 80)
+#   opening brace on the same line, EXCEPT for functions
+#   no braces on single-statement bodies
+#   typedef is discouraged - write `struct foo`
+#   one declaration per line, no assignments in conditions
+#   goto for error unwinding is CORRECT and idiomatic (ch. 33)
+#   comments: /* ... */, not //, for multi-line
+
+/* The idiomatic error path - learn to read and write this: */
+static int my_probe(struct platform_device *pdev)
+{
+        struct my_dev *d;
+        int ret;
+
+        d = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*d), GFP_KERNEL);
+        if (!d)
+                return -ENOMEM;
+
+        d-&gt;base = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(d-&gt;base))
+                return PTR_ERR(d-&gt;base);
+
+        ret = my_setup(d);
+        if (ret)
+                return ret;            /* devm cleans up */
+
+        platform_set_drvdata(pdev, d);
+        return 0;
+}
+/* Note: `sizeof(*d)` not `sizeof(struct my_dev)` - so it stays
+   correct if the type changes. This is house style and
+   reviewers will ask for it.                               */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Crash with a nonsensical backtrace</td><td>Stack overflow — check for large locals; enable <code>VMAP_STACK</code></td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code></td><td>Slept while atomic — exactly what <code>DEBUG_ATOMIC_SLEEP</code> is for</td></tr>
+<tr><td><code>scheduling while atomic</code></td><td>Same cause, caught elsewhere</td></tr>
+<tr><td>Undefined reference to <code>__aeabi_uldivmod</code> or similar</td><td>64-bit division — use <code>div_u64()</code></td></tr>
+<tr><td>Undefined reference to <code>printf</code>, <code>malloc</code></td><td>Used libc; there is no libc</td></tr>
+<tr><td>Random user-space FP corruption</td><td>Floating point in kernel code</td></tr>
+<tr><td>Crash inside freed module memory after <code>rmmod</code></td><td>Timer, work or IRQ not cancelled synchronously</td></tr>
+<tr><td>Works on one CPU, corrupts under load</td><td>Missing locking — it was always racy</td></tr>
+<tr><td>Checking a returned pointer against NULL still crashes</td><td>It was an <code>ERR_PTR</code>; use <code>IS_ERR</code></td></tr>
+<tr><td>Module loads on your kernel, not on the target's</td><td>No internal ABI stability — rebuild against the target's headers</td></tr>
+<tr><td>Sparse warnings about <code>__user</code> or endianness</td><td>Real bugs. Fix them, don't cast them away</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List ten things that differ between kernel and user-space C.</li>
+  <li>State the kernel stack size and rewrite a function with a large local buffer.</li>
+  <li>Name the three contexts plus "atomic", and say what each forbids.</li>
+  <li>Decide, for five given functions, whether they may sleep.</li>
+  <li>Translate <code>printf</code>, <code>malloc</code>, <code>strcpy</code> and <code>sprintf</code> to
+  their kernel equivalents, and say why <code>strscpy</code> beats the alternatives.</li>
+  <li>Explain why floating point is forbidden and show a fixed-point replacement.</li>
+  <li>Explain what <code>ERR_PTR</code> is for and check a result correctly.</li>
+  <li>List four ways your code can be entered concurrently.</li>
+  <li>Explain the opposite stability rules for internal and user-facing interfaces.</li>
+  <li>Run <code>checkpatch.pl</code> and <code>sparse</code> on a file and fix what they report.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

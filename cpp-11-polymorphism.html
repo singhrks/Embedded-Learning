@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inheritance, virtual functions and the vtable | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Inheritance, virtual functions and the vtable</h1>
+<p class="lead">How runtime polymorphism is implemented, exactly what it costs, and the four alternatives
+that give you the same flexibility without an indirect call. On embedded the answer is often "not virtual" —
+but you need to know the mechanism to make that judgement.</p>
+
+<h2 id="vtable">The vtable</h2>
+
+<p>Virtual dispatch is not magic: it is a hidden pointer in the object leading to a table of function pointers. Seeing the layout explains its cost, its memory overhead, and why it defeats inlining.</p>
+
+<pre class="diagram">   class Shape {
+   public:
+           virtual ~Shape() = default;
+           virtual int area() const = 0;
+           virtual void draw() const = 0;
+   };
+
+   class Circle : public Shape {
+           int r_;
+   public:
+           int area() const override { return 3 * r_ * r_; }
+           void draw() const override { ... }
+   };
+
+   OBJECT LAYOUT of a Circle on AArch64:
+
+      +0   __vptr    -----------+   8 bytes, ALWAYS FIRST
+      +8   r_                   |   4 bytes (+ 4 padding)
+      = 16 bytes total          |
+                                v
+      Circle's VTABLE (one per CLASS, in .rodata):
+         [0]  offset-to-top   0
+         [1]  typeinfo ptr    -> Circle's type_info (RTTI)
+         [2]  &amp;Circle::~Circle          (complete)
+         [3]  &amp;Circle::~Circle          (deleting)
+         [4]  &amp;Circle::area
+         [5]  &amp;Circle::draw
+
+   A CALL:
+        shape-&gt;area();
+   compiles to:
+        ldr  x8, [x0]           ; load the vptr
+        ldr  x8, [x8, #32]      ; load the slot
+        blr  x8                 ; indirect call
+
+   THREE INSTRUCTIONS AND TWO DEPENDENT LOADS, versus one
+   `bl` for a direct call.
+
+   THE COSTS, precisely:
+     · 8 bytes per OBJECT for the vptr
+     · one vtable per CLASS in .rodata
+     · two dependent loads before the call - a potential
+       cache miss each
+     · an INDIRECT branch, which the predictor must learn
+       (CA chapter 12)
+     · NO INLINING, unless the compiler can prove the dynamic
+       type - which blocks every downstream optimisation
+
+   THAT LAST POINT IS USUALLY THE LARGEST COST. The call
+   itself is a few cycles; the lost inlining can be a factor
+   of two on small functions.</pre>
+
+<h2 id="rules">The rules that matter</h2>
+
+<p>Several rules around virtual functions exist to prevent specific, silent bugs — most importantly a destructor that fails to run and an override that silently becomes an overload.</p>
+
+<pre><code>/* --- 1. A POLYMORPHIC BASE NEEDS A VIRTUAL DESTRUCTOR --- */
+        class Base { public: ~Base(); };        /* NOT virtual */
+        Base *p = new Derived;
+        delete p;               /* ~Derived NEVER RUNS -
+                                   UNDEFINED BEHAVIOUR       */
+
+        class Base { public: virtual ~Base() = default; };
+/* -Wnon-virtual-dtor / -Wdelete-non-virtual-dtor catch this.
+   Enable them.
+
+   THE EXCEPTION: if a base is never deleted through a base
+   pointer, a PROTECTED non-virtual destructor is correct and
+   cheaper:                                                */
+        class Interface {
+        protected:
+                ~Interface() = default;         /* cannot
+                                                   delete
+                                                   through
+                                                   this      */
+        public:
+                virtual void run() = 0;
+        };
+
+/* --- 2. ALWAYS WRITE `override` --- */
+        class Derived : public Base {
+                void draw() const override;     /* checked */
+                void draw();                    /* silently a
+                                                   NEW
+                                                   function -
+                                                   const
+                                                   mismatch  */
+        };
+/* -Wsuggest-override, -Winconsistent-missing-override.
+   `override` turns a silent bug into a compile error, and
+   costs one word.
+
+/* --- 3. `final` enables DEVIRTUALISATION --- */
+        class Circle final : public Shape { ... };
+        void f(Circle&amp; c) { c.area(); }   /* the compiler KNOWS
+                                             the type -&gt; a
+                                             DIRECT, INLINABLE
+                                             call            */
+/* Mark leaf classes and non-overridden virtuals `final`. It
+   is free and it recovers the inlining.
+
+/* --- 4. NEVER CALL A VIRTUAL FROM A CONSTRUCTOR --- */
+/* During Base's constructor the vptr points at BASE's vtable
+   (chapter 03). The override is not called. Use two-phase
+   init.
+
+/* --- 5. SLICING --- */
+        void f(Shape s);        /* BY VALUE - only the Shape
+                                   part is copied           */
+        Circle c;
+        f(c);                   /* SLICED - r_ is lost, and
+                                   the vptr is Shape's      */
+/* Always pass polymorphic types by reference or pointer.
+   Making the base abstract prevents it entirely, because
+   `Shape s` will not compile.                            */
+
+/* --- 6. DEFAULT ARGUMENTS ARE STATICALLY BOUND --- */
+        class Base    { virtual void f(int x = 1); };
+        class Derived { void f(int x = 2) override; };
+        Base *p = new Derived;
+        p-&gt;f();                 /* calls Derived::f(1) - the
+                                   DEFAULT came from Base   */
+/* Do not use default arguments on virtual functions.      */</code></pre>
+
+<h2 id="multiple">Multiple and virtual inheritance</h2>
+
+<p>Inheriting from several bases complicates the object layout considerably, and the virtual case introduces a pointer adjustment that surprises people reading disassembly.</p>
+
+<pre><code>/* MULTIPLE INHERITANCE from interfaces is fine and cheap: */
+        class Readable  { public: virtual int read() = 0; };
+        class Writable  { public: virtual int write(int) = 0; };
+        class Port : public Readable, public Writable { ... };
+
+/* LAYOUT: TWO vptrs, one per base. And a `Writable*` obtained
+   from a `Port*` is at a NON-ZERO OFFSET, so:            */
+        Port p;
+        Writable *w = &amp;p;       /* w != (void*)&amp;p ! */
+/* The compiler adjusts the pointer. Casting back and forth
+   with reinterpret_cast rather than static_cast breaks
+   silently - which is one reason C-style casts are dangerous
+   in C++.
+
+/* AND THE THUNK: calling through Writable* needs `this`
+   adjusted before entering Port's function, so the vtable
+   entry points at a small thunk that does the subtraction.
+   You will see these in disassembly as tiny functions named
+   `non-virtual thunk to Port::write`.
+
+/* VIRTUAL INHERITANCE - the diamond: */
+        class Base { int x; };
+        class A : virtual public Base {};
+        class B : virtual public Base {};
+        class D : public A, public B {};    /* ONE Base */
+
+/* THE COST is substantial: a virtual base pointer per
+   subobject, an extra indirection to reach Base's members,
+   and complicated construction ordering (the most-derived
+   class constructs the virtual base).
+
+   ON EMBEDDED: avoid virtual inheritance entirely. If you
+   need the diamond, you almost certainly want composition or
+   pure interfaces with no data.                          */
+
+/* THE INTERFACE RULE that avoids all of this:
+     a class with virtual functions has NO DATA MEMBERS
+     a class with data members has NO VIRTUAL FUNCTIONS and is
+     not inherited from
+   Then multiple inheritance is only ever from interfaces, and
+   the diamond cannot arise.                              */</code></pre>
+
+<div class="key">
+<b>Prefer composition to inheritance</b>
+<p>Inheritance couples the derived class to the base's implementation, its layout, and its future changes.
+Composition — holding a member and forwarding — couples only to the interface. The C++ Core Guidelines put
+it as: use inheritance for <em>substitutability</em> (an interface), and composition for
+<em>reuse</em>. Almost every "share this code between classes" problem is composition, not inheritance.</p>
+</div>
+
+<h2 id="alternatives">The four alternatives</h2>
+
+<p>Run-time polymorphism is not the only kind. Several techniques give you the same flexibility resolved entirely at compile time, which matters when the dispatch is in a hot path or the memory overhead is unacceptable.</p>
+
+<pre><code>/* --- 1. TEMPLATES: static polymorphism (chapter 06) --- */
+template&lt;typename Sensor&gt;
+void sample_loop(Sensor&amp; s)
+{
+        while (running)
+                log(s.read());          /* resolved at COMPILE
+                                           time, INLINED     */
+}
+/* ZERO cost, full inlining. The type set must be known at
+   compile time, and each instantiation is a separate copy of
+   the code.
+
+/* --- 2. CRTP (chapter 06) --- */
+template&lt;typename D&gt;
+class SensorBase {
+        D&amp; self() { return static_cast&lt;D&amp;&gt;(*this); }
+public:
+        int read() { return self().convert(self().read_raw()); }
+};
+/* An interface with shared implementation, statically
+   dispatched.
+
+/* --- 3. std::variant + std::visit (chapter 08) --- */
+        using AnySensor = std::variant&lt;Thermistor, Photodiode,
+                                       Hall&gt;;
+
+        std::array&lt;AnySensor, 4&gt; sensors;
+
+        for (auto&amp; s : sensors)
+                std::visit([](auto&amp; sensor)
+                        { log(sensor.read()); }, s);
+
+/* A HETEROGENEOUS CONTAINER with no heap and no vtable. The
+   dispatch is a jump table on the variant's index - one
+   indirect branch, but the target is a known small set and
+   the functions CAN be inlined into the visitor.
+
+   THE TRADE: the type list is closed. Adding a sensor type
+   means recompiling, which for firmware is fine and for a
+   plugin system is not.
+
+/* --- 4. A FUNCTION POINTER TABLE: the C way, still good --- */
+        struct DriverOps {
+                int  (*read)(void *ctx);
+                int  (*write)(void *ctx, int v);
+                void (*close)(void *ctx);
+        };
+        struct Driver {
+                const DriverOps *ops;
+                void *ctx;
+        };
+        d.ops-&gt;read(d.ctx);
+/* Exactly a hand-rolled vtable - and this is precisely what
+   the Linux kernel's file_operations is (Linux chapter 22).
+   It is explicit, has no language machinery behind it, and
+   costs the same indirect call.
+
+/* CHOOSING:
+
+     types known at compile time, one type per call site
+          -&gt; TEMPLATES
+     interface with shared implementation, static
+          -&gt; CRTP
+     small closed set, heterogeneous container, no heap
+          -&gt; VARIANT
+     open set, runtime plugins, ABI boundary
+          -&gt; VIRTUAL (or an ops table)
+
+   AND THE HONEST NOTE: virtual functions are not expensive
+   in absolute terms. If the function does meaningful work,
+   the indirect call is noise. The cost that matters is lost
+   inlining on SMALL functions called in a loop - and that is
+   the case where an alternative pays.                    */</code></pre>
+
+<h2 id="cost">Measuring the cost</h2>
+
+<p>The overhead of virtual dispatch is often quoted and rarely measured. These are the actual costs, and which of them dominates depends on the situation rather than on the call itself.</p>
+
+<pre><code>/* --- SIZE --- */
+        static_assert(sizeof(NonPolymorphic) == 4);
+        static_assert(sizeof(Polymorphic) == 16);
+                        /* 8 for the vptr + 4 + padding */
+
+/* On an object you allocate a thousand of, 8 bytes each is
+   8 KB. On a microcontroller that is a real consideration.
+
+/* --- SEE THE VTABLES --- */
+        clang++ -Xclang -fdump-vtable-layouts -c file.cpp
+        nm -C prog.elf | grep vtable
+        objdump -s -j .rodata prog.elf     /* they live here */
+
+/* --- CODE SIZE --- */
+        bloaty prog.elf -d symbols
+/* Look for: vtables, typeinfo objects, thunks, and the
+   __cxa_pure_virtual handler. With -fno-rtti the typeinfo
+   disappears; with -fno-exceptions much of the rest does.
+
+/* --- WHETHER A CALL WAS DEVIRTUALISED --- */
+        gcc -fdump-ipa-devirt
+        clang -Rpass=devirt
+/* Or simply read the assembly (compilers chapter 16): a `bl`
+   to a named function was devirtualised; `ldr`+`blr` was not.
+
+/* --- WHAT HELPS DEVIRTUALISATION --- */
+        final on classes and on individual virtual functions
+        -fwhole-program or LTO
+        anonymous namespaces, which prove no external
+                overrides exist
+        passing concrete types rather than base references
+        where the call site knows
+
+/* --- AND THE FLAGS THAT REMOVE THE MACHINERY --- */
+        -fno-rtti               /* no typeinfo, no
+                                   dynamic_cast            */
+        -fno-exceptions
+        -fno-threadsafe-statics
+/* All three are standard for embedded C++ (chapter 01), and
+   together they typically remove tens of kilobytes.      */</code></pre>
+
+<h2 id="rtti">RTTI</h2>
+
+<p>Run-time type information supports dynamic casts and type queries, and it is switched off in most embedded builds. Knowing what you lose tells you whether that is acceptable.</p>
+
+<pre><code>#include &lt;typeinfo&gt;
+
+        Shape *s = get_shape();
+
+        if (Circle *c = dynamic_cast&lt;Circle *&gt;(s)) {
+                use(*c);                /* it was a Circle */
+        }
+        Circle&amp; r = dynamic_cast&lt;Circle&amp;&gt;(*s);   /* THROWS
+                                                    on failure */
+
+        if (typeid(*s) == typeid(Circle)) { ... }
+        const char *name = typeid(*s).name();   /* MANGLED */
+
+/* THE COST: a typeinfo object per polymorphic class, plus a
+   runtime walk of the inheritance graph for dynamic_cast -
+   which is not constant time with multiple inheritance.
+
+/* AND -fno-rtti REMOVES IT ENTIRELY, which is what embedded
+   builds do. Then dynamic_cast and typeid are compile
+   errors.
+
+/* THE ALTERNATIVE when you need to recover the concrete type:
+   put a tag in the base and use static_cast:              */
+        class Shape {
+        public:
+                enum class Kind { Circle, Square };
+                Kind kind() const { return kind_; }
+                virtual ~Shape() = default;
+        protected:
+                explicit Shape(Kind k) : kind_(k) {}
+        private:
+                Kind kind_;
+        };
+
+        if (s-&gt;kind() == Shape::Kind::Circle)
+                auto *c = static_cast&lt;Circle *&gt;(s);
+
+/* This is LLVM's own idiom - its `isa&lt;&gt;` and `dyn_cast&lt;&gt;`
+   are exactly this, built on a kind field, and LLVM is
+   compiled with -fno-rtti for the reason above.
+
+/* AND THE BETTER ANSWER, usually: if you are asking what
+   concrete type something is, the interface is probably
+   missing a virtual function that would let you avoid
+   asking.                                                 */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Derived destructor never runs; memory leaks</td><td>Base destructor not <code>virtual</code></td></tr>
+<tr><td>An override is silently not called</td><td>Signature mismatch — <code>override</code> would have caught it</td></tr>
+<tr><td>Object loses its derived data</td><td>Slicing — passed by value</td></tr>
+<tr><td>Wrong default argument used</td><td>Defaults are statically bound on virtual functions</td></tr>
+<tr><td>Virtual call in constructor calls the base version</td><td>The vptr is not yet the derived one</td></tr>
+<tr><td>Pointer comparison fails after a cast</td><td>Multiple inheritance — a base pointer is at an offset</td></tr>
+<tr><td>Crash after <code>reinterpret_cast</code> between base and derived</td><td>Same — use <code>static_cast</code></td></tr>
+<tr><td>Objects 8 bytes larger than expected</td><td>The vptr</td></tr>
+<tr><td>Small virtual function is a bottleneck</td><td>Lost inlining — mark <code>final</code>, or use a template</td></tr>
+<tr><td><code>dynamic_cast</code> is a compile error</td><td><code>-fno-rtti</code> — use a kind tag</td></tr>
+<tr><td>Link error: <code>__cxa_pure_virtual</code></td><td>A pure virtual called during construction, or missing runtime support</td></tr>
+<tr><td>Tens of kilobytes of typeinfo in the binary</td><td>RTTI enabled — turn it off</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw an object's layout and its vtable, and write out the three instructions of a virtual call.</li>
+  <li>List the five costs of a virtual call and say which usually dominates.</li>
+  <li>Explain why a polymorphic base needs a virtual destructor, and the protected exception.</li>
+  <li>Explain what <code>override</code> and <code>final</code> each buy.</li>
+  <li>Explain slicing and how to make it impossible.</li>
+  <li>Explain why a base pointer under multiple inheritance is at an offset.</li>
+  <li>State the interface rule that prevents the diamond.</li>
+  <li>Give four alternatives to virtual dispatch and say when each fits.</li>
+  <li>Measure vtable and typeinfo cost in a real binary.</li>
+  <li>Replace <code>dynamic_cast</code> with a kind tag and explain LLVM's use of it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

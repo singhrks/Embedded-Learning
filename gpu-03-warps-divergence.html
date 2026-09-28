@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warps, wavefronts and divergence | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Warps, wavefronts and divergence</h1>
+<p class="lead">Thirty-two threads share one program counter. When an <code>if</code> sends them different
+ways the hardware does not pick one — it runs <em>both</em> sides, masking off the lanes that should not be
+there. Understanding exactly when that costs you, and when it does not, is the difference between a fast
+kernel and a correct one.</p>
+
+<h2 id="mask">Execution masking</h2>
+
+<pre class="diagram">   if (threadIdx.x % 2 == 0)  even_work();
+   else                       odd_work();
+
+   ONE warp, 32 lanes. 16 want each branch.
+
+     mask 11111111111111111111111111111111   all active
+        |
+        +-- evaluate the condition -> a 32-bit predicate
+        |
+     mask 10101010101010101010101010101010   even lanes
+        run even_work()          &lt;-- 16 lanes idle, burning
+                                     the same cycles
+        |
+     mask 01010101010101010101010101010101   odd lanes
+        run odd_work()           &lt;-- the other 16 idle
+        |
+     mask 11111111111111111111111111111111   reconverge
+
+   TIME TAKEN = time(even_work) + time(odd_work)
+   WORK DONE  = half of it
+
+   The branch was not mispredicted. It was not slow. BOTH
+   SIDES SIMPLY RAN, and half your lanes were switched off for
+   each. That is divergence.
+
+   THE COST IS THE SUM OF ALL TAKEN PATHS. A switch with 8
+   cases hit by different lanes of one warp costs 8x.</pre>
+
+<div class="key">
+<b>Divergence is per-warp, not per-thread</b>
+<p>If <em>every</em> lane of a warp takes the same branch, there is <strong>no cost at all</strong> — the
+hardware skips the untaken side entirely. A branch on <code>blockIdx.x</code>, or on data that is uniform
+across 32 consecutive elements, is free. It is only divergence <em>within</em> a warp that hurts. So the
+question is never "does my kernel branch" but "do adjacent threads branch differently".</p>
+</div>
+
+<h2 id="patterns">Divergent and uniform, side by side</h2>
+
+<pre><code>/* DIVERGENT - alternate lanes disagree. Worst case. */
+        if (threadIdx.x % 2 == 0) { ... }
+
+/* UNIFORM - the whole warp agrees. FREE. */
+        if (blockIdx.x == 0)      { ... }
+        if (N &gt; 1024)             { ... }    /* same for all   */
+
+/* UNIFORM BY CONSTRUCTION - the standard trick: branch on
+   something that changes only every 32 threads. */
+        if ((threadIdx.x / 32) % 2 == 0) { ... }   /* per-warp  */
+
+/* THE BOUNDS CHECK - technically divergent, and free anyway,
+   because only the LAST warp of the grid diverges. */
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i &lt; n) c[i] = a[i] + b[i];
+
+/* DATA-DEPENDENT - the real problem, because you cannot see
+   it in the source. */
+        if (particle[i].alive) simulate(i);
+/* If alive/dead are scattered randomly, every warp diverges
+   and you pay 2x for ever. If particles are SORTED by
+   liveness, whole warps agree and it is free. Same code, same
+   data, ten times the difference.                          */
+
+/* A LOOP WITH A DATA-DEPENDENT TRIP COUNT - divergence that
+   lasts as long as the longest lane. */
+        while (x &gt; threshold) { x = step(x); }
+/* The warp runs until the SLOWEST lane finishes. 31 lanes
+   idle while one iterates 400 more times.                  */</code></pre>
+
+<h2 id="fix">Removing divergence</h2>
+
+<pre><code>/* 1. PREDICATION - for tiny branches, the compiler does it
+      for you: compute both, select. No branch at all. */
+        y = (x &gt; 0) ? f(x) : g(x);
+/* becomes: compute f, compute g, select. Costs both, but no
+   branch overhead and no reconvergence. Good when both sides
+   are one or two instructions; bad when one side is
+   expensive - you now always pay for it.                    */
+
+/* 2. SORT THE DATA so lanes agree. Usually the biggest win
+      available. */
+        /* before: particles in creation order, alive scattered
+           after:  partition alive to the front               */
+        int n_alive = partition_by_alive(particles);
+        simulate&lt;&lt;&lt;grid(n_alive), 256&gt;&gt;&gt;(particles);
+/* Now the whole grid is alive and the branch disappears. The
+   sort costs a kernel; the divergence cost every frame.    */
+
+/* 3. STREAM COMPACTION - build a dense index list of the
+      items that need work, then launch over that. */
+        // pass 1: ballot + prefix sum to compact indices
+        // pass 2: kernel over the compacted list
+/* This is the general form of (2) and the standard answer for
+   ray tracing, sparse grids and particle systems.          */
+
+/* 4. SEPARATE KERNELS per case, when the cases are big and
+      known in advance. Two uniform kernels beat one divergent
+      one, even with two launches.                           */
+
+/* 5. RESTRUCTURE INDEXING so that consecutive lanes handle
+      consecutive similar work. Often as simple as swapping
+      which dimension maps to threadIdx.x.                   */
+
+/* 6. PERSISTENT THREADS + a work queue. Each warp pulls the
+      next item when it finishes, so a long-running lane does
+      not stall a whole block. Complex, but the standard answer
+      for highly irregular workloads.                        */</code></pre>
+
+<div class="warn">
+<b>Do not fight divergence you do not have</b>
+<p>A branch that every lane of a warp takes together is free, and branch-free tricks (bit twiddling, arithmetic
+selects) cost real instructions. Measure the divergence first — Nsight Compute reports
+<em>branch efficiency</em> and <em>warp execution efficiency</em> directly. Rewriting a uniform branch into
+branch-free arithmetic is a pure loss, and it happens constantly.</p>
+</div>
+
+<h2 id="reconverge">Reconvergence, and the deadlock it used to cause</h2>
+
+<pre class="diagram">   The hardware must know where diverged lanes rejoin. It
+   tracks this with a stack of (mask, reconvergence-PC) pairs.
+
+     push  (else-mask, PC-after-if)
+     run   the if-body with the if-mask
+     pop   -> restore else-mask, jump to else
+     run   the else-body
+     pop   -> full mask, continue at PC-after-if
+
+   PRE-VOLTA this stack was PER WARP, and reconvergence was
+   forced at the immediate post-dominator. Consequence:
+
+        if (lane == 0) {
+                while (atomicCAS(&amp;lock, 0, 1) != 0) ;   /* spin */
+                critical();
+                atomicExch(&amp;lock, 0);
+        }
+   Lane 0 acquires the lock. The other 31 lanes are masked off
+   at the SAME PC, waiting to reconverge. Lane 0 proceeds,
+   releases - fine. But reverse it:
+
+        while (atomicCAS(&amp;lock, 0, 1) != 0) ;
+   with several lanes competing: one lane wins and wants to
+   move on; the losers are still in the loop. The warp cannot
+   be in two places, so the winner is held back at the loop,
+   which means it never releases the lock. DEADLOCK, in code
+   that is obviously correct on a CPU.
+
+   VOLTA+ gives each thread its own PC, so the winner really
+   can proceed. That is why the change was made, and why any
+   intra-warp locking on old hardware is a trap.
+
+   The trade: reconvergence is no longer guaranteed at the
+   post-dominator, so you must call __syncwarp() where you
+   need it.</pre>
+
+<h2 id="measure">Measuring it</h2>
+
+<pre><code># Nsight Compute - the two metrics that matter.
+$ ncu --metrics \
+    smsp__thread_inst_executed_per_inst_executed.ratio,\
+    smsp__sass_average_branch_targets_threads_uniform.pct \
+    ./app
+
+  smsp__thread_inst_executed_per_inst_executed.ratio   18.4
+# "average active threads per issued instruction", out of 32.
+# 32.0 = perfect. 18.4 means you are wasting ~43% of every
+# instruction issue.
+
+  ...branch_targets_threads_uniform.pct                61.2%
+# fraction of branches where the whole warp agreed.
+
+# Source-level attribution, which is what you actually want:
+$ ncu --set full --import-source yes -o report ./app
+$ ncu-ui report.ncu-rep
+# the source view colours each line by divergence.
+
+# AMD:
+$ rocprof --stats ./app
+
+# DX12 / HLSL: PIX and RenderDoc both show wave occupancy and
+# divergence per draw. Nsight Graphics does the same for
+# Vulkan and DX12.
+
+# THE CHEAP ESTIMATE, if you have no profiler: comment out the
+# divergent branch (take one side unconditionally, accept the
+# wrong answer) and time it. The gap is your divergence cost.</code></pre>
+
+<h2 id="vendor">Warp width is not always 32</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Vendor</th><th>Width</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>NVIDIA</td><td>32</td><td>Stable since 2006; <code>warpSize</code> is still a variable, do not
+hardcode</td></tr>
+<tr><td>AMD GCN</td><td>64</td><td>Divergence costs twice as much per branch</td></tr>
+<tr><td>AMD RDNA</td><td>32 or 64</td><td>Wave32 by default for graphics, wave64 available; the compiler
+chooses</td></tr>
+<tr><td>Intel Xe</td><td>8, 16 or 32</td><td>Chosen per shader by the compiler — SIMD8 for register-heavy
+shaders</td></tr>
+<tr><td>ARM Mali</td><td>4–16</td><td>Much narrower, so divergence is far cheaper; older Mali is effectively
+scalar</td></tr>
+<tr><td>Apple</td><td>32</td><td>SIMD group</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Write portable code with <code>WaveGetLaneCount()</code> (HLSL), <code>gl_SubgroupSize</code> (Vulkan) or
+<code>warpSize</code> (CUDA), and never assume 32 in a loop bound. A reduction hardcoded to five shuffle steps
+is silently wrong on a 64-wide wavefront.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Kernel is 2× slower than the instruction count suggests</td><td>A two-way branch diverging in every
+warp</td></tr>
+<tr><td>Performance depends on input data ordering</td><td>Data-dependent divergence — sort or
+compact</td></tr>
+<tr><td>Warp execution efficiency well below 32</td><td>Divergence, or a partially-filled last warp</td></tr>
+<tr><td>A loop takes as long as its worst element</td><td>Divergent trip count; consider persistent
+threads</td></tr>
+<tr><td>Branch-free rewrite made it slower</td><td>The branch was uniform and therefore already free</td></tr>
+<tr><td>Deadlock in intra-warp locking</td><td>Pre-Volta forced reconvergence</td></tr>
+<tr><td>Reduction gives wrong results on AMD</td><td>Wavefront is 64; the shuffle loop assumed 32</td></tr>
+<tr><td>Fast on mobile, slow on desktop for the same branchy code</td><td>Mali's narrow warps make divergence
+cheap</td></tr>
+<tr><td>Ray tracer slows as the scene gets complex</td><td>Rays in a warp hit different materials — the
+canonical divergence problem</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what the hardware does when lanes of a warp take different branches.</li>
+  <li>State the cost rule for a divergent branch, and for a switch with eight cases.</li>
+  <li>Explain why divergence is per-warp and give two branches that are free.</li>
+  <li>Explain why a bounds check <code>if (i &lt; n)</code> costs essentially nothing.</li>
+  <li>Give six techniques for removing divergence, and when each applies.</li>
+  <li>Explain why sorting data can be faster than the divergence it removes.</li>
+  <li>Say when predication is a win and when it is a loss.</li>
+  <li>Describe the pre-Volta intra-warp deadlock and what fixed it.</li>
+  <li>Name the two profiler metrics that quantify divergence and what perfect looks like.</li>
+  <li>Give warp widths for three vendors and say what breaks if you hardcode 32.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

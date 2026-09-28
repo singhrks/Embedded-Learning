@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Character devices | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Character devices</h1>
+<p class="lead">How a driver becomes a file in <code>/dev</code>. Major and minor numbers, the
+<code>file_operations</code> table, and the per-open state that makes concurrent users work — plus the much
+simpler misc-device shortcut that is right most of the time.</p>
+
+<h2 id="numbers">Major, minor, and the node</h2>
+
+<p>A character device is how a driver appears as a file in <code>/dev</code>, so that ordinary programs can talk to it with <code>open</code>, <code>read</code> and <code>write</code>. The kernel identifies these devices by a pair of numbers, and understanding that pair explains where the file in <code>/dev</code> actually comes from.</p>
+
+<pre class="diagram">   $ ls -l /dev/mydev
+   crw-rw----  1 root root  241, 0  Jan  1 00:00 /dev/mydev
+   ^                         ^^^  ^
+   |                         major minor
+   character device
+
+  MAJOR   which driver
+  MINOR   which instance of it
+
+  A driver claims a range of (major, minor) pairs; the kernel
+  routes open() on a matching node to that driver.
+
+  dev_t packs both into one 32-bit value:
+     MAJOR(dev), MINOR(dev), MKDEV(major, minor)
+
+  THREE WAYS TO GET THE NODE INTO /dev:
+
+   1. udev/devtmpfs, automatically. The kernel creates the
+      node when you call device_create(). THIS IS WHAT YOU
+      WANT - no mknod, correct permissions, and it disappears
+      on unbind.
+
+   2. mknod by hand - for a minimal initramfs with no udev:
+         mknod /dev/mydev c 241 0
+
+   3. A misc device: major 10, a dynamically assigned minor,
+      node created for you. Simplest of all.</pre>
+
+<h2 id="misc">The misc device: start here</h2>
+
+<p>If your driver exposes a single device node — which is the common case — there is a wrapper that does almost all of the work below for you, including creating the <code>/dev</code> entry. Start here and only move to the full interface if you outgrow it.</p>
+
+<pre><code>/* If you need ONE device node and no special numbering, this
+   is 15 lines instead of 60, and it is what most simple
+   drivers should use.                                       */
+
+#include &lt;linux/miscdevice.h&gt;
+
+static const struct file_operations mydev_fops = {
+        .owner          = THIS_MODULE,
+        .open           = mydev_open,
+        .release        = mydev_release,
+        .read           = mydev_read,
+        .write          = mydev_write,
+        .unlocked_ioctl = mydev_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,
+        .poll           = mydev_poll,
+        .llseek         = no_llseek,
+};
+
+/* in probe: */
+        d-&gt;misc.minor  = MISC_DYNAMIC_MINOR;
+        d-&gt;misc.name   = "mydev";
+        d-&gt;misc.fops   = &amp;mydev_fops;
+        d-&gt;misc.parent = dev;          /* links it under the
+                                          real device in sysfs */
+
+        ret = misc_register(&amp;d-&gt;misc);
+        if (ret)
+                return ret;
+        /* -&gt; /dev/mydev now exists */
+
+/* in remove: */
+        misc_deregister(&amp;d-&gt;misc);
+
+/* GETTING BACK TO YOUR DEVICE from a file operation:
+   misc_open() sets file-&gt;private_data to the miscdevice, so
+   container_of() recovers yours.                           */
+static int mydev_open(struct inode *inode, struct file *file)
+{
+        struct miscdevice *m = file-&gt;private_data;
+        struct mydev *d = container_of(m, struct mydev, misc);
+        ...
+}</code></pre>
+
+<h2 id="cdev">The full cdev interface</h2>
+
+<p>The full interface is what you need when one driver must expose many device nodes, or when you want control over the numbering. It is more code, and every step of it is something the misc wrapper was doing on your behalf.</p>
+
+<pre><code>/* Use this when you need SEVERAL minors - one node per
+   channel, per port, per instance.                          */
+
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/device.h&gt;
+
+#define MYDEV_NR_DEVS  4
+
+static dev_t          mydev_devt;
+static struct class  *mydev_class;
+
+struct mydev {
+        struct cdev     cdev;
+        struct device  *cdev_dev;
+        ...
+};
+
+static int __init mydev_init(void)
+{
+        int ret;
+
+        /* 1. allocate a major and a range of minors */
+        ret = alloc_chrdev_region(&amp;mydev_devt, 0,
+                                  MYDEV_NR_DEVS, "mydev");
+        if (ret)
+                return ret;
+
+        /* 2. a class, so udev creates the nodes */
+        mydev_class = class_create("mydev");
+        if (IS_ERR(mydev_class)) {
+                ret = PTR_ERR(mydev_class);
+                goto err_region;
+        }
+
+        ret = platform_driver_register(&amp;mydev_driver);
+        if (ret)
+                goto err_class;
+
+        return 0;
+
+err_class:
+        class_destroy(mydev_class);
+err_region:
+        unregister_chrdev_region(mydev_devt, MYDEV_NR_DEVS);
+        return ret;
+}
+
+/* per device, in probe: */
+static int mydev_add_cdev(struct mydev *d, int idx)
+{
+        dev_t devt = MKDEV(MAJOR(mydev_devt),
+                           MINOR(mydev_devt) + idx);
+        int ret;
+
+        cdev_init(&amp;d-&gt;cdev, &amp;mydev_fops);
+        d-&gt;cdev.owner = THIS_MODULE;
+
+        /* cdev_add PUBLISHES it - from this instant, open()
+           can arrive. Everything else must already be
+           initialised.                                      */
+        ret = cdev_add(&amp;d-&gt;cdev, devt, 1);
+        if (ret)
+                return ret;
+
+        d-&gt;cdev_dev = device_create(mydev_class, d-&gt;dev, devt,
+                                    d, "mydev%d", idx);
+        if (IS_ERR(d-&gt;cdev_dev)) {
+                cdev_del(&amp;d-&gt;cdev);
+                return PTR_ERR(d-&gt;cdev_dev);
+        }
+        return 0;
+}
+
+/* teardown, exact reverse: */
+        device_destroy(mydev_class, devt);
+        cdev_del(&amp;d-&gt;cdev);
+        ...
+        class_destroy(mydev_class);
+        unregister_chrdev_region(mydev_devt, MYDEV_NR_DEVS);
+
+/* THE ORDERING RULE: cdev_add() is the point of no return.
+   After it, a concurrent open() can run. Initialise
+   everything the file operations touch BEFORE calling it, and
+   call cdev_del() FIRST when tearing down.                 */</code></pre>
+
+<h2 id="fops">The file operations</h2>
+
+<p>These are the functions the kernel calls when a program uses your device. Each corresponds to a system call, and the contracts they must honour — especially about partial transfers and file position — are what make ordinary tools work against your driver.</p>
+
+<pre><code>static int mydev_open(struct inode *inode, struct file *file)
+{
+        struct mydev *d;
+        struct mydev_session *s;
+
+        /* recover the device from the inode - cdev is embedded
+           in your struct                                     */
+        d = container_of(inode-&gt;i_cdev, struct mydev, cdev);
+
+        /* PER-OPEN state - one per file descriptor, so two
+           processes do not share a position or a mode        */
+        s = kzalloc(sizeof(*s), GFP_KERNEL);
+        if (!s)
+                return -ENOMEM;
+
+        s-&gt;dev = d;
+        file-&gt;private_data = s;
+
+        /* exclusive access, if the hardware demands it: */
+        if (test_and_set_bit(0, &amp;d-&gt;in_use)) {
+                kfree(s);
+                return -EBUSY;
+        }
+
+        return 0;
+}
+
+static int mydev_release(struct inode *inode, struct file *file)
+{
+        struct mydev_session *s = file-&gt;private_data;
+
+        clear_bit(0, &amp;s-&gt;dev-&gt;in_use);
+        kfree(s);
+        return 0;
+}
+
+static ssize_t mydev_read(struct file *file, char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+        struct mydev_session *s = file-&gt;private_data;
+        struct mydev *d = s-&gt;dev;
+        u32 sample;
+        int ret;
+
+        if (count &lt; sizeof(sample))
+                return -EINVAL;
+
+        if (file-&gt;f_flags &amp; O_NONBLOCK) {
+                if (!d-&gt;done)
+                        return -EAGAIN;
+        } else {
+                ret = wait_event_interruptible(d-&gt;wq, d-&gt;done);
+                if (ret)
+                        return -ERESTARTSYS;
+        }
+
+        mutex_lock(&amp;d-&gt;lock);
+        sample = d-&gt;last_sample;
+        d-&gt;done = false;
+        mutex_unlock(&amp;d-&gt;lock);
+
+        if (copy_to_user(buf, &amp;sample, sizeof(sample)))
+                return -EFAULT;
+
+        return sizeof(sample);          /* BYTES transferred */
+}
+
+static ssize_t mydev_write(struct file *file,
+                           const char __user *buf,
+                           size_t count, loff_t *ppos)
+{
+        struct mydev_session *s = file-&gt;private_data;
+        u32 val;
+
+        if (count != sizeof(val))
+                return -EINVAL;
+
+        if (copy_from_user(&amp;val, buf, sizeof(val)))
+                return -EFAULT;
+
+        mydev_wr(s-&gt;dev, MYDEV_REG_DATA, val);
+        return count;                   /* what you CONSUMED */
+}
+
+/* RETURN CONVENTIONS - getting these wrong breaks userspace
+   in ways that look like your hardware is faulty:
+
+     &gt; 0     bytes transferred. May be LESS than requested;
+             a correct caller loops.
+     0       end of file. For a device this usually means
+             "no more data, ever" - do not return it for
+             "nothing right now" (that is -EAGAIN).
+     -EAGAIN nothing available, and O_NONBLOCK was set
+     -EINTR / -ERESTARTSYS   interrupted before any progress
+     -EFAULT bad user pointer
+     -EINVAL bad arguments
+
+   AND: never return more than `count`. Userspace sized the
+   buffer.                                                   */</code></pre>
+
+<h2 id="poll">poll: making select() work</h2>
+
+<p>A program that wants to wait for data from several sources at once uses <code>select</code> or <code>poll</code>. For that to work with your device you have to implement one more operation, and doing it correctly is subtler than it looks because of a race that is easy to introduce.</p>
+
+<pre><code>static __poll_t mydev_poll(struct file *file,
+                           struct poll_table_struct *wait)
+{
+        struct mydev_session *s = file-&gt;private_data;
+        struct mydev *d = s-&gt;dev;
+        __poll_t mask = 0;
+
+        /* register interest - does NOT sleep. It adds this
+           task to the wait queue so a later wake_up() will
+           notify poll().                                     */
+        poll_wait(file, &amp;d-&gt;wq, wait);
+
+        if (d-&gt;done)
+                mask |= EPOLLIN | EPOLLRDNORM;   /* readable */
+
+        if (mydev_space_available(d))
+                mask |= EPOLLOUT | EPOLLWRNORM;  /* writable */
+
+        if (d-&gt;error)
+                mask |= EPOLLERR;
+
+        return mask;
+}
+
+/* THE CONTRACT:
+     · poll_wait() first, ALWAYS, before checking anything.
+       Checking first and registering after loses events - the
+       same lost-wakeup race as chapter 10.
+     · poll() must not block.
+     · every wake_up() that changes readability must be on the
+       queue you passed to poll_wait().
+
+   WITHOUT .poll, select(), poll() and epoll() report your fd
+   as always-ready, and a userspace event loop spins at 100%
+   CPU. This is not optional for any device a program will
+   wait on.                                                   */</code></pre>
+
+<div class="key">
+<b>Per-device state versus per-open state</b>
+<p>The <code>struct mydev</code> is the hardware — one per physical device, shared by every user. The
+session in <code>file-&gt;private_data</code> is per file descriptor: read position, subscribed events,
+requested mode. Putting a per-user value in the device struct means two programs silently corrupt each
+other's view, and it is the most common design bug in character drivers.</p>
+</div>
+
+<h2 id="perms">Permissions and access control</h2>
+
+<p>By default a new device node is accessible only to root. Deciding who else may use it is a real design decision rather than an afterthought, because a device node is a direct channel into kernel code.</p>
+
+<pre><code>/* By default your node is root-only. Real products need
+   something better than "run everything as root".          */
+
+/* 1. A udev rule - the normal answer:
+     /etc/udev/rules.d/99-mydev.rules                       */
+        KERNEL=="mydev", MODE="0660", GROUP="mydev"
+        SUBSYSTEM=="mydev", TAG+="uaccess"   /* the logged-in
+                                                user          */
+
+/* 2. Set the mode from the driver, via the class: */
+static char *mydev_devnode(const struct device *dev,
+                           umode_t *mode)
+{
+        if (mode)
+                *mode = 0660;
+        return NULL;
+}
+        mydev_class-&gt;devnode = mydev_devnode;
+
+/* 3. Capability checks inside a specific operation: */
+        if (!capable(CAP_SYS_RAWIO))
+                return -EPERM;
+/* Use the most specific capability that fits, not
+   CAP_SYS_ADMIN, which is effectively root.                */
+
+/* 4. Check the open mode for write operations: */
+        if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                return -EBADF;
+/* Important for ioctls: a file opened O_RDONLY can still
+   issue any ioctl unless you check. A "set configuration"
+   ioctl reachable from a read-only fd is a real privilege
+   bug.                                                     */</code></pre>
+
+<h2 id="test">Testing from userspace</h2>
+
+<p>You can exercise a character driver with nothing but shell commands, which makes the feedback loop very short. These are the checks worth running before writing any dedicated test program.</p>
+
+<pre><code>#include &lt;fcntl.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+        struct pollfd pfd;
+        uint32_t sample;
+        int fd;
+
+        fd = open("/dev/mydev", O_RDWR);
+        if (fd &lt; 0) { perror("open"); return 1; }
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+
+        for (;;) {
+                int ret = poll(&amp;pfd, 1, 1000);
+                if (ret &lt; 0)  { perror("poll"); break; }
+                if (ret == 0) { printf("timeout\n"); continue; }
+
+                if (read(fd, &amp;sample, sizeof(sample)) &lt; 0) {
+                        perror("read");
+                        break;
+                }
+                printf("sample: %u\n", sample);
+        }
+
+        close(fd);
+        return 0;
+}</code></pre>
+
+<pre><code># Quick checks without writing a program:
+    cat /dev/mydev | hexdump -C
+    echo -ne '\x01\x00\x00\x00' > /dev/mydev
+    dd if=/dev/mydev bs=4 count=10 | xxd
+
+# Does poll work, or does it spin?
+    strace -e poll,read ./mytest
+    # A correct driver blocks in poll. A broken one returns
+    # immediately, forever.
+
+# Confirm the node and its numbers:
+    ls -l /dev/mydev
+    cat /proc/devices | grep mydev
+    ls /sys/class/mydev/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>/dev/mydev</code> does not appear</td><td><code>device_create</code> not called, or no devtmpfs/udev</td></tr>
+<tr><td><code>open</code> returns <code>-ENODEV</code></td><td>Node exists with numbers no driver claims — stale <code>mknod</code></td></tr>
+<tr><td><code>open</code> returns <code>-EPERM</code></td><td>Node permissions — add a udev rule</td></tr>
+<tr><td>Crash on the first <code>open</code></td><td><code>cdev_add</code> called before the state it uses was initialised</td></tr>
+<tr><td>Two programs corrupt each other</td><td>Per-open state kept in the device struct</td></tr>
+<tr><td><code>select</code>/<code>poll</code> spins at 100% CPU</td><td>No <code>.poll</code> handler, or it does not call <code>poll_wait</code></td></tr>
+<tr><td>Events missed under load</td><td><code>poll_wait</code> called after checking the condition</td></tr>
+<tr><td><code>read</code> returns 0 and the program exits</td><td>Returned EOF instead of <code>-EAGAIN</code></td></tr>
+<tr><td>Program hangs, unkillable</td><td>Uninterruptible wait (<a href="lx-09-task-struct.html">ch. 10</a>)</td></tr>
+<tr><td><code>rmmod</code> says busy while an fd is open</td><td>Correct — <code>.owner = THIS_MODULE</code> working</td></tr>
+<tr><td>Crash after <code>rmmod</code> with an fd open</td><td><code>.owner</code> not set</td></tr>
+<tr><td>Read-only fd can change configuration</td><td><code>f_mode</code> not checked in the ioctl</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain major and minor numbers and the three ways a node appears in <code>/dev</code>.</li>
+  <li>Register a misc device and recover your device struct from a file operation.</li>
+  <li>Use the full cdev interface for four minors, with correct init and teardown order.</li>
+  <li>Explain why <code>cdev_add</code> is the point of no return.</li>
+  <li>Write <code>open</code>, <code>release</code>, <code>read</code> and <code>write</code> with correct
+  return values.</li>
+  <li>Distinguish per-device from per-open state and say what breaks if you confuse them.</li>
+  <li>Write a <code>poll</code> handler and explain the ordering requirement.</li>
+  <li>Handle <code>O_NONBLOCK</code> correctly.</li>
+  <li>Set node permissions three different ways.</li>
+  <li>Explain why an ioctl must check <code>f_mode</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

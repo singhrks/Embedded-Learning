@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Side channels and constant-time programming | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Side channels and constant-time programming</h1>
+<p class="lead">The algorithm is secure. The implementation runs on real hardware that takes measurable
+time, draws measurable current and emits measurable radiation. Everything it does with a secret is
+potentially visible.</p>
+
+<h2 id="channels">What leaks</h2>
+
+<p>An algorithm can be mathematically sound and still leak its key through how long it takes, how much power it draws, or what it does to the cache. These attacks target the implementation rather than the mathematics.</p>
+
+<pre class="diagram">   THE CHANNELS, roughly by how easy they are to exploit:
+
+   TIMING             How long an operation takes.
+                      Measurable REMOTELY, over a network,
+                      by averaging many samples. No physical
+                      access needed.
+
+   CACHE              Which memory lines were touched.
+                      Measurable BY ANOTHER PROCESS on the
+                      same machine - or another VM on the
+                      same host.
+
+   BRANCH PREDICTOR   Which way a branch went. Same
+                      cross-process reach as cache.
+
+   POWER (SPA/DPA)    Instantaneous current draw. Needs a
+                      resistor in the power line and an
+                      oscilloscope. ~$100 of equipment.
+
+   ELECTROMAGNETIC    Near-field emissions. Same information
+                      as power, WITHOUT TOUCHING THE BOARD.
+
+   FAULT INJECTION    Not observation - INDUCED ERROR.
+                      Voltage glitch, clock glitch, laser,
+                      EM pulse. Makes the device compute
+                      wrong, and wrong answers leak.
+
+   ACOUSTIC, THERMAL, PHOTONIC - real, demonstrated,
+   rarely the easiest route.
+
+   THE THREAT MODEL DECIDES WHICH MATTER:
+
+     a server in a datacentre     -> timing, cache, branch
+     a phone running your app     -> plus power, and
+                                     untrusted co-resident
+                                     code
+     a device in a customer's
+       hands                      -> ALL OF THEM. They own
+                                     the hardware, they have
+                                     unlimited time, and
+                                     ChipWhisperer costs
+                                     less than a phone.
+
+   AND THE RULE THAT FOLLOWS: IF THE ATTACKER CAN HOLD THE
+   DEVICE, ASSUME THEY CAN SEE POWER AND INJECT FAULTS.
+   Design for it, or accept that per-device keys will be
+   extracted.</pre>
+
+<h2 id="ct">The constant-time discipline</h2>
+
+<p>Constant-time code is the primary defence, and it means something precise: execution must not depend on secret data in any way an attacker can observe — which rules out branches, table lookups and early exits on secrets.</p>
+
+<pre><code>/* THE RULE, and it is short:
+
+     NO BRANCH, NO MEMORY ADDRESS, AND NO VARIABLE-LATENCY
+     INSTRUCTION MAY DEPEND ON SECRET DATA.
+
+   Everything below follows from it.                      */
+
+/* --- VIOLATION 1: BRANCHING ON A SECRET --- */
+    if (secret_byte == 0x42) do_a(); else do_b();
+    /* the branch predictor and the instruction timing both
+       reveal which way it went */
+
+/* --- VIOLATION 2: EARLY EXIT --- */
+    for (i = 0; i &lt; n; i++)
+        if (a[i] != b[i]) return 0;    /* &lt;-- leaks the
+                                              match length */
+
+    /* CONSTANT-TIME COMPARISON: */
+    int ct_memcmp(const void *a, const void *b, size_t n)
+    {
+        const volatile uint8_t *pa = a, *pb = b;
+        uint8_t diff = 0;
+        for (size_t i = 0; i &lt; n; i++)
+                diff |= pa[i] ^ pb[i];   /* ALWAYS all n */
+        return diff;                     /* 0 == equal */
+    }
+    /* the `volatile` stops the compiler proving it can
+       stop early. Better still, call the library's:
+       sodium_memcmp, CRYPTO_memcmp, mbedtls_ct_memcmp. */
+
+/* --- VIOLATION 3: SECRET-DEPENDENT MEMORY ADDRESSES --- */
+    value = table[secret_index];
+    /* WHICH CACHE LINE was loaded is visible to any process
+       sharing the cache. This is exactly the AES T-table
+       attack (chapter 04), and it recovers a full AES key
+       from another process in seconds. */
+
+    /* CONSTANT-TIME TABLE LOOKUP - touch EVERY entry: */
+    uint8_t ct_lookup(const uint8_t *tab, size_t n,
+                      size_t secret_idx)
+    {
+        uint8_t r = 0;
+        for (size_t i = 0; i &lt; n; i++) {
+                uint8_t m = ct_eq(i, secret_idx);  /* 0xFF or
+                                                      0x00 */
+                r |= tab[i] &amp; m;
+        }
+        return r;
+    }
+    /* O(n) per lookup. For a 256-entry S-box this is
+       expensive, which is why AES is BITSLICED instead -
+       computing the S-box arithmetically with no table at
+       all. */
+
+/* --- VIOLATION 4: VARIABLE-LATENCY INSTRUCTIONS --- */
+    Integer DIVIDE and MODULO take data-dependent time on
+    many cores, including several Cortex-M and Cortex-A
+    parts. So do some multiplies on small cores (the classic
+    ARM7TDMI multiplier terminated early on small operands).
+    AVOID div/mod ON SECRETS entirely; use masking and
+    shifts.
+
+/* --- THE PRIMITIVES YOU BUILD EVERYTHING FROM --- */
+
+    /* mask: 0xFFFF... if b, else 0 */
+    static inline uint32_t ct_mask(uint32_t b)
+    {   return -(uint32_t)(b &amp; 1); }
+
+    /* select a or b without branching */
+    static inline uint32_t ct_select(uint32_t cond,
+                                     uint32_t a, uint32_t b)
+    {   uint32_t m = ct_mask(cond);
+        return (a &amp; m) | (b &amp; ~m); }
+
+    /* equality -> 1 or 0, no branch */
+    static inline uint32_t ct_eq(uint32_t x, uint32_t y)
+    {   uint32_t d = x ^ y;
+        return 1 ^ ((d | -d) &gt;&gt; 31); }
+
+    /* greater-than, for bignum comparison */
+    static inline uint32_t ct_gt(uint32_t x, uint32_t y)
+    {   return (((y - x) ^ ((x ^ y) &amp; ((x - y) ^ x)))
+                &gt;&gt; 31) &amp; 1; }
+
+    /* conditional swap - the heart of a Montgomery ladder
+       (chapter 14) */
+    static void ct_cswap(uint32_t cond, uint32_t *a,
+                         uint32_t *b, size_t n)
+    {
+        uint32_t m = ct_mask(cond);
+        for (size_t i = 0; i &lt; n; i++) {
+                uint32_t t = m &amp; (a[i] ^ b[i]);
+                a[i] ^= t;  b[i] ^= t;
+        }
+    }</code></pre>
+
+<div class="warn">
+<b>The compiler is not on your side</b>
+<p>A C compiler is permitted to turn your branchless <code>ct_select</code> back into a conditional
+branch if it decides that is faster, and modern optimisers do exactly that. The mitigations, in increasing
+order of reliability: use <code>volatile</code> on the inputs; use an inline-assembly barrier such as
+<code>asm volatile("" : "+r"(x))</code> to make the value opaque; use the library's tested primitives;
+or, for the innermost loops, write the assembly yourself. Then <em>verify</em> — see the tooling section
+below. This is not hypothetical: it has silently reintroduced timing leaks into libraries that had them
+fixed.</p>
+</div>
+
+<h2 id="power">Power and fault attacks</h2>
+
+<p>Measuring a device's power consumption while it computes can recover a key, sometimes from a single trace. This is a practical attack on physical devices rather than a theoretical one.</p>
+
+<pre><code>/* --- SPA: SIMPLE POWER ANALYSIS --- */
+    Read the secret from a SINGLE trace by looking at it.
+    A square-and-multiply exponentiation shows square and
+    multiply operations with visibly different current
+    profiles - so the exponent bits are readable off the
+    oscilloscope screen (chapters 12 and 14).
+    DEFENCE: constant operation sequences. The ladder.
+
+/* --- DPA: DIFFERENTIAL POWER ANALYSIS --- */
+    Collect thousands of traces with known inputs.
+    Hypothesise one byte of the key. Predict an intermediate
+    value's Hamming weight. Correlate the prediction with the
+    measured power at every time offset. The correct
+    hypothesis shows a correlation spike.
+
+    ONE KEY BYTE AT A TIME: 16 x 256 hypotheses for AES,
+    instead of 2^128. A few thousand traces and an afternoon.
+    CONSTANT-TIME CODE DOES NOT STOP THIS - the timing is
+    identical, but the DATA VALUES still modulate the current.
+
+    DEFENCES:
+      MASKING     split every secret value into shares:
+                  x = x1 XOR x2, with x1 random per
+                  execution. Compute on the shares. The
+                  measured power then correlates with random
+                  values, not the secret. Costs 2-4x in
+                  performance and is HARD TO GET RIGHT - the
+                  shares must never recombine, including in a
+                  register or a pipeline forwarding path.
+      HIDING      random delays, dummy operations, shuffled
+                  operation order. Raises the trace count,
+                  does not eliminate the leak.
+      HARDWARE    dual-rail logic, noise generators,
+                  integrated voltage regulators. This is what
+                  a certified secure element buys you
+                  (chapter 18).
+
+/* --- FAULT INJECTION --- */
+    Voltage glitch, clock glitch, EM pulse, laser. Skip an
+    instruction, corrupt a register, flip a bit.
+
+    THE CLASSIC TARGET IS A SECURITY DECISION:
+        if (signature_valid)     &lt;-- glitch the compare
+                jump_to_image();     or the branch
+
+    AND THE CRYPTOGRAPHIC ONES:
+      · RSA-CRT: one faulty half reveals a prime (ch. 11, 12)
+      · Differential fault analysis on AES: one fault in
+        round 9 recovers the key from a pair of correct and
+        faulty ciphertexts
+      · Glitching a deterministic signature to compare two
+        outputs (chapter 15)
+
+    DEFENCES:
+      · VERIFY AFTER SIGN, always
+      · DOUBLE-CHECK SECURITY DECISIONS with different code,
+        separated in time, and use non-trivial constants:
+
+            #define OK   0x5A3C96E1u
+            #define FAIL 0xA5C36918u
+            /* not 1 and 0 - a stuck-at fault produces 0 or
+               all-ones far more easily than a specific
+               32-bit value */
+
+            uint32_t v1 = verify(sig);
+            random_delay();
+            uint32_t v2 = verify(sig);
+            if (v1 != OK || v2 != OK || v1 != v2)
+                    lockdown();
+
+      · REDUNDANT LOOP COUNTERS, so a skipped iteration is
+        detected
+      · SENSORS: voltage, clock, temperature, light. Most
+        secure MCUs have them; ENABLE THEM.
+      · and a real INFINITE-LOOP-FREE failure path: on
+        detection, wipe and halt.
+
+/* THE HONEST ASSESSMENT: full fault resistance is
+   specialist work. If your threat model includes a funded
+   attacker with the device on a bench, PUT THE KEYS IN A
+   CERTIFIED SECURE ELEMENT and let people whose whole job
+   this is defend them.                                   */</code></pre>
+
+<h2 id="micro">Microarchitectural attacks</h2>
+
+<p>Modern processors leak through shared microarchitectural state — caches, branch predictors, speculative execution. These attacks work across process and even virtual-machine boundaries.</p>
+
+<pre><code>/* The cache and speculation attacks that reshaped CPU
+   security from 2018 onward. Relevant to you if your device
+   runs untrusted code - a browser, a container, a customer
+   app - or if you are writing a driver or a hypervisor.  */
+
+   FLUSH+RELOAD    flush a shared line, wait, time the
+                   reload. Fast and precise; needs shared
+                   memory (a shared library, page dedup).
+   PRIME+PROBE     fill a cache set, wait, time it again.
+                   No sharing needed.
+   SPECTRE         mistrain the branch predictor so the CPU
+                   speculatively reads out of bounds; the
+                   access leaves a cache trace even though
+                   the result is discarded.
+   MELTDOWN        speculative reads across the
+                   user/kernel boundary. Fixed in hardware
+                   in current parts.
+   ROWHAMMER       repeated DRAM row activation flips bits
+                   in ADJACENT rows. Not a leak - a WRITE
+                   primitive, from reads alone.
+
+/* WHAT THIS MEANS FOR CRYPTOGRAPHIC CODE:
+     · NO SECRET-DEPENDENT MEMORY ACCESS - the same rule as
+       above, now with a second reason
+     · no secret-dependent branches, because speculation
+       executes both paths
+     · AND THE HARD PART: an attacker on the same core can
+       observe your code even if your code is perfect, via
+       SMT/hyperthreading. Disable SMT for
+       security-critical workloads, or pin them to a
+       dedicated core.
+
+/* ON ARM, THE RELEVANT MITIGATIONS: CSDB (consumption of
+   speculative data barrier) and the SB instruction bound
+   speculation explicitly; the DIT (Data Independent Timing)
+   bit in PSTATE on Armv8.4+ guarantees data-independent
+   timing for a defined instruction set - SET IT AROUND
+   CRYPTOGRAPHIC CODE where the core supports it. See the
+   ARM track for the barrier semantics.                  */</code></pre>
+
+<h2 id="tools">Verifying it</h2>
+
+<p>Whether code is genuinely constant-time is not obvious by inspection, particularly after the compiler has optimised it. These tools check rather than assume.</p>
+
+<pre><code>/* YOU CANNOT EYEBALL CONSTANT TIME. Measure and prove.   */
+
+/* --- dudect: statistical timing test --- */
+    Run the function with two input classes - one fixed, one
+    random - many times. Apply Welch's t-test to the timing
+    distributions. If |t| &gt; 4.5, the timing depends on the
+    data.
+    Easy to integrate, catches real leaks, and NEEDS NO
+    SOURCE ANALYSIS. Run it in CI.
+
+/* --- ctgrind / MemSan-based checking --- */
+    Mark the secret as UNINITIALISED memory for Valgrind:
+
+        VALGRIND_MAKE_MEM_UNDEFINED(key, sizeof key);
+        crypto_operation(key, ...);
+
+    Valgrind already reports branches and memory addresses
+    that depend on undefined data - which is EXACTLY the
+    property you want to check. An elegant reuse, and it
+    finds violations statically along the executed path.
+
+/* --- ChipWhisperer --- */
+    Open-source hardware plus software for power analysis and
+    glitching. A few hundred dollars. IF YOU SHIP HARDWARE
+    WITH KEYS IN IT, YOU SHOULD OWN ONE - because your
+    attackers do, and finding your own DPA leak is much
+    cheaper than reading about it.
+
+/* --- OTHERS WORTH KNOWING --- */
+    · binsec/rel, ct-verif: formal verification of
+      constant-timeness
+    · Compiler flags will not save you; there is no
+      -fconstant-time
+    · Cachegrind and perf counters for cache behaviour
+
+/* --- AND THE PRACTICAL CHECKLIST --- */
+    [ ] no branch on secret data
+    [ ] no table index derived from secret data
+    [ ] no div/mod on secret data
+    [ ] all comparisons of secrets are constant-time
+    [ ] blinding enabled on every asymmetric operation
+    [ ] verify-after-sign on RSA-CRT
+    [ ] security decisions double-checked, non-trivial
+        constants
+    [ ] secrets zeroised with an unremovable primitive
+    [ ] dudect or ctgrind in CI
+    [ ] and, if the threat model warrants it, the keys are
+        not in the application processor at all         */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>MAC tag recovered byte by byte</td><td>Early-exit comparison</td></tr>
+<tr><td>AES key recovered by a co-resident process</td><td>T-table lookups — cache timing</td></tr>
+<tr><td>RSA key recovered over the network</td><td>Unblinded exponentiation timing</td></tr>
+<tr><td>ECDSA key from a few hundred signatures</td><td>Nonce bias from a leaky scalar multiply</td></tr>
+<tr><td>Key read off an oscilloscope in one trace</td><td>SPA — branching square-and-multiply</td></tr>
+<tr><td>Key recovered despite constant-time code</td><td>DPA — needs masking, not just timing equality</td></tr>
+<tr><td>Signature check bypassed by a voltage pulse</td><td>Single unprotected branch on the security decision</td></tr>
+<tr><td>A prime recovered from one signature</td><td>CRT fault, no verify-after-sign</td></tr>
+<tr><td>A fixed leak reappears after a compiler upgrade</td><td>The optimiser reintroduced the branch</td></tr>
+<tr><td>Timing varies only under load</td><td>SMT sibling contention — pin or disable SMT</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the side channels and say which apply to a device in a customer's hands.</li>
+  <li>State the constant-time rule in one sentence.</li>
+  <li>Write constant-time equality, select, mask and conditional swap from memory.</li>
+  <li>Explain why a constant-time table lookup is O(n) and what AES does instead.</li>
+  <li>Name two instructions with data-dependent latency.</li>
+  <li>Explain why the compiler can undo your branchless code, and three mitigations.</li>
+  <li>Contrast SPA and DPA, and say why constant time does not stop DPA.</li>
+  <li>Explain masking, and the subtlety that makes it hard to implement.</li>
+  <li>Write a fault-resistant verification check and say why the constants are not 0 and 1.</li>
+  <li>Explain Flush+Reload and why speculation makes secret-dependent branches worse.</li>
+  <li>Describe dudect and ctgrind, and say what each catches that the other does not.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

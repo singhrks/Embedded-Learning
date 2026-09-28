@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The graphics pipeline, stage by stage | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The graphics pipeline, stage by stage</h1>
+<p class="lead">Triangles in, pixels out. Every graphics API is a way of configuring the same fixed sequence
+of stages, some programmable and some not — and knowing which is which tells you exactly what you can and
+cannot change.</p>
+
+<h2 id="stages">The pipeline</h2>
+
+<pre class="diagram">   [P] = programmable    [F] = fixed function, configurable
+
+   INPUT ASSEMBLER                                        [F]
+     reads vertex + index buffers, assembles primitives.
+     Decides what a "triangle" is: list, strip, or fan.
+        |  vertices
+        v
+   VERTEX SHADER                                          [P]
+     runs ONCE PER VERTEX. Transforms object space -> clip
+     space. Must output SV_Position. Whatever else you emit is
+     interpolated for the pixel shader.
+        |
+        v
+   [ HULL / TESSELLATOR / DOMAIN ]              [P][F][P]
+     optional. Subdivide patches into more triangles on the
+     GPU. Used for terrain and smooth surfaces; less popular
+     now that mesh shaders exist.
+        |
+   [ GEOMETRY SHADER ]                                    [P]
+     optional, runs per PRIMITIVE, can emit 0..N primitives.
+     Famously slow on most hardware - it serialises. Avoid.
+        |
+        v
+   CLIPPING + PERSPECTIVE DIVIDE + VIEWPORT                [F]
+     clip to the frustum, divide xyz by w, map to pixels.
+        |
+        v
+   RASTERISER                                             [F]
+     triangles -> fragments. Also does back-face culling and
+     the early-Z test. Generates 2x2 QUADS, always
+     (chapter 8).
+        |  fragments
+        v
+   PIXEL / FRAGMENT SHADER                                [P]
+     runs ONCE PER FRAGMENT. Computes a colour. This is where
+     nearly all your shading cost lives.
+        |
+        v
+   OUTPUT MERGER                                          [F]
+     depth test, stencil test, blending, write to the render
+     target. Blending is fixed-function because it must be
+     ORDER-DEPENDENT and atomic per pixel.
+        |
+        v
+   RENDER TARGET
+
+   NOTE WHAT IS FIXED: rasterisation, clipping, depth test and
+   blending. These are fixed because they are done billions of
+   times per frame and because they need guarantees
+   (ordering, atomicity) that general code cannot give
+   cheaply. You configure them; you do not write them.</pre>
+
+<div class="key">
+<b>The two counts that decide your frame time</b>
+<p>Vertex shaders run per <em>vertex</em> — perhaps a million per frame. Pixel shaders run per
+<em>fragment</em> — at 4K with any overdraw, tens of millions. A pixel shader is typically 10–100× more
+invocations than the vertex shader, which is why "move work to the vertex shader" is the oldest optimisation
+in real-time graphics, and why overdraw matters so much.</p>
+</div>
+
+<h2 id="spaces">The coordinate spaces</h2>
+
+<pre><code>/* A vertex is transformed through five spaces. Every graphics
+   bug that renders "nothing at all" is a matrix in the wrong
+   place in this chain.                                     */
+
+  OBJECT / MODEL SPACE    the mesh as the artist made it,
+                          origin at its own centre
+        | x World matrix          (position, rotate, scale)
+        v
+  WORLD SPACE             everything in one shared frame
+        | x View matrix           (the inverse of the camera's
+        v                          transform)
+  VIEW / CAMERA SPACE     camera at the origin, looking down
+                          -Z (GL) or +Z (D3D)
+        | x Projection matrix     (frustum -> a cube)
+        v
+  CLIP SPACE              homogeneous. -w &lt;= x,y &lt;= w and
+                          0 &lt;= z &lt;= w (D3D) or -w &lt;= z &lt;= w (GL)
+        | divide by w             (the PERSPECTIVE DIVIDE)
+        v
+  NDC                     the canonical cube
+        | viewport transform
+        v
+  SCREEN SPACE            pixels, plus a depth in [0,1]
+
+/* The vertex shader's job is object -> clip. Everything after
+   is fixed function.                                        */
+
+float4 VSMain(float3 pos : POSITION) : SV_Position
+{
+        float4 world = mul(float4(pos, 1.0), World);
+        float4 view  = mul(world, View);
+        return mul(view, Projection);          /* CLIP space   */
+        /* Do NOT divide by w yourself - the hardware does it,
+           and it also uses w for perspective-correct
+           interpolation.                                     */
+}
+
+/* D3D vs GL DIFFERENCES that cause upside-down or clipped
+   output when porting:
+     clip-space Z range   D3D [0,1]      GL [-1,1]
+     texture origin       D3D top-left   GL bottom-left
+     matrix convention    D3D row-major, row-vector by default
+                          GL  column-major, column-vector
+   Vulkan follows D3D on Z and GL on Y, which catches
+   everyone exactly once.                                    */</code></pre>
+
+<h2 id="perspective">Perspective-correct interpolation</h2>
+
+<pre class="diagram">   The rasteriser interpolates your vertex outputs across the
+   triangle. Doing that LINEARLY IN SCREEN SPACE is wrong for
+   anything in perspective.
+
+   A wall receding into the distance, with a checker texture:
+
+     LINEAR interpolation of u:
+       the checks stay evenly spaced -> the wall looks like
+       it is BENDING. This is the classic PlayStation 1 look;
+       that hardware had no perspective correction.
+
+     PERSPECTIVE-CORRECT:
+       interpolate u/w and 1/w linearly, then divide:
+             u = (u/w interpolated) / (1/w interpolated)
+       checks compress with distance. Correct.
+
+   The hardware does this for you, per attribute, which is
+   why the vertex shader must output w and must NOT divide.
+
+   YOU CAN TURN IT OFF, and occasionally should:
+
+     noperspective float2 screenUV : TEXCOORD0;
+       for screen-space effects, where you want the value to
+       vary linearly in pixels.
+
+     nointerpolation uint materialID : TEXCOORD1;
+       "flat" - takes the value from the provoking vertex.
+       MANDATORY for integers: interpolating an ID gives you
+       fractional nonsense.</pre>
+
+<h2 id="hidden">Hidden surface removal</h2>
+
+<pre><code>/* Drawing a pixel you cannot see costs the same as one you
+   can. Four mechanisms remove that work, at different
+   stages.                                                  */
+
+/* 1. BACK-FACE CULLING - rasteriser, free.
+      Discards triangles facing away, based on winding order.
+      Removes ~50% of a closed mesh for nothing.           */
+        rasterizerDesc.CullMode = D3D12_CULL_MODE_BACK;
+        rasterizerDesc.FrontCounterClockwise = FALSE;
+/* If your model renders inside-out, this is the setting. */
+
+/* 2. FRUSTUM CULLING - your code, on the CPU or in a compute
+      shader. Do not submit what is off-screen.            */
+
+/* 3. EARLY-Z - rasteriser, before the pixel shader.
+      Tests depth BEFORE shading. The single biggest saving
+      in a typical scene.
+
+      IT IS DISABLED, silently, if the pixel shader:
+        * writes SV_Depth
+        * uses `discard` / `clip()`
+        * writes to a UAV
+      because in each case the hardware cannot know the final
+      depth or whether the pixel survives before running the
+      shader.
+
+      So a single alpha-test material can cost far more than
+      its pixel count suggests: it forces late-Z for those
+      draws. If you must discard, mark it:                 */
+        [earlydepthstencil]           /* HLSL: "test anyway,
+        void PSMain(...) { ... }         I promise it is safe" */
+
+/* 4. HIERARCHICAL-Z - a low-resolution depth pyramid, so
+      whole tiles can be rejected at once. Automatic, but it
+      is INVALIDATED by depth writes from the pixel shader
+      and by changing the depth comparison direction
+      mid-frame. Pick one direction and keep it.           */
+
+/* THE STANDARD CONSEQUENCE: sort opaque geometry FRONT TO
+   BACK. Near objects fill the depth buffer first, so far
+   ones fail early-Z and never shade. Then draw transparent
+   geometry BACK TO FRONT, because blending is order
+   dependent - and that is why transparency is expensive and
+   why it cannot use early-Z at all.                       */</code></pre>
+
+<div class="warn">
+<b>Overdraw is measured in shaded fragments, not pixels</b>
+<p>A 4K frame is 8.3 million pixels. With an average overdraw of 3 — perfectly normal for a scene with
+foliage, particles and UI — the pixel shader runs 25 million times. Halving the shader cost saves less than
+eliminating one layer of overdraw. Every profiler has an overdraw visualisation; it is usually the first place
+to look when a frame is slow and the geometry count is modest.</p>
+</div>
+
+<h2 id="modern">Mesh shaders: the pipeline being replaced</h2>
+
+<pre class="diagram">   The front of the pipeline is a 1998 design: fixed input
+   assembly, one vertex in and one vertex out, optional
+   tessellation stages nobody enjoys.
+
+   MESH SHADERS (DX12 Ultimate, Vulkan, Metal) replace
+   IA + VS + hull/domain/GS with two compute-like stages:
+
+     AMPLIFICATION / TASK SHADER
+       runs first, decides HOW MANY mesh shader groups to
+       launch. This is where you do GPU-side culling.
+        |
+     MESH SHADER
+       a workgroup cooperatively produces a MESHLET - a small
+       batch of vertices and primitives (typically up to 64
+       vertices, 126 triangles) - and writes them straight
+       into the rasteriser.
+
+   WHY IT IS BETTER
+     * you control the data layout; no fixed input assembler
+     * culling per meshlet, on the GPU, before any vertex work
+     * no serialisation bottleneck like the geometry shader
+     * one workgroup can share vertex work across triangles
+
+   WHY IT IS NOT UNIVERSAL YET
+     * needs newer hardware (Turing+, RDNA2+)
+     * the asset pipeline must build meshlets offline
+     * the classic path still works fine for most content
+
+   Worth knowing exists; the rest of this track uses the
+   classic pipeline because that is what you will meet.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Nothing renders at all</td><td>Matrix order wrong, or the object is behind the camera or outside the
+frustum</td></tr>
+<tr><td>Model appears inside-out</td><td>Winding order versus cull mode</td></tr>
+<tr><td>Textures swim or bend on receding surfaces</td><td>Interpolation not perspective-correct — usually
+because <code>w</code> was divided too early</td></tr>
+<tr><td>Image is upside down after a port</td><td>D3D/GL texture origin or clip-space Y</td></tr>
+<tr><td>Geometry clipped at the wrong distance</td><td>D3D [0,1] versus GL [-1,1] clip Z</td></tr>
+<tr><td>An integer varying comes through as garbage</td><td>Needs <code>nointerpolation</code></td></tr>
+<tr><td>Frame time collapses when foliage appears</td><td><code>discard</code> disabled early-Z for those
+draws</td></tr>
+<tr><td>Depth pre-pass made it slower</td><td>The scene was not overdraw-bound; you doubled the geometry
+cost</td></tr>
+<tr><td>Transparent objects render in the wrong order</td><td>Blending is order-dependent; sort back to
+front</td></tr>
+<tr><td>Geometry shader is unexpectedly slow</td><td>It serialises on most hardware — use instancing or mesh
+shaders</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the pipeline stages in order and mark which are programmable.</li>
+  <li>Say why rasterisation and blending are fixed function.</li>
+  <li>Give the ratio of pixel-shader to vertex-shader invocations in a typical frame.</li>
+  <li>Name the five coordinate spaces and the matrix between each pair.</li>
+  <li>Explain why the vertex shader must not divide by <code>w</code>.</li>
+  <li>Explain perspective-correct interpolation and what it looks like when absent.</li>
+  <li>Say when to use <code>noperspective</code> and when <code>nointerpolation</code> is
+  mandatory.</li>
+  <li>Name three things that disable early-Z and why each does.</li>
+  <li>Explain the sort order for opaque and for transparent geometry, and why they differ.</li>
+  <li>Describe what mesh shaders replace and the main advantage they bring.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

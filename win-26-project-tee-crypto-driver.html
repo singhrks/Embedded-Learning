@@ -1,0 +1,1505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a TrustZone-backed crypto driver in C++ | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a TrustZone-backed crypto driver in C++</h1>
+<p class="lead">A Windows KMDF driver on ARM64 that hashes with CNG in the normal world, sends only the digest
+across a transport into the secure world, and returns a signature made by a key it has never seen. This
+chapter builds the Windows half; <a href="win-27-project-tee-qemu.html">chapter 39</a> builds the trusted
+application and runs the whole thing on QEMU.</p>
+
+<h2 id="reality">Read this before you start</h2>
+
+<p>Windows on ARM does not talk to OP-TEE. That is not a gap in your knowledge; it is the actual state of the
+world, and the project is designed around it rather than pretending otherwise.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Claim</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td>"Windows uses OP-TEE for TrustZone"</td><td><strong>No.</strong> Windows reaches the secure world
+through <strong>TrEE</strong> (Trusted Execution Environment), a class-extension driver model. The secure-side
+implementation is the silicon vendor's — QSEE/QTEE on Qualcomm parts, not OP-TEE</td></tr>
+<tr><td>"A KMDF driver can issue an SMC"</td><td><strong>No.</strong> There is no documented SMC API for
+ordinary Windows drivers. The world switch belongs to the TrEE provider, which is firmware-adjacent and
+vendor-supplied</td></tr>
+<tr><td>"Windows and OP-TEE can run together under TF-A"</td><td>In principle. In practice no public TrEE
+provider speaks the OP-TEE SMC ABI, so nothing bridges them</td></tr>
+<tr><td>"Windows ARM64 runs under QEMU"</td><td><strong>Yes</strong>, via UEFI, slowly but usably. That part
+is real</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>So what are we actually building?</b>
+<p>A driver whose <em>transport is a seam</em>. Above the seam — the IOCTL surface, the CNG hashing, the
+command ABI, the trusted application, the user-mode client — everything is real and production-shaped. Below
+it there are two implementations: <strong>TrEE</strong>, which is what you would ship on hardware, and a
+<strong>shared-memory mailbox</strong>, which is what actually runs on QEMU. The driver does not know or care
+which one it has.</p>
+</div>
+
+<pre class="diagram">   WINDOWS ARM64 GUEST                         THE SECURE SIDE
+
+   +--------------------------------------+
+   | secteectl.exe   (user mode, C++)     |
+   |   CreateFile on the device interface |
+   |   DeviceIoControl                     |
+   +------------------+-------------------+
+                      |  IOCTL_SECTEE_*
+                      v
+   +--------------------------------------+
+   | sectee.sys   (KMDF, C++)             |
+   |                                      |
+   |  * SHA-256 with CNG (ksecdd)  &lt;--- the "crypto driver"
+   |  * ECDSA verify with CNG           part: normal-world
+   |  * marshals a command              crypto stays here
+   |  * ITeeTransport::Invoke()         |
+   +------------------+-------------------+
+                      |
+        +-------------+--------------+
+        |                            |
+   ON HARDWARE                  ON QEMU
+   TreeTransport                MailboxTransport
+   TrEE class extension         ivshmem BAR2 + doorbell
+        |                            |
+        v                            v
+   TrustZone, S-EL1            a second VM running
+   vendor trusted OS           OP-TEE, bridged by a
+                               host daemon (chapter 39)
+                                     |
+                                     v
+                            +---------------------------+
+                            | sectee_ta  (S-EL0, C++)   |
+                            |   P-256 key, made and     |
+                            |   kept inside             |
+                            |   ECDSA sign              |
+                            +---------------------------+
+
+   WHAT IS HONEST ABOUT THE QEMU PATH:
+     the isolation you get is VM isolation between two QEMU
+     instances, NOT TrustZone isolation. It exercises every
+     line of software and proves the protocol; it does not
+     prove the security property. Chapter 39 says so again,
+     louder.</pre>
+
+<h2 id="cpp">C++ in a Windows kernel driver</h2>
+
+<p>The WDK compiles C++ perfectly well. What it does not give you is a C++ <em>runtime</em>: there is no CRT
+startup to run your global constructors, no exception unwinder, and no heap behind <code>new</code>. You get
+the language, and you supply the plumbing.</p>
+
+<pre><code>// SecTee/Kernel/CppSupport.h
+//
+// Everything C++ needs from us before the language works in
+// kernel mode. About forty lines, written once, reused for ever.
+
+#pragma once
+#include &lt;ntddk.h&gt;
+
+#define SECTEE_POOL_TAG 'eeTS'   // "STee" reversed, as WinDbg
+                                 // displays tags little-endian
+
+// ---------------------------------------------------------------
+// operator new / delete
+//
+// We deliberately do NOT define a global parameterless `new`.
+// Every allocation must name its pool, because getting NonPaged
+// vs Paged wrong is a bugcheck at DISPATCH_LEVEL, and a default
+// makes it easy to not think about it.
+// ---------------------------------------------------------------
+_IRQL_requires_max_(DISPATCH_LEVEL)
+inline void* __cdecl operator new(size_t size, POOL_FLAGS flags,
+                                  ULONG tag)
+{
+    if (size == 0) size = 1;
+    // ExAllocatePool2 zeroes by default and is the modern spelling;
+    // ExAllocatePoolWithTag is deprecated and fails WDK analysis.
+    return ExAllocatePool2(flags, size, tag);
+}
+
+inline void __cdecl operator delete(void* p, size_t)
+{
+    if (p) ExFreePoolWithTag(p, SECTEE_POOL_TAG);
+}
+inline void __cdecl operator delete(void* p)
+{
+    if (p) ExFreePoolWithTag(p, SECTEE_POOL_TAG);
+}
+
+// Placement new, for constructing into memory WDF already owns
+// (a WDFDEVICE context, for instance).
+inline void* __cdecl operator new(size_t, void* where) { return where; }
+inline void  __cdecl operator delete(void*, void*) {}
+
+// ---------------------------------------------------------------
+// The compiler emits a reference to this for any file-scope object
+// with a destructor. We never rely on static destruction, but the
+// symbol must exist to link.
+// ---------------------------------------------------------------
+extern "C" int __cdecl atexit(void (__cdecl*)(void)) { return 0; }
+extern "C" void* __dso_handle = nullptr;
+
+// ---------------------------------------------------------------
+// A scope guard. This is most of the reason to use C++ here: it
+// replaces the goto-cleanup ladder that every C driver grows.
+// ---------------------------------------------------------------
+template &lt;typename F&gt;
+class ScopeExit
+{
+public:
+    explicit ScopeExit(F f) : m_f(f), m_armed(true) {}
+    ~ScopeExit() { if (m_armed) m_f(); }
+    void Dismiss() { m_armed = false; }
+
+    ScopeExit(const ScopeExit&amp;)            = delete;
+    ScopeExit&amp; operator=(const ScopeExit&amp;) = delete;
+private:
+    F    m_f;
+    bool m_armed;
+};
+
+template &lt;typename F&gt;
+ScopeExit&lt;F&gt; MakeScopeExit(F f) { return ScopeExit&lt;F&gt;(f); }
+
+#define SECTEE_CONCAT2(a, b) a##b
+#define SECTEE_CONCAT(a, b)  SECTEE_CONCAT2(a, b)
+#define SECTEE_ON_EXIT(code) \
+    auto SECTEE_CONCAT(guard_, __LINE__) = MakeScopeExit([&amp;]() { code; })</code></pre>
+
+<div class="warn">
+<b>The four project settings that make this legal</b>
+<p>In the <code>.vcxproj</code>: <code>&lt;CompileAs&gt;CompileAsCpp&lt;/CompileAs&gt;</code>,
+<code>&lt;RuntimeTypeInfo&gt;false&lt;/RuntimeTypeInfo&gt;</code> (<code>/GR-</code>),
+<code>&lt;ExceptionHandling&gt;false&lt;/ExceptionHandling&gt;</code> (<code>/EHs-c-</code>), and the
+<code>/kernel</code> switch, which makes the compiler <em>reject</em> constructs that need a runtime rather
+than letting them link and fail at load. Turn <code>/kernel</code> on first, not last — it tells you
+immediately which C++ you are not allowed to have.</p>
+</div>
+
+<pre class="diagram">   WHAT YOU MAY USE          WHAT YOU MAY NOT
+
+   classes, members          exceptions (try/catch/throw)
+   constructors/destructors  RTTI (dynamic_cast, typeid)
+   RAII and scope guards     the STL - all of it
+   templates                 std::string, std::vector, ...
+   references                global objects with constructors
+   overloading               new/delete without a pool
+   constexpr, enum class     virtual inheritance games
+   lambdas (no captures      thread_local
+     that allocate)          floating point (without
+   nullptr, auto               KeSaveFloatingPointState)
+
+   The STL exclusion is not snobbery: every container allocates
+   from a heap that does not exist here, and throws on failure
+   in a context with no unwinder. Write the two or three small
+   containers you need, or use WDF's collections.</pre>
+
+<h2 id="abi">The ABI</h2>
+
+<p>As always, the interface comes first and separately — and here it matters more than usual, because the security property of the whole project depends on what this interface does and does not allow through.</p>
+
+<pre><code>// SecTee/Common/SecTeeAbi.h
+//
+// Shared verbatim by the driver, the user-mode client and (via a
+// C-compatible subset) the trusted application. One file, three
+// consumers, no numbers written twice.
+
+#pragma once
+
+#ifdef _KERNEL_MODE
+#include &lt;ntddk.h&gt;
+#else
+#include &lt;windows.h&gt;
+#endif
+
+#include &lt;initguid.h&gt;
+
+// The device interface the client opens. A GUID, not a fixed
+// symbolic-link name, so several instances can coexist and
+// SetupDi can enumerate them (chapter 20).
+// {6F1A2B3C-4D5E-4F60-9A1B-2C3D4E5F6071}
+DEFINE_GUID(GUID_DEVINTERFACE_SECTEE,
+    0x6f1a2b3c, 0x4d5e, 0x4f60, 0x9a, 0x1b,
+    0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71);
+
+#define SECTEE_ABI_VERSION 1u
+
+#define SECTEE_DEVICE_TYPE 0x8000u   // vendor range starts here
+
+#define IOCTL_SECTEE_GET_PUBKEY  CTL_CODE(SECTEE_DEVICE_TYPE, 0x800, \
+                                 METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_SECTEE_SIGN        CTL_CODE(SECTEE_DEVICE_TYPE, 0x801, \
+                                 METHOD_BUFFERED, \
+                                 FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_SECTEE_VERIFY      CTL_CODE(SECTEE_DEVICE_TYPE, 0x802, \
+                                 METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_SECTEE_COUNTER     CTL_CODE(SECTEE_DEVICE_TYPE, 0x803, \
+                                 METHOD_BUFFERED, \
+                                 FILE_READ_DATA | FILE_WRITE_DATA)
+
+// METHOD_BUFFERED: the I/O manager copies in and out for us, into
+// a single system buffer. For payloads of a few hundred bytes it
+// is the right choice - no MDLs, no probe-and-lock, no user
+// pointer ever dereferenced in the driver. METHOD_OUT_DIRECT would
+// only start paying off in the tens of kilobytes.
+
+#define SECTEE_PUBKEY_LEN 64u   // P-256, X || Y, fixed width
+#define SECTEE_SIG_LEN    64u   // P-256, r || s, fixed width
+#define SECTEE_DIGEST_LEN 32u   // SHA-256
+#define SECTEE_MAX_INPUT  (64u * 1024u)
+
+#include &lt;pshpack8.h&gt;
+
+typedef struct _SECTEE_HEADER {
+    ULONG Version;     // caller sets SECTEE_ABI_VERSION
+    ULONG Reserved;    // must be zero; gives us room and keeps
+                       // the following members 8-byte aligned
+} SECTEE_HEADER;
+
+typedef struct _SECTEE_PUBKEY_OUT {
+    SECTEE_HEADER Header;
+    UCHAR         PublicKey[SECTEE_PUBKEY_LEN];
+} SECTEE_PUBKEY_OUT;
+
+// The driver hashes, so the client sends DATA, not a digest.
+// That is the point of putting crypto in the driver.
+typedef struct _SECTEE_SIGN_IN {
+    SECTEE_HEADER Header;
+    ULONG         DataLength;
+    ULONG         Reserved2;
+    UCHAR         Data[ANYSIZE_ARRAY];
+} SECTEE_SIGN_IN;
+
+typedef struct _SECTEE_SIGN_OUT {
+    SECTEE_HEADER Header;
+    UCHAR         Digest[SECTEE_DIGEST_LEN];   // what we signed
+    UCHAR         Signature[SECTEE_SIG_LEN];   // raw r || s
+} SECTEE_SIGN_OUT;
+
+typedef struct _SECTEE_VERIFY_IN {
+    SECTEE_HEADER Header;
+    UCHAR         Digest[SECTEE_DIGEST_LEN];
+    UCHAR         Signature[SECTEE_SIG_LEN];
+} SECTEE_VERIFY_IN;
+
+typedef struct _SECTEE_COUNTER_INOUT {
+    SECTEE_HEADER Header;
+    ULONG         Increment;   // 1 = bump before reading
+    ULONG         Reserved2;
+    ULONGLONG     Value;       // out
+} SECTEE_COUNTER_INOUT;
+
+#include &lt;poppack.h&gt;
+
+// Commands on the far side of the transport. Deliberately NOT the
+// same numbers as the IOCTLs: the driver is a translator, and the
+// two interfaces are allowed to version independently.
+#define TA_CMD_GET_PUBKEY 0u
+#define TA_CMD_SIGN       1u
+#define TA_CMD_COUNTER    2u</code></pre>
+
+<div class="note">
+<b>Why the driver hashes and the TA only signs</b>
+<p>The same split as <a href="tee-25-project-rust-fullstack.html">the Rust project</a>, for the same reason:
+bulk data is not secret, and pushing 64 KB through a transport into a secure world with a few hundred
+kilobytes of heap is slow and pointless. Only the 32-byte digest crosses. The private key is the one thing
+that must not leak, so it is the one thing that lives on the far side.</p>
+</div>
+
+<h2 id="transport">The transport seam</h2>
+
+<p>This project spans two worlds, so there has to be a seam where the Windows driver hands off to the secure side. Deciding exactly where that seam sits is the central design question of the whole thing.</p>
+
+<pre><code>// SecTee/Kernel/ITeeTransport.h
+#pragma once
+#include "CppSupport.h"
+#include "..\Common\SecTeeAbi.h"
+
+// A pure interface. This is where C++ earns its place a second
+// time: two wildly different mechanisms behind one vtable, chosen
+// at PrepareHardware, with no #ifdefs sprayed through the driver.
+class ITeeTransport
+{
+public:
+    virtual ~ITeeTransport() {}
+
+    // Called at PASSIVE_LEVEL from EvtDevicePrepareHardware.
+    virtual NTSTATUS Start(WDFDEVICE Device,
+                           WDFCMRESLIST Raw,
+                           WDFCMRESLIST Translated) = 0;
+
+    virtual void Stop() = 0;
+
+    // One request into the secure world and back.
+    //   Command  - TA_CMD_*
+    //   In/InLen - marshalled input, may be null
+    //   Out      - buffer for the reply
+    //   InOutLen - in: capacity of Out; out: bytes produced
+    //
+    // PASSIVE_LEVEL only. Every implementation may block.
+    _IRQL_requires_(PASSIVE_LEVEL)
+    virtual NTSTATUS Invoke(ULONG Command,
+                            const void* In,  ULONG InLen,
+                            void* Out, ULONG* InOutLen) = 0;
+};
+
+// Factories. Exactly one is compiled in, selected by the INF's
+// hardware ID match - see the two INF sections at the end.
+NTSTATUS CreateMailboxTransport(ITeeTransport** Out);   // QEMU
+NTSTATUS CreateTreeTransport(ITeeTransport** Out);      // hardware</code></pre>
+
+<h3>The production transport: TrEE</h3>
+
+<pre><code>// SecTee/Kernel/TreeTransport.cpp
+//
+// The shape of the production path. Windows exposes the secure
+// world to drivers through the Trusted Execution Environment class
+// extension: your driver is a "TrEE service driver", it links
+// against the TrEE ClassExtension, and it addresses a trusted
+// application by GUID.
+//
+// HONEST CAVEAT: the exact class-extension entry points and the
+// structures they take differ between WDK releases, and the
+// interface is thinly documented compared with the rest of WDF.
+// The sequence below is correct in SHAPE - open a session to a TA
+// by GUID, marshal parameters, send, read the reply, close - and
+// you should take the precise spellings from the
+// TrustedRuntime headers in the WDK you are building against.
+//
+// Everything above this file is unaffected either way, which is
+// the whole argument for the ITeeTransport seam.
+
+#include "ITeeTransport.h"
+
+class TreeTransport : public ITeeTransport
+{
+public:
+    NTSTATUS Start(WDFDEVICE Device, WDFCMRESLIST, WDFCMRESLIST) override
+    {
+        m_Device = Device;
+
+        // 1. Attach to the TrEE class extension for this device.
+        //    The platform's TrEE provider - vendor firmware glue -
+        //    is what actually performs the world switch.
+        //
+        // 2. Open a session to our trusted application, addressed
+        //    by its GUID. On Windows a TA is identified by a GUID
+        //    rather than the 16-byte UUID OP-TEE uses; they are
+        //    the same 128 bits in a different textual convention.
+        //
+        // 3. Cache the session handle for the driver's lifetime,
+        //    exactly as the mailbox transport caches its mapping.
+
+        return STATUS_NOT_IMPLEMENTED;   // see caveat above
+    }
+
+    void Stop() override
+    {
+        // Close the session, then detach from the class extension.
+        // Reverse order of Start, always.
+    }
+
+    NTSTATUS Invoke(ULONG Command,
+                    const void* In, ULONG InLen,
+                    void* Out, ULONG* InOutLen) override
+    {
+        UNREFERENCED_PARAMETER(Command);
+        UNREFERENCED_PARAMETER(In);
+        UNREFERENCED_PARAMETER(InLen);
+        UNREFERENCED_PARAMETER(Out);
+        UNREFERENCED_PARAMETER(InOutLen);
+
+        // Marshal into the TrEE parameter list - the same
+        // four-slot value/memref model GlobalPlatform uses
+        // (chapter 13), because both descend from the same
+        // TEE Client API specification.
+        //
+        // Then issue the command and map the returned status
+        // onto an NTSTATUS with the table below.
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+private:
+    WDFDEVICE m_Device = nullptr;
+};
+
+NTSTATUS CreateTreeTransport(ITeeTransport** Out)
+{
+    auto* t = new (POOL_FLAG_NON_PAGED, SECTEE_POOL_TAG) TreeTransport();
+    if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+    *Out = t;
+    return STATUS_SUCCESS;
+}</code></pre>
+
+<h3>The transport that runs: a shared-memory mailbox</h3>
+
+<pre><code>// SecTee/Kernel/MailboxTransport.cpp
+//
+// Runs on QEMU against an ivshmem device, which gives us a PCI
+// function with:
+//   BAR0  256 bytes of registers, including a doorbell
+//   BAR2  a shared memory window, visible to another VM
+//
+// The far end is a daemon in a second VM that owns the same
+// memory and calls into OP-TEE. Chapter 39 builds it.
+//
+// No QEMU patching is required: ivshmem is a stock device.
+
+#include "ITeeTransport.h"
+
+// ---- the ivshmem register block, BAR0 -------------------------
+#define IVSHMEM_REG_INTRMASK   0x00
+#define IVSHMEM_REG_INTRSTATUS 0x04
+#define IVSHMEM_REG_IVPOSITION 0x08   // our peer id, read-only
+#define IVSHMEM_REG_DOORBELL   0x0c   // (peer &lt;&lt; 16) | vector
+
+// ---- our protocol, laid out in BAR2 ---------------------------
+#include &lt;pshpack8.h&gt;
+struct MailboxHeader
+{
+    ULONG    Magic;        // 'TEEM'
+    ULONG    Version;
+    volatile LONG Sequence;   // bumped by us on submit
+    volatile LONG Ack;        // bumped by the peer on completion
+    ULONG    Command;
+    ULONG    InLength;
+    ULONG    OutLength;
+    LONG     Result;       // the peer's TEE_Result, 0 = success
+};
+#include &lt;poppack.h&gt;
+
+#define MAILBOX_MAGIC     0x4D454554u   // "TEEM" little-endian
+#define MAILBOX_VERSION   1u
+#define MAILBOX_DATA_OFF  0x100u
+#define MAILBOX_DATA_MAX  0x1000u
+#define MAILBOX_TIMEOUT_MS 5000
+
+class MailboxTransport : public ITeeTransport
+{
+public:
+    NTSTATUS Start(WDFDEVICE Device,
+                   WDFCMRESLIST /*Raw*/,
+                   WDFCMRESLIST Translated) override
+    {
+        PAGED_CODE();
+        m_Device = Device;
+
+        // Walk the translated resource list. On ARM64 the PCI
+        // driver has already assigned these; we take the first
+        // two memory descriptors in BAR order.
+        const ULONG count = WdfCmResourceListGetCount(Translated);
+        ULONG memIndex = 0;
+
+        for (ULONG i = 0; i &lt; count; i++)
+        {
+            PCM_PARTIAL_RESOURCE_DESCRIPTOR d =
+                WdfCmResourceListGetDescriptor(Translated, i);
+            if (!d) continue;
+
+            if (d-&gt;Type == CmResourceTypeMemory ||
+                d-&gt;Type == CmResourceTypeMemoryLarge)
+            {
+                // MmNonCached: this is device memory shared with
+                // another virtual machine. Caching it would let
+                // us read a stale Ack for ever - the exact
+                // attribute mistake chapter 08 of the
+                // virtualisation track describes.
+                PVOID va = MmMapIoSpaceEx(d-&gt;u.Memory.Start,
+                                          d-&gt;u.Memory.Length,
+                                          PAGE_READWRITE | PAGE_NOCACHE);
+                if (!va) return STATUS_INSUFFICIENT_RESOURCES;
+
+                if (memIndex == 0) {
+                    m_Regs    = static_cast&lt;PUCHAR&gt;(va);
+                    m_RegsLen = d-&gt;u.Memory.Length;
+                } else if (memIndex == 1) {
+                    m_Shm     = static_cast&lt;PUCHAR&gt;(va);
+                    m_ShmLen  = d-&gt;u.Memory.Length;
+                } else {
+                    MmUnmapIoSpace(va, d-&gt;u.Memory.Length);
+                }
+                memIndex++;
+            }
+        }
+
+        if (!m_Regs || !m_Shm || m_ShmLen &lt; MAILBOX_DATA_OFF + MAILBOX_DATA_MAX)
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+
+        // Our peer id, so the far end knows who to answer.
+        m_PeerId = READ_REGISTER_ULONG(
+            reinterpret_cast&lt;PULONG&gt;(m_Regs + IVSHMEM_REG_IVPOSITION));
+
+        auto* hdr = Header();
+
+        // The daemon writes the magic when it is ready. If it is
+        // absent we fail PrepareHardware rather than pretending to
+        // work - a driver that starts with no far end produces
+        // timeouts nobody can diagnose.
+        if (hdr-&gt;Magic != MAILBOX_MAGIC)
+        {
+            TraceError("mailbox magic 0x%08x, expected 0x%08x - "
+                       "is secteed running?", hdr-&gt;Magic, MAILBOX_MAGIC);
+            return STATUS_DEVICE_NOT_READY;
+        }
+        if (hdr-&gt;Version != MAILBOX_VERSION)
+            return STATUS_REVISION_MISMATCH;
+
+        m_LastAck = hdr-&gt;Ack;
+        return STATUS_SUCCESS;
+    }
+
+    void Stop() override
+    {
+        if (m_Shm)  { MmUnmapIoSpace(m_Shm,  m_ShmLen);  m_Shm  = nullptr; }
+        if (m_Regs) { MmUnmapIoSpace(m_Regs, m_RegsLen); m_Regs = nullptr; }
+    }
+
+    _IRQL_requires_(PASSIVE_LEVEL)
+    NTSTATUS Invoke(ULONG Command,
+                    const void* In, ULONG InLen,
+                    void* Out, ULONG* InOutLen) override
+    {
+        PAGED_CODE();
+
+        if (InLen &gt; MAILBOX_DATA_MAX) return STATUS_INVALID_BUFFER_SIZE;
+        if (!InOutLen)                return STATUS_INVALID_PARAMETER;
+
+        // One request at a time. The mailbox is a single slot, so
+        // this is not merely a nicety - two concurrent submits
+        // would interleave in shared memory.
+        NTSTATUS status = KeWaitForSingleObject(&amp;m_Lock, Executive,
+                                                KernelMode, FALSE, nullptr);
+        if (!NT_SUCCESS(status)) return status;
+        SECTEE_ON_EXIT(KeReleaseMutex(&amp;m_Lock, FALSE));
+
+        auto* hdr  = Header();
+        auto* data = m_Shm + MAILBOX_DATA_OFF;
+
+        if (In &amp;&amp; InLen)
+            RtlCopyMemory(data, In, InLen);
+
+        hdr-&gt;Command   = Command;
+        hdr-&gt;InLength  = InLen;
+        hdr-&gt;OutLength = 0;
+        hdr-&gt;Result    = 0;
+
+        // Publish the payload BEFORE the sequence number that
+        // announces it. Same rule as a virtqueue: the reader must
+        // never see the index move ahead of the data.
+        KeMemoryBarrier();
+        const LONG seq = InterlockedIncrement(&amp;hdr-&gt;Sequence);
+        KeMemoryBarrier();
+
+        Ring();
+
+        status = WaitForAck(seq);
+        if (!NT_SUCCESS(status)) return status;
+
+        KeMemoryBarrier();   // Ack observed before we read the reply
+
+        if (hdr-&gt;Result != 0)
+        {
+            TraceError("TA command %u returned 0x%08x",
+                       Command, hdr-&gt;Result);
+            return TeeResultToNtStatus(static_cast&lt;ULONG&gt;(hdr-&gt;Result));
+        }
+
+        const ULONG produced = hdr-&gt;OutLength;
+        if (produced &gt; MAILBOX_DATA_MAX)   return STATUS_DATA_ERROR;
+        if (produced &gt; *InOutLen)          { *InOutLen = produced;
+                                             return STATUS_BUFFER_TOO_SMALL; }
+
+        if (Out &amp;&amp; produced)
+            RtlCopyMemory(Out, data, produced);
+        *InOutLen = produced;
+        return STATUS_SUCCESS;
+    }
+
+    MailboxTransport()
+    {
+        KeInitializeMutex(&amp;m_Lock, 0);
+    }
+
+private:
+    MailboxHeader* Header() const
+    {
+        return reinterpret_cast&lt;MailboxHeader*&gt;(m_Shm);
+    }
+
+    void Ring() const
+    {
+        // Peer 0 is the daemon by convention; vector 0.
+        WRITE_REGISTER_ULONG(
+            reinterpret_cast&lt;PULONG&gt;(m_Regs + IVSHMEM_REG_DOORBELL),
+            (0u &lt;&lt; 16) | 0u);
+    }
+
+    // Poll, because this transport has no interrupt wired up and
+    // the whole point is to keep it simple. A real driver would
+    // take the ivshmem MSI-X vector and complete the request
+    // asynchronously from the ISR's DPC - see the exercise at the
+    // end of chapter 39.
+    NTSTATUS WaitForAck(LONG expect)
+    {
+        LARGE_INTEGER interval;
+        interval.QuadPart = -1 * 10 * 1000;   // 1 ms, relative
+
+        for (ULONG waited = 0; waited &lt; MAILBOX_TIMEOUT_MS; waited++)
+        {
+            if (Header()-&gt;Ack == expect) return STATUS_SUCCESS;
+            KeDelayExecutionThread(KernelMode, FALSE, &amp;interval);
+        }
+        TraceError("mailbox timeout waiting for ack %d", expect);
+        return STATUS_IO_TIMEOUT;
+    }
+
+    // GlobalPlatform TEE_Result -> NTSTATUS. Doing this in one
+    // place is the difference between a driver you can debug from
+    // user mode and one that returns STATUS_UNSUCCESSFUL for
+    // everything.
+    static NTSTATUS TeeResultToNtStatus(ULONG r)
+    {
+        switch (r)
+        {
+        case 0xFFFF0004: return STATUS_NOT_SUPPORTED;        // NOT_SUPPORTED
+        case 0xFFFF0006: return STATUS_INVALID_PARAMETER;    // BAD_PARAMETERS
+        case 0xFFFF0008: return STATUS_OBJECT_NAME_NOT_FOUND;// ITEM_NOT_FOUND
+        case 0xFFFF000C: return STATUS_BUFFER_TOO_SMALL;     // SHORT_BUFFER
+        case 0xFFFF000F: return STATUS_ACCESS_DENIED;        // ACCESS_DENIED
+        case 0xFFFF3024: return STATUS_INSUFFICIENT_RESOURCES;
+        case 0xFFFF3110: return STATUS_DEVICE_NOT_CONNECTED; // TARGET_DEAD
+        default:         return STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    WDFDEVICE m_Device  = nullptr;
+    PUCHAR    m_Regs    = nullptr;
+    PUCHAR    m_Shm     = nullptr;
+    SIZE_T    m_RegsLen = 0;
+    SIZE_T    m_ShmLen  = 0;
+    ULONG     m_PeerId  = 0;
+    LONG      m_LastAck = 0;
+    KMUTEX    m_Lock;
+};
+
+NTSTATUS CreateMailboxTransport(ITeeTransport** Out)
+{
+    auto* t = new (POOL_FLAG_NON_PAGED, SECTEE_POOL_TAG) MailboxTransport();
+    if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+    *Out = t;
+    return STATUS_SUCCESS;
+}</code></pre>
+
+<h2 id="crypto">The crypto half: CNG in kernel mode</h2>
+
+<p>This is the part that makes it a <em>crypto driver</em> rather than a pipe. Windows exposes CNG to kernel
+drivers through <code>ksecdd.sys</code>; the API is the same <code>BCrypt*</code> surface user mode gets,
+with two extra rules.</p>
+
+<pre><code>// SecTee/Kernel/Crypto.cpp
+//
+// RULE 1: pass BCRYPT_PROV_DISPATCH when opening an algorithm
+//         provider in kernel mode. Without it the call fails.
+// RULE 2: PASSIVE_LEVEL only. CNG allocates and may page.
+//
+// Link against ksecdd.lib.
+
+#include "CppSupport.h"
+#include &lt;bcrypt.h&gt;
+#include "..\Common\SecTeeAbi.h"
+
+// A tiny RAII wrapper per handle type. Four small classes remove
+// every goto in this file.
+class BcryptAlg
+{
+public:
+    ~BcryptAlg() { if (m_h) BCryptCloseAlgorithmProvider(m_h, 0); }
+    NTSTATUS Open(LPCWSTR id)
+    {
+        return BCryptOpenAlgorithmProvider(&amp;m_h, id, nullptr,
+                                           BCRYPT_PROV_DISPATCH);
+    }
+    operator BCRYPT_ALG_HANDLE() const { return m_h; }
+private:
+    BCRYPT_ALG_HANDLE m_h = nullptr;
+};
+
+class BcryptHash
+{
+public:
+    ~BcryptHash() { if (m_h) BCryptDestroyHash(m_h); }
+    NTSTATUS Create(BCRYPT_ALG_HANDLE alg)
+    {
+        return BCryptCreateHash(alg, &amp;m_h, nullptr, 0,
+                                nullptr, 0, 0);
+    }
+    operator BCRYPT_HASH_HANDLE() const { return m_h; }
+private:
+    BCRYPT_HASH_HANDLE m_h = nullptr;
+};
+
+class BcryptKey
+{
+public:
+    ~BcryptKey() { if (m_h) BCryptDestroyKey(m_h); }
+    BCRYPT_KEY_HANDLE* Put() { return &amp;m_h; }
+    operator BCRYPT_KEY_HANDLE() const { return m_h; }
+private:
+    BCRYPT_KEY_HANDLE m_h = nullptr;
+};
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS SecTeeSha256(const void* data, ULONG length,
+                      UCHAR digest[SECTEE_DIGEST_LEN])
+{
+    PAGED_CODE();
+
+    BcryptAlg alg;
+    NTSTATUS status = alg.Open(BCRYPT_SHA256_ALGORITHM);
+    if (!NT_SUCCESS(status)) return status;
+
+    BcryptHash hash;
+    status = hash.Create(alg);
+    if (!NT_SUCCESS(status)) return status;
+
+    // BCryptHashData takes a non-const pointer. It does not write
+    // through it; the const_cast is the API's fault, not ours.
+    status = BCryptHashData(hash,
+                            const_cast&lt;PUCHAR&gt;(
+                                static_cast&lt;const UCHAR*&gt;(data)),
+                            length, 0);
+    if (!NT_SUCCESS(status)) return status;
+
+    return BCryptFinishHash(hash, digest, SECTEE_DIGEST_LEN, 0);
+    // Both handles close here, in reverse construction order,
+    // on every path including the early returns above.
+}
+
+// Verify a signature the SECURE WORLD produced, using the public
+// key it gave us. Nothing here is secret - this is a check the
+// driver performs on its own output, and it is how you catch a
+// transport that is corrupting bytes.
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS SecTeeVerifyP256(const UCHAR publicKey[SECTEE_PUBKEY_LEN],
+                          const UCHAR digest[SECTEE_DIGEST_LEN],
+                          const UCHAR signature[SECTEE_SIG_LEN])
+{
+    PAGED_CODE();
+
+    BcryptAlg alg;
+    NTSTATUS status = alg.Open(BCRYPT_ECDSA_P256_ALGORITHM);
+    if (!NT_SUCCESS(status)) return status;
+
+    // CNG's public-key blob: a BCRYPT_ECCKEY_BLOB header followed
+    // by X then Y, each cbKey bytes, big-endian, fixed width.
+    // Note there is NO 0x04 uncompressed-point prefix here -
+    // that is a SEC1/OpenSSL convention. CNG does not want it.
+    struct {
+        BCRYPT_ECCKEY_BLOB Header;
+        UCHAR              XY[SECTEE_PUBKEY_LEN];
+    } blob;
+
+    blob.Header.dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+    blob.Header.cbKey   = 32;
+    RtlCopyMemory(blob.XY, publicKey, SECTEE_PUBKEY_LEN);
+
+    BcryptKey key;
+    status = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+                                 key.Put(),
+                                 reinterpret_cast&lt;PUCHAR&gt;(&amp;blob),
+                                 sizeof(blob), 0);
+    if (!NT_SUCCESS(status)) return status;
+
+    // And CNG wants the signature as raw r || s, fixed width -
+    // NOT the DER SEQUENCE that OpenSSL insists on. Our TA emits
+    // exactly this, so it goes straight in.
+    return BCryptVerifySignature(key, nullptr,
+                                 const_cast&lt;PUCHAR&gt;(digest),
+                                 SECTEE_DIGEST_LEN,
+                                 const_cast&lt;PUCHAR&gt;(signature),
+                                 SECTEE_SIG_LEN, 0);
+    // STATUS_INVALID_SIGNATURE on mismatch, STATUS_SUCCESS on match.
+}</code></pre>
+
+<div class="key">
+<b>Two ecosystems, two signature encodings</b>
+<p>The TA produces raw <code>r || s</code>, 64 fixed bytes. <strong>CNG takes that directly.</strong>
+<strong>OpenSSL does not</strong> — it wants an ASN.1 <code>SEQUENCE</code> of two <code>INTEGER</code>s, which
+is why <a href="tee-25-project-rust-fullstack.html">the Rust project</a> needed a conversion step and this one
+does not. Neither is more correct; they are different conventions with the same mathematics underneath, and
+knowing which side wants which saves an afternoon every single time.</p>
+</div>
+
+<h2 id="driver">The driver itself</h2>
+
+<p>The driver itself, in C++ rather than C — which brings RAII to kernel code and removes a whole class of cleanup bug, provided you stay inside the subset the kernel permits.</p>
+
+<pre><code>// SecTee/Kernel/Driver.cpp
+#include "CppSupport.h"
+#include &lt;wdf.h&gt;
+#include "ITeeTransport.h"
+
+extern "C" {
+DRIVER_INITIALIZE                DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD        SecTeeEvtDeviceAdd;
+EVT_WDF_DEVICE_PREPARE_HARDWARE  SecTeeEvtPrepareHardware;
+EVT_WDF_DEVICE_RELEASE_HARDWARE  SecTeeEvtReleaseHardware;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SecTeeEvtIoDeviceControl;
+}
+
+NTSTATUS SecTeeSha256(const void*, ULONG, UCHAR[SECTEE_DIGEST_LEN]);
+NTSTATUS SecTeeVerifyP256(const UCHAR[SECTEE_PUBKEY_LEN],
+                          const UCHAR[SECTEE_DIGEST_LEN],
+                          const UCHAR[SECTEE_SIG_LEN]);
+
+// Per-device context. WDF allocates it; we placement-new the C++
+// members into it, because WDF does not know about constructors.
+struct DEVICE_CONTEXT
+{
+    ITeeTransport* Transport;
+};
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
+
+extern "C"
+NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
+                     _In_ PUNICODE_STRING RegistryPath)
+{
+    WDF_DRIVER_CONFIG config;
+    WDF_DRIVER_CONFIG_INIT(&amp;config, SecTeeEvtDeviceAdd);
+
+    return WdfDriverCreate(DriverObject, RegistryPath,
+                           WDF_NO_OBJECT_ATTRIBUTES,
+                           &amp;config, WDF_NO_HANDLE);
+}
+
+NTSTATUS SecTeeEvtDeviceAdd(_In_ WDFDRIVER, _Inout_ PWDFDEVICE_INIT DeviceInit)
+{
+    PAGED_CODE();
+
+    // We own hardware, so we need the PnP callbacks.
+    WDF_PNPPOWER_EVENT_CALLBACKS pnp;
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&amp;pnp);
+    pnp.EvtDevicePrepareHardware = SecTeeEvtPrepareHardware;
+    pnp.EvtDeviceReleaseHardware = SecTeeEvtReleaseHardware;
+    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &amp;pnp);
+
+    // Exclusive: one client at a time. The mailbox is a single
+    // slot and the TA is single-instance; letting two processes
+    // in would only move the queueing somewhere less obvious.
+    WdfDeviceInitSetExclusive(DeviceInit, TRUE);
+
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attrs, DEVICE_CONTEXT);
+
+    WDFDEVICE device;
+    NTSTATUS status = WdfDeviceCreate(&amp;DeviceInit, &amp;attrs, &amp;device);
+    if (!NT_SUCCESS(status)) return status;
+
+    RtlZeroMemory(DeviceGetContext(device), sizeof(DEVICE_CONTEXT));
+
+    // The interface the user-mode client looks for.
+    status = WdfDeviceCreateDeviceInterface(device,
+                                            &amp;GUID_DEVINTERFACE_SECTEE,
+                                            nullptr);
+    if (!NT_SUCCESS(status)) return status;
+
+    // A sequential queue: WDF delivers one request at a time, so
+    // the IOCTL handler never re-enters. Combined with the
+    // transport's own mutex this is belt and braces, and it costs
+    // nothing.
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&amp;queueConfig,
+                                           WdfIoQueueDispatchSequential);
+    queueConfig.EvtIoDeviceControl = SecTeeEvtIoDeviceControl;
+
+    // The handler calls CNG and blocks on the mailbox, so it must
+    // run at PASSIVE_LEVEL. This is the line that guarantees it.
+    WDF_OBJECT_ATTRIBUTES queueAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&amp;queueAttrs);
+    queueAttrs.ExecutionLevel = WdfExecutionLevelPassive;
+
+    WDFQUEUE queue;
+    return WdfIoQueueCreate(device, &amp;queueConfig, &amp;queueAttrs, &amp;queue);
+}
+
+NTSTATUS SecTeeEvtPrepareHardware(_In_ WDFDEVICE Device,
+                                  _In_ WDFCMRESLIST Raw,
+                                  _In_ WDFCMRESLIST Translated)
+{
+    PAGED_CODE();
+    auto* ctx = DeviceGetContext(Device);
+
+    NTSTATUS status = CreateMailboxTransport(&amp;ctx-&gt;Transport);
+    if (!NT_SUCCESS(status)) return status;
+
+    // If Start fails we must not leak the object - and this is
+    // exactly the case a C driver gets wrong on the third edit.
+    auto guard = MakeScopeExit([&amp;]() {
+        delete ctx-&gt;Transport;
+        ctx-&gt;Transport = nullptr;
+    });
+
+    status = ctx-&gt;Transport-&gt;Start(Device, Raw, Translated);
+    if (!NT_SUCCESS(status)) return status;
+
+    guard.Dismiss();
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SecTeeEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST)
+{
+    PAGED_CODE();
+    auto* ctx = DeviceGetContext(Device);
+    if (ctx-&gt;Transport)
+    {
+        ctx-&gt;Transport-&gt;Stop();
+        delete ctx-&gt;Transport;      // virtual destructor runs
+        ctx-&gt;Transport = nullptr;
+    }
+    return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------
+// The IOCTL handler
+// ---------------------------------------------------------------
+void SecTeeEvtIoDeviceControl(_In_ WDFQUEUE Queue,
+                              _In_ WDFREQUEST Request,
+                              _In_ size_t OutputBufferLength,
+                              _In_ size_t InputBufferLength,
+                              _In_ ULONG IoControlCode)
+{
+    PAGED_CODE();
+
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    auto*     ctx    = DeviceGetContext(device);
+    NTSTATUS  status = STATUS_INVALID_DEVICE_REQUEST;
+    size_t    written = 0;
+
+    // METHOD_BUFFERED, so both of these are the same system
+    // buffer and neither is a user pointer. WdfRequestRetrieve*
+    // also validates the length for us.
+    PVOID  inBuf  = nullptr;
+    PVOID  outBuf = nullptr;
+
+    if (InputBufferLength)
+    {
+        status = WdfRequestRetrieveInputBuffer(Request,
+                    sizeof(SECTEE_HEADER), &amp;inBuf, nullptr);
+        if (!NT_SUCCESS(status)) goto complete;
+
+        // Version check before anything else, always.
+        if (static_cast&lt;SECTEE_HEADER*&gt;(inBuf)-&gt;Version != SECTEE_ABI_VERSION)
+        {
+            status = STATUS_REVISION_MISMATCH;
+            goto complete;
+        }
+    }
+    if (OutputBufferLength)
+    {
+        status = WdfRequestRetrieveOutputBuffer(Request,
+                    sizeof(SECTEE_HEADER), &amp;outBuf, nullptr);
+        if (!NT_SUCCESS(status)) goto complete;
+    }
+
+    switch (IoControlCode)
+    {
+    // -----------------------------------------------------------
+    case IOCTL_SECTEE_GET_PUBKEY:
+    {
+        if (OutputBufferLength &lt; sizeof(SECTEE_PUBKEY_OUT))
+        { status = STATUS_BUFFER_TOO_SMALL; break; }
+
+        auto* out = static_cast&lt;SECTEE_PUBKEY_OUT*&gt;(outBuf);
+        ULONG len = SECTEE_PUBKEY_LEN;
+
+        status = ctx-&gt;Transport-&gt;Invoke(TA_CMD_GET_PUBKEY,
+                                        nullptr, 0,
+                                        out-&gt;PublicKey, &amp;len);
+        if (!NT_SUCCESS(status)) break;
+        if (len != SECTEE_PUBKEY_LEN) { status = STATUS_DATA_ERROR; break; }
+
+        out-&gt;Header.Version  = SECTEE_ABI_VERSION;
+        out-&gt;Header.Reserved = 0;
+        written = sizeof(SECTEE_PUBKEY_OUT);
+        break;
+    }
+
+    // -----------------------------------------------------------
+    case IOCTL_SECTEE_SIGN:
+    {
+        if (InputBufferLength  &lt; sizeof(SECTEE_SIGN_IN) ||
+            OutputBufferLength &lt; sizeof(SECTEE_SIGN_OUT))
+        { status = STATUS_BUFFER_TOO_SMALL; break; }
+
+        auto* in  = static_cast&lt;SECTEE_SIGN_IN*&gt;(inBuf);
+        auto* out = static_cast&lt;SECTEE_SIGN_OUT*&gt;(outBuf);
+
+        // Validate the length the caller CLAIMS against the length
+        // the I/O manager actually gave us. Trusting DataLength
+        // alone is the classic Windows driver overread.
+        const size_t headerBytes =
+            FIELD_OFFSET(SECTEE_SIGN_IN, Data);
+        if (in-&gt;DataLength &gt; SECTEE_MAX_INPUT ||
+            in-&gt;DataLength &gt; InputBufferLength - headerBytes)
+        { status = STATUS_INVALID_BUFFER_SIZE; break; }
+
+        // 1. Hash HERE, in the normal world, with CNG.
+        UCHAR digest[SECTEE_DIGEST_LEN];
+        status = SecTeeSha256(in-&gt;Data, in-&gt;DataLength, digest);
+        if (!NT_SUCCESS(status)) break;
+
+        // 2. Only the 32-byte digest crosses the boundary.
+        ULONG sigLen = SECTEE_SIG_LEN;
+        status = ctx-&gt;Transport-&gt;Invoke(TA_CMD_SIGN,
+                                        digest, SECTEE_DIGEST_LEN,
+                                        out-&gt;Signature, &amp;sigLen);
+        if (!NT_SUCCESS(status)) break;
+        if (sigLen != SECTEE_SIG_LEN) { status = STATUS_DATA_ERROR; break; }
+
+        RtlCopyMemory(out-&gt;Digest, digest, SECTEE_DIGEST_LEN);
+        out-&gt;Header.Version  = SECTEE_ABI_VERSION;
+        out-&gt;Header.Reserved = 0;
+        written = sizeof(SECTEE_SIGN_OUT);
+        break;
+    }
+
+    // -----------------------------------------------------------
+    case IOCTL_SECTEE_VERIFY:
+    {
+        if (InputBufferLength &lt; sizeof(SECTEE_VERIFY_IN))
+        { status = STATUS_BUFFER_TOO_SMALL; break; }
+
+        auto* in = static_cast&lt;SECTEE_VERIFY_IN*&gt;(inBuf);
+
+        UCHAR pub[SECTEE_PUBKEY_LEN];
+        ULONG len = SECTEE_PUBKEY_LEN;
+        status = ctx-&gt;Transport-&gt;Invoke(TA_CMD_GET_PUBKEY,
+                                        nullptr, 0, pub, &amp;len);
+        if (!NT_SUCCESS(status)) break;
+
+        // Verified with CNG, in the driver, against the public key
+        // the secure world published. No secret is involved.
+        status = SecTeeVerifyP256(pub, in-&gt;Digest, in-&gt;Signature);
+        break;
+    }
+
+    // -----------------------------------------------------------
+    case IOCTL_SECTEE_COUNTER:
+    {
+        if (InputBufferLength  &lt; sizeof(SECTEE_COUNTER_INOUT) ||
+            OutputBufferLength &lt; sizeof(SECTEE_COUNTER_INOUT))
+        { status = STATUS_BUFFER_TOO_SMALL; break; }
+
+        auto* in  = static_cast&lt;SECTEE_COUNTER_INOUT*&gt;(inBuf);
+        auto* out = static_cast&lt;SECTEE_COUNTER_INOUT*&gt;(outBuf);
+
+        ULONG increment = in-&gt;Increment ? 1u : 0u;
+        ULONGLONG value = 0;
+        ULONG len = sizeof(value);
+
+        status = ctx-&gt;Transport-&gt;Invoke(TA_CMD_COUNTER,
+                                        &amp;increment, sizeof(increment),
+                                        &amp;value, &amp;len);
+        if (!NT_SUCCESS(status)) break;
+        if (len != sizeof(value)) { status = STATUS_DATA_ERROR; break; }
+
+        out-&gt;Header.Version = SECTEE_ABI_VERSION;
+        out-&gt;Header.Reserved = 0;
+        out-&gt;Increment = increment;
+        out-&gt;Reserved2 = 0;
+        out-&gt;Value     = value;
+        written = sizeof(SECTEE_COUNTER_INOUT);
+        break;
+    }
+
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+
+complete:
+    WdfRequestCompleteWithInformation(Request, status, written);
+}</code></pre>
+
+<div class="warn">
+<b>The overread this code is written to avoid</b>
+<p><code>SECTEE_SIGN_IN::DataLength</code> is a number the caller chose. The buffer size is a number the I/O
+manager measured. Hashing <code>DataLength</code> bytes without checking it against
+<code>InputBufferLength - FIELD_OFFSET(...)</code> reads past the system buffer into whatever pool follows —
+a kernel information disclosure straight back to the caller, since the digest goes in the output. Check the
+claim against the measurement, every time, for every variable-length field.</p>
+</div>
+
+<h2 id="client">The user-mode client</h2>
+
+<p>The application side, showing how the operation looks to whoever actually uses it, and confirming that the key never appears anywhere in this half of the system.</p>
+
+<pre><code>// SecTee/Client/secteectl.cpp
+//
+// Finds the device by interface GUID rather than by a hard-coded
+// name, which is what lets the driver be installed more than once
+// and is what SetupDi exists for (chapter 26).
+
+#include &lt;windows.h&gt;
+#include &lt;setupapi.h&gt;
+#include &lt;cfgmgr32.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;memory&gt;
+#include "..\Common\SecTeeAbi.h"
+
+#pragma comment(lib, "setupapi.lib")
+
+namespace {
+
+// RAII for a HANDLE. Here in user mode we DO have the STL and
+// exceptions, and there is no reason not to use them.
+struct HandleDeleter
+{
+    using pointer = HANDLE;
+    void operator()(HANDLE h) const
+    { if (h &amp;&amp; h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+};
+using UniqueHandle = std::unique_ptr&lt;HANDLE, HandleDeleter&gt;;
+
+UniqueHandle OpenSecTee()
+{
+    HDEVINFO set = SetupDiGetClassDevsW(&amp;GUID_DEVINTERFACE_SECTEE,
+                       nullptr, nullptr,
+                       DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("SetupDiGetClassDevs failed");
+
+    SP_DEVICE_INTERFACE_DATA ifData{};
+    ifData.cbSize = sizeof(ifData);
+
+    if (!SetupDiEnumDeviceInterfaces(set, nullptr,
+                                     &amp;GUID_DEVINTERFACE_SECTEE,
+                                     0, &amp;ifData))
+    {
+        SetupDiDestroyDeviceInfoList(set);
+        throw std::runtime_error(
+            "no SecTee device present - is the driver installed "
+            "and started?");
+    }
+
+    DWORD needed = 0;
+    SetupDiGetDeviceInterfaceDetailW(set, &amp;ifData, nullptr, 0,
+                                     &amp;needed, nullptr);
+
+    std::vector&lt;BYTE&gt; buf(needed);
+    auto* detail = reinterpret_cast&lt;PSP_DEVICE_INTERFACE_DETAIL_DATA_W&gt;(
+                       buf.data());
+    detail-&gt;cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+    if (!SetupDiGetDeviceInterfaceDetailW(set, &amp;ifData, detail,
+                                          needed, nullptr, nullptr))
+    {
+        SetupDiDestroyDeviceInfoList(set);
+        throw std::runtime_error("SetupDiGetDeviceInterfaceDetail failed");
+    }
+
+    UniqueHandle h(CreateFileW(detail-&gt;DevicePath,
+                               GENERIC_READ | GENERIC_WRITE,
+                               0, nullptr, OPEN_EXISTING, 0, nullptr));
+    SetupDiDestroyDeviceInfoList(set);
+
+    if (h.get() == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("CreateFile failed, error " +
+                                 std::to_string(GetLastError()));
+    return h;
+}
+
+void Ioctl(HANDLE h, DWORD code,
+           void* in, DWORD inLen, void* out, DWORD outLen)
+{
+    DWORD returned = 0;
+    if (!DeviceIoControl(h, code, in, inLen, out, outLen,
+                         &amp;returned, nullptr))
+        throw std::runtime_error("ioctl 0x" + std::to_string(code) +
+                                 " failed, error " +
+                                 std::to_string(GetLastError()));
+}
+
+std::string Hex(const UCHAR* p, size_t n)
+{
+    static const char* d = "0123456789abcdef";
+    std::string s;
+    s.reserve(n * 2);
+    for (size_t i = 0; i &lt; n; i++)
+    { s += d[p[i] &gt;&gt; 4]; s += d[p[i] &amp; 0xf]; }
+    return s;
+}
+
+std::vector&lt;BYTE&gt; ReadWholeFile(const wchar_t* path)
+{
+    UniqueHandle f(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr));
+    if (f.get() == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("cannot open input file");
+
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f.get(), &amp;size);
+    if (size.QuadPart &gt; SECTEE_MAX_INPUT)
+        throw std::runtime_error("file too large for one request");
+
+    std::vector&lt;BYTE&gt; data(static_cast&lt;size_t&gt;(size.QuadPart));
+    DWORD read = 0;
+    if (!data.empty())
+        ReadFile(f.get(), data.data(),
+                 static_cast&lt;DWORD&gt;(data.size()), &amp;read, nullptr);
+    data.resize(read);
+    return data;
+}
+
+} // namespace
+
+int wmain(int argc, wchar_t** argv)
+{
+    try
+    {
+        auto dev = OpenSecTee();
+
+        if (argc &gt;= 2 &amp;&amp; !wcscmp(argv[1], L"pubkey"))
+        {
+            SECTEE_PUBKEY_OUT out{};
+            Ioctl(dev.get(), IOCTL_SECTEE_GET_PUBKEY,
+                  nullptr, 0, &amp;out, sizeof(out));
+            printf("04%s\n", Hex(out.PublicKey, SECTEE_PUBKEY_LEN).c_str());
+            //     ^^ the SEC1 uncompressed prefix, added here so the
+            //        output can be pasted into OpenSSL. CNG did not
+            //        want it; OpenSSL does.
+        }
+        else if (argc &gt;= 3 &amp;&amp; !wcscmp(argv[1], L"sign"))
+        {
+            auto data = ReadWholeFile(argv[2]);
+
+            const size_t inSize =
+                FIELD_OFFSET(SECTEE_SIGN_IN, Data) + data.size();
+            std::vector&lt;BYTE&gt; inBuf(inSize);
+            auto* in = reinterpret_cast&lt;SECTEE_SIGN_IN*&gt;(inBuf.data());
+            in-&gt;Header.Version = SECTEE_ABI_VERSION;
+            in-&gt;Header.Reserved = 0;
+            in-&gt;DataLength = static_cast&lt;ULONG&gt;(data.size());
+            in-&gt;Reserved2  = 0;
+            if (!data.empty())
+                memcpy(in-&gt;Data, data.data(), data.size());
+
+            SECTEE_SIGN_OUT out{};
+            Ioctl(dev.get(), IOCTL_SECTEE_SIGN,
+                  inBuf.data(), static_cast&lt;DWORD&gt;(inSize),
+                  &amp;out, sizeof(out));
+
+            printf("digest %s\n", Hex(out.Digest, SECTEE_DIGEST_LEN).c_str());
+            printf("sig    %s\n", Hex(out.Signature, SECTEE_SIG_LEN).c_str());
+        }
+        else if (argc &gt;= 3 &amp;&amp; !wcscmp(argv[1], L"verify"))
+        {
+            auto data = ReadWholeFile(argv[2]);
+
+            // Sign, then ask the driver to verify its own result.
+            // A round trip that exercises CNG on both sides.
+            const size_t inSize =
+                FIELD_OFFSET(SECTEE_SIGN_IN, Data) + data.size();
+            std::vector&lt;BYTE&gt; inBuf(inSize);
+            auto* si = reinterpret_cast&lt;SECTEE_SIGN_IN*&gt;(inBuf.data());
+            si-&gt;Header.Version = SECTEE_ABI_VERSION;
+            si-&gt;DataLength = static_cast&lt;ULONG&gt;(data.size());
+            memcpy(si-&gt;Data, data.data(), data.size());
+
+            SECTEE_SIGN_OUT so{};
+            Ioctl(dev.get(), IOCTL_SECTEE_SIGN,
+                  inBuf.data(), static_cast&lt;DWORD&gt;(inSize),
+                  &amp;so, sizeof(so));
+
+            SECTEE_VERIFY_IN vi{};
+            vi.Header.Version = SECTEE_ABI_VERSION;
+            memcpy(vi.Digest,    so.Digest,    SECTEE_DIGEST_LEN);
+            memcpy(vi.Signature, so.Signature, SECTEE_SIG_LEN);
+
+            Ioctl(dev.get(), IOCTL_SECTEE_VERIFY,
+                  &amp;vi, sizeof(vi), nullptr, 0);
+            printf("VALID\n");
+        }
+        else if (argc &gt;= 2 &amp;&amp; !wcscmp(argv[1], L"counter"))
+        {
+            SECTEE_COUNTER_INOUT io{};
+            io.Header.Version = SECTEE_ABI_VERSION;
+            io.Increment = (argc &gt;= 3 &amp;&amp; !wcscmp(argv[2], L"inc")) ? 1 : 0;
+            Ioctl(dev.get(), IOCTL_SECTEE_COUNTER,
+                  &amp;io, sizeof(io), &amp;io, sizeof(io));
+            printf("%llu\n", io.Value);
+        }
+        else
+        {
+            fwprintf(stderr, L"usage: secteectl pubkey\n"
+                             L"       secteectl sign   &lt;file&gt;\n"
+                             L"       secteectl verify &lt;file&gt;\n"
+                             L"       secteectl counter [inc]\n");
+            return 2;
+        }
+        return 0;
+    }
+    catch (const std::exception&amp; e)
+    {
+        fprintf(stderr, "secteectl: %s\n", e.what());
+        return 1;
+    }
+}</code></pre>
+
+<h2 id="inf">The INF</h2>
+
+<p>The installation package for a driver with no real hardware behind it, which is its own small puzzle — there is no device to enumerate, so something has to create one.</p>
+
+<pre><code>; SecTee.inf - binds to the ivshmem PCI function on QEMU.
+;
+; On real hardware the same driver would be an ACPI-enumerated
+; device with a TrEE-capable hardware ID; only this section and
+; the transport factory in PrepareHardware change.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = SecTee.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13          ; the driver store package directory
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+SecTee.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard, NTARM64
+
+; ivshmem: Red Hat vendor 1AF4, device 1110.
+[Standard.NTARM64]
+%SecTee.DeviceDesc% = SecTee_Install, PCI\VEN_1AF4&amp;DEV_1110
+
+[SecTee_Install.NT]
+CopyFiles = SecTee_CopyFiles
+
+[SecTee_CopyFiles]
+SecTee.sys
+
+[SecTee_Install.NT.Services]
+AddService = SecTee, 0x00000002, SecTee_Service
+
+[SecTee_Service]
+DisplayName   = %SecTee.SvcDesc%
+ServiceType   = 1            ; SERVICE_KERNEL_DRIVER
+StartType     = 3            ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %13%\SecTee.sys
+
+[SecTee_Install.NT.Wdf]
+KmdfService = SecTee, SecTee_wdfsect
+
+[SecTee_wdfsect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ManufacturerName   = "Embedded Learning Hub"
+DiskName           = "SecTee Installation Disk"
+SecTee.DeviceDesc  = "TrustZone-backed crypto device"
+SecTee.SvcDesc     = "SecTee Service"</code></pre>
+
+<pre><code>REM Building. From an ARM64 Developer Command Prompt for the WDK.
+
+msbuild SecTee.sln /p:Configuration=Release /p:Platform=ARM64
+
+REM Test-sign it, because an unsigned driver will not load
+REM (chapter 21). On the TARGET machine, once:
+bcdedit /set testsigning on
+shutdown /r /t 0
+
+REM Then, on the target, as Administrator:
+certmgr /add SecTee.cer /s /r localMachine root
+certmgr /add SecTee.cer /s /r localMachine trustedpublisher
+pnputil /add-driver SecTee.inf /install
+
+REM Confirm:
+pnputil /enum-devices /class System /connected
+sc query SecTee</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Link error: unresolved <code>operator new</code></td><td><code>CppSupport.h</code> not included, or a
+parameterless <code>new</code> used somewhere</td></tr>
+<tr><td>Link error: <code>_purecall</code>, <code>__CxxFrameHandler</code>,
+<code>atexit</code></td><td>Exceptions or RTTI still enabled, or a global object with a
+constructor</td></tr>
+<tr><td>Driver loads, then bugchecks on first IOCTL</td><td>CNG called above PASSIVE_LEVEL — set
+<code>ExecutionLevel = WdfExecutionLevelPassive</code> on the queue</td></tr>
+<tr><td><code>BCryptOpenAlgorithmProvider</code> returns
+<code>STATUS_INVALID_PARAMETER</code></td><td><code>BCRYPT_PROV_DISPATCH</code> not passed</td></tr>
+<tr><td>Unresolved <code>BCrypt*</code> at link</td><td><code>ksecdd.lib</code> not in the linker
+inputs</td></tr>
+<tr><td><code>STATUS_DEVICE_NOT_READY</code> from PrepareHardware</td><td>Mailbox magic absent — the far-end
+daemon is not running (chapter 39)</td></tr>
+<tr><td>Every request times out after 5 s</td><td>Doorbell going to the wrong peer, or the daemon is not
+watching the doorbell</td></tr>
+<tr><td>Ack never observed although the daemon says it replied</td><td>Shared memory mapped cached — must be
+<code>PAGE_NOCACHE</code></td></tr>
+<tr><td><code>STATUS_REVISION_MISMATCH</code></td><td>Client and driver built against different
+<code>SecTeeAbi.h</code></td></tr>
+<tr><td>Signature verifies with CNG, fails with OpenSSL</td><td>Expected — OpenSSL needs DER, CNG needs raw
+r&#124;&#124;s</td></tr>
+<tr><td>Public key rejected by CNG</td><td>The <code>0x04</code> SEC1 prefix was included; CNG's
+<code>BCRYPT_ECCKEY_BLOB</code> does not take it</td></tr>
+<tr><td>Driver will not install: "third-party INF does not contain digital signature information"</td><td>Not
+test-signed, or test signing is off on the target</td></tr>
+<tr><td>Verifier flags a pool leak on unload</td><td><code>ReleaseHardware</code> not deleting the transport,
+or an early-return path in <code>PrepareHardware</code> without the scope guard</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State what Windows actually uses to reach the secure world on ARM, and why this project needs a
+  transport seam.</li>
+  <li>Say precisely which security property the QEMU configuration does <em>not</em> demonstrate.</li>
+  <li>List four things C++ gives you in a kernel driver and four it forbids, with the reason for each
+  prohibition.</li>
+  <li>Explain why <code>operator new</code> here takes a pool type instead of defaulting.</li>
+  <li>Justify <code>METHOD_BUFFERED</code> for this ABI and say when you would switch.</li>
+  <li>Explain why <code>DataLength</code> must be checked against <code>InputBufferLength</code>, and what
+  leaks if it is not.</li>
+  <li>Give the two extra rules for calling CNG from kernel mode.</li>
+  <li>Explain why the driver hashes but the TA signs.</li>
+  <li>State the difference between CNG's and OpenSSL's ECDSA signature encodings, and which one the TA
+  emits.</li>
+  <li>Explain why the shared memory must be mapped non-cached.</li>
+  <li>Point to the memory barrier before the sequence increment and say what it prevents.</li>
+  <li>Trace one <code>secteectl sign</code> from <code>DeviceIoControl</code> to the transport and back,
+  naming every buffer the data occupies.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sysfs, debugfs and procfs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>sysfs, debugfs and procfs</h1>
+<p class="lead">Three filesystems that expose kernel state as files. They look interchangeable and are not:
+one is a permanent ABI, one is a debugging free-for-all, and one you should not add to at all.</p>
+
+<h2 id="three">Which is which</h2>
+
+<p>The lead paragraph's warning has a concrete cause: the three filesystems below share a superficial interface
+— read a file, get some kernel state — but carry opposite stability guarantees, and picking the wrong one for
+a given piece of information either breaks user-space programs on a kernel upgrade or, just as badly, freezes
+a debugging tool into a permanent ABI it was never meant to be.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>sysfs</th><th>debugfs</th><th>procfs</th></tr></thead>
+<tbody>
+<tr><td>Mounted at</td><td><code>/sys</code></td><td><code>/sys/kernel/debug</code></td><td><code>/proc</code></td></tr>
+<tr><td>Stability</td><td><strong>Permanent ABI</strong></td><td><strong>None</strong> — change freely</td><td>Permanent for what exists</td></tr>
+<tr><td>Rule</td><td><strong>One value per file</strong></td><td>Anything you like</td><td>Historical mess</td></tr>
+<tr><td>Available in production</td><td>Yes</td><td>Usually not mounted</td><td>Yes</td></tr>
+<tr><td>Documented in</td><td><code>Documentation/ABI/</code></td><td>Nowhere required</td><td>—</td></tr>
+<tr><td>Use for</td><td>Configuration and status userspace depends on</td><td>Development, diagnostics, dumps</td><td><strong>Do not add new files</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The decision</b>
+<p>If a program will depend on it, it goes in <strong>sysfs</strong>, one value per file, with an entry in
+<code>Documentation/ABI/</code>. If it is for you and your colleagues while debugging, it goes in
+<strong>debugfs</strong>, where you can restructure it tomorrow. Nothing new goes in
+<strong>procfs</strong> — it predates both and is reserved for process information.</p>
+</div>
+
+<h2 id="sysfs">sysfs attributes</h2>
+
+<p>A sysfs attribute is a file whose contents are produced by a function in your driver when something reads it. This is how a driver exposes a single value — a status, a setting — in a way any script or program can consume without special tooling.</p>
+
+<pre><code>#include &lt;linux/sysfs.h&gt;
+#include &lt;linux/device.h&gt;
+
+/* --- a read-only attribute ------------------------------- */
+static ssize_t temperature_show(struct device *dev,
+                                struct device_attribute *attr,
+                                char *buf)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+        int milli_c;
+
+        milli_c = mydev_read_temp(d);
+
+        /* sysfs_emit() is the correct helper: it knows the
+           buffer is one PAGE and bounds the write for you.
+           Use it, not sprintf.                              */
+        return sysfs_emit(buf, "%d\n", milli_c);
+}
+static DEVICE_ATTR_RO(temperature);
+        /* creates: struct device_attribute dev_attr_temperature
+           with .show = temperature_show, mode 0444          */
+
+/* --- a read/write attribute ------------------------------ */
+static ssize_t gain_show(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+
+        return sysfs_emit(buf, "%u\n", d-&gt;gain);
+}
+
+static ssize_t gain_store(struct device *dev,
+                          struct device_attribute *attr,
+                          const char *buf, size_t count)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+        unsigned int val;
+        int ret;
+
+        ret = kstrtouint(buf, 0, &amp;val);   /* base 0: accepts
+                                             decimal AND 0x   */
+        if (ret)
+                return ret;
+
+        if (val &gt; MYDEV_MAX_GAIN)
+                return -EINVAL;
+
+        mutex_lock(&amp;d-&gt;lock);
+        ret = mydev_set_gain(d, val);
+        mutex_unlock(&amp;d-&gt;lock);
+        if (ret)
+                return ret;
+
+        return count;         /* RETURN count ON SUCCESS.
+                                 Returning 0 makes the writing
+                                 program loop forever, because
+                                 it thinks nothing was
+                                 consumed.                   */
+}
+static DEVICE_ATTR_RW(gain);
+
+/* --- grouping and registering ---------------------------- */
+static struct attribute *mydev_attrs[] = {
+        &amp;dev_attr_temperature.attr,
+        &amp;dev_attr_gain.attr,
+        NULL,                            /* sentinel */
+};
+ATTRIBUTE_GROUPS(mydev);        /* -&gt; mydev_groups */
+
+static struct platform_driver mydev_driver = {
+        .driver = {
+                .name = "my-device",
+                .dev_groups = mydev_groups,   /* &lt;-- the core
+                                                 creates and
+                                                 removes them
+                                                 around probe */
+                ...
+        },
+        ...
+};
+
+/* USING dev_groups is much better than device_create_file()
+   in probe: the attributes exist BEFORE probe returns and are
+   removed AFTER remove, so there is no window where userspace
+   can see a file backed by a half-initialised device - and no
+   cleanup for you to forget.                                */</code></pre>
+
+<h2 id="sysfsrules">The sysfs rules</h2>
+
+<p>sysfs is a permanent ABI, so its conventions are strict, and the strictness has a purpose: it is what lets a program read any driver's attribute without knowing anything about that driver. Breaking these rules is the main reason a sysfs interface gets rejected upstream.</p>
+
+<pre><code>/* These are enforced in review, and for good reasons: */
+
+   1. ONE VALUE PER FILE.
+        good:  /sys/.../temperature       "42000\n"
+        bad:   /sys/.../status            "temp=42 gain=3 ok"
+      A multi-value file cannot be parsed reliably, cannot be
+      extended without breaking parsers, and cannot be watched
+      with poll() per-value.
+
+   2. TEXT, human readable, with a trailing newline.
+
+   3. USE THE STANDARD UNITS. The sysfs convention is
+      milli-units: millivolts, millidegrees, milliamps. Not
+      degrees, not raw ADC counts. Userspace tools assume it.
+
+   4. NO ACTIONS WITH SIDE EFFECTS beyond the obvious. A file
+      called `gain` sets the gain. A file that reprograms the
+      firmware when you write "1" to it is a surprise and
+      belongs elsewhere.
+
+   5. DOCUMENT IT in Documentation/ABI/testing/sysfs-...
+      before it becomes stable:
+
+        What:           /sys/bus/platform/devices/*/gain
+        Date:           March 2026
+        KernelVersion:  6.14
+        Contact:        you@example.com
+        Description:
+                        Amplifier gain, 0-15. Writing a value
+                        outside that range returns -EINVAL.
+
+   6. RETURN count FROM store(), or a negative error. Never 0.
+
+   7. THE BUFFER IN show() IS ONE PAGE. sysfs_emit() enforces
+      it; sprintf does not.                                  */</code></pre>
+
+<h2 id="poll">Making a sysfs file pollable</h2>
+
+<p>A program can wait for a sysfs value to change rather than polling it in a loop, but only if your driver explicitly notifies on change. This is a small addition that removes a lot of wasted CPU in user space.</p>
+
+<pre><code>/* An attribute can notify userspace of a change, so a program
+   can wait on it rather than polling in a loop.            */
+
+        /* when the value changes, in your driver: */
+        sysfs_notify(&amp;dev-&gt;kobj, NULL, "alarm");
+
+/* userspace: */
+        fd = open("/sys/.../alarm", O_RDONLY);
+        read(fd, buf, sizeof(buf));      /* read it once FIRST */
+
+        pfd.fd = fd;
+        pfd.events = POLLPRI | POLLERR;  /* NOT POLLIN - sysfs
+                                            uses POLLPRI      */
+        poll(&amp;pfd, 1, -1);
+
+        lseek(fd, 0, SEEK_SET);          /* rewind */
+        read(fd, buf, sizeof(buf));      /* the new value */
+
+/* THE THREE THINGS PEOPLE GET WRONG:
+     · waiting on POLLIN instead of POLLPRI
+     · not reading once before the first poll (the initial
+       read arms the notification)
+     · not lseek()ing back to 0 before re-reading           */</code></pre>
+
+<h2 id="debugfs">debugfs</h2>
+
+<p>Where sysfs is a permanent, one-value-per-file ABI, debugfs is the opposite by design: no rules, no stability guarantee, and not normally mounted on a production system. That freedom is exactly what makes it right for diagnostics.</p>
+
+<pre><code>#include &lt;linux/debugfs.h&gt;
+
+/* --- the one-liners, for simple values -------------------- */
+static int __init mydev_debugfs_init(struct mydev *d)
+{
+        d-&gt;dbg = debugfs_create_dir("mydev", NULL);
+        /* NOTE: debugfs_create_dir NEVER returns NULL on
+           failure - it returns an ERR_PTR, and every other
+           debugfs function accepts an ERR_PTR harmlessly. So
+           you do NOT need to check it. This is deliberate:
+           debugfs failures must never break a driver.      */
+
+        debugfs_create_u32("irq_count",  0444, d-&gt;dbg,
+                           &amp;d-&gt;irq_count);
+        debugfs_create_u32("error_count", 0444, d-&gt;dbg,
+                           &amp;d-&gt;error_count);
+        debugfs_create_bool("verbose", 0644, d-&gt;dbg,
+                            &amp;d-&gt;verbose);
+        debugfs_create_x32("last_status", 0444, d-&gt;dbg,
+                           &amp;d-&gt;last_status);   /* hex */
+
+        /* a raw memory blob */
+        d-&gt;blob.data = d-&gt;fw_image;
+        d-&gt;blob.size = d-&gt;fw_size;
+        debugfs_create_blob("firmware", 0444, d-&gt;dbg, &amp;d-&gt;blob);
+
+        return 0;
+}
+        debugfs_remove_recursive(d-&gt;dbg);      /* in remove */
+
+/* --- a custom file, for anything structured --------------- */
+static int mydev_regs_show(struct seq_file *s, void *unused)
+{
+        struct mydev *d = s-&gt;private;
+        int i;
+
+        seq_printf(s, "%-16s %s\n", "REGISTER", "VALUE");
+        for (i = 0; i &lt; ARRAY_SIZE(mydev_reg_names); i++)
+                seq_printf(s, "%-16s 0x%08x\n",
+                           mydev_reg_names[i],
+                           mydev_rd(d, i * 4));
+        return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mydev_regs);
+        /* generates the whole file_operations for you */
+
+        debugfs_create_file("registers", 0444, d-&gt;dbg, d,
+                            &amp;mydev_regs_fops);
+
+/* seq_file handles pagination for you - output larger than a
+   page just works, unlike sysfs. That is why register dumps,
+   tables and statistics belong here.                       */
+
+/* MOUNT IT: */
+        mount -t debugfs none /sys/kernel/debug
+        cat /sys/kernel/debug/mydev/registers</code></pre>
+
+<div class="warn">
+<b>debugfs is root-only and often absent</b>
+<p>Production kernels frequently do not enable <code>CONFIG_DEBUG_FS</code>, and hardened ones do not mount
+it. So a driver must <strong>work correctly when debugfs does not exist</strong> — never put required
+functionality there, and never make a debugfs failure fatal. The API is designed so that ignoring every
+return value is the correct thing to do.</p>
+</div>
+
+<h2 id="dyndbg">Dynamic debug</h2>
+
+<p>Debug messages are usually compiled out or left permanently on, and neither is satisfactory. Dynamic debug is a third option: the messages stay in the binary, cost nothing while disabled, and can be switched on individually at runtime — down to a single line of a single file.</p>
+
+<pre><code>/* The best debug-printing mechanism the kernel has: messages
+   compiled in but disabled, switchable at runtime with zero
+   cost when off (they are patched out with jump labels).   */
+
+        CONFIG_DYNAMIC_DEBUG=y
+
+/* In your driver, just use these: */
+        pr_debug("value is %d\n", val);
+        dev_dbg(dev, "channel %u ready\n", ch);
+
+/* Then at runtime: */
+    # everything in one file
+    echo 'file mydev.c +p' > /sys/kernel/debug/dynamic_debug/control
+
+    # one function
+    echo 'func mydev_probe +p' > .../control
+
+    # one module
+    echo 'module mydev +p' > .../control
+
+    # a line range
+    echo 'file mydev.c line 100-200 +p' > .../control
+
+    # turn it off again
+    echo 'module mydev -p' > .../control
+
+    # add the module, function, line and thread id to each
+    # message:
+    echo 'module mydev +pmfl' > .../control
+
+    # see what is available and what is enabled:
+    cat /sys/kernel/debug/dynamic_debug/control | grep mydev
+
+/* AND AT BOOT, before debugfs is even mounted: */
+        dyndbg="module mydev +p"          # kernel command line
+        mydev.dyndbg="+p"                 # per-module form
+
+/* THIS REPLACES the #ifdef DEBUG / custom-verbosity-flag
+   pattern entirely. Use dev_dbg() liberally in your driver -
+   it costs nothing when off, and it means a field problem can
+   be diagnosed without a rebuild.                          */</code></pre>
+
+<h2 id="tracing">Trace events</h2>
+
+<p>For anything high-frequency, printing is the wrong tool — it is too slow and it perturbs the timing you are trying to measure. Trace events are the alternative: near-free when nobody is listening, and structured rather than text when someone is.</p>
+
+<pre><code>/* For anything in a hot path, a trace event beats a printk:
+   it is nearly free when disabled, has a binary format, and
+   integrates with ftrace, perf and trace-cmd.              */
+
+/* include/trace/events/mydev.h */
+#undef TRACE_SYSTEM
+#define TRACE_SYSTEM mydev
+
+#if !defined(_TRACE_MYDEV_H) || defined(TRACE_HEADER_MULTI_READ)
+#define _TRACE_MYDEV_H
+
+#include &lt;linux/tracepoint.h&gt;
+
+TRACE_EVENT(mydev_xfer,
+        TP_PROTO(unsigned int chan, unsigned int len, int ret),
+        TP_ARGS(chan, len, ret),
+        TP_STRUCT__entry(
+                __field(unsigned int, chan)
+                __field(unsigned int, len)
+                __field(int,          ret)
+        ),
+        TP_fast_assign(
+                __entry-&gt;chan = chan;
+                __entry-&gt;len  = len;
+                __entry-&gt;ret  = ret;
+        ),
+        TP_printk("chan=%u len=%u ret=%d",
+                  __entry-&gt;chan, __entry-&gt;len, __entry-&gt;ret)
+);
+
+#endif
+#include &lt;trace/define_trace.h&gt;
+
+/* in the driver: */
+        trace_mydev_xfer(chan, len, ret);
+
+/* use it: */
+    echo 1 > /sys/kernel/tracing/events/mydev/mydev_xfer/enable
+    cat /sys/kernel/tracing/trace_pipe
+    # or:
+    trace-cmd record -e mydev
+    trace-cmd report</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Writing to a sysfs file hangs the program</td><td><code>store()</code> returned 0 instead of <code>count</code></td></tr>
+<tr><td>sysfs output truncated</td><td>Used <code>sprintf</code> past one page — use <code>sysfs_emit</code></td></tr>
+<tr><td>Attribute exists before the device works</td><td>Created in probe instead of via <code>dev_groups</code></td></tr>
+<tr><td>Attribute left behind after unbind</td><td>Manual <code>device_create_file</code> without a matching remove</td></tr>
+<tr><td><code>poll()</code> on a sysfs file never fires</td><td>Waiting on POLLIN instead of POLLPRI, or no initial read</td></tr>
+<tr><td>Userspace tool cannot parse your value</td><td>Multiple values in one file, or non-standard units</td></tr>
+<tr><td>debugfs files missing in production</td><td><code>CONFIG_DEBUG_FS</code> off or not mounted — as expected</td></tr>
+<tr><td>Driver fails to probe when debugfs is absent</td><td>Checked a debugfs return value and treated it as fatal</td></tr>
+<tr><td>Large debugfs output truncated</td><td>Not using <code>seq_file</code></td></tr>
+<tr><td><code>dev_dbg</code> prints nothing</td><td>Dynamic debug not enabled for that file/module</td></tr>
+<tr><td>Kernel upgrade breaks a userspace tool</td><td>A sysfs attribute was renamed or its format changed — it was an ABI</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Say which of the three filesystems a given piece of information belongs in, and why.</li>
+  <li>Write a read-only and a read/write sysfs attribute correctly.</li>
+  <li>Explain why <code>store()</code> must return <code>count</code>.</li>
+  <li>Explain the advantage of <code>dev_groups</code> over creating files in probe.</li>
+  <li>List the seven sysfs rules.</li>
+  <li>Make an attribute pollable and write the userspace side correctly.</li>
+  <li>Add debugfs counters and a <code>seq_file</code> register dump.</li>
+  <li>Explain why debugfs return values need not be checked.</li>
+  <li>Use dynamic debug to enable one function's messages at runtime and at boot.</li>
+  <li>Add a trace event and say when to prefer it over <code>dev_dbg</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

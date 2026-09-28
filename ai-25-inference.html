@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inference: sampling, the KV cache and context | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Inference: sampling, the KV cache and context</h1>
+<p class="lead">Training happens once; inference happens billions of times. This is where the systems
+engineering lives, and where an embedded engineer's instincts about memory bandwidth turn out to be
+exactly the right ones.</p>
+
+<h2 id="loop">The generation loop</h2>
+
+<p>Generation is a loop that runs the whole model once per token, which is a different performance problem from training and is the source of most serving cost.</p>
+
+<pre class="diagram">   A MODEL PRODUCES ONE DISTRIBUTION OVER THE VOCABULARY,
+   FOR THE NEXT TOKEN. Generating text means running it
+   repeatedly, feeding each choice back in.
+
+     tokens = tokenise(prompt)
+     loop:
+        logits = model(tokens)[-1]      # last position only
+        probs  = softmax(logits / T)
+        next   = sample(probs)
+        tokens.append(next)
+        if next == EOS or len(tokens) >= max: break
+
+   THIS IS AUTOREGRESSIVE DECODING, and it has two distinct
+   phases with completely different performance characters:
+
+   PREFILL - process the whole prompt at once
+     · one forward pass over n tokens, fully parallel
+     · MATRIX-MATRIX products -> COMPUTE BOUND (chapter 04)
+     · fast per token: thousands of tokens/second
+     · determines TIME TO FIRST TOKEN
+
+   DECODE - generate one token at a time
+     · one forward pass per token, inherently sequential
+     · MATRIX-VECTOR products -> MEMORY BANDWIDTH BOUND
+     · EVERY WEIGHT IN THE MODEL IS READ FROM MEMORY TO
+       PRODUCE ONE TOKEN
+     · determines TOKENS PER SECOND
+
+   THE ARITHMETIC THAT EXPLAINS EVERYTHING:
+
+     70B model in fp16 = 140 GB of weights.
+     At 2 TB/s of HBM bandwidth:
+        140 / 2000 = 70 ms per token = ~14 tokens/second
+     AND THE ARITHMETIC UNITS ARE ALMOST ENTIRELY IDLE.
+
+   SO EVERY INFERENCE OPTIMISATION IS AN ATTACK ON BYTES
+   MOVED, NOT ON FLOPS:
+     · QUANTISATION - fewer bytes per weight (chapter 26)
+     · BATCHING - amortise the weight read over many
+       requests
+     · SPECULATIVE DECODING - verify several tokens in one
+       memory-bound pass
+     · SMALLER MODELS
+   None of them make the arithmetic faster, because the
+   arithmetic was never the problem.</pre>
+
+<h2 id="kv">The KV cache</h2>
+
+<p>The KV cache is the single most important optimisation in serving, turning a quadratic amount of recomputation into a linear amount of memory. Its size is what limits how many users a GPU can hold.</p>
+
+<pre><code>/* THE NAIVE LOOP RECOMPUTES EVERYTHING EVERY STEP.
+
+   Generating token 100 re-runs attention over tokens 1..99,
+   recomputing keys and values that have not changed. TOTAL
+   COST IS O(n^2) FORWARD PASSES for n tokens - quadratic on
+   top of attention's own quadratic.
+
+   THE FIX: CACHE THE KEYS AND VALUES.
+
+   Because of the causal mask (chapter 19), the K and V for
+   position i NEVER CHANGE once computed. Store them. Each
+   new token computes only its own Q, K, V and attends to
+   the cache.
+
+     WITHOUT CACHE   O(n) work per token, O(n^2) total
+     WITH CACHE      O(1) work per token, O(n) total
+
+   THIS IS NOT AN OPTIMISATION - IT IS THE DIFFERENCE
+   BETWEEN USABLE AND UNUSABLE.                            */
+
+    class KVCache:
+        def __init__(self):
+            self.k = None   # (B, n_kv_head, T, d_head)
+            self.v = None
+
+        def update(self, k_new, v_new):
+            if self.k is None:
+                self.k, self.v = k_new, v_new
+            else:
+                self.k = torch.cat([self.k, k_new], dim=2)
+                self.v = torch.cat([self.v, v_new], dim=2)
+            return self.k, self.v
+
+    # in attention, during decode:
+    #   q is (B, H, 1, d)  - ONE new position
+    #   k, v are the FULL cache
+    #   -> one row of the attention matrix, not the whole
+    #      thing. And is_causal is unnecessary: there is
+    #      nothing after the current position anyway.
+
+/* --- THE COST, AND IT IS THE BINDING CONSTRAINT --- */
+
+    per token = 2 (K and V)
+              * n_layers
+              * n_kv_heads
+              * d_head
+              * bytes_per_element
+
+    Llama-3-8B, fp16:
+        2 * 32 * 8 * 128 * 2 = 131 KB PER TOKEN
+        8k context   -> 1.0 GB
+        128k context -> 16 GB    <-- LARGER THAN THE MODEL
+
+    WITHOUT GQA (32 KV heads instead of 8) that would be
+    4x more. THIS IS WHY GQA EXISTS (chapter 19), and it is
+    a pure inference-memory optimisation.
+
+/* --- MANAGING IT: PAGED ATTENTION --- */
+    Naively, you preallocate max_length per request and
+    waste most of it. vLLM's PagedAttention borrows the
+    idea from virtual memory (see the OS track): allocate
+    the cache in fixed-size BLOCKS, keep a per-request
+    BLOCK TABLE, and let blocks be non-contiguous.
+
+      · near-zero internal fragmentation
+      · COPY-ON-WRITE SHARING of a common prompt prefix
+        across parallel samples
+      · 2-4x more concurrent requests on the same hardware
+
+    A PAGE TABLE, FOR ATTENTION. If you have read the OS
+    track this will feel extremely familiar, and that is not
+    a coincidence - it is the same problem.
+
+/* --- CONTINUOUS BATCHING --- */
+    Static batching waits for the longest sequence in the
+    batch to finish, idling everything else. Continuous
+    (in-flight) batching removes finished sequences and
+    admits new ones EVERY STEP.
+    Typically 2-3x higher throughput. Standard in vLLM,
+    TGI, TensorRT-LLM.
+
+/* --- PREFIX CACHING --- */
+    A long system prompt shared across requests need only be
+    prefilled ONCE. Cache the KV for the shared prefix and
+    reuse it. Large latency win for agent and chat
+    workloads, and the reason API providers charge less for
+    cached input tokens.                                   */</code></pre>
+
+<h2 id="sampling">Sampling</h2>
+
+<p>The model outputs a distribution; turning that into a token is a separate decision with its own parameters, and those parameters change the character of the output more than most people expect.</p>
+
+<pre><code>/* THE MODEL GIVES A DISTRIBUTION. HOW YOU DRAW FROM IT
+   changes the output character completely.               */
+
+/* --- GREEDY: always the argmax --- */
+    next = logits.argmax()
+    Deterministic and reproducible; frequently REPETITIVE,
+    and it falls into loops ("and then, and then, and
+    then"). Correct for tasks with one right answer -
+    classification, extraction, structured output.
+
+/* --- TEMPERATURE (chapter 08) --- */
+    probs = softmax(logits / T)
+      T -> 0    approaches greedy
+      T = 0.7   a common default: coherent, some variety
+      T = 1.0   the model's own calibrated distribution
+      T > 1.2   creative, and increasingly incoherent
+
+/* --- TOP-K --- */
+    Keep the k highest-probability tokens, renormalise.
+    k = 40 is typical.
+    THE FLAW: a fixed k is wrong in both directions. When
+    the model is CERTAIN, 40 candidates includes 39 bad
+    ones. When it is genuinely uncertain, 40 may be too few.
+
+/* --- TOP-P / NUCLEUS SAMPLING. THE DEFAULT. --- */
+    Keep the smallest set of tokens whose cumulative
+    probability exceeds p. p = 0.9 or 0.95.
+
+    ADAPTIVE: a confident distribution yields 1-2
+    candidates; a flat one yields hundreds. This is why it
+    outperforms top-k, and it is what almost every API uses.
+
+    def top_p(logits, p=0.9, T=1.0):
+        logits = logits / T
+        s, idx = torch.sort(logits, descending=True)
+        probs = torch.softmax(s, dim=-1)
+        cum = torch.cumsum(probs, dim=-1)
+        # keep everything up to and including the crossing
+        mask = cum - probs &gt; p
+        s[mask] = float('-inf')
+        return idx[torch.multinomial(
+                     torch.softmax(s, -1), 1)]
+
+/* --- MIN-P: newer, and often better --- */
+    Keep tokens with probability at least
+    min_p * p_max. Scales the threshold with the model's own
+    confidence, and tends to be more robust at high
+    temperature.
+
+/* --- REPETITION AND PRESENCE PENALTIES --- */
+    Subtract from the logits of tokens already generated.
+    Reduces loops. USE SPARINGLY: a strong penalty degrades
+    text that legitimately repeats words - code, lists,
+    technical writing where the same identifier recurs.
+
+/* --- BEAM SEARCH --- */
+    Keep the b highest-probability SEQUENCES rather than
+    tokens.
+    · better for translation and summarisation, where a
+      single best output exists
+    · WORSE for open-ended generation - it produces bland,
+      high-probability, generic text, because the most
+      probable sequence is rarely the most interesting one
+    · b times the compute and b times the KV cache
+
+/* --- STRUCTURED / CONSTRAINED DECODING --- */
+    Force the output to match a grammar or JSON schema by
+    MASKING INVALID TOKENS at each step - set their logits
+    to -inf.
+
+    THE OUTPUT IS THEN VALID BY CONSTRUCTION, not by hope.
+    For any system that parses model output - which for an
+    engineer is most of them - this is far more reliable
+    than asking politely and retrying. Outlines, XGrammar
+    and llama.cpp's GBNF all do this.
+
+/* --- WHAT TO USE --- */
+    factual Q&amp;A, extraction   T=0 (greedy)
+    code                      T=0.2, or greedy
+    general chat              T=0.7, top_p=0.95
+    creative writing          T=0.9-1.1, top_p=0.95
+    anything parsed           CONSTRAINED DECODING
+    reproducible tests        greedy + a fixed seed        */</code></pre>
+
+<div class="key">
+<b>Speculative decoding</b>
+<pre>1. A SMALL DRAFT MODEL generates k tokens cheaply.
+2. The BIG MODEL scores all k IN ONE FORWARD PASS.
+3. Accept the longest prefix matching what the big
+   model would have sampled; reject the rest.
+
+Because decode is memory-bound, verifying k tokens costs
+almost the same as generating one. Typical speedup
+2-3x, and — the crucial property — THE OUTPUT
+DISTRIBUTION IS MATHEMATICALLY IDENTICAL to sampling
+from the big model alone. It is free.
+
+Variants: Medusa (extra heads on the same model),
+EAGLE (feature-level drafting), and n-gram lookup
+(no draft model at all — just match against the
+prompt, which works remarkably well for
+summarisation and code editing).</pre>
+</div>
+
+<h2 id="context">Context length</h2>
+
+<p>Context length is quoted as a single number and behaves like several different constraints at once — memory, cost, and whether the model actually uses what is in there.</p>
+
+<pre><code>/* --- WHAT LIMITS IT --- */
+    1. ATTENTION IS QUADRATIC in compute (chapter 19)
+    2. THE KV CACHE IS LINEAR in memory - and at long
+       context it exceeds the model itself
+    3. POSITIONAL ENCODING must extrapolate (chapter 21)
+    4. AND TRAINING DATA: long documents are rare, so the
+       model has seen few genuine long-range dependencies
+
+/* --- HOW LONG CONTEXTS WERE ACHIEVED --- */
+    · ROPE FREQUENCY SCALING (position interpolation, NTK
+      scaling, YaRN) - extend an 8k model to 128k with a
+      short fine-tune (chapter 21)
+    · FLASH ATTENTION - removes the O(n^2) MEMORY
+      (chapter 19)
+    · SLIDING WINDOW attention for most layers
+    · GQA and KV-cache quantisation
+    · training on synthetically constructed long documents
+
+/* --- AND THE HONEST LIMITATION: LOST IN THE MIDDLE --- */
+
+    Retrieval accuracy across a long context is not
+    uniform. Models attend well to the BEGINNING and the
+    END and measurably worse to the MIDDLE:
+
+      accuracy
+        |  \                       /
+        |   \                    /
+        |     \_______________/
+        +------------------------------> position in context
+         start        middle        end
+
+    A 128k CONTEXT WINDOW IS NOT 128k OF RELIABLE WORKING
+    MEMORY. The practical implications:
+      · put the important material at the START or the END
+      · RETRIEVE THE RELEVANT PARTS (chapter 17) rather than
+        stuffing everything in - shorter context is usually
+        MORE accurate as well as cheaper
+      · and test retrieval at YOUR context length, rather
+        than trusting the advertised number
+
+/* --- COST SCALES WITH CONTEXT --- */
+    prefill compute   O(n^2)
+    KV cache memory   O(n)
+    per-token decode  O(n) attention + O(1) weights
+    So a 100k-token prompt is not 10x a 10k prompt; it is
+    considerably worse for time-to-first-token, and it
+    permanently occupies a large amount of cache memory for
+    the whole session.
+
+/* --- SERVING METRICS TO MEASURE --- */
+    TTFT      time to first token - dominated by prefill
+    TPOT      time per output token - dominated by
+              bandwidth
+    THROUGHPUT total tokens/second across all requests
+    GOODPUT   requests meeting their latency target
+
+    AND THE TRADE-OFF TO UNDERSTAND: LARGER BATCHES RAISE
+    THROUGHPUT AND RAISE PER-REQUEST LATENCY. There is no
+    setting that optimises both; pick according to whether
+    you are serving an interactive product or a batch
+    pipeline.                                             */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Generation slows quadratically with length</td><td>No KV cache</td></tr>
+<tr><td>Out of memory at long context</td><td>KV cache exceeds the model — quantise it, or use GQA</td></tr>
+<tr><td>GPU utilisation near zero while generating</td><td>Memory bound — expected; batch or quantise</td></tr>
+<tr><td>Output loops "and then, and then"</td><td>Greedy or very low temperature — add top-p</td></tr>
+<tr><td>Output incoherent</td><td>Temperature too high</td></tr>
+<tr><td>Code output degraded by a repetition penalty</td><td>Code legitimately repeats identifiers — reduce it</td></tr>
+<tr><td>JSON output occasionally malformed</td><td>Not using constrained decoding</td></tr>
+<tr><td>Facts in the middle of a long prompt ignored</td><td>Lost in the middle — retrieve instead of stuffing</td></tr>
+<tr><td>Time to first token very high</td><td>Prefill is O(n²) — shorten the prompt or cache the prefix</td></tr>
+<tr><td>Throughput good, latency terrible</td><td>Batch size too large for an interactive workload</td></tr>
+<tr><td>Few concurrent requests fit</td><td>Static cache allocation — use paged attention</td></tr>
+<tr><td>Results not reproducible</td><td>Sampling enabled, or non-deterministic kernels</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish prefill and decode, and say which is compute bound and which memory bound.</li>
+  <li>Compute tokens per second for a 70B fp16 model at 2 TB/s.</li>
+  <li>Explain why the KV cache is valid, and what it changes asymptotically.</li>
+  <li>Compute the KV cache size per token for Llama-3-8B and at 128k context.</li>
+  <li>Explain paged attention and name the OS concept it borrows.</li>
+  <li>Explain continuous batching and prefix caching.</li>
+  <li>Compare greedy, top-k, top-p and min-p, and say why top-p beats top-k.</li>
+  <li>Say when beam search helps and when it hurts.</li>
+  <li>Explain constrained decoding and why it beats retrying.</li>
+  <li>Explain speculative decoding and why the output distribution is unchanged.</li>
+  <li>Give the four limits on context length and how each was addressed.</li>
+  <li>Explain "lost in the middle" and three practical responses.</li>
+  <li>Name four serving metrics and the throughput/latency trade-off.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

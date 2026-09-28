@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel memory allocators | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Kernel memory allocators</h1>
+<p class="lead">Five allocators, layered on one another, each solving a problem the one below it cannot.
+Choosing wrongly costs you memory, performance, or — with DMA — a driver that silently corrupts data.</p>
+
+<h2 id="stack">The stack of allocators</h2>
+
+<p>The kernel does not have one <code>malloc</code>. It has five allocators layered on top of each other, and each exists because the one beneath it could not solve a particular problem. Seeing them as a stack — rather than as five unrelated functions — is what makes choosing between them straightforward.</p>
+
+<pre class="diagram">   +---------------------------------------------------------+
+   |  devm_kmalloc()     device-managed. Freed on unbind.    |
+   |                     USE THIS IN DRIVERS. (chapter 33)   |
+   +---------------------------------------------------------+
+   |  kmalloc() / kmem_cache_alloc()          SLAB / SLUB    |
+   |     small objects, PHYSICALLY CONTIGUOUS                |
+   |     8 bytes .. a few pages                              |
+   +---------------------------------------------------------+
+   |  vmalloc()                                              |
+   |     large, VIRTUALLY contiguous only                    |
+   |     builds page tables; physically scattered            |
+   +---------------------------------------------------------+
+   |  alloc_pages() / __get_free_pages()      BUDDY ALLOCATOR|
+   |     power-of-two page runs, physically contiguous       |
+   |     the foundation everything above sits on             |
+   +---------------------------------------------------------+
+   |  memblock                                               |
+   |     boot only, before the buddy allocator exists        |
+   +---------------------------------------------------------+
+   |  PHYSICAL MEMORY, from the device tree                  |
+   +---------------------------------------------------------+
+
+   And, off to the side but important for drivers:
+
+   dma_alloc_coherent()   physically contiguous, DMA-mapped,
+                          cache-coherent. (chapter 30)
+   CMA                    a reserved pool that can serve large
+                          contiguous allocations at runtime</pre>
+
+<h2 id="buddy">The buddy allocator</h2>
+
+<p>Everything above is ultimately built on this one. The buddy allocator hands out whole pages, always in power-of-two runs, and it is the layer that actually owns physical memory. You will rarely call it directly, but its behaviour — especially the way it fragments — leaks upward into every allocator above it.</p>
+
+<pre><code>/* The foundation: allocates 2^order contiguous PAGES.       */
+
+struct page *alloc_pages(gfp_t gfp, unsigned int order);
+void         __free_pages(struct page *page, unsigned int order);
+
+unsigned long __get_free_pages(gfp_t gfp, unsigned int order);
+void          free_pages(unsigned long addr, unsigned int order);
+
+        order 0  =  1 page   =  4 KB
+        order 1  =  2 pages  =  8 KB
+        order 2  =  4 pages  = 16 KB
+        ...
+        order 10 = 1024 pages = 4 MB    (MAX_ORDER limit,
+                                         configurable)
+
+/* HOW IT WORKS: free memory is kept in 11 lists, one per
+   order. To satisfy an order-2 request with only order-4
+   blocks free, it splits an order-4 into two order-3s, takes
+   one, splits it into two order-2s, takes one. On free, if
+   the adjacent "buddy" block is also free, they merge back.
+
+   CONSEQUENCE - FRAGMENTATION. After hours of uptime, plenty
+   of memory can be free while no high-order block exists.
+   An order-0 allocation succeeds; an order-4 fails. This is
+   why:
+
+     · high-order allocations must ALWAYS be error-checked
+     · a driver that needs 4 MB contiguous at runtime should
+       use CMA, or allocate at probe time and keep it
+     · "it works after reboot, fails after a week" is often
+       exactly this
+
+   SEE THE STATE:
+        cat /proc/buddyinfo
+   Node 0, zone   Normal   1432  882  341  102   43  12  3 0 0 0 0
+                           ^order0                        ^order10
+   Lots of low-order, nothing high-order = fragmented.   */</code></pre>
+
+<h2 id="slab">kmalloc and the slab allocator</h2>
+
+<p><code>kmalloc</code> is the one you will type most, and it is the closest thing the kernel has to ordinary <code>malloc</code>. Underneath, it is not a general-purpose heap at all: it keeps pools of fixed-size blocks and rounds your request up to the nearest one, which has consequences worth knowing before you size a structure.</p>
+
+<pre><code>void *kmalloc(size_t size, gfp_t flags);
+void *kzalloc(size_t size, gfp_t flags);        /* zeroed */
+void *kcalloc(size_t n, size_t size, gfp_t f);  /* n*size,
+                                                   OVERFLOW-
+                                                   CHECKED   */
+void *krealloc(const void *p, size_t new, gfp_t f);
+void  kfree(const void *p);
+size_t ksize(const void *p);       /* what you ACTUALLY got */
+
+/* kmalloc serves from a set of fixed-size caches:
+        8, 16, 32, 64, 96, 128, 192, 256, 512, 1024,
+        2048, 4096, 8192 ... up to KMALLOC_MAX_SIZE
+
+   ROUNDING UP MATTERS: kmalloc(100) consumes 128 bytes.
+   kmalloc(129) consumes 192. In a driver allocating one
+   object per packet, choosing 128 over 129 is a 33% memory
+   saving. Check with ksize().
+
+   PROPERTIES:
+     · PHYSICALLY CONTIGUOUS - so it is DMA-able (with the
+       right GFP flags), and virt_to_phys() works on it
+     · fast: per-CPU freelists, usually no locking
+     · above ~2 pages it falls back to the page allocator, and
+       becomes subject to fragmentation
+
+   ALWAYS CHECK THE RETURN:
+        p = kmalloc(n, GFP_KERNEL);
+        if (!p)
+                return -ENOMEM;
+   Even GFP_KERNEL can fail. "Small allocations never fail" is
+   almost true and entirely unsafe to rely on.             */
+
+/* SIZE ARITHMETIC - use the checked helpers: */
+        p = kmalloc(n * size, GFP_KERNEL);      /* CAN OVERFLOW */
+        p = kmalloc_array(n, size, GFP_KERNEL); /* checked      */
+        p = kcalloc(n, size, GFP_KERNEL);       /* checked+zero */
+        p = kmalloc(struct_size(obj, items, n), GFP_KERNEL);
+                        /* checked, for flexible array members */</code></pre>
+
+<h2 id="cache">Your own slab cache</h2>
+
+<p>If your driver allocates thousands of copies of one particular structure, you can ask the slab allocator for a pool dedicated to exactly that size. This costs a few lines of setup and buys you three things — tighter memory use, faster allocation, and a named line in the kernel's own statistics that makes a leak in your driver immediately visible.</p>
+
+<pre><code>/* When you allocate many objects of ONE type, a dedicated
+   cache is tighter and faster than kmalloc's rounding.     */
+
+static struct kmem_cache *my_cache;
+
+static int __init my_init(void)
+{
+        my_cache = kmem_cache_create("my_request",
+                                     sizeof(struct my_request),
+                                     __alignof__(struct my_request),
+                                     SLAB_HWCACHE_ALIGN, /* flags */
+                                     NULL);              /* ctor */
+        if (!my_cache)
+                return -ENOMEM;
+        return 0;
+}
+
+        obj = kmem_cache_alloc(my_cache, GFP_KERNEL);
+        kmem_cache_free(my_cache, obj);
+
+static void __exit my_exit(void)
+{
+        kmem_cache_destroy(my_cache);   /* WARNS loudly if
+                                           objects are still
+                                           allocated - which is
+                                           a free leak detector */
+}
+
+/* USEFUL FLAGS:
+     SLAB_HWCACHE_ALIGN   align to a cache line - avoids false
+                          sharing between CPUs (CA ch. 15)
+     SLAB_POISON          fill freed objects with a pattern
+     SLAB_RED_ZONE        guard bytes around each object
+     SLAB_ACCOUNT         charge to the memory cgroup
+
+/* WHY BOTHER:
+     · exact sizing: 100-byte objects cost 100 bytes, not 128
+     · a NAMED line in /proc/slabinfo, so leaks are visible
+       and attributable to your driver
+     · kmem_cache_destroy() warning is a built-in leak test
+
+   INSPECT:
+        sudo cat /proc/slabinfo | grep my_request
+        sudo slabtop -s c            # sorted by cache size  */</code></pre>
+
+<h2 id="vmalloc">vmalloc</h2>
+
+<p>Sometimes you need a large buffer and do not care where the physical pages are. <code>vmalloc</code> stitches scattered pages into one contiguous <em>virtual</em> range, which lets it satisfy allocations the buddy allocator would refuse — at a cost, and with one restriction that causes serious, hard-to-find bugs when ignored.</p>
+
+<pre><code>void *vmalloc(unsigned long size);
+void *vzalloc(unsigned long size);
+void  vfree(const void *addr);
+
+/* Allocates SCATTERED physical pages and maps them into a
+   contiguous VIRTUAL range by building page tables.
+
+   USE IT FOR: large buffers where only the CPU touches the
+   memory. Firmware images, big lookup tables, module text.
+
+   DO NOT USE IT FOR:
+     · DMA. The pages are not physically contiguous, and
+       virt_to_phys() DOES NOT WORK on vmalloc addresses.
+       This is a top-three driver bug: DMA "works" on a
+       machine with little fragmentation, then corrupts
+       random memory on a busy one.
+     · anything in atomic context - vmalloc can sleep.
+     · small allocations - the page-table overhead and TLB
+       cost dominate.
+
+   COMPARE:
+                     kmalloc         vmalloc
+     contiguous      physical+virt   virtual only
+     max size        ~4 MB           very large
+     speed           fast            slow (page tables, TLB)
+     DMA-safe        yes             NO
+     can sleep       depends on GFP  always
+     virt_to_phys    works           BROKEN
+
+   For a vmalloc buffer you must reach page by page:
+        struct page *p = vmalloc_to_page(addr);            */</code></pre>
+
+<div class="danger">
+<b>The DMA rule, stated once</b>
+<p>Memory for DMA must be obtained from <code>dma_alloc_coherent()</code>, or from
+<code>kmalloc</code>/<code>alloc_pages</code> and then mapped with <code>dma_map_single()</code>. Never
+<code>vmalloc</code>. Never a stack buffer (it may not be DMA-able and its physical address is
+meaningless to a device). Never a module-static array without mapping it. <a href="lx-24-dma-api.html">Chapter
+30</a> covers this properly, but the rule is worth learning before you need it.</p>
+</div>
+
+<h2 id="choose">Choosing</h2>
+
+<p>The right allocator is determined entirely by two questions — does this memory need to be physically
+contiguous for a device to use it, and what context (process, atomic, driver-lifetime) is it allocated and
+freed in — and almost every wrong choice in real driver code traces back to skipping one of those two
+questions rather than to not knowing an API existed.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>You need</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>A small struct in a driver, freed on unbind</td><td><code>devm_kzalloc()</code></td></tr>
+<tr><td>A small struct with a different lifetime</td><td><code>kzalloc()</code> + explicit <code>kfree()</code></td></tr>
+<tr><td>Many objects of one type</td><td><code>kmem_cache_create()</code></td></tr>
+<tr><td>An array</td><td><code>kcalloc()</code> / <code>kmalloc_array()</code></td></tr>
+<tr><td>Whole pages</td><td><code>alloc_pages()</code></td></tr>
+<tr><td>A large CPU-only buffer</td><td><code>vmalloc()</code></td></tr>
+<tr><td>A DMA buffer, long-lived</td><td><code>dma_alloc_coherent()</code></td></tr>
+<tr><td>A DMA buffer, streaming</td><td><code>kmalloc()</code> + <code>dma_map_single()</code></td></tr>
+<tr><td>Many small DMA buffers</td><td><code>dma_pool_create()</code></td></tr>
+<tr><td>Large contiguous at runtime</td><td>CMA, via <code>dma_alloc_coherent()</code></td></tr>
+<tr><td>In an interrupt handler</td><td><code>kmalloc(..., GFP_ATOMIC)</code>, and check the result</td></tr>
+<tr><td>Something that must not fail</td><td>Preallocate at probe time. There is no other answer.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="cma">CMA — contiguous memory at runtime</h2>
+
+<p>Some hardware genuinely requires a large, physically contiguous buffer — a camera or a video codec may need tens of megabytes in one unbroken run. After a few hours of uptime, ordinary allocation cannot deliver that at any price, so the kernel needs a way to reserve the memory in advance without wasting it in the meantime.</p>
+
+<pre><code>/* THE PROBLEM: a camera or video codec needs 32 MB physically
+   contiguous, at runtime, after hours of uptime. The buddy
+   allocator cannot deliver that - fragmentation guarantees it.
+
+   THE SOLUTION: reserve a region at boot, but let MOVABLE
+   pages (page cache, anonymous memory) use it meanwhile. When
+   a contiguous allocation arrives, migrate them out.       */
+
+        reserved-memory {
+                #address-cells = &lt;2&gt;;
+                #size-cells = &lt;2&gt;;
+                ranges;
+
+                cma_pool: linux,cma {
+                        compatible = "shared-dma-pool";
+                        reusable;          /* &lt;-- makes it CMA */
+                        size = &lt;0x0 0x8000000&gt;;   /* 128 MB */
+                        alignment = &lt;0x0 0x400000&gt;;
+                        linux,cma-default;
+                };
+        };
+
+        my_codec: codec@1c000000 {
+                compatible = "vendor,codec";
+                reg = &lt;0x0 0x1c000000 0x0 0x10000&gt;;
+                memory-region = &lt;&amp;cma_pool&gt;;
+        };
+
+/* Then in the driver, dma_alloc_coherent() transparently comes
+   from CMA:                                                */
+        of_reserved_mem_device_init(dev);
+        buf = dma_alloc_coherent(dev, SZ_32M, &amp;dma, GFP_KERNEL);
+
+/* CAVEATS worth knowing before you rely on it:
+     · migration can FAIL if a page is pinned - so CMA
+       allocation can still fail, just much less often
+     · migration takes time; a large allocation can stall for
+       tens of milliseconds
+     · `reusable` is what allows the memory to be borrowed. A
+       carve-out without it is simply removed from the kernel's
+       view entirely - which is what you want for a security
+       boundary (isolation ch. 18), and not what you want for
+       a codec buffer.
+
+   MONITOR:
+        cat /proc/meminfo | grep Cma
+        CmaTotal:  131072 kB
+        CmaFree:    98304 kB                                */</code></pre>
+
+<h2 id="debug">Finding leaks and overruns</h2>
+
+<p>Memory bugs in the kernel rarely crash at the point of the mistake; they corrupt something and the machine dies later, somewhere unrelated. The tools below exist to convert those delayed, unreproducible failures into an immediate message naming the exact line — and they are the difference between a bug found in an afternoon and one hunted for a week.</p>
+
+<pre><code># KASAN - the one that finds real bugs. Enable it in
+# development and leave it on.
+    CONFIG_KASAN=y
+    CONFIG_KASAN_INLINE=y
+# Catches: use-after-free, out-of-bounds read and write,
+# double-free, use-after-scope. Reports with two backtraces -
+# where it was allocated and where it was freed. ~2-3x slower
+# and ~1/8 more memory, and worth every bit of it.
+
+# KFENCE - a sampling version, cheap enough for production:
+    CONFIG_KFENCE=y
+    CONFIG_KFENCE_SAMPLE_INTERVAL=100
+# Catches a small fraction of the same bugs at near-zero cost.
+
+# kmemleak - finds objects nothing points to any more:
+    CONFIG_DEBUG_KMEMLEAK=y
+    echo scan > /sys/kernel/debug/kmemleak
+    cat /sys/kernel/debug/kmemleak
+# Reports false positives; read them, do not just believe them.
+
+# Slab poisoning and red zones, without full KASAN:
+    slub_debug=FZPU              # on the command line
+    slub_debug=FZPU,my_request   # or just your cache
+
+# Where memory went:
+    cat /proc/meminfo
+    sudo slabtop -s c
+    cat /proc/vmallocinfo
+    cat /proc/buddyinfo
+    cat /proc/pagetypeinfo</code></pre>
+
+<div class="tip">
+<b>The allocation-failure message is a diagnosis, not just an error</b>
+<p>When an allocation fails the kernel dumps the order requested, the GFP flags, the zone state and a full
+backtrace. The <em>order</em> tells you whether you hit real exhaustion (order 0 failing) or fragmentation
+(order 0 fine, order 4 failing) — and those have completely different fixes. Read the dump before
+concluding you are out of memory.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>DMA works sometimes, corrupts memory otherwise</td><td><code>vmalloc</code> or stack memory used for DMA</td></tr>
+<tr><td>Large allocation fails after long uptime</td><td>Fragmentation — check <code>/proc/buddyinfo</code>; use CMA</td></tr>
+<tr><td>Memory shrinks steadily</td><td>A leak — <code>slabtop</code> to find the cache, then kmemleak</td></tr>
+<tr><td>Crash long after a <code>kfree</code></td><td>Use-after-free — enable KASAN</td></tr>
+<tr><td>Corruption in an unrelated structure</td><td>Buffer overrun into the neighbouring object — KASAN or <code>slub_debug</code></td></tr>
+<tr><td><code>kmem_cache_destroy</code> warns on unload</td><td>Objects still allocated — a leak your driver owns</td></tr>
+<tr><td>Allocation returns NULL in an interrupt</td><td><code>GFP_ATOMIC</code> pool exhausted — preallocate instead</td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code> at kmalloc</td><td><code>GFP_KERNEL</code> in atomic context (<a href="lx-06-gfp-flags.html">ch. 07</a>)</td></tr>
+<tr><td>Memory use far above what you allocated</td><td>kmalloc rounding — check <code>ksize()</code>, consider a cache</td></tr>
+<tr><td>CMA allocation fails</td><td>Pages pinned and unmigratable, or the pool is too small</td></tr>
+<tr><td><code>virt_to_phys</code> returns nonsense</td><td>Called on a vmalloc address</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the allocator stack and say what each layer adds.</li>
+  <li>Explain buddy fragmentation and read <code>/proc/buddyinfo</code>.</li>
+  <li>Explain kmalloc size rounding and its cost in a hot path.</li>
+  <li>Create a slab cache and say what it buys over <code>kmalloc</code>.</li>
+  <li>List three things <code>vmalloc</code> must never be used for.</li>
+  <li>Choose the right allocator for eight concrete situations.</li>
+  <li>Explain what CMA does, and the difference <code>reusable</code> makes.</li>
+  <li>Turn on KASAN and read one of its reports.</li>
+  <li>Read an allocation-failure dump and say whether it is exhaustion or fragmentation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

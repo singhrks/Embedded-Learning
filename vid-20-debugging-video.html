@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging a video pipeline | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging a video pipeline</h1>
+<p class="lead">A video bug has a visible signature, and the signature names the layer. Learning to read
+"green frame", "diagonal skew", "washed out", "judder" as diagnoses rather than symptoms turns a day of
+guessing into ten minutes of bisection.</p>
+
+<h2 id="signatures">Read the artefact, find the layer</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>What you see</th><th>Layer</th><th>Look at</th></tr></thead>
+<tbody>
+<tr><td><strong>Diagonal skew</strong>, each row shifted further</td><td>Buffer</td><td>Stride confused with
+width (<a href="vid-01-image-representation.html">ch 1</a>)</td></tr>
+<tr><td><strong>Purple / orange</strong> picture, luma correct</td><td>Buffer</td><td>U and V swapped —
+NV12 vs NV21 (<a href="vid-04-pixel-formats.html">ch 4</a>)</td></tr>
+<tr><td><strong>Scrambled rectangles</strong></td><td>Buffer</td><td>Tiled buffer read as linear; modifier
+mismatch</td></tr>
+<tr><td><strong>Washed out</strong> or <strong>crushed</strong></td><td>Colour</td><td>Limited/full range
+mismatch (<a href="vid-02-colour-and-gamma.html">ch 2</a>)</td></tr>
+<tr><td><strong>Slight colour shift</strong>, faces off</td><td>Colour</td><td>BT.601 vs BT.709
+matrix</td></tr>
+<tr><td><strong>Bottom rows garbage</strong></td><td>Codec</td><td>Crop ignored — 1080 vs 1088
+(<a href="vid-16-hardware-codecs.html">ch 16</a>)</td></tr>
+<tr><td><strong>Green frame</strong> then correct</td><td>Codec</td><td>Displaying before the first keyframe,
+or an uninitialised DPB</td></tr>
+<tr><td><strong>Smearing</strong> that clears at a keyframe</td><td>Transport</td><td>Packet loss; references
+corrupted (<a href="vid-10-frame-types-gop.html">ch 10</a>)</td></tr>
+<tr><td><strong>Blocking</strong> that pulses</td><td>Encoder</td><td>Rate control
+(<a href="vid-13-rate-control.html">ch 13</a>)</td></tr>
+<tr><td><strong>Judder</strong> on pans</td><td>Display</td><td>Cadence — 24 fps on 60 Hz
+(<a href="vid-18-drm-kms.html">ch 18</a>)</td></tr>
+<tr><td><strong>Tearing</strong>, a horizontal seam</td><td>Display</td><td>No vblank
+synchronisation</td></tr>
+<tr><td><strong>Lip sync drift</strong></td><td>Container</td><td>Timestamps
+(<a href="vid-15-containers-sync.html">ch 15</a>)</td></tr>
+<tr><td><strong>Combing</strong> on motion</td><td>Source</td><td>Interlaced, not deinterlaced</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Bisect the pipeline, do not stare at the output</b>
+<p>A pipeline is capture → encode → mux → transmit → demux → decode → convert → display. The fastest way to
+localise a bug is to <em>dump the intermediate</em>: write the raw frames after capture, the elementary stream
+after encode, the decoded frames before display. Whichever dump is the first to look wrong contains the bug.
+Ten minutes of dumping beats a day of reasoning about which stage is guilty.</p>
+</div>
+
+<h2 id="dump">Dumping at every stage</h2>
+
+<pre><code># 1. AFTER CAPTURE - raw frames from the device
+$ v4l2-ctl -d /dev/video0 \
+    --set-fmt-video=width=1920,height=1080,pixelformat=NV12 \
+    --stream-mmap --stream-count=30 --stream-to=cap.nv12
+$ ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 cap.nv12
+# Wrong here -> sensor, ISP, or your format assumption.
+
+# 2. AFTER ENCODE - the elementary stream, no container
+$ ffmpeg -i input.mp4 -c:v copy -bsf:v h264_mp4toannexb -f h264 es.264
+$ ffplay es.264
+# Plays -> the codec data is fine and the problem is the
+# container or the transport.
+
+# 3. AFTER DECODE - what the decoder actually produced
+$ ffmpeg -i input.mp4 -pix_fmt nv12 -f rawvideo dec.nv12
+$ ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 dec.nv12
+# Correct here but wrong on screen -> conversion or display.
+
+# 4. COMPARE two stages numerically rather than by eye
+$ ffmpeg -i original.y4m -i decoded.y4m \
+    -lavfi "[0:v][1:v]psnr=stats_file=psnr.log" -f null -
+$ awk '$0 ~ /psnr_avg/ {print}' psnr.log | sort -t: -k6 -n | head
+# The worst frames first. A single terrible frame among good
+# ones is a dropped reference; a gradual decline is drift
+# (chapter 11).
+
+# 5. VISUAL DIFF, which finds what metrics miss
+$ ffmpeg -i a.mp4 -i b.mp4 \
+    -lavfi "[0:v][1:v]blend=all_mode=difference,eq=contrast=8" \
+    -c:v libx264 -crf 18 diff.mp4
+# Black = identical. Anything visible is a real difference,
+# amplified 8x.</code></pre>
+
+<h2 id="stream">Inspecting the bitstream itself</h2>
+
+<pre><code># When the pixels are wrong and you suspect the stream.
+
+# Every NAL unit, its type and size:
+$ ffmpeg -i in.mp4 -c copy -bsf:v trace_headers -f null - 2>&amp;1 | head -60
+[trace_headers] Sequence Parameter Set
+[trace_headers] 0           forbidden_zero_bit          0
+[trace_headers] 1           nal_ref_idc                11 = 3
+[trace_headers] 3           nal_unit_type          00111 = 7
+[trace_headers] 8           profile_idc          01100100 = 100
+[trace_headers] 16          level_idc            00101000 = 40
+[trace_headers] ...         pic_width_in_mbs_minus1   = 119
+[trace_headers] ...         pic_height_in_map_units_minus1 = 67
+#                                                        ^^ 68
+#   68 * 16 = 1088, and frame_cropping tells you it is really
+#   1080. This is where you check the crop (chapter 16).
+
+# Frame types, sizes and timestamps in one view:
+$ ffprobe -select_streams v -show_entries \
+    frame=pict_type,key_frame,pkt_size,pkt_pts_time \
+    -of csv=p=0 in.mp4 | head -20
+
+# Bitrate over time - finds spikes and starved regions:
+$ ffprobe -select_streams v -show_entries frame=pkt_size \
+    -of csv=p=0 in.mp4 | awk '{s+=$1; n++}
+      n%30==0 {printf "%d %.0f kbit/s\n", n/30, s*8/1000; s=0}'
+
+# Is the file structurally valid at all?
+$ ffmpeg -v error -i in.mp4 -f null -
+# Silence = clean. Any output here is a real decode error.
+
+# Deeper conformance:
+$ ffmpeg -v verbose -err_detect explode -i in.mp4 -f null -
+# Turns warnings that are normally tolerated into failures.
+
+# For MP4 box structure:
+$ MP4Box -info in.mp4
+$ mp4dump in.mp4 | head -40
+# Missing moov, wrong track duration, an edit list you did not
+# expect (chapter 15) - all visible here.</code></pre>
+
+<div class="warn">
+<b>"It plays in VLC" proves almost nothing</b>
+<p>VLC and ffmpeg are extraordinarily tolerant — they resynchronise after corruption, guess missing metadata,
+ignore level violations and work around broken muxers. A hardware decoder does none of that. If a file plays
+in VLC and fails on a device, the file is very likely wrong and VLC is compensating. Test with
+<code>-err_detect explode</code>, and on the actual target.</p>
+</div>
+
+<h2 id="perf">Performance, not correctness</h2>
+
+<pre><code># THE FIRST QUESTION: is the hardware path in use at all
+# (chapters 16, 19)?
+
+$ sudo intel_gpu_top             # "Video" and "VideoEnhance" rows
+$ nvidia-smi dmon -s u           # "dec" and "enc" columns
+$ adb shell dumpsys SurfaceFlinger | grep -A5 'Composition'
+$ sudo cat /sys/kernel/debug/dri/0/state | grep -c 'format=NV12'
+# Zero in any of these = you are on the software path.
+
+# THE SECOND: where is the time going?
+$ perf top -p $(pidof myplayer)
+# Expect to see, in a healthy software decoder:
+#   ff_h264_decode_mb_cabac      entropy   (chapter 8)
+#   h264_idct_add8_8_avx         transform
+#   ff_h264_filter_mb            deblock   (chapter 12)
+#   ff_hscale / yuv2rgb          CONVERSION - if this is high,
+#                                you have an unnecessary
+#                                format conversion
+
+# THE THIRD: memory bandwidth, which is what actually limits
+# embedded pipelines (chapter 16).
+$ sudo perf stat -e uncore_imc/data_reads/,uncore_imc/data_writes/ \
+    -a sleep 5
+# Compare against the theoretical (frame size x fps x copies).
+# Much higher than expected = hidden copies.
+
+# LATENCY, end to end, measured rather than estimated:
+$ ffmpeg -f lavfi -i "testsrc=size=640x480:rate=60" \
+    -vf "drawtext=text='%{pts\\:hms}':fontsize=48:x=10:y=10" \
+    -f v4l2 /dev/video1
+# Point a camera at the screen showing the timestamp, and
+# compare. Crude, and it measures the WHOLE chain including
+# the display, which is the number that actually matters.
+
+# GStreamer's built-in latency tracer:
+$ GST_DEBUG="GST_TRACER:7" GST_TRACERS="latency" \
+    gst-launch-1.0 ... 2>&amp;1 | grep latency</code></pre>
+
+<h2 id="method">The method</h2>
+
+<ol class="steps">
+  <li><strong>Name the artefact.</strong> Use the table above. Half of all video bugs are identified by their
+  appearance alone.</li>
+  <li><strong>Bisect by dumping.</strong> Raw after capture, elementary stream after encode, raw after decode.
+  The first bad dump contains the bug.</li>
+  <li><strong>Check the metadata before the pixels.</strong> Format, stride, colour tags, crop, timestamps.
+  These are cheap to inspect and are the cause far more often than the codec.</li>
+  <li><strong>Reproduce with ffmpeg alone.</strong> If <code>ffmpeg -i in -f null -</code> is clean, the file
+  is fine and your pipeline is not.</li>
+  <li><strong>Test on the target.</strong> Desktop tolerance hides level violations, missing headers and
+  alignment problems that a hardware decoder will not accept.</li>
+  <li><strong>Separate correctness from performance.</strong> They have different tools and different
+  answers, and confusing them wastes the most time.</li>
+</ol>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Plays on desktop, fails on device</td><td>Level, profile, alignment or missing SPS/PPS — desktop
+tolerance</td></tr>
+<tr><td>First frames green or grey</td><td>Rendering before the first keyframe</td></tr>
+<tr><td>Corruption clears at each keyframe</td><td>Packet loss corrupting references</td></tr>
+<tr><td>Frame rate fine, power high</td><td>Software path or hidden copies — measure, do not
+watch</td></tr>
+<tr><td>PSNR fine, viewers complain</td><td>A temporal artefact no frame-wise metric sees
+(<a href="vid-06-why-compression-works.html">ch 6</a>)</td></tr>
+<tr><td>Bug disappears under a debugger</td><td>Timing-dependent — a buffer race or a missing fence</td></tr>
+<tr><td>Works with 4 buffers, drops with 2</td><td>Starving the driver (<a href="vid-17-v4l2.html">ch
+17</a>)</td></tr>
+<tr><td>Encoder output valid but unplayable on a TV</td><td>Non-conformant HRD or an exceeded level</td></tr>
+<tr><td>Latency far above the sum of the stages</td><td>Queueing between stages, or encoder
+lookahead</td></tr>
+<tr><td>Reproducible only at a specific resolution</td><td>Alignment — try a multiple of 16 in both
+dimensions</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Given diagonal skew, purple output and a washed-out picture, name the layer for each.</li>
+  <li>Explain the bisect-by-dumping method and the three points to dump at.</li>
+  <li>Extract an elementary stream from an MP4 and say what it proves if it plays.</li>
+  <li>Use <code>trace_headers</code> to find the coded height and the crop.</li>
+  <li>Say why "it plays in VLC" is weak evidence.</li>
+  <li>Give three ways to verify the hardware path is in use.</li>
+  <li>Read a decoder profile and identify an unnecessary format conversion.</li>
+  <li>Describe a way to measure true end-to-end latency.</li>
+  <li>Explain why a frame-wise metric can look fine while viewers complain.</li>
+  <li>List the six steps of the method in order.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

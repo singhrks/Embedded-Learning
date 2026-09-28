@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bare metal on the Pi: no Linux at all | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Bare metal on the Pi: no Linux at all</h1>
+<p class="lead">Replace <code>kernel8.img</code> with your own binary and the firmware will happily start it
+instead of Linux. You get four Cortex-A cores at EL2 with nothing underneath — which makes the Pi one of the
+cheapest ways to run the <a href="track.html?t=arm">ARM track</a>'s material on real silicon.</p>
+
+<h2 id="why">Why do this</h2>
+
+<pre class="diagram">   NOT as a way to build products - almost nobody ships
+   bare-metal on a Pi. As a way to LEARN, it is unmatched:
+
+   - the ARM track becomes executable. Read TTBR0_EL1, build
+     your own page tables, take a real exception, decode a
+     real ESR.
+   - you see what Linux is doing for you, by having to do it
+     yourself.
+   - four cores means real SMP: cache coherency, barriers
+     and spinlocks that genuinely matter (ARM track,
+     chapters 19-22).
+   - EL2 means you can write a toy hypervisor
+     (virtualisation track).
+   - it costs nothing beyond the board you already have.
+
+   COMPARE WITH THE MCU TRACK: a Cortex-M has no MMU, no
+   exception levels, no SMP and no caches to speak of. All
+   the ARM-track material that does not apply there applies
+   here. The two tracks meet: the STRUCTURE of a bare-metal
+   program (vector table, linker script, startup code) is
+   the same, and the machine underneath is far richer.</pre>
+
+<h2 id="handoff">What the firmware hands you</h2>
+
+<pre><code>/* At entry, per the Pi firmware's documented contract: */
+
+/*  - Core 0 is running your code. Cores 1-3 are parked in a
+      spin table, polling a mailbox (chapter 03).
+    - Exception level EL2 on 64-bit (unless configured
+      otherwise).
+    - MMU OFF. Caches OFF. Every access is uncached and
+      device-ordered, and everything is SLOW until you turn
+      them on - a factor of 20 or more.
+    - x0 holds the physical address of the device tree blob
+      the firmware prepared. x1-x3 are zero.
+    - Your image is loaded at 0x80000 by default.
+    - The UART is already initialised by the firmware if
+      enable_uart=1, which means you can print before you
+      have written a UART driver. Enormously useful.       */
+
+/* config.txt (chapter 09) to boot your own image: */
+arm_64bit=1
+kernel=myos.img
+kernel_address=0x80000
+enable_uart=1
+/* disable_commandline_tags=1 if you do not want the
+   firmware appending ATAGS/DTB pointers */
+</code></pre>
+
+<h2 id="minimal">A minimal program</h2>
+
+<pre><code>/* boot.S - the entry point. Compare with mcu chapter 06:
+   same five jobs, different machine.                      */
+
+.section ".text.boot"
+.global _start
+_start:
+    /* Park cores 1-3. Only core 0 continues; the others
+       wait for a wake-up we will send later. */
+    mrs     x1, mpidr_el1
+    and     x1, x1, #3
+    cbz     x1, core0
+hang:
+    wfe                        /* sleep until an event     */
+    b       hang
+
+core0:
+    /* Set up the stack. The image is at 0x80000, so the
+       space below it is free. */
+    ldr     x1, =_start
+    mov     sp, x1
+
+    /* Zero .bss - the C runtime contract (mcu chapter 06) */
+    ldr     x1, =__bss_start
+    ldr     w2, =__bss_size
+1:  cbz     w2, 2f
+    str     xzr, [x1], #8
+    sub     w2, w2, #1
+    cbnz    w2, 1b
+
+2:  bl      kernel_main
+    b       hang
+
+/* NOTE: no .data copy. A bare-metal image loaded whole into
+   RAM has its .data already in place - unlike the MCU case
+   where it must be copied out of flash. One of the few
+   places the two are genuinely different.                 */
+</code></pre>
+
+<pre><code>/* link.ld */
+SECTIONS
+{
+    . = 0x80000;               /* where the firmware loads us */
+    .text : { KEEP(*(.text.boot)) *(.text*) }
+    .rodata : { *(.rodata*) }
+    .data : { *(.data*) }
+    . = ALIGN(8);
+    __bss_start = .;
+    .bss : { *(.bss*) *(COMMON) }
+    . = ALIGN(8);
+    __bss_end = .;
+}
+__bss_size = (__bss_end - __bss_start) &gt;&gt; 3;   /* in 8-byte units */
+</code></pre>
+
+<pre><code>/* kernel.c - print something, and read the machine. */
+
+#include &lt;stdint.h&gt;
+
+/* Pi 4 peripheral base. On a Pi 5 the low-speed peripherals
+   are on RP1 across PCIe (chapter 14), which must be
+   enumerated before you can reach them - which is why
+   bare-metal Pi 5 I/O is substantially harder and most
+   tutorials target the Pi 4.                              */
+#define MMIO_BASE   0xFE000000UL
+#define UART0_BASE  (MMIO_BASE + 0x201000)
+#define UART0_DR    (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART0_FR    (*(volatile uint32_t *)(UART0_BASE + 0x18))
+
+static void putc_(char c)
+{
+    while (UART0_FR &amp; (1 &lt;&lt; 5)) { }   /* TXFF: FIFO full */
+    UART0_DR = c;
+}
+static void puts_(const char *s)
+{
+    for (; *s; s++) { if (*s == '\n') putc_('\r'); putc_(*s); }
+}
+static void puthex(uint64_t v)
+{
+    puts_("0x");
+    for (int i = 60; i &gt;= 0; i -= 4)
+        putc_("0123456789abcdef"[(v &gt;&gt; i) &amp; 0xF]);
+}
+
+void kernel_main(uint64_t dtb_ptr)
+{
+    uint64_t el, mpidr, ctr, midr;
+
+    puts_("\nbare metal on a Pi\n");
+
+    /* THE ARM TRACK, EXECUTABLE. Every one of these is a
+       register that track spends a chapter on.            */
+    __asm__ volatile ("mrs %0, currentel" : "=r"(el));
+    puts_("CurrentEL  "); puthex(el &gt;&gt; 2); putc_('\n');
+
+    __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
+    puts_("MPIDR_EL1  "); puthex(mpidr); putc_('\n');
+
+    __asm__ volatile ("mrs %0, midr_el1"  : "=r"(midr));
+    puts_("MIDR_EL1   "); puthex(midr); putc_('\n');
+
+    __asm__ volatile ("mrs %0, ctr_el0"   : "=r"(ctr));
+    puts_("CTR_EL0    "); puthex(ctr); putc_('\n');
+    /* CTR_EL0 gives you the cache line size, which you need
+       before writing any cache maintenance (ARM ch 18).   */
+
+    puts_("DTB at     "); puthex(dtb_ptr); putc_('\n');
+
+    for (;;) { __asm__ volatile ("wfe"); }
+}
+</code></pre>
+
+<pre><code># Build and deploy.
+$ aarch64-linux-gnu-gcc -ffreestanding -nostdlib -nostartfiles \
+      -mcpu=cortex-a72 -O2 -c boot.S -o boot.o
+$ aarch64-linux-gnu-gcc -ffreestanding -nostdlib -nostartfiles \
+      -mcpu=cortex-a72 -O2 -c kernel.c -o kernel.o
+$ aarch64-linux-gnu-ld -T link.ld boot.o kernel.o -o kernel.elf
+$ aarch64-linux-gnu-objcopy -O binary kernel.elf myos.img
+
+# The FLAT BINARY is what the firmware wants, not the ELF.
+# Copy it and config.txt to the boot partition:
+$ cp myos.img config.txt /media/$USER/bootfs/
+
+# Attach the serial console (chapter 05) and power on. This
+# is why the console is non-negotiable here: it is your
+# ONLY output.
+
+# ITERATE FAST: keep two SD cards, or better, use network
+# boot so a rebuild is a file copy rather than a card swap.
+# The firmware's TFTP boot (BOOT_ORDER, chapter 03) makes
+# bare-metal development enormously less tedious.
+</code></pre>
+
+<div class="key">
+<b>QEMU first, hardware second</b>
+<p><code>qemu-system-aarch64 -M raspi4b -kernel kernel.elf -serial stdio</code> gives you the same program
+with a debugger attached and no card swapping. The <a href="track.html?t=qemu">QEMU track</a> covers this
+properly. Develop in emulation until the logic is right, then move to the board for the things QEMU does not
+model — cache behaviour, real timing, and the peripherals whose emulation is approximate. Doing it the other
+way round means debugging your code and the platform at the same time.</p>
+</div>
+
+<h2 id="next">What to build next</h2>
+
+<pre class="diagram">   A ROADMAP, roughly in order of difficulty, each mapping
+   onto a chapter of the ARM track:
+
+   1. UART driver of your own          (bus track ch 02-03)
+      Stop relying on the firmware having set it up.
+
+   2. Exception vectors and a handler  (ARM ch 27-29)
+      Install VBAR_EL1, deliberately cause a data abort,
+      decode ESR_EL1 and print what happened. This is the
+      single most instructive exercise here.
+
+   3. The MMU                          (ARM ch 12-16)
+      Build a page table, set TTBR0_EL1, MAIR_EL1 and
+      TCR_EL1, enable the MMU. Everything gets ~20x faster
+      the moment caches become usable, which makes the
+      point about caches viscerally.
+
+   4. Timer and interrupts             (ARM ch 23-24, 32)
+      Program the generic timer, route it through the GIC,
+      take a periodic interrupt.
+
+   5. Wake the other three cores       (ARM ch 19-22)
+      Write the entry address to each core's mailbox and
+      send an event. Now you have real SMP - and your first
+      race condition, and a reason to care about barriers.
+
+   6. A scheduler                      (mcu ch 17-18)
+      The same idea as the MCU track's RTOS, on a much
+      bigger machine.
+
+   7. Drop to EL1, then trap something at EL2
+                                       (virt track)
+      A hypervisor in miniature.
+
+   EXISTING PROJECTS WORTH READING:
+     Circle (C++ bare-metal framework for the Pi),
+     rpi-open-firmware, and the various
+     "bare metal Raspberry Pi tutorials" repositories.
+     Reading a working one is much faster than fighting
+     the firmware contract alone.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Nothing at all on the console</td><td>Image not found, wrong load address, or
+<code>enable_uart=1</code> missing</td></tr>
+<tr><td>Firmware boots Linux instead</td><td><code>kernel=</code> line absent or misspelled in
+<code>config.txt</code></td></tr>
+<tr><td>Garbage on the console</td><td>Wrong peripheral base — the Pi 4 base differs from earlier
+models</td></tr>
+<tr><td>Nothing works on a Pi 5</td><td>Peripherals are behind RP1 over PCIe (chapter 14)</td></tr>
+<tr><td>Runs once, hangs on reset</td><td>Cores 1–3 not parked, or the stack overlaps the image</td></tr>
+<tr><td>Global variables hold garbage</td><td><code>.bss</code> not zeroed in startup</td></tr>
+<tr><td>Extremely slow execution</td><td>MMU and caches still off — that is the default</td></tr>
+<tr><td>ELF loaded instead of a flat binary</td><td>The firmware wants the <code>objcopy</code>
+output</td></tr>
+<tr><td>Works in QEMU, not on hardware</td><td>Emulation does not model caches or peripheral timing
+faithfully</td></tr>
+<tr><td>Data aborts once the MMU is enabled</td><td>Page table, MAIR or TCR misconfigured — decode
+ESR_EL1</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State what the firmware guarantees at entry: exception level, MMU state, and register contents.</li>
+  <li>Explain why cores 1–3 must be parked and how they are woken later.</li>
+  <li>Say why there is no <code>.data</code> copy here but there is on a microcontroller.</li>
+  <li>Explain why the firmware's UART setup is useful before you write a driver.</li>
+  <li>Give the config.txt lines needed to boot your own image.</li>
+  <li>Say why the firmware wants a flat binary rather than an ELF.</li>
+  <li>Explain why bare metal is much harder on a Pi 5 than a Pi 4.</li>
+  <li>Say what happens to performance when you enable the MMU, and why.</li>
+  <li>Name the exercise that teaches exception handling most directly.</li>
+  <li>Explain why QEMU should come before hardware, and what it will not tell you.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

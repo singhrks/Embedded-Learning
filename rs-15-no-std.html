@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>no_std and bare-metal Rust | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1><code>no_std</code> and bare-metal Rust</h1>
+<p class="lead">Rust without an operating system: what you lose, what you keep, and the boilerplate that
+turns a crate into a firmware image. Unlike C++, Rust was designed for this case from the start, and the
+result is genuinely comfortable.</p>
+
+<h2 id="layers">The three layers</h2>
+
+<p>"No standard library" is really three separate questions, and separating them is what makes the rest of the chapter straightforward.</p>
+
+<pre class="diagram">   core          ALWAYS AVAILABLE. No OS, no allocator.
+                 Option, Result, Iterator, slices, str,
+                 integers and floats, core::fmt, atomics,
+                 mem, ptr, marker traits, panic machinery.
+                 Most of the LANGUAGE lives here.
+
+   alloc         needs a GLOBAL ALLOCATOR, nothing more.
+                 Box, Vec, String, BTreeMap, Rc, Arc.
+                 Opt in with `extern crate alloc;`.
+
+   std           needs an OS. Files, sockets, threads,
+                 processes, time, environment, HashMap
+                 (because of random seeding).
+
+   `#![no_std]` OPTS OUT OF std, keeping core. Add `alloc`
+   back if you want heap collections and can supply an
+   allocator.
+
+   THE PRACTICAL POINT: `core` is not a cut-down subset -
+   it contains iterators, the whole Option/Result API,
+   formatting, atomics and the numeric traits. Idiomatic
+   Rust works almost unchanged; what you lose is I/O,
+   threads and heap collections.
+
+   COMPARE C++ FREESTANDING (C++ chapter 15), where you must
+   check header by header what is available and supply
+   several runtime functions yourself.</pre>
+
+<h2 id="skeleton">A minimal firmware crate</h2>
+
+<p>The smallest firmware crate that builds and runs, with every line explained — because on a bare-metal target every one of them is doing something you would otherwise get from a runtime.</p>
+
+<pre><code>#![no_std]
+#![no_main]
+
+use panic_halt as _;            // supplies #[panic_handler]
+use cortex_m_rt::entry;         // supplies the reset vector
+use cortex_m::asm;
+
+#[entry]
+fn main() -> ! {                // NEVER returns
+    let p = pac::Peripherals::take().unwrap();
+
+    p.RCC.ahb1enr.modify(|_, w| w.gpiocen().set_bit());
+    p.GPIOC.moder.modify(|_, w| w.moder13().output());
+
+    loop {
+        p.GPIOC.bsrr.write(|w| w.bs13().set_bit());
+        asm::delay(8_000_000);
+        p.GPIOC.bsrr.write(|w| w.br13().set_bit());
+        asm::delay(8_000_000);
+    }
+}
+
+/* `#![no_main]` because the C `main` signature and the
+   pre-main runtime do not exist. `#[entry]` from
+   cortex-m-rt provides the reset handler, which zeroes .bss,
+   copies .data from flash, initialises the FPU, and calls
+   your function (compilers chapter 12).
+
+/* THE PANIC HANDLER is mandatory - core cannot provide one
+   because the right behaviour is application-specific: */
+    use panic_halt as _;        // spin forever
+    use panic_reset as _;       // system reset
+    use panic_probe as _;       // print over RTT, then halt
+    use panic_persist as _;     // save the message to RAM
+                                // across a reset
+
+/* OR WRITE ONE, which is what a product does: */
+    #[panic_handler]
+    fn panic(info: &amp;core::panic::PanicInfo) -> ! {
+        // save the location for the next boot to report
+        cortex_m::interrupt::disable();
+        write_panic_record(info.location());
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+
+/* AND THE INTERRUPT HANDLERS: */
+    use cortex_m_rt::exception;
+    use stm32f4xx_hal::pac::interrupt;
+
+    #[exception]
+    fn SysTick() { TICKS.fetch_add(1, Ordering::Relaxed); }
+
+    #[interrupt]
+    fn USART1() { critical_section::with(|cs| { ... }); }
+
+    #[exception]
+    unsafe fn HardFault(ef: &amp;ExceptionFrame) -> ! {
+        // ef holds the stacked registers - log them
+        log_fault(ef);
+        loop {}
+    }
+/* The names are checked against the device's vector table by
+   the PAC, so a typo is a compile error rather than an
+   interrupt that never fires.                            */</code></pre>
+
+<h2 id="project">Project layout</h2>
+
+<p>An embedded Rust project needs a few files that a hosted one does not, and each exists to answer a question the toolchain cannot infer.</p>
+
+<pre><code># Cargo.toml
+    [dependencies]
+    cortex-m = "0.7"
+    cortex-m-rt = "0.7"
+    embedded-hal = "1.0"
+    stm32f4xx-hal = { version = "0.21",
+                      features = ["stm32f411"] }
+    heapless = "0.8"
+    defmt = "0.3"
+    defmt-rtt = "0.4"
+    panic-probe = { version = "0.3", features = ["print-defmt"] }
+    critical-section = "1.1"
+
+    [profile.release]
+    opt-level = "z"
+    lto = "fat"
+    codegen-units = 1
+    panic = "abort"
+    debug = 2                   # symbols cost nothing in
+                                # flash and defmt needs them
+    overflow-checks = false
+
+    [profile.dev]
+    opt-level = 1               # -O0 firmware is often too
+                                # slow to run
+
+# .cargo/config.toml
+    [build]
+    target = "thumbv7em-none-eabihf"
+
+    [target.thumbv7em-none-eabihf]
+    runner = "probe-rs run --chip STM32F411RETx"
+    rustflags = [
+      "-C", "link-arg=-Tlink.x",        # from cortex-m-rt
+      "-C", "link-arg=-Tdefmt.x",       # for defmt
+      "-C", "linker=flip-link",         # STACK OVERFLOW
+                                        # PROTECTION
+    ]
+
+# memory.x - the memory map, read by cortex-m-rt's link.x
+    MEMORY
+    {
+      FLASH : ORIGIN = 0x08000000, LENGTH = 512K
+      RAM   : ORIGIN = 0x20000000, LENGTH = 128K
+    }
+
+# build.rs copies memory.x into OUT_DIR (chapter 11).
+
+# THEN:
+    cargo run --release
+# builds, flashes and runs on the target, streaming defmt
+# logs back. One command.
+
+/* flip-link IS WORTH SPECIAL MENTION: it moves the stack
+   BELOW static memory, so a stack overflow hits an unmapped
+   region and faults immediately instead of silently
+   corrupting .bss. That is a free fix for the single worst
+   embedded failure mode (Linux chapter 02 describes the same
+   problem), and it costs nothing.                        */</code></pre>
+
+<div class="key">
+<b>The three tools that change the experience</b>
+<p><strong>probe-rs</strong> — flash, run, debug and stream logs with one command, no vendor IDE.
+<strong>defmt</strong> — deferred formatting: the format string stays in the ELF and only the arguments go
+over the wire, so a log line costs a few bytes and a handful of cycles. <strong>flip-link</strong> — stack
+overflow becomes a fault instead of corruption. Together they are why embedded Rust tooling is frequently
+better than the C equivalent, not merely comparable.</p>
+</div>
+
+<h2 id="missing">What you lose, and the replacement</h2>
+
+<p>Working out what you actually lose, and what replaces it, is the practical core of going <code>no_std</code>. Most of the replacements are better than expected.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Absent</th><th>Use instead</th></tr></thead>
+<tbody>
+<tr><td><code>Vec&lt;T&gt;</code>, <code>String</code></td><td><code>heapless::Vec&lt;T, N&gt;</code>, <code>heapless::String&lt;N&gt;</code></td></tr>
+<tr><td><code>HashMap</code></td><td><code>heapless::FnvIndexMap</code>, or a sorted array</td></tr>
+<tr><td><code>println!</code></td><td><code>defmt::info!</code>, or <code>write!</code> to a UART</td></tr>
+<tr><td><code>std::error::Error</code></td><td>Your own enum (<a href="rs-07-error-handling.html">ch. 07</a>)</td></tr>
+<tr><td><code>std::time::Instant</code></td><td><code>embassy_time::Instant</code>, or a tick counter</td></tr>
+<tr><td><code>std::thread</code></td><td>Interrupts, RTIC tasks, or Embassy tasks</td></tr>
+<tr><td><code>std::sync::Mutex</code></td><td><code>critical_section::Mutex</code>, <code>embassy_sync::Mutex</code></td></tr>
+<tr><td>Floating-point <code>f64::sin</code> etc.</td><td><code>libm</code>, or fixed-point</td></tr>
+<tr><td><code>rand</code></td><td>The hardware RNG, or a PRNG crate with <code>default-features=false</code></td></tr>
+<tr><td><code>std::io</code></td><td><code>embedded-io</code>, <code>core::fmt::Write</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* MAKING A LIBRARY WORK BOTH WAYS - the convention every
+   good crate follows: */
+
+    #![cfg_attr(not(feature = "std"), no_std)]
+
+    #[cfg(feature = "alloc")]
+    extern crate alloc;
+
+    #[cfg(feature = "alloc")]
+    use alloc::vec::Vec;
+
+    // Cargo.toml
+    [features]
+    default = ["std"]
+    std = ["alloc"]
+    alloc = []
+
+/* AND THE CHECK: `cargo build --no-default-features` in CI,
+   so a std-only dependency cannot creep in unnoticed.
+
+/* USING A DEPENDENCY IN no_std: */
+    serde = { version = "1", default-features = false,
+              features = ["derive"] }
+/* `default-features = false` is the crucial part - most
+   crates enable std by default. If a crate does not support
+   no_std, that is usually a hard blocker.               */</code></pre>
+
+<h2 id="alloc">Adding a heap, if you must</h2>
+
+<p>A heap is available if you want one, and the decision to use it is a design decision with real consequences on a device with no memory protection.</p>
+
+<pre><code>    #![no_std]
+    extern crate alloc;
+
+    use embedded_alloc::LlffHeap as Heap;
+    use alloc::{vec::Vec, string::String};
+
+    #[global_allocator]
+    static HEAP: Heap = Heap::empty();
+
+    #[entry]
+    fn main() -> ! {
+        {
+            use core::mem::MaybeUninit;
+            const HEAP_SIZE: usize = 8 * 1024;
+            static mut MEM: [MaybeUninit&lt;u8&gt;; HEAP_SIZE] =
+                [MaybeUninit::uninit(); HEAP_SIZE];
+            unsafe {
+                HEAP.init(core::ptr::addr_of_mut!(MEM) as usize,
+                          HEAP_SIZE)
+            }
+        }
+
+        let mut v = Vec::new();
+        v.push(42);
+        ...
+    }
+
+/* HANDLING EXHAUSTION: */
+    let mut v = Vec::new();
+    v.try_reserve(100)?;                // Result, not a panic
+    // otherwise allocation failure calls the OOM handler,
+    // which by default panics
+
+/* SHOULD YOU? Usually not.
+     · fragmentation is unbounded over a long uptime
+     · allocation time is not deterministic
+     · failure handling is awkward
+     · heapless gives you the same interfaces with a bounded
+       failure mode (chapter 08)
+
+   WHEN IT IS REASONABLE: a device with megabytes of RAM
+   running a network stack or a filesystem, where the working
+   set genuinely varies. On a 64 KB microcontroller, use
+   heapless and static allocation.                        */</code></pre>
+
+<h2 id="size">Controlling size</h2>
+
+<p>Binary size is a hard constraint rather than a preference on most microcontrollers, and Rust's defaults are not tuned for it. These settings are where the wins are.</p>
+
+<pre><code># --- MEASURE FIRST ---
+    cargo size --release -- -A
+       .vector_table  1024
+       .text         18432
+       .rodata        2048
+       .data           128
+       .bss           4096
+
+    cargo bloat --release -n 30
+    cargo bloat --release --crates       # by dependency
+
+# --- THE BIGGEST WINS, in order ---
+
+# 1. THE PROFILE (chapter 11) - typically halves the binary:
+    opt-level = "z", lto = "fat", codegen-units = 1,
+    panic = "abort"
+
+# 2. AVOID CORE::FMT. The formatting machinery is often the
+#    single largest item in a small firmware:
+    panic!("bad value: {}", x);         // pulls in fmt
+    panic!("bad value");                // does not
+    defmt::info!("value {=u32}", x);    // FORMATS ON THE
+                                        // HOST - the string
+                                        // never enters the
+                                        // binary
+
+# 3. defmt INSTEAD OF ANY OTHER LOGGING. It is the difference
+#    between a few hundred bytes and several kilobytes.
+
+# 4. PANICS. Every `unwrap`, every index, every slice
+#    operation can panic, and each panic site carries a
+#    location string. Use `get()`, `checked_*` and explicit
+#    handling (chapter 07). Then:
+    panic-never = "0.1"
+#    makes any REACHABLE panic a LINK ERROR - which is a
+#    build-time proof that no panic can occur.
+
+# 5. build-std, to rebuild core with your profile:
+    cargo +nightly build -Z build-std=core \
+        -Z build-std-features=panic_immediate_abort \
+        --target thumbv7em-none-eabihf --release
+#    `panic_immediate_abort` removes the panic formatting
+#    from core itself. Often several kilobytes.
+
+# 6. --gc-sections is on by default via link.x, but check:
+    cargo nm --release | sort -k1
+
+# A REALISTIC RESULT: a blinky is around 2 KB; a firmware
+# with a HAL, defmt logging and a USB stack is 30-60 KB.
+# Comparable with C once the profile is right, and the
+# difference is usually formatting rather than the language.</code></pre>
+
+<h2 id="testing">Testing and debugging</h2>
+
+<p>Testing code that cannot run on your development machine needs a different approach, and the standard answer splits the problem in two.</p>
+
+<pre><code>/* --- HOST TESTS for the portable logic (chapter 11) --- */
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn crc_matches_reference() {
+            assert_eq!(crc32(b"hello"), 0x3610A686);
+        }
+    }
+    // cargo test --target x86_64-unknown-linux-gnu
+    // put the logic in a portable crate so this works
+
+/* --- ON-TARGET TESTS --- */
+    #[defmt_test::tests]
+    mod tests {
+        #[test]
+        fn uart_loopback() {
+            let mut u = setup_uart();
+            u.write(b'x').unwrap();
+            assert_eq!(u.read().unwrap(), b'x');
+        }
+    }
+    // cargo test --target thumbv7em-none-eabihf
+    // runs on the DEVICE, results streamed back over RTT
+
+/* --- LOGGING --- */
+    defmt::trace!("entering state {}", state);
+    defmt::debug!("adc = {=u16}", raw);
+    defmt::info!("ready");
+    defmt::warn!("retry {=u8}/{=u8}", n, max);
+    defmt::error!("fault: {}", e);
+    defmt::assert!(x &lt; 10, "x too large: {}", x);
+
+    #[derive(defmt::Format)]        // like Debug, for defmt
+    struct Reading { temp: i16, humidity: u8 }
+
+    // filter at build time:
+    DEFMT_LOG=info cargo run --release
+
+/* --- DEBUGGING --- */
+    probe-rs run --chip STM32F411RETx target/.../fw
+    probe-rs attach --chip STM32F411RETx
+    cargo embed                     # a TUI with RTT
+
+    # GDB, when you need it:
+    probe-rs gdb --chip STM32F411RETx
+    (gdb) target remote :1337
+    (gdb) monitor reset halt
+    (gdb) break main
+    (gdb) continue
+
+/* --- AND THE HARD FAULT HANDLER, which is worth writing
+       properly: */
+    #[exception]
+    unsafe fn HardFault(ef: &amp;ExceptionFrame) -> ! {
+        defmt::error!("HardFault at pc={=u32:#x} lr={=u32:#x}",
+                      ef.pc(), ef.lr());
+        // and the fault status registers (ARM chapter 29)
+        let cfsr = (*SCB::PTR).cfsr.read();
+        defmt::error!("CFSR = {=u32:#x}", cfsr);
+        loop {}
+    }
+/* Which turns "it hangs" into "it faulted at this address
+   because of an unaligned access" - the same diagnosis
+   process as ARM chapter 29, with the registers named.  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>"can't find crate for <code>std</code>"</td><td>A dependency needs std — set <code>default-features = false</code></td></tr>
+<tr><td>"<code>#[panic_handler]</code> function required"</td><td>Add <code>use panic_halt as _;</code> or write one</td></tr>
+<tr><td>"language item required: <code>eh_personality</code>"</td><td>Set <code>panic = "abort"</code></td></tr>
+<tr><td>"undefined reference to <code>memcpy</code>"</td><td>Needs a <code>compiler_builtins</code> or the target's runtime</td></tr>
+<tr><td>Linker error about <code>link.x</code> or memory regions</td><td><code>memory.x</code> missing or not copied by <code>build.rs</code></td></tr>
+<tr><td>Binary far larger than expected</td><td>Profile not tuned, or <code>core::fmt</code> pulled in</td></tr>
+<tr><td>Firmware hangs immediately</td><td>Stack overflow — use <code>flip-link</code>; or clocks not configured</td></tr>
+<tr><td>Interrupt never fires</td><td>Not unmasked in the NVIC, or the handler name is wrong</td></tr>
+<tr><td>Panic with no message</td><td><code>panic-halt</code> — switch to <code>panic-probe</code> while developing</td></tr>
+<tr><td><code>Peripherals::take()</code> returns <code>None</code></td><td>Called twice — by design (<a href="rs-02-ownership.html">ch. 02</a>)</td></tr>
+<tr><td>Allocation fails at run time</td><td>Heap too small, or fragmented — prefer <code>heapless</code></td></tr>
+<tr><td>defmt output is garbled</td><td>The ELF and the running binary differ — reflash</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish <code>core</code>, <code>alloc</code> and <code>std</code>, and say what each needs.</li>
+  <li>Write a minimal <code>no_std</code> firmware crate with an entry point and a panic handler.</li>
+  <li>Explain what <code>cortex-m-rt</code> does before your <code>main</code> runs.</li>
+  <li>Configure <code>Cargo.toml</code>, <code>.cargo/config.toml</code> and <code>memory.x</code>.</li>
+  <li>Explain what <code>flip-link</code> prevents and why it is free.</li>
+  <li>Name eight <code>std</code> facilities and their <code>no_std</code> replacements.</li>
+  <li>Make a library build both with and without <code>std</code>, and test both in CI.</li>
+  <li>Add a global allocator, and give three reasons not to.</li>
+  <li>List six size-reduction techniques in order of effect.</li>
+  <li>Explain why <code>defmt</code> is smaller than any alternative.</li>
+  <li>Write a useful HardFault handler.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

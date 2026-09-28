@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust in the Linux kernel | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Rust in the Linux kernel</h1>
+<p class="lead">Since 6.1 the kernel accepts Rust drivers. This chapter is what that actually means: how
+the abstractions are built, what a Rust driver looks like beside the C one from
+<a href="lx-19-platform-driver.html">Linux chapter 21</a>, and an honest account of the state of it.</p>
+
+<h2 id="why">Why the kernel accepted it</h2>
+
+<p>The kernel had rejected new languages before. Understanding what changed is more instructive than the syntax, because the argument was about maintenance rather than elegance.</p>
+
+<pre class="diagram">   THE ARGUMENT, made over several years and finally
+   accepted:
+
+     · roughly two thirds of kernel CVEs are memory safety
+       issues - use-after-free, buffer overflow, race
+       conditions on refcounts
+     · drivers are the largest and least-reviewed part of the
+       tree, and where most of those bugs live
+     · the existing tooling - KASAN, lockdep, sparse, smatch,
+       syzkaller (Linux chapter 34) - finds a great deal and
+       still misses a great deal
+     · a language that makes the class impossible is
+       structurally better than one that makes it detectable
+
+   THE CONDITIONS ATTACHED, which shape everything below:
+
+     1. NO REWRITE. C remains the kernel's language; Rust is
+        for NEW code, chiefly drivers.
+     2. NO SECOND ABI. Rust code calls the existing C
+        interfaces through bindings; it does not define a
+        parallel kernel API.
+     3. C DEVELOPERS ARE NOT REQUIRED TO LEARN RUST. If a C
+        change breaks Rust code, fixing it is the Rust
+        maintainers' problem.
+     4. NO PANICS. A kernel panic is unacceptable; the
+        abstractions must return errors instead.
+     5. NO IMPLICIT ALLOCATION FAILURE. Kernel allocation can
+        fail, so the standard library's infallible
+        collections are not usable - the kernel has its own.
+
+   TIMELINE:
+     6.1 (2022)   the infrastructure merged
+     6.3-6.7      abstractions grow; the first real drivers
+     6.8+         Binder, the Nova GPU driver, PHY drivers,
+                  null_blk
+     6.12+        Rust is production-supported on several
+                  architectures
+
+   AND THE REALISTIC STATUS in 2026: several shipping
+   drivers, an actively growing abstraction layer, and the
+   Android Binder rewrite as the flagship. Not yet routine,
+   and no longer experimental.</pre>
+
+<h2 id="differences">What differs from ordinary Rust</h2>
+
+<p>Kernel Rust is a restricted dialect, and the restrictions follow directly from constraints you already know from the Linux track.</p>
+
+<pre><code>/* --- 1. NO std, NO alloc-as-you-know-it --- */
+    #![no_std]
+/* The kernel provides its own `kernel` crate, containing the
+   allocation types, synchronisation primitives and
+   abstractions. `alloc`'s infallible Vec::push is unusable
+   because kernel allocation FAILS.                       */
+
+    use kernel::alloc::{flags, KVec};
+
+    let mut v = KVec::new();
+    v.push(42, flags::GFP_KERNEL)?;     // FALLIBLE - returns
+                                        // Result
+
+/* NOTE the GFP flag as a parameter - the allocation context
+   question from Linux chapter 07 is in the type system,
+   where the compiler can see it.
+
+/* --- 2. NO PANICS --- */
+    v[0]                        // indexing PANICS - avoid
+    v.get(0).ok_or(EINVAL)?     // this instead
+/* The kernel builds with panic=abort, and an abort is a
+   kernel panic. Every abstraction is written to return
+   Result rather than panic, and the same discipline applies
+   to driver code (chapter 07).
+
+/* --- 3. THE ERROR TYPE IS AN ERRNO --- */
+    use kernel::error::{code::*, Result};
+
+    fn probe(...) -> Result {
+        if bad { return Err(EINVAL); }
+        let p = ioremap(addr).ok_or(ENOMEM)?;
+        Ok(())
+    }
+/* `Result` defaults to `Result&lt;()&gt;` with the kernel's Error
+   type, which wraps a negative errno - so it converts
+   directly at the C boundary.
+
+/* --- 4. PINNED INITIALISATION --- */
+    #[pin_data]
+    struct MyDevice {
+        #[pin] lock: SpinLock&lt;State&gt;,
+        base: IoMem&lt;0x1000&gt;,
+    }
+/* Kernel objects frequently contain self-referential
+   structures - a list_head that points at itself, a lock
+   with an address registered with lockdep. They cannot be
+   moved after initialisation. The `pin-init` crate makes
+   in-place, fallible construction expressible, which is
+   machinery ordinary Rust rarely needs (chapter 17's Pin,
+   applied).
+
+/* --- 5. NO EXTERNAL CRATES --- */
+/* Everything must be in-tree. No crates.io, no Cargo
+   dependency resolution - the kernel build system compiles
+   the Rust files directly.                               */</code></pre>
+
+<h2 id="driver">A driver, beside the C version</h2>
+
+<p>Setting the two versions side by side is the clearest way to see what the safety guarantees actually buy in a real driver, and what they cost in ceremony.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+//! A minimal platform driver.
+
+use kernel::{
+    c_str, device::Core, of, platform, prelude::*,
+    sync::aref::ARef,
+};
+
+struct MyDriver {
+    pdev: ARef&lt;platform::Device&gt;,
+    base: IoMem&lt;0x1000&gt;,
+}
+
+kernel::of_device_table!(
+    OF_TABLE,
+    MODULE_OF_TABLE,
+    &lt;MyDriver as platform::Driver&gt;::IdInfo,
+    [
+        (of::DeviceId::new(c_str!("vendor,my-device")), ()),
+    ]
+);
+
+impl platform::Driver for MyDriver {
+    type IdInfo = ();
+    const OF_ID_TABLE: Option&lt;of::IdTable&lt;Self::IdInfo&gt;&gt;
+        = Some(&amp;OF_TABLE);
+
+    fn probe(
+        pdev: &amp;platform::Device&lt;Core&gt;,
+        _info: Option&lt;&amp;Self::IdInfo&gt;,
+    ) -> Result&lt;Pin&lt;KBox&lt;Self&gt;&gt;&gt; {
+        dev_info!(pdev.as_ref(), "probing\n");
+
+        let base = pdev.io_request_and_map(0, c_str!("mydev"))?;
+
+        let id = base.read32(REG_ID);
+        if id != EXPECTED_ID {
+            dev_err!(pdev.as_ref(), "bad id {:#x}\n", id);
+            return Err(ENODEV);
+        }
+
+        KBox::pin_init(
+            try_pin_init!(MyDriver {
+                pdev: pdev.into(),
+                base,
+            }),
+            GFP_KERNEL,
+        )
+    }
+}
+
+impl Drop for MyDriver {
+    fn drop(&amp;mut self) {
+        // the equivalent of remove() - runs automatically
+        dev_info!(self.pdev.as_ref(), "removing\n");
+    }
+}
+
+kernel::module_platform_driver! {
+    type: MyDriver,
+    name: "my_driver",
+    author: "Your Name",
+    description: "Example platform driver",
+    license: "GPL",
+}
+
+/* COMPARE THE C VERSION (Linux chapter 21) POINT BY POINT:
+
+   · NO GOTO LADDER. The `?` operator returns early, and Drop
+     releases everything acquired so far. The error path
+     cannot be wrong because it is not written
+     (Linux chapter 33's devm_, but from the language).
+
+   · NO remove() FUNCTION. Drop is the teardown, and it runs
+     in reverse construction order, automatically.
+
+   · io_request_and_map RETURNS A TYPE whose Drop unmaps.
+     Forgetting is impossible.
+
+   · IoMem&lt;0x1000&gt; CARRIES THE SIZE IN THE TYPE, so
+     read32(offset) is bounds-checked at COMPILE TIME where
+     the offset is a constant.
+
+   · THE ID TABLE is checked by the macro rather than being a
+     hand-written array with a sentinel that can be omitted
+     (Linux chapter 19's classic crash).
+
+   · dev_err! is the same dev_err(), with format checking.
+
+   THE C DRIVER IS ABOUT 90 LINES; THE RUST ONE IS ABOUT 60,
+   AND THE 30 LINES REMOVED ARE THE ERROR PATHS - which is
+   exactly where the bugs were.                          */</code></pre>
+
+<div class="key">
+<b>What the abstraction layer is doing</b>
+<p>Between the Rust driver and the C kernel sits a hand-written layer of <code>unsafe</code> code that
+wraps each C interface in a safe Rust API — checking null, enforcing lifetimes, tying refcounts to
+<code>Drop</code>. That layer is the project: writing it correctly, for each subsystem, is most of the work
+and most of the review. The driver above is safe <em>because</em> someone proved the wrapper's invariants
+once (<a href="rs-11-unsafe.html">chapter 14</a>).</p>
+</div>
+
+<h2 id="abstractions">The abstractions</h2>
+
+<p>The safe wrappers are where the real work is: each one takes a C API with rules enforced by convention and re-expresses those rules as something the compiler checks.</p>
+
+<pre><code>/* --- SYNCHRONISATION, with the guard pattern --- */
+    use kernel::sync::{Mutex, SpinLock, new_mutex};
+
+    #[pin_data]
+    struct Shared {
+        #[pin] data: Mutex&lt;State&gt;,
+    }
+
+    let guard = shared.data.lock();
+    guard.field = 5;                    // the guard DEREFS to
+                                        // State
+    // unlocked when the guard drops - no unlock to forget
+
+/* THE TYPE SYSTEM ENFORCES what lockdep checks at run time
+   in C (Linux chapter 12): you cannot touch the data without
+   the guard, and the guard cannot outlive the lock.
+
+/* --- REFERENCE COUNTING --- */
+    use kernel::sync::aref::ARef;
+
+    let dev: ARef&lt;Device&gt; = pdev.into();
+/* ARef is a refcounted reference to a kernel object whose
+   Drop calls put_device(). The get/put imbalance that
+   leaks a device or frees it early (Windows chapter 04 has
+   the same failure mode) is not expressible.
+
+/* --- MMIO --- */
+    let base: IoMem&lt;0x1000&gt; = pdev.io_request_and_map(0,
+                                        c_str!("mydev"))?;
+    let v = base.read32(0x04);          // compile-time bounds
+                                        // check
+    base.write32(0x08, value);
+    base.try_read32(offset)?;           // runtime check, for
+                                        // a dynamic offset
+/* Volatile by construction, sized by the type, and the
+   mapping released on Drop.
+
+/* --- WORK QUEUES, TIMERS, WAIT QUEUES --- */
+    use kernel::workqueue::{self, Work, WorkItem};
+    use kernel::time::{Delta, Instant};
+    use kernel::sync::CondVar;
+
+/* --- CHAR DEVICES and file operations --- */
+    use kernel::miscdevice::{MiscDevice, MiscDeviceOptions};
+
+    #[vtable]
+    impl MiscDevice for MyDevice {
+        type Ptr = Pin&lt;KBox&lt;Self&gt;&gt;;
+
+        fn open(_file: &amp;File, _misc: &amp;MiscDeviceRegistration&lt;Self&gt;)
+                -> Result&lt;Self::Ptr&gt; { ... }
+
+        fn ioctl(me: Pin&lt;&amp;Self&gt;, _file: &amp;File,
+                 cmd: u32, arg: usize) -> Result&lt;isize&gt; {
+            match cmd {
+                MY_IOCTL_GET => { ... }
+                _ => Err(ENOTTY),
+            }
+        }
+    }
+
+/* --- USER MEMORY, where the type system earns its keep --- */
+    use kernel::uaccess::{UserSlice, UserSliceReader};
+
+    fn read_from_user(ptr: UserPtr, len: usize) -> Result&lt;KVec&lt;u8&gt;&gt; {
+        let mut reader = UserSlice::new(ptr, len).reader();
+        let mut buf = KVec::with_capacity(len, GFP_KERNEL)?;
+        reader.read_all(&amp;mut buf, GFP_KERNEL)?;
+        Ok(buf)
+    }
+/* A UserPtr is a DISTINCT TYPE from a kernel pointer. You
+   cannot dereference it; you must go through the checked
+   readers. The `__user` annotation that sparse checks in C
+   (Linux chapter 09) is a real type here, enforced by the
+   compiler rather than by an optional static analyser.  */</code></pre>
+
+<h2 id="building">Building it</h2>
+
+<p>Getting a Rust-enabled kernel to build has a few specific requirements, and the version coupling is tighter than most people expect.</p>
+
+<pre><code># --- PREREQUISITES ---
+    rustup override set $(scripts/min-tool-version.sh rustc)
+    rustup component add rust-src
+    cargo install --locked bindgen-cli
+    rustup component add clippy rustfmt
+
+# --- CHECK the toolchain is acceptable ---
+    make LLVM=1 rustavailable
+    # prints exactly what is missing if anything is
+
+# --- CONFIGURE ---
+    make LLVM=1 menuconfig
+    #   General setup ---&gt; Rust support   [*]
+    #   (needs CONFIG_MODVERSIONS=n on some versions)
+
+# --- BUILD ---
+    make LLVM=1 -j$(nproc)
+    make LLVM=1 rust-analyzer        # generates
+                                     # rust-project.json for
+                                     # IDE support
+
+# --- THE SAMPLES, which are the best documentation ---
+    samples/rust/rust_minimal.rs
+    samples/rust/rust_print.rs
+    samples/rust/rust_misc_device.rs
+    samples/rust/rust_driver_platform.rs
+    samples/rust/rust_driver_pci.rs
+
+# --- THE SOURCE TO READ ---
+    rust/kernel/            the abstraction layer
+    rust/bindings/          bindgen output for the C headers
+    rust/macros/            #[vtable], module!, pin_data
+    Documentation/rust/     coding guidelines and the design
+                            rationale
+
+# --- WRITING A DRIVER ---
+    drivers/foo/foo.rs
+    # in the Makefile:
+    obj-$(CONFIG_FOO) += foo.o
+    # in Kconfig:
+    config FOO
+        tristate "Foo driver"
+        depends on RUST
+
+# LLVM=1 IS EFFECTIVELY REQUIRED: rustc uses LLVM, and mixing
+# GCC-compiled C with LLVM-compiled Rust works but is less
+# well tested, particularly for LTO.</code></pre>
+
+<h2 id="state">An honest assessment</h2>
+
+<p>An assessment of where this actually stands, separated from both the enthusiasm and the objections — which is harder to find than it should be.</p>
+
+<pre><code>/* WHAT WORKS WELL TODAY:
+     · character devices and misc devices
+     · platform and PCI drivers
+     · the synchronisation abstractions - Mutex, SpinLock,
+       CondVar, ARef
+     · allocation with proper failure handling
+     · Binder (Android's IPC) - the largest Rust component in
+       the kernel, and in production on millions of devices
+     · the Nova GPU driver and several network PHY drivers
+
+/* WHAT IS STILL THIN:
+     · many subsystems have no abstractions yet - writing a
+       driver for one means writing the wrapper too, which is
+       the hard part
+     · filesystems, block layer, and much of networking
+     · documentation, compared with the C side
+     · the abstraction API changes between releases, so
+       out-of-tree Rust drivers churn more than C ones
+
+/* THE POLITICAL SITUATION, stated neutrally: some
+   maintainers welcome it and some do not, and the "no C
+   developer is required to learn Rust" rule means the Rust
+   side absorbs the maintenance cost of C changes. That
+   arrangement has produced friction in specific subsystems.
+   It has also produced shipping code.
+
+/* WHAT IT MEANS FOR YOU:
+
+     LEARNING IT: worthwhile. The abstractions are a
+     well-written example of the safe-wrapper discipline
+     (chapter 14), and reading rust/kernel/ teaches both Rust
+     and the kernel.
+
+     WRITING A DRIVER TODAY: reasonable IF your subsystem has
+     abstractions. Check rust/kernel/ first. If it does not,
+     you are writing the abstraction layer, which is a much
+     larger project and needs to be upstreamed to be useful.
+
+     FOR A PRODUCT: viable for Android-adjacent work, and
+     early for most other things. The C path is still the
+     default, and choosing Rust should be a decision with a
+     reason rather than a preference.
+
+     AND THE DIRECTION IS CLEAR: the trend across Android,
+     Windows, and now Linux is that new systems code in
+     memory-unsafe languages increasingly needs
+     justification. That is worth positioning for regardless
+     of what you write this year.                        */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td><code>make rustavailable</code> fails</td><td>It names exactly what is missing — usually the rustc version or <code>rust-src</code></td></tr>
+<tr><td>"Rust support" not offered in menuconfig</td><td>Toolchain check failed, or a conflicting config option</td></tr>
+<tr><td>Abstraction does not exist for your subsystem</td><td>You must write and upstream it — check <code>rust/kernel/</code> first</td></tr>
+<tr><td>Code breaks on a kernel upgrade</td><td>The abstraction API is not stable — expect churn</td></tr>
+<tr><td>Allocation compiles but should not</td><td>Use the kernel's fallible <code>KVec</code>, not <code>alloc</code>'s</td></tr>
+<tr><td>A panic reaches the kernel</td><td>An <code>unwrap</code> or an index — use <code>get</code> and <code>?</code></td></tr>
+<tr><td>"cannot move out of pinned value"</td><td>Kernel objects are pinned — use <code>pin_init</code></td></tr>
+<tr><td>Cannot dereference a user pointer</td><td>Correct — go through <code>UserSlice</code></td></tr>
+<tr><td>Symbol not found at module load</td><td>The C symbol is not exported, or not bound in <code>rust/bindings</code></td></tr>
+<tr><td>Building with GCC produces oddities</td><td>Use <code>LLVM=1</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="deeper">A project that uses all of this</h2>
+
+<p><a href="tee-25-project-rust-fullstack.html">OP-TEE chapter 25</a> builds a signing service in which every
+layer is Rust: a user-mode driver, a kernel module of the kind this chapter describes, and a trusted
+application in the secure world. It is also an honest look at the rough edges — the kernel module has to
+carry its own FFI bindings, because there is no <code>kernel::tee</code> abstraction upstream, and the
+<code>MiscDevice</code> and <code>UserSlice</code> APIs used here are still moving between releases.</p>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the argument for Rust in the kernel and the five conditions attached.</li>
+  <li>Name five ways kernel Rust differs from ordinary Rust.</li>
+  <li>Explain why <code>KVec::push</code> takes a GFP flag and returns <code>Result</code>.</li>
+  <li>Write a platform driver and compare it point by point with the C version.</li>
+  <li>Explain what replaces the <code>goto</code> ladder and the <code>remove()</code> function.</li>
+  <li>Explain what the abstraction layer is and why it is the real work.</li>
+  <li>Say what <code>ARef</code>, <code>IoMem</code> and <code>UserSlice</code> each make
+  impossible.</li>
+  <li>Explain why kernel objects need pinned initialisation.</li>
+  <li>Build a kernel with Rust support and run a sample.</li>
+  <li>Give an honest recommendation for three different project situations.</li>
+</ul>
+
+<div class="tip">
+<b>End of the Rust track</b>
+<p>Seventeen chapters, from ownership to the kernel. You have the model, the embedded ecosystem, the unsafe
+discipline and the FFI boundary — enough to write a firmware image or a driver and to judge when Rust is the
+right choice. Next: <a href="track.html?t=cr">cryptography</a>, where correctness matters more than anywhere
+else in this curriculum.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

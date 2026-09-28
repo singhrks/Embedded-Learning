@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging &amp; bring-up toolkit | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 14</p>
+<h1>Debugging &amp; bring-up toolkit</h1>
+<p class="lead">Embedded debugging is a discipline, not a set of tools. This chapter is the method —
+how to narrow a problem systematically — followed by the tools that implement it on both platforms.</p>
+
+<h2 id="method">The method</h2>
+
+<p>Beginners reach for a debugger first. Experienced engineers spend most of their time <em>narrowing the
+search space</em> and only then attach a tool. The order matters:</p>
+
+<ol class="steps">
+  <li><strong>Make it reproducible.</strong> An intermittent bug is a bug you cannot fix. Find the smallest
+  reliable trigger, even if it takes a day. Everything after this is faster once you have it.</li>
+  <li><strong>Establish what is known good.</strong> Did it ever work? On another board? With another
+  kernel? Under a different load? The difference between working and not working <em>is</em> the bug.</li>
+  <li><strong>Bisect.</strong> In code (<code>git bisect</code>), in configuration (halve the defconfig),
+  in hardware (swap the board), in time (when did it start?). Each bisection halves the space; ten of them
+  reduce a thousand possibilities to one.</li>
+  <li><strong>Form one falsifiable hypothesis.</strong> "The DMA buffer is not being invalidated" is
+  testable. "Something is wrong with the memory" is not.</li>
+  <li><strong>Test it with the cheapest tool that can.</strong> Often a single print, or reading one register.</li>
+  <li><strong>Change one thing at a time.</strong> Two simultaneous changes give you an uninterpretable result
+  and you will have to redo both.</li>
+  <li><strong>Write down what you learned</strong>, including the dead ends. Next time this class of bug
+  appears, that note saves you the week.</li>
+</ol>
+
+<div class="key">
+<b>The most useful question in embedded debugging</b>
+<p>"Is the transaction actually reaching the hardware?" Most bugs that feel mysterious resolve into one of:
+the write never left the CPU (cache/barrier), the write never reached the device (address, clock, power,
+firewall), or the device did something other than what you expected (errata, wrong register, wrong order).
+Establish which of the three you are in, and you have cut the problem down by two-thirds.</p>
+</div>
+
+<h2 id="triage">Universal triage flow</h2>
+
+<pre class="diagram">  Something does not work
+        |
+        v
+  Does the CPU even get there?
+        add a print / toggle a GPIO / set a breakpoint at the entry
+        no  -> the problem is upstream: wrong branch, not probed, not
+               registered, initcall ordering, driver not bound
+        yes |
+            v
+  Is the hardware powered and clocked?
+        check power domains and clock enables FIRST — an unclocked block
+        reads as 0 or aborts, which mimics a dozen other bugs
+        no  -> fix the clock/regulator; almost always a device-tree or
+               PM-reference-counting issue
+        yes |
+            v
+  Can you read a known-constant register (an ID or version register)?
+        no  -> the access is not reaching the block:
+                 wrong base address? wrong size in the mapping?
+                 mapped cacheable instead of Device?
+                 XPU/firewall denying it? (chapter 07)
+                 the bus bridge not enabled?
+        yes |
+            v
+  Do your writes stick? (write, read back)
+        no  -> read-only register, write-1-to-clear semantics, wrong offset,
+               the block held in reset, or writes are being swallowed by a firewall
+        yes |
+            v
+  Does the device do what the writes should make it do?
+        no  -> wrong order of programming, missing enable bit, missing
+               barrier between writes, or an erratum. READ THE ERRATA.
+        yes |
+            v
+  Do interrupts arrive?
+        check the interrupt count. Zero = wrong IRQ number, wrong trigger
+        type, masked at the GIC, or never enabled at the device.
+        Rising forever without progress = you are not clearing it at the source.
+        yes |
+            v
+  Does DMA land where you expect?
+        dump the buffer before and after. All zeros = it never wrote.
+        Garbage = cache coherency. Fault = translation or the SMMU (chapter 05).</pre>
+
+<h2 id="printing">Level 0: printing</h2>
+
+<p>Unfashionable and extremely effective. A print tells you the code path taken and the values at a
+specific moment, with no tooling and no timing distortion if used carefully.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Linux</th><th>Windows</th><th>Bare metal</th></tr></thead>
+<tbody>
+<tr><td>Basic</td><td><code>pr_info()</code>, <code>dev_info(dev, ...)</code></td><td><code>KdPrint()</code>, <code>DbgPrintEx()</code></td><td>UART <code>putc</code> loop</td></tr>
+<tr><td>Conditional</td><td><code>pr_debug()</code> + dynamic debug</td><td>WPP tracing</td><td><code>#ifdef DEBUG</code></td></tr>
+<tr><td>View it</td><td><code>dmesg -w</code></td><td>DebugView, WinDbg, <code>traceview</code></td><td>Serial terminal</td></tr>
+<tr><td>Rate limited</td><td><code>pr_info_ratelimited()</code></td><td>Guard it yourself</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Printing changes timing</b>
+<p>A print in an interrupt handler can add milliseconds and make a race disappear — the classic
+"Heisenbug". If the problem vanishes when you add a print, that <em>is</em> information: you have a timing
+or concurrency bug. Switch to a low-overhead mechanism (ftrace, WPP, a GPIO toggle, or a memory ring buffer
+you dump later) rather than concluding the print fixed it.</p>
+</div>
+
+<pre><code># Linux: enable pr_debug at runtime, no rebuild
+echo 'module mydriver +p'                &gt; /sys/kernel/debug/dynamic_debug/control
+echo 'file drivers/x/my.c line 100-200 +p' &gt; /sys/kernel/debug/dynamic_debug/control
+echo 'func my_probe +p'                  &gt; /sys/kernel/debug/dynamic_debug/control
+
+# raise console verbosity
+echo 8 &gt; /proc/sys/kernel/printk
+dmesg -w --level=err,warn</code></pre>
+
+<h2 id="gpio">Level 0.5: a GPIO and an oscilloscope</h2>
+
+<p>When timing matters and printing is too slow, toggle a pin at the points of interest and look at it on a
+scope or logic analyser. Overhead is a few nanoseconds and you get exact timing, jitter and ordering
+between cores.</p>
+
+<pre><code>/* the cheapest instrumentation there is */
+#define PROBE_HIGH()  writel(BIT(7), gpio_base + GPIO_SET)
+#define PROBE_LOW()   writel(BIT(7), gpio_base + GPIO_CLR)
+
+static irqreturn_t my_isr(int irq, void *d)
+{
+        PROBE_HIGH();          /* rising edge = interrupt entry  */
+        ...
+        PROBE_LOW();           /* falling edge = interrupt exit  */
+        return IRQ_HANDLED;    /* pulse width = handler latency  */
+}</code></pre>
+
+<p>This answers questions no software tool can: is the interrupt actually being asserted by the device? How
+long is the handler really taking, worst case? Are two cores entering the critical section simultaneously?</p>
+
+<h2 id="jtag">Level 1: JTAG / SWD hardware debugging</h2>
+
+<p>A hardware debug probe halts the core and inspects it directly. It is the only tool that works before
+any software is running — during bring-up, in the boot ROM, or when the system is hard-hung.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Interface</th><th>Pins</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>JTAG</strong></td><td>TCK, TMS, TDI, TDO (+TRST)</td><td>Standard, chainable across multiple devices</td></tr>
+<tr><td><strong>SWD</strong></td><td>SWCLK, SWDIO</td><td>Two pins, ARM-specific, the norm on Cortex-M</td></tr>
+<tr><td><strong>SWO / ITM</strong></td><td>+1 pin</td><td>Low-overhead trace output — <code>printf</code> without a UART</td></tr>
+<tr><td><strong>ETM / CoreSight</strong></td><td>Trace port</td><td>Full instruction trace — you can replay exactly what executed</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># OpenOCD + GDB, the open-source path
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
+# in another terminal:
+aarch64-none-elf-gdb firmware.elf
+(gdb) target extended-remote :3333
+(gdb) monitor reset halt
+(gdb) load
+(gdb) break main
+(gdb) continue
+
+# inspect the system state directly
+(gdb) info registers
+(gdb) p/x $sp
+(gdb) x/16xw 0x40000000        # dump a peripheral register block
+(gdb) monitor mdw 0x40000000 8 # read memory through the probe, bypassing the CPU</code></pre>
+
+<div class="danger">
+<b>Debug may be fused off</b>
+<p>On a production part with secure boot enabled, JTAG for the secure world — and sometimes entirely — is
+disabled by fuses (see <a href="trustzone.html#secure-boot">chapter 06</a>). If your probe cannot connect on
+production silicon but works on a development board, this is why. You need a signed debug-unlock token from
+the vendor, or a development part.</p>
+</div>
+
+<h2 id="linux-tools">Linux toolkit</h2>
+
+<h3>ftrace — what is the kernel doing?</h3>
+<pre><code>cd /sys/kernel/debug/tracing
+
+# what functions are being called, and how long do they take?
+echo function_graph &gt; current_tracer
+echo my_driver_probe &gt; set_graph_function
+echo 1 &gt; tracing_on
+cat trace_pipe
+
+# trace specific events without any code changes
+echo 1 &gt; events/irq/enable
+echo 1 &gt; events/sched/sched_switch/enable
+echo 1 &gt; events/iommu/enable
+
+# find what is causing latency
+echo irqsoff &gt; current_tracer        # longest interrupts-disabled region
+echo preemptoff &gt; current_tracer
+cat tracing_max_latency
+
+# add your own trace point (no printk overhead when disabled)
+trace_printk("value=%d state=%d\n", v, s);</code></pre>
+
+<h3>perf — where is the time going?</h3>
+<pre><code>perf stat -e cycles,instructions,cache-misses,dTLB-load-misses ./workload
+perf record -g -a sleep 10 &amp;&amp; perf report      # system-wide profile with callgraphs
+perf top                                        # live
+perf trace                                      # like strace, much cheaper
+perf probe --add 'my_driver_read buf len'       # dynamic tracepoint on any function</code></pre>
+
+<h3>Sanitisers and checkers</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Config</th><th>Catches</th></tr></thead>
+<tbody>
+<tr><td><code>CONFIG_KASAN</code></td><td>Use-after-free, out-of-bounds — the single highest-value option</td></tr>
+<tr><td><code>CONFIG_PROVE_LOCKING</code></td><td>Lock ordering violations, before they deadlock</td></tr>
+<tr><td><code>CONFIG_DEBUG_ATOMIC_SLEEP</code></td><td>Sleeping in atomic context</td></tr>
+<tr><td><code>CONFIG_KCSAN</code></td><td>Data races</td></tr>
+<tr><td><code>CONFIG_DEBUG_OBJECTS</code></td><td>Using a timer/workqueue after it was freed</td></tr>
+<tr><td><code>CONFIG_UBSAN</code></td><td>Undefined behaviour: shifts, overflows, misaligned access</td></tr>
+<tr><td><code>CONFIG_FAIL_MAKE_REQUEST</code> etc.</td><td>Fault injection — tests your error paths</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Inspecting a live system</h3>
+<pre><code>cat /proc/interrupts             # is the ISR firing?
+cat /proc/iomem                  # who owns which physical range
+cat /proc/device-tree/...        # what the bootloader actually passed
+ls /sys/bus/platform/drivers/    # what bound to what
+ls /sys/kernel/iommu_groups/
+cat /sys/kernel/debug/clk/clk_summary       # clock tree with rates and enable counts
+cat /sys/kernel/debug/regulator/regulator_summary
+cat /sys/kernel/debug/gpio
+cat /sys/kernel/debug/pinctrl/*/pinmux-pins
+
+# devmem2 / busybox devmem: peek and poke physical memory (development only!)
+devmem 0x40000000 32             # read
+devmem 0x40000004 32 0x1         # write</code></pre>
+
+<h3>Crash analysis</h3>
+<pre><code># decode an oops address to a source line
+scripts/faddr2line vmlinux my_read+0x48/0x120
+addr2line -e mydriver.o -f 0x148
+
+# decode a raw oops with the decoder script
+scripts/decode_stacktrace.sh vmlinux &lt; oops.txt
+
+# post-mortem: kdump captures a crash dump into a second kernel
+crash vmlinux /var/crash/127.0.0.1-2026-08-19/vmcore
+crash&gt; bt          # backtrace
+crash&gt; log         # the dmesg from the crashed kernel
+crash&gt; struct my_device ffff8880123456</code></pre>
+
+<h2 id="windows-tools">Windows toolkit</h2>
+
+<h3>WinDbg</h3>
+<pre><code>.sympath srv*C:\symbols*https://msdl.microsoft.com/download/symbols;C:\proj\Debug
+.reload /f
+
+!analyze -v            :: ALWAYS start here on a bug check
+k / kb / kv            :: stack, with parameters
+lm / lmvm mydriver     :: loaded modules
+!irql                  :: current IRQL
+!running               :: what each CPU is doing
+!process 0 0           :: all processes    !thread &lt;addr&gt;
+!pool &lt;addr&gt;           :: which allocation contains this address
+!poolused 2            :: pool usage by tag - leak hunting
+!verifier 0x3          :: what Verifier recorded
+!devnode 0 1           :: the whole PnP tree
+!devobj / !drvobj / !irp
+.load wdfkd.dll
+!wdfkd.wdflogdump mydriver     :: WDF's own internal trace
+!wdfkd.wdfdevicequeues &lt;dev&gt;   :: what is stuck in your queues
+dx -r2 @$curprocess             :: modern data-model queries
+dt mydriver!_DEVICE_CONTEXT @rcx</code></pre>
+
+<h3>The rest of the Windows kit</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tool</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td><strong>Driver Verifier</strong></td><td>Runtime instrumentation. Turn it on before you believe anything works.</td></tr>
+<tr><td><strong>SDV</strong></td><td>Static proof of API rule compliance</td></tr>
+<tr><td><strong>WPA / Xperf (ETW)</strong></td><td>System-wide performance and latency traces</td></tr>
+<tr><td><strong>DebugView</strong></td><td>See <code>DbgPrint</code> output with no debugger attached</td></tr>
+<tr><td><strong>WinObj</strong></td><td>Browse the object namespace — is your device object where you think?</td></tr>
+<tr><td><strong>Device Manager / devcon</strong></td><td>PnP state, error codes (Code 10, Code 31, Code 52…)</td></tr>
+<tr><td><strong>SetupAPI logs</strong></td><td><code>C:\Windows\INF\setupapi.dev.log</code> — why an install failed, in detail</td></tr>
+<tr><td><strong>Process Monitor</strong></td><td>Trace the user-mode side: which IOCTL, which handle, which failure</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="patterns">Bug patterns and their signatures</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Signature</th><th>Likely cause</th><th>First check</th></tr></thead>
+<tbody>
+<tr><td>Works with a debugger, fails at speed</td><td>Race, or missing barrier, or a device needing a delay</td><td>Add the barrier; check the TRM for required wait states</td></tr>
+<tr><td>Works with prints, fails without</td><td>Timing-dependent race</td><td>Enable lockdep/KCSAN; look for missing locks</td></tr>
+<tr><td>Works on one core, fails on SMP</td><td>Missing lock or memory barrier</td><td>Every shared field, every lock</td></tr>
+<tr><td>Fails only under memory pressure</td><td>Unchecked allocation failure, or <code>GFP_KERNEL</code> in atomic context</td><td>Fault injection / Verifier low-resource simulation</td></tr>
+<tr><td>Register reads return all 0 or all F</td><td>Not clocked, not powered, wrong address, or firewall denial</td><td>Clock &rarr; power &rarr; address &rarr; <a href="xpu.html">XPU</a></td></tr>
+<tr><td>Writes have no effect</td><td>Cacheable MMIO mapping, W1C register, block in reset, denied write</td><td>Mapping attributes; read back after write</td></tr>
+<tr><td>Interrupt fires forever</td><td>Not cleared at the device before EOI</td><td>Clear at source, then acknowledge</td></tr>
+<tr><td>Interrupt never fires</td><td>Wrong number, wrong trigger type, masked, not enabled at the device</td><td><code>/proc/interrupts</code>, the DT specifier, the device's IRQ enable bit</td></tr>
+<tr><td>DMA reads stale data</td><td>Cache not cleaned before the device read</td><td>Use the DMA API properly; check coherency</td></tr>
+<tr><td>DMA writes not visible</td><td>Cache not invalidated after the device wrote</td><td>Same</td></tr>
+<tr><td>Random corruption near a buffer</td><td>Off-by-one or overflow</td><td>KASAN / Verifier special pool</td></tr>
+<tr><td>Crash on unload only</td><td>Something asynchronous still running: timer, work item, IRQ, DMA</td><td>Quiesce everything before freeing</td></tr>
+<tr><td>Fails after a suspend/resume cycle</td><td>State not restored, or clocks not re-enabled</td><td>Your PM callbacks</td></tr>
+<tr><td>Works on dev board, fails on production</td><td>Fuses, secure boot, tightened firewall defaults</td><td><a href="trustzone.html">Chapter 06</a> and <a href="xpu.html">chapter 07</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="bringup">A board bring-up checklist</h2>
+
+<p>New hardware, nothing works yet. Go in this order — each step depends on the previous one:</p>
+
+<ol class="steps">
+  <li><strong>Power.</strong> Measure every rail with a meter. Sequencing errors damage parts. Do not skip this
+  because "it must be fine".</li>
+  <li><strong>Clocks.</strong> Scope the main oscillator and the PLL outputs. A wrong crystal load capacitor
+  produces a system that half-works.</li>
+  <li><strong>Reset.</strong> Confirm reset asserts and releases cleanly, with correct timing.</li>
+  <li><strong>Boot mode straps.</strong> Read the boot-mode pins. Confirm the SoC is trying to boot from what
+  you think.</li>
+  <li><strong>JTAG connectivity.</strong> Can the probe see the core's IDCODE? If not, stop and fix that first —
+  everything downstream is guesswork without it.</li>
+  <li><strong>The first instruction.</strong> Halt at reset; confirm the PC and the reset vector.</li>
+  <li><strong>UART out.</strong> The single most valuable milestone. Getting one character out of a serial port
+  turns the rest of bring-up from blind to sighted.</li>
+  <li><strong>SRAM.</strong> Write and read back patterns (0x00, 0xFF, 0x55, 0xAA, address-as-data). Catches
+  stuck and shorted data/address lines.</li>
+  <li><strong>DDR.</strong> Init and calibrate, then run an extended memory test at temperature. Marginal DDR
+  timing is the source of "random" crashes months later.</li>
+  <li><strong>Boot media.</strong> eMMC / SD / SPI-NOR enumerate and read.</li>
+  <li><strong>Bootloader.</strong> U-Boot prompt.</li>
+  <li><strong>Kernel.</strong> <code>earlycon</code> output, then a full boot.</li>
+  <li><strong>Rootfs and userspace.</strong> A shell prompt.</li>
+  <li><strong>Peripherals</strong>, one at a time, each with a test.</li>
+</ol>
+
+<pre><code># the two kernel command-line options that make early boot debuggable
+earlycon                        # console before the real driver probes
+earlyprintk keep
+
+# a kernel that dies before any output at all:
+#   CONFIG_DEBUG_LL=y + CONFIG_EARLY_PRINTK, and check that your DT's
+#   stdout-path / chosen node points at the right UART</code></pre>
+
+<h2 id="habits">Habits of good debuggers</h2>
+<ul class="checklist">
+  <li>Read the error message. All of it. Twice. It usually says exactly what is wrong.</li>
+  <li>Read the errata before assuming your code is wrong — and read your code before assuming the silicon is.</li>
+  <li>Keep a known-good build to bisect against, always.</li>
+  <li>Version-control your configuration, not just your code. Half of embedded bugs are configuration.</li>
+  <li>When stuck for more than two hours, explain the problem out loud to someone. You will often solve it
+  mid-sentence.</li>
+  <li>When you fix something, understand <em>why</em> the fix works. A fix you cannot explain is a coincidence
+  waiting to reappear.</li>
+  <li>Write the regression test before you move on.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging bare metal: SWD, breakpoints and semihosting | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging bare metal: SWD, breakpoints and semihosting</h1>
+<p class="lead">There is no <code>gdb</code> attaching to a process here — there is a two-wire connection to
+the silicon itself, and a debug unit built into the core. This chapter covers what that unit can do, and the
+techniques that work when stopping the CPU is not an option.</p>
+
+<h2 id="swd">SWD and what is behind it</h2>
+
+<pre class="diagram">   Two wires plus ground. SWCLK and SWDIO.
+
+   HOST                    TARGET
+   +--------+  SWCLK   +--------------------------------+
+   | probe  |--------&gt;--| SW-DP  (debug port)            |
+   | ST-Link|  SWDIO   |    |                            |
+   | J-Link |&lt;-------&gt;--|    +-- AHB-AP (memory access)  |
+   | CMSIS  |          |    |      |                     |
+   | -DAP   |          |    |      +--&gt; the whole bus:   |
+   +--------+          |    |           RAM, flash,      |
+                       |    |           peripherals      |
+                       |    |                            |
+                       |    +-- core debug registers:    |
+                       |         halt, step, breakpoints |
+                       |                                 |
+                       |    FPB   6 hardware breakpoints |
+                       |    DWT   4 watchpoints, cycle   |
+                       |          counter, profiling     |
+                       |    ITM   instrumentation trace  |
+                       +--------------------------------+
+
+   The key property: the AHB-AP is a BUS MASTER. The probe
+   can read and write any address WITHOUT halting the core.
+   That is what makes live variable watching possible, and
+   it is the basis of the best debugging techniques here.</pre>
+
+<h2 id="breakpoints">Breakpoints and watchpoints are finite</h2>
+
+<pre><code>/* HARDWARE BREAKPOINTS: the FPB unit compares the fetch
+   address against a small set of registers. Cortex-M3/M4
+   give you SIX. Cortex-M0 gives you FOUR.
+
+   They work in flash, which software breakpoints cannot -
+   a software breakpoint replaces the instruction with BKPT,
+   and you cannot rewrite flash cheaply. So on an MCU the
+   limit is hard: your seventh breakpoint silently does not
+   work, or your debugger refuses.
+
+   WATCHPOINTS: the DWT unit, FOUR comparators, trigger on a
+   data ADDRESS being read or written. These are the most
+   under-used feature in embedded debugging.               */
+
+/* THE CANONICAL USE: "this variable is being corrupted and
+   I have no idea by what."                                */
+
+(gdb) watch g_sensor_state
+(gdb) continue
+/* Hardware Watchpoint 2: g_sensor_state
+   Old value = 3
+   New value = 51966
+   memcpy () at string.c:71                                */
+
+/* Three seconds instead of three days. A watchpoint answers
+   "who wrote here" directly, and it is the correct first
+   move for any corruption bug rather than the last resort
+   it usually is.
+
+   You can also set one from code, which is useful when the
+   corruption happens before the debugger connects:        */
+DWT-&gt;COMP0     = (uint32_t) &amp;g_sensor_state;
+DWT-&gt;MASK0     = 0;
+DWT-&gt;FUNCTION0 = (6u &lt;&lt; 0);   /* watch for writes */
+</code></pre>
+
+<div class="key">
+<b>Halting changes the system</b>
+<p>Stopping the core stops your code, but not the world. A motor keeps spinning, a PWM output freezes at
+whatever level it held, a UART peer times out, a watchdog fires, and any peripheral with a FIFO overflows. For
+anything with a control loop or a protocol partner, halting produces a state that could never occur at run
+time — and you then debug the artefact rather than the bug. This is why the non-stop techniques below matter
+more on an MCU than on a workstation.</p>
+</div>
+
+<h2 id="printing">Getting output, cheapest first</h2>
+
+<pre><code>/* 1. A GPIO PIN AND A SCOPE.  Cost: ~2 cycles.
+      The fastest instrumentation that exists. Toggle a pin
+      at the top and bottom of an ISR and you can MEASURE
+      its duration and jitter directly - something no
+      software tool gives you.                             */
+#define PROBE_HI()  (GPIOB-&gt;BSRR = (1u &lt;&lt; 0))
+#define PROBE_LO()  (GPIOB-&gt;BSRR = (1u &lt;&lt; 16))
+
+void TIM2_IRQHandler(void) {
+    PROBE_HI();
+    /* ... work ... */
+    PROBE_LO();
+}
+/* The scope now shows execution time, frequency, and
+   whether two ISRs ever overlap. For real-time work this
+   beats every other technique.                             */
+
+/* 2. ITM / SWO.  Cost: ~5 cycles per word.
+      A dedicated trace pin. Non-blocking: writes go to a
+      FIFO and are dropped if it is full, so your timing is
+      barely perturbed.                                     */
+static inline void itm_putc(char c) {
+    if ((ITM-&gt;TCR &amp; 1) &amp;&amp; (ITM-&gt;TER &amp; 1)) {
+        while (ITM-&gt;PORT[0].u32 == 0) { }
+        ITM-&gt;PORT[0].u8 = (uint8_t) c;
+    }
+}
+/* SWO needs the trace clock configured to match the probe's
+   expectation - the usual reason "SWO produces garbage".   */
+
+/* 3. RTT (Segger's Real Time Transfer).  Cost: ~1 us.
+      A ring buffer in RAM that the probe reads over SWD
+      WITHOUT halting - using the AHB-AP's bus mastering.
+      No extra pin, works on any part with SWD, and is
+      roughly a thousand times faster than semihosting.
+      For most projects this is the right answer.           */
+
+/* 4. UART printf.  Cost: 87 us per character at 115200.
+      Blocking, and slow enough to change timing profoundly.
+      A printf in an ISR that runs at 10 kHz is an instant
+      system failure. Use DMA if you must have it.          */
+
+/* 5. SEMIHOSTING.  Cost: MILLISECONDS per call.
+      The core executes BKPT 0xAB and the DEBUGGER performs
+      the I/O. Convenient, needs no hardware, and:
+
+        - HALTS THE CPU for every character
+        - HANGS THE CHIP if no debugger is attached, because
+          BKPT with no debugger escalates to HardFault
+
+      That second point ships products that work on the
+      bench and brick in the field. Use semihosting for
+      early bring-up only, and make sure it cannot survive
+      into a release build.                                 */
+</code></pre>
+
+<h2 id="cyclecount">Measuring time exactly</h2>
+
+<pre><code>/* The DWT cycle counter is a free, exact, 32-bit tally of
+   core cycles. It is the correct tool for micro-benchmarks
+   and for proving a deadline is met.                      */
+
+static void cycle_counter_init(void)
+{
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT-&gt;LAR   = 0xC5ACCE55;      /* unlock on some parts   */
+    DWT-&gt;CYCCNT = 0;
+    DWT-&gt;CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+uint32_t t0 = DWT-&gt;CYCCNT;
+do_the_thing();
+uint32_t elapsed = DWT-&gt;CYCCNT - t0;   /* wrap-safe subtraction */
+
+/* At 168 MHz one cycle is 5.95 ns, and the counter wraps
+   every 25.6 seconds. The subtraction above is correct
+   across the wrap for any interval shorter than that.
+
+   Use it to record a WORST CASE rather than an average -
+   the maximum is what a deadline cares about:             */
+static uint32_t worst;
+if (elapsed &gt; worst) { worst = elapsed; }
+
+/* This turns "the ISR is fast enough" from an opinion into
+   a number you can assert on. Combined with the priority
+   analysis of chapter 08, it is most of what real-time
+   verification amounts to on a small system.              */
+</code></pre>
+
+<h2 id="noprobe">When there is no debugger at all</h2>
+
+<pre class="diagram">   The situations that actually matter in production:
+
+   FIELD FAILURE          -&gt; .noinit crash log, reported on
+                             the next boot (chapter 15)
+
+   TIMING-DEPENDENT BUG   -&gt; GPIO probe + scope; halting
+                             would destroy the evidence
+
+   HAPPENS ONCE A WEEK    -&gt; RTT ring buffer left running,
+                             read whenever it triggers
+
+   DEBUG PORT DISABLED    -&gt; a fault log over whatever
+   (security)                interface the product already
+                             has, gated behind
+                             authentication
+
+   BOOTS AND DIES BEFORE  -&gt; toggle a pin at successive
+   THE PROBE CONNECTS        points in startup; the last
+                             one that toggles brackets it.
+                             Crude, and it always works.
+
+   The common thread: design the observability in before you
+   need it. A product with a crash log, a probe pin and an
+   RTT buffer is debuggable in the field. One without them
+   requires the unit back on your desk - and it will then
+   fail to reproduce.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Seventh breakpoint does not trigger</td><td>Only six hardware comparators exist; flash cannot hold
+software breakpoints</td></tr>
+<tr><td>Chip hangs when run without a debugger</td><td>Semihosting left enabled — <code>BKPT</code> escalates
+to HardFault</td></tr>
+<tr><td>Bug disappears while single-stepping</td><td>Halting changed the timing; use a GPIO probe
+instead</td></tr>
+<tr><td>Motor runs away when you hit a breakpoint</td><td>Peripherals do not halt with the core — configure
+debug-freeze bits</td></tr>
+<tr><td>Watchdog resets during a debug session</td><td>Enable the debug freeze for the watchdog in
+<code>DBGMCU</code></td></tr>
+<tr><td>SWO output is garbage</td><td>Trace clock frequency does not match the probe's setting</td></tr>
+<tr><td>Adding <code>printf</code> makes the bug vanish</td><td>UART output is slow enough to change the
+timing you are chasing</td></tr>
+<tr><td>Cannot connect after flashing new firmware</td><td>Code reconfigured or disabled the SWD pins — use
+connect-under-reset</td></tr>
+<tr><td>Cycle counter always reads zero</td><td><code>TRCENA</code> not set, or the DWT lock not
+written</td></tr>
+<tr><td>Corruption source unknown after days of work</td><td>A watchpoint would have named it in seconds — use
+it first</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what the AHB-AP allows a probe to do without halting the core.</li>
+  <li>State how many hardware breakpoints and watchpoints a typical Cortex-M4 provides.</li>
+  <li>Explain why software breakpoints are not an option in flash.</li>
+  <li>Give the first debugging move for a variable being corrupted by unknown code.</li>
+  <li>List three things that go wrong in the system when you halt the core.</li>
+  <li>Rank GPIO, ITM, RTT, UART and semihosting by cost per output.</li>
+  <li>Explain why semihosting can brick a device in the field.</li>
+  <li>Show how to measure a function's worst-case duration in cycles.</li>
+  <li>Explain why the DWT counter subtraction is safe across its wrap.</li>
+  <li>Name three observability features worth designing in before you need them.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache maintenance operations | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Cache maintenance operations</h1>
+<p class="lead">Three verbs — clean, invalidate, and both — applied to a point in the hierarchy. Get the verb
+or the point wrong and you get silent data corruption that appears on one board and not another. This chapter
+is the operational reference.</p>
+
+<h2 id="verbs">The three verbs</h2>
+
+<div class="key">
+<b>Clean, invalidate, clean-and-invalidate</b>
+<ul>
+<li><strong>Clean</strong> — write dirty lines out to the target point. The line stays in the cache, now
+clean. Memory now matches the cache. <em>Use before a device reads your buffer.</em></li>
+<li><strong>Invalidate</strong> — discard the lines without writing them back. Any dirty data is
+<strong>lost</strong>. The next access re-fetches from memory. <em>Use before you read what a device
+wrote.</em></li>
+<li><strong>Clean and invalidate</strong> — write back, then discard. Safe in both directions, slightly more
+expensive. <em>Use when unsure, or for bidirectional buffers.</em></li>
+</ul>
+<p>The asymmetry matters: cleaning is always safe; <strong>invalidating can destroy data</strong> if the line
+was dirty and you did not mean to discard it.</p>
+</div>
+
+<h2 id="instructions">The instructions</h2>
+
+<p>This table is chapter 17's table applied to concrete instructions: each row is one specific combination of
+"which operation" (clean, invalidate, or both) and "which cache" (data, by virtual address, versus
+instruction). The pattern worth internalising is that the mnemonic tells you exactly what it does —
+<code>DC</code> means data cache, <code>IC</code> means instruction cache, <code>CVAC</code> reads as "clean
+by VA to point of Coherency", <code>CVAU</code> as "clean by VA to point of Unification" — so once you can
+parse the mnemonic you rarely need to look the instruction up again. The one row that is not like the others
+is <code>DC ISW/CSW/CISW</code>: it operates by cache set and way rather than by address, which only makes
+sense when you are about to power the cache off entirely and have no addresses left to target.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Instruction</th><th>Operation</th><th>Point</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>DC CVAC, Xn</code></td><td>Clean by VA</td><td>PoC</td><td>Before a non-coherent device reads</td></tr>
+<tr><td><code>DC IVAC, Xn</code></td><td>Invalidate by VA</td><td>PoC</td><td>Before reading what a device wrote (EL1+ only)</td></tr>
+<tr><td><code>DC CIVAC, Xn</code></td><td>Clean and invalidate</td><td>PoC</td><td>Bidirectional; the safe default</td></tr>
+<tr><td><code>DC CVAU, Xn</code></td><td>Clean by VA</td><td><strong>PoU</strong></td><td>Before executing written instructions</td></tr>
+<tr><td><code>DC CVAP, Xn</code></td><td>Clean by VA</td><td>PoP</td><td>Persistent memory (ARMv8.2)</td></tr>
+<tr><td><code>DC ZVA, Xn</code></td><td>Zero a cache line</td><td>—</td><td>Fast <code>memset(0)</code></td></tr>
+<tr><td><code>IC IVAU, Xn</code></td><td>Invalidate I-cache by VA</td><td>PoU</td><td>After writing instructions</td></tr>
+<tr><td><code>IC IALLU</code></td><td>Invalidate all I-cache, this core</td><td>PoU</td><td>Bulk code modification</td></tr>
+<tr><td><code>IC IALLUIS</code></td><td>…broadcast to the inner domain</td><td>PoU</td><td>SMP code modification</td></tr>
+<tr><td><code>DC ISW/CSW/CISW</code></td><td>By set and way</td><td>Level</td><td><strong>Power down only</strong> — see <a href="arm-17-cache-hierarchy.html">chapter 17</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Decoding the mnemonics — they are systematic:
+
+   DC = Data Cache          IC = Instruction Cache
+
+   C   Clean                I   Invalidate       CI  Clean+Invalidate
+   VA  by Virtual Address   SW  by Set/Way       ALL everything
+   C   to Point of Coherency
+   U   to Point of Unification
+   P   to Point of Persistence
+
+   DC CVAC  = Data Cache, Clean by VA to PoC
+   DC CIVAC = Data Cache, Clean and Invalidate by VA to PoC
+   IC IVAU  = Instruction Cache, Invalidate by VA to PoU
+
+Once you see the pattern the whole set is memorable.</pre>
+
+<h2 id="broadcast">VA operations broadcast; set/way do not</h2>
+
+<p>This distinction decides whether an operation you issue on one core affects the others. Getting it wrong produces code that works on a single-core bring-up and fails the moment the other cores come online.</p>
+
+<pre><code>/* This is the property that makes VA operations the right choice:
+
+   DC CVAC and friends are BROADCAST to every core in the
+   shareability domain of the address. One instruction cleans the
+   line wherever it lives.
+
+   DC CISW affects only THIS core's caches. On SMP it silently
+   does not do what you want.
+
+   So: use VA-based operations for everything except the
+   power-down flush.                                          */</code></pre>
+
+<h2 id="loops">Writing a maintenance loop</h2>
+
+<div class="danger">
+<b>Operate on cache LINES, not on your buffer's bounds</b>
+<p>Maintenance operates on whole lines. If your buffer starts mid-line, cleaning "from the start of the
+buffer" still writes back the <em>entire</em> line — including the neighbouring data that shares it. Worse, an
+<strong>invalidate</strong> on a partial line discards the neighbour's dirty data.</p>
+<p>This is exactly why you must never DMA to or from a stack buffer, and why the DMA API requires
+cache-line-aligned allocations.</p>
+</div>
+
+<pre><code>static void dcache_clean_range(void *start, size_t size)
+{
+        uint64_t ctr;
+        asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        size_t line = 4UL &lt;&lt; ((ctr &gt;&gt; 16) &amp; 0xF);   /* never hardcode */
+
+        uintptr_t addr = (uintptr_t)start &amp; ~(line - 1);   /* round DOWN */
+        uintptr_t end  = (uintptr_t)start + size;
+
+        for (; addr &lt; end; addr += line)
+                asm volatile("dc cvac, %0" :: "r"(addr) : "memory");
+
+        asm volatile("dsb ish" ::: "memory");   /* wait for completion */
+}
+
+/* Three things to notice:
+     1. the line size comes from CTR_EL0
+     2. the start is rounded DOWN to a line boundary
+     3. a DSB is REQUIRED afterwards — maintenance operations are
+        issued asynchronously, and without the barrier you may
+        start the DMA before the writeback has finished     */</code></pre>
+
+<h2 id="dma">The DMA sequences</h2>
+
+<p>These two sequences are the practical core of the chapter. Almost every DMA correctness bug is one of them performed in the wrong order, or omitted because the test happened to have cold caches.</p>
+
+<pre class="diagram">CPU → DEVICE  (the device will READ your buffer)
+
+   1. write the data
+   2. DC CVAC over the buffer          clean: push it to PoC
+   3. DSB ISH                          wait for completion
+   4. start the DMA (write a register)
+
+   Without step 2, the device reads DRAM while your data sits
+   dirty in L1. It gets garbage — usually the previous contents
+   of that buffer, which makes the bug look like stale data
+   rather than a coherency problem.
+
+
+DEVICE → CPU  (the device WROTE your buffer)
+
+   1. start the DMA, wait for completion
+   2. DC IVAC over the buffer          invalidate: discard stale
+   3. DSB ISH
+   4. read the data
+
+   Without step 2, the CPU may still hold a clean copy from
+   before the transfer and return it. The symptom is a buffer
+   that "never updates" — often mistaken for the device not
+   working.
+
+   SUBTLETY: you must ALSO invalidate BEFORE starting the
+   transfer, not only after. A speculative read during the DMA
+   could pull a stale line into the cache, which then survives
+   your post-transfer invalidate window. Linux's dma_map_single
+   handles both edges; hand-rolled code frequently does not.
+
+
+BIDIRECTIONAL
+
+   DC CIVAC before, DC IVAC after. Or just use the DMA API.</pre>
+
+<pre><code>/* Which is why you should never hand-roll this in an OS driver: */
+
+dma_addr_t d = dma_map_single(dev, buf, len, DMA_TO_DEVICE);
+/* ...device owns the buffer... */
+dma_unmap_single(dev, d, len, DMA_TO_DEVICE);
+
+/* The API knows whether this device is coherent (from
+   `dma-coherent` in the device tree), and emits the right
+   maintenance — or correctly emits NONE. Hand-written
+   maintenance on a coherent system is wasted work; omitted
+   maintenance on a non-coherent one is corruption.        */
+
+dma_sync_single_for_cpu(dev, d, len, DMA_FROM_DEVICE);
+inspect(buf);
+dma_sync_single_for_device(dev, d, len, DMA_FROM_DEVICE);</code></pre>
+
+<h2 id="icache">Making written instructions executable</h2>
+
+<p>Writing instructions into memory does not make them executable, because the data and instruction sides of the cache hierarchy are separate. JIT compilers, module loaders and self-modifying code all need this exact sequence.</p>
+
+<pre class="diagram">The I-cache and D-cache are SEPARATE and NOT coherent with each
+other. Writing bytes through the data path does not make them
+visible to instruction fetch.
+
+Required sequence, for JITs, module loaders, trampolines and
+self-modifying boot code:
+
+   1. write the instructions          (through the D-cache)
+   2. DC CVAU  over the range         clean D-cache to PoU
+   3. DSB ISH                         wait
+   4. IC IVAU  over the range         invalidate I-cache to PoU
+   5. DSB ISH                         wait
+   6. ISB                             flush THIS core's pipeline
+
+Every step matters:
+   · without 2, the instructions are still dirty in the D-cache
+     and the I-side cannot see them
+   · without 4, the I-cache may hold the OLD bytes at that address
+   · without 6, this core may already have PREFETCHED the old
+     instructions into the pipeline
+
+On SMP, other cores need the ISB too. Linux sends an IPI
+(kick_all_cpus_sync) to force it, because there is no way to
+broadcast an ISB.
+
+Shortcut: CTR_EL0.DIC and .IDC tell you when steps can be
+skipped on this implementation. Do not assume — read them.</pre>
+
+<pre><code>static void flush_icache_range(void *start, size_t size)
+{
+        uintptr_t addr, end = (uintptr_t)start + size;
+        size_t iline, dline;
+        uint64_t ctr;
+
+        asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        dline = 4UL &lt;&lt; ((ctr &gt;&gt; 16) &amp; 0xF);
+        iline = 4UL &lt;&lt; (ctr &amp; 0xF);          /* I and D can DIFFER */
+
+        if (!(ctr &amp; (1UL &lt;&lt; 28))) {          /* IDC clear: need clean */
+                for (addr = (uintptr_t)start &amp; ~(dline - 1);
+                     addr &lt; end; addr += dline)
+                        asm volatile("dc cvau, %0" :: "r"(addr) : "memory");
+                asm volatile("dsb ish" ::: "memory");
+        }
+
+        if (!(ctr &amp; (1UL &lt;&lt; 29))) {          /* DIC clear: need invalidate */
+                for (addr = (uintptr_t)start &amp; ~(iline - 1);
+                     addr &lt; end; addr += iline)
+                        asm volatile("ic ivau, %0" :: "r"(addr) : "memory");
+                asm volatile("dsb ish" ::: "memory");
+        }
+
+        asm volatile("isb" ::: "memory");
+}
+
+/* In userspace, do not write this — call the builtin, which
+   emits whatever the platform requires:                     */
+        __builtin___clear_cache(start, end);</code></pre>
+
+<h2 id="dczva">DC ZVA: fast zeroing</h2>
+
+<p>Zeroing memory is common enough to deserve a dedicated instruction that writes a whole cache line without reading it first. It is significantly faster than a store loop, with one alignment requirement.</p>
+
+<pre><code>/* Zeroes a whole cache line without READING it first — avoiding
+   the read-for-ownership that a normal store sequence causes.
+   This is what memset(0) uses for large blocks.             */
+
+        mrs     x1, dczid_el0
+        tbnz    x1, #4, no_dczva        /* DZP: prohibited?        */
+        and     w1, w1, #0xF            /* log2 of the block size
+                                           in WORDS               */
+        mov     x2, #4
+        lsl     x2, x2, x1              /* block size in bytes     */
+
+1:      dc      zva, x0                 /* zero one block          */
+        add     x0, x0, x2
+        subs    x3, x3, x2
+        b.gt    1b
+
+/* The block size is NOT necessarily the cache line size — read
+   DCZID_EL0. And DZP may be set, meaning the instruction is
+   prohibited (it is trapped at EL0 on some configurations).
+
+   Note: DC ZVA on Device memory is UNPREDICTABLE. It is a
+   cache operation, and Device memory is not cached.       */</code></pre>
+
+<h2 id="barriers">Maintenance needs barriers</h2>
+
+<div class="warn">
+<b>Cache operations complete asynchronously</b>
+<p>A <code>DC CVAC</code> instruction <em>issues</em> the operation; it does not wait for the writeback to
+reach memory. Without a following <code>DSB</code>, you can start a DMA transfer before your data has
+arrived.</p>
+<p>The general rule: <strong>maintenance, then <code>DSB</code>, then rely on it.</strong> And for instruction
+cache work, add an <code>ISB</code> because the pipeline must also be flushed.</p>
+</div>
+
+<pre><code>/* Choosing the DSB domain:
+     dsb ish     inner shareable — SMP within the cluster.
+                 The usual choice.
+     dsb osh     outer shareable — when a device outside the inner
+                 domain is involved
+     dsb sy      full system — the safest, and the slowest
+     dsb nsh     non-shareable — this core only; used for local
+                 TLB and cache work in boot code
+
+   Use the narrowest domain that is correct. `dsb sy` in a hot
+   path is a measurable cost.                                */</code></pre>
+
+<h2 id="mmu-off">Maintenance with the MMU off</h2>
+
+<p>Early boot code runs before translation is enabled, which changes how cache maintenance behaves and which operations are even meaningful. This is the situation bootloader authors have to reason about.</p>
+
+<pre><code>/* Before the MMU is enabled, all memory is treated as
+   Device-nGnRnE and the data cache is effectively bypassed. Two
+   consequences for boot code:                                */
+
+/* 1. Data written with the MMU OFF goes straight to memory. Data
+      written with the MMU ON may sit in a cache. So if a boot
+      stage writes a structure with the MMU off, then enables the
+      MMU and reads it, all is well — but the reverse can leave
+      stale data. Clean before disabling the MMU.            */
+
+/* 2. Before enabling the MMU, INVALIDATE the caches: they may
+      contain lines from a previous boot stage with different
+      attributes.                                             */
+
+        /* early boot, before enabling the MMU */
+        bl      invalidate_dcache_all       /* set/way — legitimate
+                                               here: single core,
+                                               nothing else running */
+        ic      iallu
+        dsb     nsh
+        isb
+        /* now build tables and enable the MMU (chapter 12) */
+
+/* 3. And when handing off to another stage that will run with
+      the MMU off — such as a kernel entered per the boot
+      contract (OS chapter 18) — you must CLEAN the image you
+      loaded to PoC, or it will not see your writes.        */</code></pre>
+
+<h2 id="checklist">Decision procedure</h2>
+
+<p>Rather than reasoning from first principles each time, this reduces the chapter to a short procedure. Follow it and the common cases are correct by construction.</p>
+
+<pre class="diagram">   Is the other observer a COHERENT CPU in the same domain?
+        → NO maintenance needed. You may need a BARRIER
+          (chapter 21) — a different problem.
+
+   Is it a NON-COHERENT DEVICE?
+        device will READ  → DC CVAC  + DSB     (clean to PoC)
+        device WROTE      → DC IVAC  + DSB     (invalidate to PoC)
+                            and invalidate BEFORE the transfer too
+        both              → DC CIVAC + DSB
+        → or better: use the DMA API and let it decide
+
+   Am I about to EXECUTE bytes I just wrote?
+        → DC CVAU, DSB, IC IVAU, DSB, ISB      (to PoU)
+        → or: __builtin___clear_cache()
+
+   Am I powering down a core or cluster?
+        → the set/way flush of everything
+
+   Am I changing page tables?
+        → TLB maintenance (chapter 15), plus cache maintenance
+          only if the table walker is not coherent
+
+   Anything else?
+        → you probably do not need cache maintenance. Check
+          whether you actually have an ORDERING problem.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Device reads garbage or previous contents</td><td>Missing clean before the transfer</td></tr>
+<tr><td>Buffer never appears to update after DMA</td><td>Missing invalidate after the transfer</td></tr>
+<tr><td>DMA result correct only sometimes</td><td>Missing invalidate <em>before</em> the transfer; speculation pulled in a stale line</td></tr>
+<tr><td>Neighbouring data corrupted by an invalidate</td><td>Partial cache line — the buffer was not line-aligned</td></tr>
+<tr><td>JIT or module code executes garbage</td><td>Missing <code>DC CVAU</code> / <code>IC IVAU</code> / <code>ISB</code></td></tr>
+<tr><td>Self-modifying code works on one core, not another</td><td>Missing <code>ISB</code> on the other core</td></tr>
+<tr><td>Maintenance loop misses the last line</td><td>Start not rounded down to a line boundary</td></tr>
+<tr><td>Hardcoded 64-byte stride fails on some SoC</td><td>Line size differs — read <code>CTR_EL0</code></td></tr>
+<tr><td>Set/way flush does not fix an SMP issue</td><td>Not broadcast — use VA operations</td></tr>
+<tr><td>Corruption starting DMA immediately after cleaning</td><td>Missing <code>DSB</code>; the writeback had not completed</td></tr>
+<tr><td>Next boot stage runs stale code</td><td>Image not cleaned to PoC before handing over with the MMU off</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define clean, invalidate and clean-and-invalidate, and say which can lose data.</li>
+  <li>Decode <code>DC CIVAC</code> and <code>IC IVAU</code> from the mnemonic.</li>
+  <li>Say why VA operations are preferred over set/way on SMP.</li>
+  <li>Write a maintenance loop correctly, including line size and alignment.</li>
+  <li>Give both DMA sequences, and explain why an invalidate is also needed before a device-to-CPU transfer.</li>
+  <li>Give the full six-step sequence for making written instructions executable.</li>
+  <li>Explain why a <code>DSB</code> is required after maintenance.</li>
+  <li>Explain what goes wrong when a DMA buffer is not cache-line aligned.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

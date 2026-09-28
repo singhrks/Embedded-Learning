@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heterogeneous multiprocessing: big.LITTLE and DynamIQ | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Heterogeneous multiprocessing: big.LITTLE and DynamIQ</h1>
+<p class="lead">Every chapter so far has quietly assumed the cores in a system are identical. On almost every
+ARM device you will actually work on, they are not — and that single fact changes scheduling, benchmarking,
+power measurement and even what "this code is fast" means. This chapter is why the asymmetry exists and what
+follows from it.</p>
+
+<h2 id="why">Why identical cores stopped being the right answer</h2>
+
+<p>Making a core faster costs power superlinearly: the design techniques that raise single-thread performance
+— deeper pipelines, wider issue, aggressive speculation — all consume energy whether or not the workload
+needs them. That relationship is what makes a mixture of core types better than any single design.</p>
+
+<pre class="diagram">   THE OBSERVATION BEHIND THE WHOLE IDEA:
+
+     A "big" out-of-order core might deliver 3x the
+     performance of a small in-order one - and cost 8x the
+     energy per unit of work.
+
+     So for work that must finish NOW, the big core is
+     correct despite the cost. For work that merely must
+     finish - a background sync, a sensor poll, playing audio
+     - the small core does it for a fraction of the energy.
+
+   MOST WORKLOADS ARE A MIXTURE OF BOTH, and they alternate
+   rapidly: a phone is idle, then briefly needs everything it
+   has when you touch the screen, then is idle again.
+
+   A SINGLE CORE TYPE MUST COMPROMISE. Build only big cores
+   and idle power is poor; build only small ones and the
+   interactive response is poor. Build BOTH, and let software
+   place each piece of work on the appropriate one.
+
+   THE COST OF THIS IS PAID IN SOFTWARE: something must now
+   decide WHERE each thread runs, and that decision is
+   continuous rather than one-time.</pre>
+
+<div class="key">
+<b>The cores must be architecturally identical, and only microarchitecturally different</b>
+<p>This is the constraint that makes the whole scheme workable. Every core implements the same instruction set
+and the same architectural features, so a thread can be moved between them mid-execution without any software
+involvement beyond the ordinary context switch — the destination core will execute exactly the same
+instructions with exactly the same results. What differs is only <em>how fast</em> and <em>at what energy
+cost</em>: pipeline depth, issue width, cache sizes. This is precisely the architecture-versus-microarchitecture
+distinction from <a href="arm-01-what-is-arm.html">chapter 1</a>, and it is load-bearing here rather than
+academic. Where implementations genuinely differ in features, the kernel must either restrict itself to the
+common subset or refuse to migrate — which is why an asymmetry in something like the cache line size or an
+optional extension is a serious problem rather than a detail.</p>
+</div>
+
+<h2 id="models">Three ways to use the cores, in historical order</h2>
+
+<p>The hardware capability arrived before the software could exploit it properly, so three usage models
+appeared in sequence. Only the last is used now, but knowing the earlier two explains why the scheduler looks
+the way it does.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>How it works</th><th>Limitation</th></tr></thead>
+<tbody>
+<tr><td><strong>Cluster migration</strong></td><td>All threads run on the big cluster or all on the LITTLE
+cluster; the whole cluster switches at once</td><td>Coarse — one demanding thread forces every thread onto
+the big cores</td></tr>
+<tr><td><strong>CPU migration</strong> (in-kernel switcher)</td><td>Each big core is paired with a LITTLE
+core; the pair appears as one virtual CPU and the active half switches</td><td>Half the cores are idle by
+construction — you can never use big and LITTLE simultaneously</td></tr>
+<tr><td><strong>Global task scheduling</strong> (HMP / EAS)</td><td>Every core is independently visible to the
+scheduler, which places each thread individually</td><td>None structurally — but the scheduler now needs an
+energy model to decide well</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Global task scheduling is what every current system uses, and it moves the entire difficulty into the
+scheduler: with all cores available, deciding where a thread belongs requires knowing both how much work it
+does and what that work would cost on each core type.</p>
+
+<pre class="diagram">   ENERGY AWARE SCHEDULING, which is how Linux answers that:
+
+     1. PER-TASK UTILISATION TRACKING
+          The scheduler maintains a running estimate of how
+          much CPU each task actually uses, decayed over
+          time so recent behaviour dominates.
+
+     2. AN ENERGY MODEL, supplied by the platform
+          For each core type and each frequency, roughly what
+          does a unit of work cost?
+
+     3. PLACEMENT AS AN ARITHMETIC QUESTION
+          Given this task's utilisation and the current state
+          of each core, which placement results in the lowest
+          total energy while still fitting the work?
+
+   WHAT THIS EXPLAINS IN PRACTICE:
+
+     · A BENCHMARK IS SLOW FOR ITS FIRST FEW HUNDRED
+       MILLISECONDS. A newly created task has no utilisation
+       history, so the scheduler does not yet know it is
+       demanding. It starts somewhere conservative, and
+       migrates once the estimate rises - which costs a
+       migration plus a frequency ramp (chapter 33).
+
+     · THE SAME CODE TIMED TWICE GIVES DIFFERENT ANSWERS,
+       because the two runs landed on different core types.
+
+     · PINNING A THREAD TO A BIG CORE CAN MAKE A SYSTEM
+       SLOWER OVERALL, by denying the scheduler the placement
+       it would have chosen and burning power that then
+       forces thermal throttling elsewhere.</pre>
+
+<h2 id="mpidr">Telling the cores apart: MPIDR and the topology</h2>
+
+<p>Software that cares about placement must first be able to identify which core it is running on and how the
+cores are grouped. The architecture provides one register for this, and its hierarchical structure maps onto
+the physical hierarchy of the chip.</p>
+
+<pre><code>/* MPIDR_EL1 - the Multiprocessor Affinity Register. Read-only
+   and unique per core.                                      */
+
+        MRS  x0, MPIDR_EL1
+
+     Aff3 [39:32]   Aff2 [23:16]   Aff1 [15:8]   Aff0 [7:0]
+
+/* THE LEVELS MAP ONTO THE PHYSICAL HIERARCHY, and exactly
+   how is implementation-defined - which is why you read the
+   topology from firmware rather than assuming:
+
+     classic big.LITTLE      Aff1 = cluster, Aff0 = core
+                             within the cluster
+     DynamIQ (DSU)           cores share ONE cluster, so
+                             typically Aff1 = DSU, Aff0 = core
+
+   THIS IS THE SAME AFFINITY SCHEME THE GIC USES for
+   interrupt routing (chapter 23) - deliberately, so that
+   "send this interrupt to that core" and "which core am I"
+   speak the same language.                                  */
+
+/* LINUX PUBLISHES THE PARSED TOPOLOGY rather than making
+   every program decode MPIDR: */
+
+$ cat /sys/devices/system/cpu/cpu0/topology/cluster_id
+$ cat /sys/devices/system/cpu/cpu0/topology/core_siblings_list
+
+/* AND THE CAPACITY OF EACH CORE, normalised so the largest
+   is 1024 - this is the number the scheduler actually uses,
+   and reading it is the quickest way to see which cores are
+   big on an unfamiliar board:                               */
+
+$ for c in /sys/devices/system/cpu/cpu*/cpu_capacity; do
+      echo "$c: $(cat $c)"
+  done
+/sys/devices/system/cpu/cpu0/cpu_capacity: 383     &lt;- LITTLE
+/sys/devices/system/cpu/cpu4/cpu_capacity: 1024    &lt;- big</code></pre>
+
+<h2 id="coherency">Coherency across different cores</h2>
+
+<p>Moving a thread between cores only works because the caches stay coherent across the boundary, and on a
+heterogeneous system that boundary may separate physically different cache hierarchies. This is where the
+shareability attributes from <a href="arm-19-shareability.html">chapter 19</a> stop being abstract.</p>
+
+<pre class="diagram">   CLASSIC big.LITTLE - two separate clusters:
+
+     ┌───────────────┐      ┌───────────────┐
+     │  big cluster  │      │LITTLE cluster │
+     │  L1  L1       │      │  L1  L1       │
+     │     L2        │      │     L2        │
+     └───────┬───────┘      └───────┬───────┘
+             └──────────┬───────────┘
+                ┌───────────────┐
+                │ COHERENT      │  CCI / CMN - maintains
+                │ INTERCONNECT  │  coherency BETWEEN the
+                └───────┬───────┘  clusters (chapter 25)
+                        v
+                      memory
+
+     Migrating a thread between clusters means its cache
+     lines must move across the interconnect. That is
+     transparent and NOT free - it is the main cost of a
+     migration, and it is why the scheduler is reluctant.
+
+     INNER SHAREABLE must span BOTH clusters, or a thread
+     that migrates stops seeing its own writes. Getting this
+     wrong in firmware produces failures that only appear
+     under migration.
+
+   DynamIQ - one cluster, mixed core types:
+
+     ┌─────────────────────────────────────┐
+     │  big   big   LITTLE  LITTLE  ...    │
+     │   L1    L1     L1      L1           │
+     │  ┌───────────────────────────────┐  │
+     │  │  DSU - shared L3, and the      │  │
+     │  │  coherency point for all of    │  │
+     │  │  them                          │  │
+     │  └───────────────────────────────┘  │
+     └─────────────────────────────────────┘
+
+     Cores of DIFFERENT types now share one cluster and one
+     L3. Migration between them no longer crosses the
+     interconnect, which makes it substantially cheaper -
+     and is why DynamIQ allows much more aggressive
+     placement than classic big.LITTLE did. It also allows
+     mixtures that were previously impossible, such as one
+     big core with seven small ones.</pre>
+
+<h2 id="consequences">What this means when you are measuring or tuning</h2>
+
+<p>Most of the practical impact of heterogeneity lands on people trying to measure something, because every
+measurement now depends on a placement decision that was made for you and is not visible in the result.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>If you are…</th><th>The heterogeneity problem</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>Benchmarking</td><td>Two runs land on different core types and differ by 3×</td><td>Pin to a specific
+core for the measurement, and say which one in the result</td></tr>
+<tr><td>Reading PMU counters (<a href="arm-34-pmu.html">ch. 34</a>)</td><td>Counters are per-core; a migrated
+thread leaves half its events behind</td><td>Pin, or use per-task counting that follows the thread</td></tr>
+<tr><td>Chasing real-time latency</td><td>A deadline-critical thread gets placed on a LITTLE core</td><td>Pin
+it, and isolate that core from the general scheduler</td></tr>
+<tr><td>Measuring power</td><td>The same work costs wildly different energy depending on placement</td><td>
+Measure the whole system over a whole workload, not one thread</td></tr>
+<tr><td>Writing a driver</td><td>Your interrupt lands on whichever core the GIC routes it to</td><td>Set
+interrupt affinity deliberately if latency matters (<a href="arm-24-gic-lifecycle.html">ch. 24</a>)</td></tr>
+<tr><td>Timing with the counter (<a href="arm-32-timers.html">ch. 32</a>)</td><td>Nothing — the system counter
+is common to all cores and runs at a constant rate</td><td>Use it rather than cycle counts, which are
+per-core and frequency-dependent</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Cycle counts are not comparable across cores; elapsed time is</b>
+<p>The PMU cycle counter advances at that core's current frequency, which differs between core types and
+changes continuously under DVFS. A loop measured at 10,000 cycles on a LITTLE core and 10,000 cycles on a big
+core did not take the same amount of time, and the same loop measured twice on one core need not either. The
+system counter from <a href="arm-32-timers.html">chapter 32</a> is deliberately different: it is common to the
+whole system and runs at a fixed frequency regardless of what any core is doing, which is exactly why it is
+what both the kernel and the vDSO use for timekeeping.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>The same benchmark gives two different results on one machine</td><td>The runs landed on different core
+types — pin before measuring</td></tr>
+<tr><td>Code is slow for the first ~200 ms and then speeds up</td><td>The scheduler had no utilisation history
+yet; it migrated once the estimate rose</td></tr>
+<tr><td>Pinning a thread to a big core made the system slower</td><td>Denied the scheduler its placement, and
+the extra power caused thermal throttling</td></tr>
+<tr><td>A real-time thread misses deadlines intermittently</td><td>It is being placed on a LITTLE core — pin
+and isolate</td></tr>
+<tr><td>PMU counts are lower than the work performed</td><td>The thread migrated; counters are per-core</td></tr>
+<tr><td>Cycle counts disagree with wall-clock measurements</td><td>Expected — cycle counters are per-core and
+frequency-dependent; use the system counter</td></tr>
+<tr><td>A thread stops seeing its own writes after migrating</td><td>Inner shareable does not span both
+clusters — a firmware or page-attribute error</td></tr>
+<tr><td>Migration is far cheaper on a newer SoC</td><td>DynamIQ shares an L3, so migration no longer crosses
+the interconnect</td></tr>
+<tr><td>An optional feature is present on some cores and not others</td><td>A serious asymmetry — the kernel
+must restrict itself to the common subset</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why mixing core types beats any single core design for a bursty workload.</li>
+  <li>Explain why the cores must be architecturally identical and may be microarchitecturally different.</li>
+  <li>Name the three usage models and the limitation that retired each of the first two.</li>
+  <li>Explain what an energy model is and what the scheduler does with it.</li>
+  <li>Explain why a freshly started benchmark is often slow for its first few hundred milliseconds.</li>
+  <li>Explain what <code>MPIDR_EL1</code> provides and why the topology is read from firmware rather than
+  assumed.</li>
+  <li>Explain why <code>cpu_capacity</code> is the quickest way to identify big cores on an unfamiliar
+  board.</li>
+  <li>Explain what a thread migration costs, and why DynamIQ made it cheaper.</li>
+  <li>Explain why cycle counts are not comparable across cores, and what to use instead.</li>
+  <li>Give three situations where pinning is the correct response to heterogeneity.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Making a Pi survive: read-only root and watchdogs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Making a Pi survive: read-only root and watchdogs</h1>
+<p class="lead">A Pi on your desk that you reboot daily is one thing. A Pi in a cabinet that must run for two
+years, lose power without warning, and recover on its own is a different engineering problem — and it is the
+one that separates a prototype from a product.</p>
+
+<h2 id="threats">What actually kills them</h2>
+
+<pre class="diagram">   IN ORDER OF HOW OFTEN IT IS THE CAUSE:
+
+   1. POWER LOSS DURING A WRITE
+      The SD card's controller is mid-erase on a block when
+      the rail collapses. The block is left indeterminate.
+      ext4's journal protects METADATA, not your file's
+      contents, and not the FAT boot partition at all.
+      -&gt; read-only root, section below
+
+   2. SD CARD WEAR
+      Consumer cards are rated in the hundreds of write
+      cycles for the cheapest, thousands for good ones.
+      Logs, swap and a database will get there.
+      -&gt; move writes off the card
+
+   3. UNDER-VOLTAGE (chapter 18)
+      Not a distinct failure so much as a cause of 1.
+
+   4. SOFTWARE HANG
+      A deadlocked kernel, an OOM storm, a wedged driver.
+      The board is powered and unreachable.
+      -&gt; watchdog
+
+   5. FILESYSTEM FULL
+      Logs grow until nothing can write. Everything fails
+      in confusing ways.
+      -&gt; log rotation and quotas
+
+   6. HEAT (chapter 18)
+      Rarely fatal; commonly the reason a device is slow
+      rather than dead.
+
+   NOTE THAT FIVE OF THE SIX ARE STORAGE OR POWER. This is
+   why an embedded Linux product spends so much design
+   effort on those two things and comparatively little on
+   the application.</pre>
+
+<h2 id="ro">Read-only root</h2>
+
+<pre><code># The single most effective reliability measure available.
+# If nothing writes to the card during normal operation, a
+# power cut cannot corrupt it.
+
+# THE EASY ROUTE - Raspberry Pi OS has this built in:
+$ sudo raspi-config
+#   Performance Options -> Overlay File System -> enable
+#   and also set the boot partition read-only
+
+# WHAT IT ACTUALLY DOES: mounts an overlayfs with the SD
+# card as a read-only lower layer and a tmpfs as the
+# writable upper layer. Writes go to RAM and are DISCARDED
+# at reboot. The card is never written.
+
+# THE CONSEQUENCE you must design around: every change is
+# lost on reboot. Configuration, logs, state, everything.
+# So you need somewhere real for the things that must
+# persist.
+
+# --- THE MANUAL VERSION, so you understand what raspi-config
+#     did, and can tune it ---
+
+# /etc/fstab
+PARTUUID=xxxx-01  /boot/firmware  vfat  ro,noatime          0 2
+PARTUUID=xxxx-02  /               ext4  ro,noatime          0 1
+tmpfs             /tmp            tmpfs defaults,noatime,size=64M 0 0
+tmpfs             /var/log        tmpfs defaults,noatime,size=32M 0 0
+tmpfs             /var/tmp        tmpfs defaults,noatime,size=16M 0 0
+
+# noatime matters independently: without it, every READ
+# updates an inode timestamp, which is a WRITE. On a
+# read-mostly system that is most of your write traffic
+# for no benefit.
+
+# A SEPARATE DATA PARTITION for what must survive, mounted
+# with the safest options:
+PARTUUID=xxxx-03  /data  ext4  rw,noatime,sync,errors=remount-ro  0 2
+
+# sync makes every write hit the card before returning:
+# slow, and much harder to corrupt. For a few kilobytes of
+# state a day, the cost is irrelevant and the protection is
+# real.
+
+# TEMPORARILY WRITABLE, for maintenance:
+$ sudo mount -o remount,rw /
+$ ... make changes ...
+$ sudo mount -o remount,ro /
+# Raspberry Pi OS installs `rpi-rw` and `rpi-ro` helpers
+# that do exactly this.
+</code></pre>
+
+<div class="key">
+<b>Design for "power can be cut at any instant"</b>
+<p>Not "power will be cut cleanly", not "the user will shut down properly" — at <em>any</em> instant, including
+halfway through your write. The test is simple and you should actually run it: pull the plug a hundred times
+under load and see what happens. Products that survive this were designed for it; products that were not fail
+in the field at a rate that looks like bad hardware. If your device writes state, write it to a temporary file
+then <code>rename()</code> — that is atomic on ext4, and it is the whole trick.</p>
+</div>
+
+<h2 id="writes">Finding and eliminating writes</h2>
+
+<pre><code># Before you can go read-only you need to know what writes.
+
+# Live view of what is writing, per process:
+$ sudo apt install iotop
+$ sudo iotop -o -a
+
+# Total writes since boot, per device:
+$ cat /proc/diskstats
+$ vmstat 5
+
+# Catch every write to a path with ftrace (chapter 17):
+$ sudo bpftrace -e '
+    tracepoint:syscalls:sys_enter_openat
+    /str(args-&gt;filename) != ""/ {
+      @[comm, str(args-&gt;filename)] = count();
+    }'
+
+# THE USUAL CULPRITS, and their fixes:
+
+#   systemd-journald  -&gt; volatile storage, RAM only
+$ sudo mkdir -p /etc/systemd/journald.conf.d
+$ printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=16M\n' | \
+      sudo tee /etc/systemd/journald.conf.d/volatile.conf
+
+#   rsyslog           -&gt; remove it, or log to tmpfs
+#   swap              -&gt; disable entirely on SD
+$ sudo systemctl disable --now dphys-swapfile
+$ sudo apt purge -y dphys-swapfile
+
+#   man-db, apt, logrotate timers -&gt; disable on an appliance
+$ sudo systemctl disable --now man-db.timer apt-daily.timer \
+      apt-daily-upgrade.timer
+
+#   dhcpcd / NetworkManager leases -&gt; small, but they exist
+#   bash history, .Xauthority, etc -&gt; symlink to /tmp
+
+# MEASURE AGAIN after each change. The goal is zero writes
+# to the root device in steady state:
+$ awk '/mmcblk0 /{print $10}' /proc/diskstats   # sectors written
+# take two readings ten minutes apart; the difference should
+# be zero.
+</code></pre>
+
+<h2 id="watchdog">The watchdog</h2>
+
+<pre><code># The BCM SoC has a hardware watchdog. If nothing pets it,
+# the board resets - which is the only thing that recovers a
+# hung kernel.
+
+# Enable the driver, in config.txt if not already present:
+dtparam=watchdog=on
+
+$ ls -l /dev/watchdog*
+$ dmesg | grep -i watchdog
+bcm2835-wdt bcm2835-wdt: Broadcom BCM2835 watchdog timer
+
+# --- THE SIMPLE ROUTE: let systemd own it ---
+# /etc/systemd/system.conf
+RuntimeWatchdogSec=15
+RebootWatchdogSec=2min
+ShutdownWatchdogSec=10min
+
+# systemd now pets the hardware watchdog every 7.5s. If
+# systemd itself hangs, or the kernel does, the board
+# resets. RebootWatchdogSec also catches a shutdown that
+# hangs, which is a real and annoying failure.
+
+# --- APPLICATION-LEVEL: the more useful kind ---
+# A running kernel with a dead application is the common
+# case, and a kernel watchdog will not catch it. Have your
+# service tell systemd it is alive:
+
+# myapp.service
+[Service]
+Type=notify
+WatchdogSec=30
+Restart=on-failure
+NotifyAccess=main
+
+# and in the application:
+#include &lt;systemd/sd-daemon.h&gt;
+sd_notify(0, "READY=1");
+for (;;) {
+    do_one_cycle();
+    sd_notify(0, "WATCHDOG=1");     /* only if genuinely
+                                       healthy - do NOT pet
+                                       it from a timer that
+                                       runs regardless      */
+}
+
+# THE RULE THAT MAKES A WATCHDOG USEFUL: pet it only from
+# the place that proves real progress. A watchdog fed by a
+# separate thread on a timer will happily keep a completely
+# stuck application alive forever, which is worse than no
+# watchdog because it hides the fault.
+
+# --- WHY DID IT RESET? ---
+$ cat /sys/class/watchdog/watchdog0/bootstatus
+$ vcgencmd get_rsts                 # reset source bits
+# Record this at boot into your persistent log, or you will
+# never know whether a field unit rebooted from a power cut,
+# a watchdog, or a clean restart.
+</code></pre>
+
+<h2 id="update">Updating in the field</h2>
+
+<pre class="diagram">   A read-only, watchdogged appliance still needs updates,
+   and "apt upgrade over SSH" is not an update strategy for
+   something you cannot reach.
+
+   THE STANDARD PATTERN IS A/B (dual bank):
+
+   +-------------+-------------+-----------+-----------+
+   | boot (FAT)  | rootfs A    | rootfs B  |   /data   |
+   +-------------+-------------+-----------+-----------+
+
+   1. Running from A. Download the new image, write it to B.
+   2. Verify B: checksum, and ideally a signature.
+   3. Flip a flag telling the bootloader to try B next.
+   4. Reboot.
+   5. B boots and must CONFIRM itself within N minutes.
+      If it does not, the watchdog resets and the
+      bootloader falls back to A.
+
+   Property that matters: a power cut at ANY point leaves a
+   bootable system. During step 1 you are still on A; after
+   step 4 either B confirms or you fall back to A.
+
+   TOOLS THAT IMPLEMENT THIS - use one rather than writing
+   your own, because the failure cases are subtle:
+     RAUC, SWUpdate, Mender
+
+   On a Pi the bootloader flip is done with the autoboot
+   configuration or by having tryboot select an alternative
+   config.txt; the Pi firmware supports a "tryboot" flag
+   that boots once from an alternative configuration and
+   reverts unless confirmed, which is exactly the primitive
+   this pattern needs.
+
+   THE ALTERNATIVE, for a device you can physically reach:
+   ship a new SD card. Do not underestimate this - for a
+   fleet of ten, it is cheaper than building an update
+   system.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Corruption after a power cut</td><td>Writable root — go read-only</td></tr>
+<tr><td>Card fails after months</td><td>Write endurance: logs, swap or a database on the card</td></tr>
+<tr><td>Config changes lost on reboot</td><td>Working as designed with overlayfs — use a data
+partition</td></tr>
+<tr><td>Board powered but unreachable</td><td>Hang with no watchdog enabled</td></tr>
+<tr><td>Watchdog enabled, hung app never reset</td><td>Kernel watchdog cannot see a stuck userspace — use
+<code>WatchdogSec</code></td></tr>
+<tr><td>Watchdog never fires despite a stuck app</td><td>Petted from a timer rather than from real
+progress</td></tr>
+<tr><td>Reboot loop after an update</td><td>No A/B fallback — the new image is the only image</td></tr>
+<tr><td>Cannot tell why a field unit rebooted</td><td>Reset cause not recorded at boot</td></tr>
+<tr><td>Filesystem fills up over weeks</td><td>Logs not rotated or not on tmpfs</td></tr>
+<tr><td>Shutdown occasionally hangs forever</td><td>No <code>ShutdownWatchdogSec</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the six common causes of field failure and note how many are storage or power.</li>
+  <li>Explain what ext4's journal protects and what it does not.</li>
+  <li>Describe what the overlay filesystem does and the design consequence it forces.</li>
+  <li>Say why <code>noatime</code> matters on a read-mostly system.</li>
+  <li>Give the atomic pattern for writing state that must survive a power cut.</li>
+  <li>Name four things that write to the card by default and how to stop each.</li>
+  <li>Explain how to verify you have reached zero writes in steady state.</li>
+  <li>State the rule for where a watchdog must be petted, and why.</li>
+  <li>Explain why a kernel watchdog does not catch a stuck application.</li>
+  <li>Describe the A/B update sequence and why a power cut is safe at every step.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

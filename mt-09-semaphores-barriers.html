@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Semaphores, barriers and latches | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Semaphores, barriers and latches</h1>
+<p class="lead">Three primitives that are not mutexes. A semaphore counts permits; a latch is a one-shot
+gate; a barrier is a rendezvous. Reaching for the right one turns several pages of condition-variable code
+into a line, and reaching for the wrong one produces the most durable deadlocks in this track.</p>
+
+<h2 id="semaphore">Semaphores: counting permits</h2>
+
+<p>A semaphore is a counter with waiting built in, which makes it a natural fit for limiting access to a pool of resources rather than for mutual exclusion — even though it can do both.</p>
+
+<pre class="diagram">   A semaphore is an integer with two atomic operations and a
+   waiting rule.
+
+     wait / P / acquire / down
+         if count > 0:  count--,  proceed
+         else:          block until someone posts
+
+     post / V / release / up
+         count++,  wake one waiter if any
+
+   THREE DISTINCT USES, and they look nothing alike:
+
+   1. COUNTING A RESOURCE    initial = N
+        N identical things (connections, buffers, slots).
+        wait = take one, post = give one back.
+
+   2. SIGNALLING             initial = 0
+        "an event happened". Producer posts, consumer waits.
+        The count IS the number of pending events, so unlike a
+        condition variable a semaphore REMEMBERS a post that
+        arrives before anyone waits. No lost wake-ups.
+
+   3. MUTUAL EXCLUSION       initial = 1
+        A "binary semaphore". Works, and you should not:
+        it has no owner, so no priority inheritance, no
+        deadlock detection, no error checking, and anyone may
+        post a semaphore they never waited on.
+
+   THE KEY DIFFERENCE FROM A CONDITION VARIABLE:
+     a condvar is stateless and a signal to nobody is lost.
+     a semaphore is stateful and a post to nobody is stored.
+   That single property decides which one your problem wants.</pre>
+
+<pre><code>/* POSIX */
+#include &lt;semaphore.h&gt;
+
+sem_t slots;
+sem_init(&amp;slots, 0 /* not process-shared */, 8 /* permits */);
+
+sem_wait(&amp;slots);        /* take one, blocking            */
+sem_trywait(&amp;slots);     /* or fail with EAGAIN           */
+sem_timedwait(&amp;slots, &amp;abs_timeout);
+/* ... use the resource ... */
+sem_post(&amp;slots);        /* give it back                  */
+
+/* sem_post is ASYNC-SIGNAL-SAFE - almost uniquely among
+   synchronisation primitives. It is the only correct way to
+   wake a thread from a signal handler.                     */
+
+/* C++20 */
+#include &lt;semaphore&gt;
+std::counting_semaphore&lt;8&gt; slots{8};
+std::binary_semaphore     signal{0};
+
+slots.acquire();
+slots.release();
+if (slots.try_acquire_for(std::chrono::milliseconds(10))) { ... }
+
+/* Windows */
+HANDLE s = CreateSemaphore(NULL, 8, 8, NULL);
+WaitForSingleObject(s, INFINITE);
+ReleaseSemaphore(s, 1, NULL);</code></pre>
+
+<div class="key">
+<b>The rule that catches most semaphore bugs</b>
+<p>Wrap it. A raw <code>sem_wait</code>/<code>sem_post</code> pair scattered across a function has exactly the
+problem manual <code>unlock</code> has, plus no owner to blame. Use a RAII guard, and make the semaphore
+private to the type that owns the resource it counts — never a global that any code may post.</p>
+</div>
+
+<pre><code>/* Semaphore as a connection pool - use 1, the good one. */
+
+class Pool {
+    std::counting_semaphore&lt;&gt; permits_;
+    std::mutex               m_;
+    std::vector&lt;Conn&gt;        free_;
+public:
+    explicit Pool(int n) : permits_(n) { /* fill free_ */ }
+
+    class Lease {                       /* RAII, so a throw or
+                                           an early return
+                                           cannot leak a permit */
+        Pool *p_; Conn c_;
+    public:
+        Lease(Pool *p, Conn c) : p_(p), c_(std::move(c)) {}
+        ~Lease() { if (p_) p_-&gt;give_back(std::move(c_)); }
+        Lease(Lease&amp;&amp; o) : p_(o.p_), c_(std::move(o.c_))
+                          { o.p_ = nullptr; }
+        Conn &amp;get() { return c_; }
+    };
+
+    Lease take() {
+        permits_.acquire();             /* blocks if all N are
+                                           out - THIS is the
+                                           backpressure         */
+        std::lock_guard&lt;std::mutex&gt; g(m_);
+        Conn c = std::move(free_.back());
+        free_.pop_back();
+        return Lease(this, std::move(c));
+    }
+private:
+    void give_back(Conn c) {
+        { std::lock_guard&lt;std::mutex&gt; g(m_); free_.push_back(std::move(c)); }
+        permits_.release();             /* release AFTER the
+                                           object is back in
+                                           the list             */
+    }
+};</code></pre>
+
+<h2 id="latch">Latches: a gate that opens once</h2>
+
+<p>Sometimes you need to wait for a set of things to finish exactly once, with no reuse. A latch is that: a one-shot countdown, simpler and harder to misuse than the reusable alternative.</p>
+
+<pre><code>/* A latch counts DOWN to zero and then stays open for ever.
+   Single use. Nobody resets it.                            */
+
+#include &lt;latch&gt;                        /* C++20             */
+
+std::latch ready(3);                    /* three participants */
+
+/* worker */
+        do_setup();
+        ready.count_down();             /* "I am ready"        */
+        ready.wait();                   /* wait for the others */
+        /* all three are past setup here */
+
+/* or, from a coordinator that does not participate: */
+        ready.wait();                   /* until all 3 counted */
+
+/* arrive_and_wait() is count_down() + wait() in one call.  */
+
+/* USES
+     - start N workers, wait until all have initialised
+     - fan out N requests, wait for all N to complete
+     - hold workers at a starting line for a benchmark
+
+   Before C++20, or in C, it is a counter plus a condvar: */
+
+struct latch {
+        pthread_mutex_t m;
+        pthread_cond_t  cv;
+        unsigned        n;
+};
+void latch_count_down(struct latch *l) {
+        pthread_mutex_lock(&amp;l-&gt;m);
+        if (l-&gt;n &gt; 0 &amp;&amp; --l-&gt;n == 0)
+                pthread_cond_broadcast(&amp;l-&gt;cv);   /* broadcast:
+                                                     everyone is
+                                                     released    */
+        pthread_mutex_unlock(&amp;l-&gt;m);
+}
+void latch_wait(struct latch *l) {
+        pthread_mutex_lock(&amp;l-&gt;m);
+        while (l-&gt;n &gt; 0)
+                pthread_cond_wait(&amp;l-&gt;cv, &amp;l-&gt;m);
+        pthread_mutex_unlock(&amp;l-&gt;m);
+}</code></pre>
+
+<h2 id="barrier">Barriers: a rendezvous, repeatedly</h2>
+
+<p>A barrier makes every participating thread wait until all have arrived, then releases them together. It is the standard structure for phased parallel computation, and it reuses itself for the next phase.</p>
+
+<pre><code>/* A barrier is a REUSABLE latch. Every participant waits
+   until all arrive; then all are released and the barrier
+   resets for the next round.                               */
+
+#include &lt;barrier&gt;                      /* C++20             */
+
+std::barrier sync(4, [] {               /* completion function:
+        swap_buffers();                    runs ONCE per phase,
+        ++generation;                      by one thread, while
+});                                        all others wait    */
+
+void worker(int id) {
+        for (int step = 0; step &lt; 1000; step++) {
+                compute_my_share(id);
+                sync.arrive_and_wait();     /* phase boundary  */
+                /* every thread's writes from this phase are
+                   visible to every thread in the next one    */
+        }
+}
+
+/* pthread barriers, the same thing: */
+pthread_barrier_t b;
+pthread_barrier_init(&amp;b, NULL, 4);
+int r = pthread_barrier_wait(&amp;b);
+if (r == PTHREAD_BARRIER_SERIAL_THREAD) {
+        /* exactly ONE thread gets this - do the once-per-phase
+           work here */
+}
+
+/* WHAT BARRIERS ARE FOR: bulk-synchronous parallelism.
+   Iterative solvers, physics steps, image filters, any
+   "everyone computes, then everyone exchanges" loop.
+
+   THE COST: every phase runs at the speed of the SLOWEST
+   participant. With 16 threads and one that is 10% slow,
+   you lose 10% of all 16. Load imbalance is the whole game.
+
+   THE DEADLOCK: if any participant leaves early - returns,
+   throws, hits an error path - every other thread waits for
+   ever. arrive_and_drop() exists for exactly this, and code
+   that can throw between arrivals needs it.               */</code></pre>
+
+<div class="warn">
+<b>The three ways barriers deadlock</b>
+<p><strong>1.</strong> A participant exits the loop early on an error and never arrives again. <strong>2.</strong>
+The count does not match the number of threads — off by one, or a thread that failed to start.
+<strong>3.</strong> Two barriers used in different orders by different threads. All three present identically:
+everything hangs, no CPU used, and a stack dump shows every thread in <code>barrier_wait</code>.</p>
+</div>
+
+<h2 id="choose">Choosing</h2>
+
+<p>These three primitives overlap enough that the choice is not obvious from their descriptions. This reduces it to what you are actually trying to express.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>You want to…</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>Protect data from concurrent access</td><td><strong>Mutex</strong> — it has an owner</td></tr>
+<tr><td>Wait for a state to become true</td><td><strong>Condition variable</strong></td></tr>
+<tr><td>Limit concurrency to N</td><td><strong>Counting semaphore</strong></td></tr>
+<tr><td>Signal from an interrupt or signal handler</td><td><strong>Semaphore</strong> — the only async-signal-safe
+one</td></tr>
+<tr><td>Wake a thread for an event that may arrive first</td><td><strong>Semaphore</strong>, which stores the
+post</td></tr>
+<tr><td>Wait for N things to finish, once</td><td><strong>Latch</strong></td></tr>
+<tr><td>Synchronise phases of a loop, repeatedly</td><td><strong>Barrier</strong></td></tr>
+<tr><td>Run something exactly once</td><td><code>call_once</code> / <code>pthread_once</code></td></tr>
+<tr><td>Deliver a single value to a single waiter</td><td><code>future</code> / <code>promise</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Pool exhausts and never recovers</td><td>A permit leaked on an error path — needs RAII</td></tr>
+<tr><td>More than N concurrent users of an N-permit resource</td><td>Somebody posted without waiting; a
+semaphore has no owner to stop them</td></tr>
+<tr><td>Real-time thread misses deadlines behind a binary semaphore</td><td>No priority inheritance — use a
+mutex (<a href="mt-15-priority-inversion.html">chapter 15</a>)</td></tr>
+<tr><td>Everything hangs at a barrier</td><td>Wrong participant count, or one thread left early</td></tr>
+<tr><td>Barrier phase takes as long as the slowest thread every time</td><td>Working as designed — fix load
+balance, not the barrier</td></tr>
+<tr><td>Latch never opens</td><td>Fewer <code>count_down</code> calls than the initial count, often an early
+return</td></tr>
+<tr><td>Deadlock on shutdown with waiters on a semaphore</td><td>Semaphores have no "close" — post N times or
+use a different primitive</td></tr>
+<tr><td>Signal handler deadlocks the process</td><td>It took a mutex or signalled a condvar; only
+<code>sem_post</code> is safe there</td></tr>
+<tr><td>Counter drifts over days</td><td>Unbalanced wait/post, usually one path that returns without
+releasing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define a semaphore's two operations and give the three distinct uses.</li>
+  <li>State the key difference between a semaphore and a condition variable, and when it decides the
+  choice.</li>
+  <li>Explain why a binary semaphore is a poor mutex — give three specific losses.</li>
+  <li>Say why <code>sem_post</code> is the only safe wake-up from a signal handler.</li>
+  <li>Write a permit-leaking bug and fix it with RAII.</li>
+  <li>Distinguish a latch from a barrier in one sentence.</li>
+  <li>Explain what a barrier's completion function is for.</li>
+  <li>Give the three ways a barrier deadlocks and how each presents.</li>
+  <li>Explain why a barrier makes every phase run at the slowest participant's speed.</li>
+  <li>Pick the right primitive for six of the situations in the table without looking.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

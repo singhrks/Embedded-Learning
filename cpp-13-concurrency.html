@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The C++ memory model, threads and atomics | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The C++ memory model, threads and atomics</h1>
+<p class="lead">C++11 gave the language a formal memory model — the first time C or C++ said anything
+precise about what threads may observe. It maps directly onto the ARM barriers from
+<a href="arm-21-barriers.html">ARM chapter 21</a>, and it is what makes portable lock-free code possible at
+all.</p>
+
+<h2 id="model">The memory model</h2>
+
+<p>C++11 gave the language its own memory model rather than deferring to the platform, which means concurrent C++ has defined behaviour independent of the processor. That is what makes portable lock-free code possible at all.</p>
+
+<pre class="diagram">   THE CENTRAL RULE:
+
+     A DATA RACE IS UNDEFINED BEHAVIOUR.
+
+   A data race exists when two threads access the same memory
+   location, at least one writes, and the accesses are not
+   ordered by a happens-before relationship.
+
+   NOT "you get one value or the other". Undefined - the
+   compiler may cache the value in a register forever, split a
+   store into two, invent a store, or fold the branch away
+   (compilers chapter 15).
+
+   SO EVERY SHARED MUTABLE LOCATION must be either:
+     · protected by a mutex, or
+     · declared std::atomic
+
+   `volatile` IS NOT THE ANSWER. volatile means "this access
+   is observable, do not elide or reorder it relative to other
+   volatile accesses". It says NOTHING about atomicity or
+   about ordering relative to non-volatile accesses. It is for
+   MMIO (chapter 02), not for threads. This is the single most
+   common misconception in C++ concurrency.
+
+   HAPPENS-BEFORE is established by:
+     · sequenced-before, within one thread
+     · a mutex unlock, then a lock of the same mutex
+     · a release store, then an acquire load that reads it
+     · thread creation, and join
+     · and transitively through all of the above</pre>
+
+<h2 id="atomics">Atomics</h2>
+
+<p>Atomic types give you indivisible operations without a lock. Whether a given type is genuinely lock-free depends on the platform, and assuming rather than checking is a real portability trap.</p>
+
+<pre><code>#include &lt;atomic&gt;
+
+        std::atomic&lt;int&gt; counter{0};
+
+        counter++;                      /* atomic RMW */
+        counter.fetch_add(1);
+        counter.store(5);
+        int v = counter.load();
+        int old = counter.exchange(10);
+
+        int expected = 5;
+        if (counter.compare_exchange_strong(expected, 10)) {
+                /* it WAS 5, now it is 10 */
+        } else {
+                /* it was not; `expected` now holds the actual
+                   value - note the IN-OUT parameter        */
+        }
+
+/* THE WEAK FORM may fail SPURIOUSLY, and is cheaper on
+   LL/SC architectures like ARM - so always use it in a
+   loop: */
+        int old = counter.load();
+        int next;
+        do {
+                next = compute(old);
+        } while (!counter.compare_exchange_weak(old, next));
+
+/* IS IT LOCK-FREE? */
+        static_assert(std::atomic&lt;int&gt;::is_always_lock_free);
+        std::atomic&lt;BigStruct&gt; x;
+        assert(x.is_lock_free());       /* probably FALSE -
+                                           it uses a hidden
+                                           MUTEX             */
+/* An atomic larger than the machine's widest atomic
+   instruction is implemented with a lock, which on embedded
+   is almost never acceptable. Assert lock-freedom on
+   anything you rely on.
+
+   ON AARCH64: 1, 2, 4, 8 bytes are lock-free natively, and
+   16 bytes are with LSE (ARMv8.1) via CASP.
+
+/* std::atomic_flag is the only type GUARANTEED lock-free
+   everywhere: */
+        std::atomic_flag lock = ATOMIC_FLAG_INIT;
+        while (lock.test_and_set(std::memory_order_acquire))
+                ;                       /* a spinlock */
+        ...
+        lock.clear(std::memory_order_release);</code></pre>
+
+<h2 id="orderings">Memory orderings</h2>
+
+<p>Every atomic operation takes a memory-ordering argument, and the default is the strongest and slowest. Choosing a weaker one correctly requires understanding exactly what it does and does not guarantee.</p>
+
+<pre><code>/* Six orderings, from strongest to weakest. Each maps to
+   specific ARM instructions.                              */
+
+   memory_order_seq_cst      the DEFAULT. Sequential
+                             consistency: a single total order
+                             of all seq_cst operations, seen
+                             identically by every thread.
+        ARM: ldar / stlr, plus a dmb ish for stores on some
+        implementations.
+
+   memory_order_acquire      a load. Nothing after it in
+                             program order may move before it.
+        ARM: ldar
+
+   memory_order_release      a store. Nothing before it may
+                             move after it.
+        ARM: stlr
+
+   memory_order_acq_rel      for read-modify-write: both.
+        ARM: ldaxr / stlxr
+
+   memory_order_relaxed      atomicity only. NO ordering
+                             guarantees at all.
+        ARM: a plain ldr / str
+
+   memory_order_consume      deprecated in practice - every
+                             implementation promotes it to
+                             acquire.
+
+/* THE RELEASE/ACQUIRE PAIR is the workhorse, and it is
+   exactly the ARM pattern from chapter 21: */
+
+        /* producer */
+        data = 42;                              /* plain */
+        ready.store(true, std::memory_order_release);
+
+        /* consumer */
+        if (ready.load(std::memory_order_acquire))
+                use(data);      /* GUARANTEED to see 42 */
+
+/* THE RELEASE STORE publishes everything written before it;
+   the ACQUIRE LOAD that observes it sees all of that. This is
+   RCU's rcu_assign_pointer/rcu_dereference (Linux chapter 14)
+   expressed in the language.
+
+/* RELAXED, and when it is correct: */
+        std::atomic&lt;uint64_t&gt; packet_count{0};
+        packet_count.fetch_add(1, std::memory_order_relaxed);
+/* A statistic that nothing else depends on: you need the
+   increment to be atomic, and you do not care when other
+   threads see it. Relaxed is a plain `ldxr/stxr` (or an LSE
+   `ldadd`) with no barrier - meaningfully cheaper.
+
+/* THE COST ON ARM, roughly:
+     relaxed     ~ the same as a plain access
+     acquire     ldar - a few cycles
+     release     stlr - a few cycles
+     seq_cst     as above, plus possibly a dmb - tens of
+                 cycles under contention
+
+   USE THE DEFAULT (seq_cst) unless you have measured a
+   problem AND can prove the weaker ordering is correct.
+   Reasoning about relaxed orderings is genuinely difficult,
+   and the failures are unreproducible.                   */</code></pre>
+
+<div class="danger">
+<b>The <code>volatile</code> trap, stated once more</b>
+<pre><code>volatile bool ready = false;    // WRONG for threads
+ready = true;                   // not atomic, no ordering
+</code></pre>
+<p><code>volatile</code> prevents the compiler eliding the access. It does <strong>not</strong> make it
+atomic, and it emits no barrier — so on ARM the CPU may still reorder it relative to the data it was meant to
+publish. Java and C# gave <code>volatile</code> acquire/release semantics; C and C++ did not. Use
+<code>std::atomic</code> for threads and <code>volatile</code> for MMIO, and never confuse them.</p>
+</div>
+
+<h2 id="threads">Threads and mutexes</h2>
+
+<p>The standard threading facilities are convenient and assume an operating system underneath. On bare metal or in a kernel you will use the platform's primitives instead, but the reasoning transfers.</p>
+
+<pre><code>#include &lt;thread&gt;
+#include &lt;mutex&gt;
+#include &lt;condition_variable&gt;
+
+        std::thread t{[]{ work(); }};
+        std::thread t2{worker_fn, arg1, arg2};
+
+        t.join();               /* wait for it */
+        t.detach();             /* let it run independently */
+/* A std::thread that is neither joined nor detached calls
+   std::terminate in its destructor. That is deliberate:
+   silently abandoning a thread is worse.
+
+        std::jthread jt{[](std::stop_token st) {
+                while (!st.stop_requested()) work();
+        }};                     /* C++20 - joins automatically
+                                   in its destructor, and
+                                   carries a stop token     */
+
+/* MUTEXES, always via a guard (RAII, chapter 02): */
+        std::mutex m;
+
+        {
+                std::lock_guard lk{m};          /* C++17 CTAD */
+                shared_data++;
+        }                                       /* unlocked */
+
+        std::unique_lock lk{m};         /* movable, can unlock
+                                           and relock        */
+        lk.unlock();
+        lk.lock();
+
+        std::scoped_lock lk{m1, m2};    /* SEVERAL mutexes,
+                                           deadlock-free
+                                           ordering          */
+
+        std::shared_mutex sm;
+        { std::shared_lock r{sm}; }     /* many readers */
+        { std::unique_lock w{sm}; }     /* one writer */
+
+/* NEVER lock and unlock by hand. An early return or an
+   exception between them leaves it locked forever.
+
+/* CONDITION VARIABLES: */
+        std::mutex m;
+        std::condition_variable cv;
+        bool ready = false;
+
+        /* waiter */
+        {
+                std::unique_lock lk{m};
+                cv.wait(lk, []{ return ready; });   /* the
+                                                       PREDICATE
+                                                       form   */
+                consume();
+        }
+
+        /* notifier */
+        {
+                std::lock_guard lk{m};
+                ready = true;
+        }
+        cv.notify_one();
+
+/* THE PREDICATE FORM IS MANDATORY. Without it a SPURIOUS
+   WAKEUP - which is permitted and does happen - returns from
+   wait() with the condition false. The predicate overload
+   loops for you.
+
+/* AND THE LOST-WAKEUP RULE: set the condition WHILE HOLDING
+   the mutex, then notify. Notifying without the lock is
+   allowed and sometimes faster, but setting the flag without
+   it is a race.                                           */</code></pre>
+
+<h2 id="patterns">Patterns</h2>
+
+<p>A handful of patterns cover most concurrent code, and each has a standard implementation worth copying rather than reinventing — because the subtly wrong versions are easy to write and hard to detect.</p>
+
+<pre><code>/* --- SINGLE-PRODUCER SINGLE-CONSUMER RING, lock-free ---- */
+template&lt;typename T, size_t N&gt;
+class SpscQueue {
+        static_assert((N &amp; (N - 1)) == 0, "N must be a power
+                                            of two");
+        std::array&lt;T, N&gt; buf_;
+        alignas(64) std::atomic&lt;size_t&gt; head_{0};   /* producer */
+        alignas(64) std::atomic&lt;size_t&gt; tail_{0};   /* consumer */
+
+public:
+        bool push(const T&amp; v)
+        {
+                size_t h = head_.load(std::memory_order_relaxed);
+                size_t t = tail_.load(std::memory_order_acquire);
+
+                if (h - t &gt;= N) return false;   /* full */
+
+                buf_[h &amp; (N - 1)] = v;
+                head_.store(h + 1, std::memory_order_release);
+                return true;
+        }
+
+        bool pop(T&amp; out)
+        {
+                size_t t = tail_.load(std::memory_order_relaxed);
+                size_t h = head_.load(std::memory_order_acquire);
+
+                if (h == t) return false;       /* empty */
+
+                out = buf_[t &amp; (N - 1)];
+                tail_.store(t + 1, std::memory_order_release);
+                return true;
+        }
+};
+
+/* THE THREE THINGS THAT MAKE IT CORRECT:
+     1. each index is written by ONE thread only, so no CAS is
+        needed
+     2. the release store publishes the DATA written before
+        it; the acquire load on the other side sees it
+     3. alignas(64) puts head_ and tail_ on SEPARATE CACHE
+        LINES - without it, the producer's store to head_
+        invalidates the consumer's cached tail_ on every
+        operation. FALSE SHARING (CA chapter 15), and it can
+        cost an order of magnitude.
+
+/* --- A SPINLOCK, when a mutex is too heavy --------------- */
+class Spinlock {
+        std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+public:
+        void lock()
+        {
+                while (flag_.test_and_set(
+                                std::memory_order_acquire)) {
+                        while (flag_.test(
+                                std::memory_order_relaxed))
+                                __builtin_arm_yield();
+                                /* the ARM `yield` hint -
+                                   relaxes the pipeline and
+                                   helps SMT/cluster peers  */
+                }
+        }
+        void unlock()
+                { flag_.clear(std::memory_order_release); }
+};
+/* THE TEST-AND-TEST-AND-SET SHAPE matters: spinning on
+   test_and_set writes the cache line every iteration,
+   bouncing it between cores. Spinning on a relaxed `test`
+   only reads, so the line stays shared until it is actually
+   free.
+
+/* --- CALL ONCE --- */
+        std::once_flag flag;
+        std::call_once(flag, []{ expensive_init(); });
+
+/* --- AND THE SIMPLEST CORRECT SINGLETON --- */
+        Device&amp; device() {
+                static Device instance;  /* thread-safe
+                                            initialisation is
+                                            GUARANTEED since
+                                            C++11            */
+                return instance;
+        }
+/* -fno-threadsafe-statics removes the guard variable, which
+   is correct only if you know initialisation is
+   single-threaded (chapter 01).                          */</code></pre>
+
+<h2 id="embedded">On embedded</h2>
+
+<p>Concurrency on an embedded target usually means an interrupt rather than a thread, which changes which primitives are usable and introduces constraints the standard model does not describe.</p>
+
+<pre><code>/* std::thread needs an OS. On bare metal you have interrupts
+   and possibly an RTOS instead - but the MEMORY MODEL still
+   applies, and atomics are still the right tool.        */
+
+/* --- SHARING WITH AN INTERRUPT HANDLER --- */
+        std::atomic&lt;uint32_t&gt; sample_count{0};
+        std::atomic&lt;bool&gt;     data_ready{false};
+        Sample buffer[N];               /* plain */
+
+        extern "C" void ADC_IRQHandler(void)
+        {
+                buffer[idx] = read_adc();       /* plain
+                                                   stores    */
+                data_ready.store(true,
+                        std::memory_order_release);
+        }
+
+        void main_loop(void)
+        {
+                if (data_ready.load(std::memory_order_acquire)) {
+                        process(buffer);        /* sees the
+                                                   stores    */
+                        data_ready.store(false,
+                                std::memory_order_relaxed);
+                }
+        }
+
+/* ON A SINGLE CORE, an interrupt cannot interleave with
+   itself, so the ordering concern is only the COMPILER's -
+   and atomic gives you that for free, portably, instead of a
+   `volatile` plus a hand-written barrier.
+
+   ON A MULTI-CORE MCU or an AMP system, the full memory model
+   applies exactly as on a big system.
+
+/* --- WHAT std::atomic COMPILES TO on an ARMv7-M --- */
+        std::atomic&lt;uint32_t&gt; x;
+        x.fetch_add(1);
+   -&gt;   a LDREX/STREX loop - no lock, no library call.
+        std::atomic&lt;uint64_t&gt; y;        /* on 32-bit ARM */
+        y.fetch_add(1);
+   -&gt;   possibly a LIBRARY CALL with a lock. Check with
+        is_always_lock_free before relying on it.
+
+/* --- AND THE CRITICAL-SECTION ALTERNATIVE --- */
+        class InterruptLock { ... };    /* chapter 02 */
+        {
+                InterruptLock guard;
+                shared_struct.field_a = 1;      /* a MULTI-WORD
+                shared_struct.field_b = 2;         update      */
+        }
+/* For anything larger than one atomic word on a single-core
+   part, disabling interrupts briefly is simpler and cheaper
+   than a lock-free algorithm. Use atomics for single values
+   and interrupt masking for compound updates.           */</code></pre>
+
+<h2 id="testing">Finding races</h2>
+
+<p>Concurrency bugs do not reproduce on demand. These tools find them by instrumenting every access rather than waiting for the unlucky interleaving to occur naturally.</p>
+
+<pre><code># ThreadSanitizer - the only tool that reliably finds these:
+    g++ -fsanitize=thread -g -O1 prog.cpp
+    ./prog
+
+    WARNING: ThreadSanitizer: data race
+      Write of size 4 at 0x... by thread T2:
+        #0 worker() prog.cpp:15
+      Previous read of size 4 at 0x... by thread T1:
+        #0 main prog.cpp:22
+      Location is global 'counter' of size 4
+
+# ~10x slower, ~5x memory. Run your test suite under it
+# nightly; it finds races that will never reproduce under
+# ordinary testing.
+
+# HELGRIND, for lock-order problems:
+    valgrind --tool=helgrind ./prog
+
+# AND THE STATIC CHECKS:
+    clang -Wthread-safety, with annotations:
+        class Cache {
+                std::mutex m_;
+                int data_ GUARDED_BY(m_);
+                void update() REQUIRES(m_);
+        };
+# The compiler then verifies at BUILD TIME that data_ is only
+# touched with m_ held. This is genuinely excellent and badly
+# underused - it turns a class of race into a compile error.
+
+# ON EMBEDDED, where sanitizers are unavailable:
+#   · reason explicitly about every shared variable and write
+#     the reasoning down
+#   · make everything shared either atomic or interrupt-masked
+#   · use static analysis and code review
+#   · stress test with an interrupt rate far above the
+#     expected one
+#   · and prefer designs with a single owner per datum, so
+#     the question does not arise</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works in debug, fails in release</td><td>A race the optimiser exposed — <code>volatile</code> instead of <code>atomic</code></td></tr>
+<tr><td>Works on one core, fails on many</td><td>Missing barriers; the ordering was accidental</td></tr>
+<tr><td>A flag is never observed as set</td><td>The compiler cached it in a register — needs <code>atomic</code></td></tr>
+<tr><td>Data visible after the flag, but stale</td><td>Missing release/acquire pairing</td></tr>
+<tr><td>Spurious wakeup processes garbage</td><td>Condition variable wait without a predicate</td></tr>
+<tr><td>Deadlock acquiring two mutexes</td><td>Inconsistent order — use <code>std::scoped_lock</code></td></tr>
+<tr><td>Terminate on thread destruction</td><td>Neither joined nor detached — use <code>jthread</code></td></tr>
+<tr><td>Atomic operations are surprisingly slow</td><td><code>seq_cst</code> under contention, or not lock-free</td></tr>
+<tr><td>Queue throughput collapses with two cores</td><td>False sharing — <code>alignas(64)</code> the indices</td></tr>
+<tr><td>A 64-bit atomic calls into the library</td><td>Not lock-free on that target — assert it</td></tr>
+<tr><td>Race found by TSan that never reproduces</td><td>Real. Fix it — reproducibility is not the test</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State what a data race is and what the standard says happens.</li>
+  <li>Explain precisely why <code>volatile</code> is not a threading tool.</li>
+  <li>Name the ways happens-before is established.</li>
+  <li>Use <code>compare_exchange</code> correctly, and say why the weak form needs a loop.</li>
+  <li>Name the six memory orderings and their ARM instructions.</li>
+  <li>Write a release/acquire pair and say exactly what it guarantees.</li>
+  <li>Say when <code>relaxed</code> is correct.</li>
+  <li>Explain why a condition variable wait needs a predicate.</li>
+  <li>Write an SPSC ring and justify each ordering and the <code>alignas</code>.</li>
+  <li>Explain test-and-test-and-set and the cache-line reason for it.</li>
+  <li>Use atomics to share data with an interrupt handler, and say when to mask instead.</li>
+  <li>Run TSan and use <code>-Wthread-safety</code> annotations.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

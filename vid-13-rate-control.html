@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate control and buffer models | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Rate control and buffer models</h1>
+<p class="lead">Deciding the quantisation parameter for every frame, under a constraint you cannot violate.
+It is the part of encoding that most affects what viewers actually see, and the part most often configured by
+copying a command line without understanding which mode it selected.</p>
+
+<h2 id="modes">The modes, and which one you want</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Mode</th><th>You specify</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>CQP</strong></td><td>A fixed QP</td><td>Testing and research only. Bitrate varies wildly with
+content</td></tr>
+<tr><td><strong>CRF</strong></td><td>A quality target</td><td><strong>The default for anything stored.</strong>
+Constant perceptual quality, variable bitrate, one pass</td></tr>
+<tr><td><strong>ABR</strong> (1-pass)</td><td>An average bitrate</td><td>Rarely the right answer — it must
+guess the future, and it guesses badly</td></tr>
+<tr><td><strong>2-pass VBR</strong></td><td>A target bitrate or file size</td><td>When the size is a hard
+requirement. Pass 1 measures complexity, pass 2 spends accordingly</td></tr>
+<tr><td><strong>CBR</strong></td><td>A constant bitrate</td><td>Broadcast, and links with a fixed
+capacity. Wastes bits on easy content by padding</td></tr>
+<tr><td><strong>Capped CRF</strong></td><td>CRF <em>plus</em> a maximum bitrate</td><td><strong>The right
+answer for streaming.</strong> Quality-driven, but never exceeds what the client can pull</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># CRF - the one to reach for.
+$ ffmpeg -i in.mov -c:v libx264 -crf 23 -preset slow out.mp4
+
+#   x264 CRF 18   visually lossless-ish
+#         23      the default; good
+#         28      noticeably compressed
+#   x265 and AV1 use a similar scale but the numbers are NOT
+#   comparable - x265 CRF 28 is roughly x264 CRF 23.
+#   +6 CRF is about half the bitrate. -6 is about double.
+
+# CAPPED CRF - quality-driven with a ceiling. This is what
+# streaming services actually use:
+$ ffmpeg -i in.mov -c:v libx264 -crf 23 \
+    -maxrate 6M -bufsize 12M -preset slow out.mp4
+#   crf      the quality you want
+#   maxrate  the ceiling you must not exceed
+#   bufsize  how much short-term variation is allowed
+# Easy scenes come out well under 6M; hard scenes are capped.
+
+# 2-PASS, when the SIZE is the requirement:
+$ ffmpeg -i in.mov -c:v libx264 -b:v 5M -pass 1 -an -f null /dev/null
+$ ffmpeg -i in.mov -c:v libx264 -b:v 5M -pass 2 out.mp4
+# Pass 1 writes a stats file recording each frame's
+# complexity. Pass 2 distributes the bit budget across the
+# whole file, giving hard scenes more and easy ones less.
+
+# CBR - genuinely constant, with padding:
+$ ffmpeg -i in.mov -c:v libx264 -b:v 5M -minrate 5M -maxrate 5M \
+    -bufsize 5M -x264-params "nal-hrd=cbr" out.ts
+
+# THE MISTAKE PEOPLE MAKE: setting -b:v AND -crf together.
+# CRF wins and the bitrate is ignored, so the file comes out
+# a completely different size than intended and nobody can
+# see why.</code></pre>
+
+<div class="key">
+<b>CRF is not "constant quality", it is constant <em>effort</em></b>
+<p>CRF adjusts QP per frame using a complexity estimate, deliberately spending fewer bits on frames where the
+eye will not notice — fast motion, dark scenes, high-detail texture. That is <em>adaptive quantisation</em>,
+and it is why CRF looks better than fixed QP at the same average bitrate. It also means the measured PSNR
+varies frame to frame by design, which surprises people benchmarking it.</p>
+</div>
+
+<h2 id="hrd">The buffer model</h2>
+
+<pre class="diagram">   A decoder receives bits at some rate and consumes a whole
+   frame instantly at each display time. If the buffer runs
+   dry, playback stalls. The HRD (Hypothetical Reference
+   Decoder) is the model that guarantees it will not.
+
+     buffer
+     fullness
+        |     /\      /\
+        |    /  \    /  \        fills at the bitrate,
+   full |---/----\--/----\-----  drains by one frame's bits
+        |  /      \/      \      at each frame time
+        | /                \
+   empty|/------------------\--  &lt;-- UNDERFLOW = a stall
+        +----------------------- time
+
+   THE THREE PARAMETERS
+
+     bitrate    the fill rate
+     bufsize    the buffer capacity, in bits
+     initial    how full before playback starts - this is
+                your startup delay
+
+   THE RULE: bufsize / bitrate = the seconds of variation
+   allowed.
+
+     bufsize = bitrate      1 second of slack. Tight; forces
+                            near-constant frame sizes; costs
+                            quality on hard scenes.
+     bufsize = 2 x bitrate  the usual streaming choice.
+     bufsize = 5 x bitrate  loose. Better quality, but the
+                            client needs a bigger buffer and
+                            a longer startup delay.
+
+   WHY IT MATTERS
+     * a live stream that overflows the client buffer causes
+       REBUFFERING - the visible failure viewers actually
+       complain about
+     * hardware decoders implement the HRD literally, and a
+       non-conformant stream can be REJECTED outright even
+       though software players accept it
+     * broadcast multiplexers allocate a fixed slot; exceeding
+       it corrupts the whole multiplex, not just your channel
+
+   AND THE FRAME-SIZE CONSEQUENCE: an I-frame is 10-20x a
+   P-frame (chapter 10). With a tight buffer the encoder must
+   either shrink the I-frame - hurting the whole GOP that
+   predicts from it - or spread the cost over the following
+   frames. Both look worse than a bigger buffer.</pre>
+
+<h2 id="aq">Adaptive quantisation and lookahead</h2>
+
+<pre><code>/* WITHIN a frame, not all blocks deserve the same QP. */
+
+  PSYCHOVISUAL MASKING: the eye cannot see quantisation error
+  in a busy, high-contrast region, but sees it immediately in
+  a smooth one. So:
+
+     flat areas    -> LOWER QP (finer quantisation)
+                      because banding and blocking would show
+     detailed areas -> HIGHER QP
+                      because the detail masks the error
+
+  This is backwards from what "spend bits where the detail is"
+  suggests, and it is measurably better.
+
+    --aq-mode 1    variance-based AQ
+    --aq-mode 2    auto-variance
+    --aq-mode 3    auto-variance with a dark-scene bias -
+                   x264's default, because dark areas show
+                   banding badly
+    --aq-strength  how aggressive, default 1.0
+
+/* LOOKAHEAD: the encoder buffers N frames before deciding. */
+
+    --rc-lookahead 40      x264's default
+
+  WITH LOOKAHEAD THE ENCODER CAN:
+    * see a scene cut coming and not waste bits on the frames
+      about to be discarded
+    * identify frames that many others will predict from and
+      spend MORE on them - MB-tree / macroblock tree, which
+      propagates a "how much does this block matter to the
+      future" weight backwards
+    * distribute the bit budget over an upcoming hard scene
+      instead of reacting to it late
+
+  MB-TREE IS WORTH 5-15% ON ITS OWN and is why x264 at
+  --preset slow beats a naive encoder at the same bitrate.
+
+  THE COST: latency. 40 frames of lookahead is 1.6 seconds at
+  25 fps. Real-time encoding sets --rc-lookahead 0 and
+  accepts the loss (chapter 10).                            */</code></pre>
+
+<div class="warn">
+<b>Quality pumping and how to recognise it</b>
+<p>If quality visibly oscillates — sharp, then soft, then sharp again on a two-second cycle — rate control is
+overreacting. Usual causes: <code>bufsize</code> too small for the content, ABR mode trying to hit an average
+without lookahead, or a GOP whose I-frame consumes so much of the budget that the following frames are
+starved. The fix is almost always a larger <code>bufsize</code> or switching to capped CRF; it is very rarely
+a higher bitrate.</p>
+</div>
+
+<h2 id="abr">Rate control for adaptive streaming</h2>
+
+<pre><code># A streaming ladder is several renditions of the same source,
+# and the client switches between them. Constraints:
+
+  1. GOP-ALIGNED. Every rendition must have a keyframe at the
+     same timestamps, or switching produces a glitch.
+       -x264-params "keyint=48:min-keyint=48:scenecut=0"
+     with 48 = 2 seconds at 24 fps. Scene cuts MUST be
+     disabled or the alignment breaks (chapter 10).
+
+  2. CAPPED CRF per rung, not fixed bitrate. An easy scene at
+     1080p may only need 2 Mbit/s; forcing 6 wastes bandwidth
+     and gains nothing.
+
+  3. THE LADDER ITSELF should be per-title. Netflix's
+     per-title encoding measures each title's complexity and
+     builds a custom ladder - an animated series needs far
+     less bitrate at 1080p than a grainy film, and a fixed
+     ladder over-serves one and under-serves the other.
+
+# A reasonable fixed ladder, for reference:
+#   1920x1080  crf 21  maxrate  6000k  bufsize 12000k
+#   1280x720   crf 21  maxrate  3000k  bufsize  6000k
+#    854x480   crf 22  maxrate  1500k  bufsize  3000k
+#    640x360   crf 23  maxrate   800k  bufsize  1600k
+#    426x240   crf 24  maxrate   400k  bufsize   800k
+
+# Segment and package:
+$ ffmpeg -i in.mp4 \
+  -c:v libx264 -crf 21 -maxrate 6000k -bufsize 12000k \
+  -x264-params "keyint=48:min-keyint=48:scenecut=0" \
+  -f hls -hls_time 2 -hls_playlist_type vod \
+  -hls_segment_filename "1080p_%03d.ts" 1080p.m3u8
+
+# VERIFY THE ALIGNMENT - this is the check people skip:
+$ for f in 1080p 720p 480p; do
+    echo -n "$f: "
+    ffprobe -select_streams v -skip_frame nokey \
+      -show_entries frame=pkt_pts_time -of csv=p=0 $f.m3u8 \
+      | head -5 | tr '\n' ' '
+    echo
+  done
+1080p: 0 2 4 6 8
+720p:  0 2 4 6 8
+480p:  0 2 4 6 8        # aligned. If these differ, switching
+                        # will glitch.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>File size nothing like the bitrate you set</td><td><code>-crf</code> and <code>-b:v</code> both given;
+CRF won</td></tr>
+<tr><td>Quality visibly pulses</td><td><code>bufsize</code> too small, or ABR without lookahead</td></tr>
+<tr><td>Playback rebuffers on a good connection</td><td>Peak bitrate exceeds what the buffer model allows —
+cap it</td></tr>
+<tr><td>Hardware decoder rejects a valid-looking stream</td><td>HRD non-conformance</td></tr>
+<tr><td>ABR switching glitches</td><td>GOPs not aligned across renditions, or scene cuts left on</td></tr>
+<tr><td>Dark scenes band badly</td><td>Adaptive quantisation off, or <code>aq-mode</code> without the dark
+bias</td></tr>
+<tr><td>First frames after a cut look terrible</td><td>No lookahead, so the encoder reacted late</td></tr>
+<tr><td>Real-time encoding has 1.6 s of latency</td><td><code>rc-lookahead</code> — set it to 0</td></tr>
+<tr><td>Two-pass produced a smaller file than requested</td><td>The content was easier than the target; that is
+correct behaviour</td></tr>
+<tr><td>Animation over-served, film under-served by one ladder</td><td>Fixed ladder rather than per-title</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the six rate-control modes and say which to use for stored video, for streaming and for a fixed
+  file size.</li>
+  <li>Explain what CRF actually holds constant.</li>
+  <li>Say what happens if you specify both a bitrate and a CRF.</li>
+  <li>Draw the HRD buffer model and say what underflow means to a viewer.</li>
+  <li>Explain what <code>bufsize / bitrate</code> represents and give a typical value.</li>
+  <li>Explain why a tight buffer hurts quality across a whole GOP.</li>
+  <li>Explain adaptive quantisation and why flat areas get <em>lower</em> QP.</li>
+  <li>Say what lookahead enables, and name the technique worth 5–15%.</li>
+  <li>Give three constraints on rate control for an adaptive streaming ladder.</li>
+  <li>Verify GOP alignment across renditions and say what a mismatch causes.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

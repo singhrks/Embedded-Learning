@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building a root filesystem | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Building a root filesystem</h1>
+<p class="lead">A kernel without userspace panics in half a second. This chapter covers the four ways to give
+it one — an initramfs you assemble by hand, Buildroot, a debootstrap image, and a container image reused as a
+rootfs — and when each is the right tool.</p>
+
+<h2 id="choose">Choosing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Method</th><th>Build time</th><th>Size</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><strong>Hand-built initramfs</strong></td><td>Seconds</td><td>2–5 MB</td><td>Driver testing, boot
+debugging, anything where you want to see everything that runs</td></tr>
+<tr><td><strong>Buildroot</strong></td><td>15–40 min first time, then
+incremental</td><td>10–100 MB</td><td>Realistic embedded userspace, cross-compiled packages, reproducible
+builds. The right default for this site's projects</td></tr>
+<tr><td><strong>debootstrap / mmdebstrap</strong></td><td>2–5 min</td><td>300 MB–1 GB</td><td>You want
+<code>apt</code>, a package archive and a normal distribution</td></tr>
+<tr><td><strong>Container image export</strong></td><td>Seconds</td><td>50–500 MB</td><td>You already have the
+userspace you want as a Docker image</td></tr>
+<tr><td><strong>Yocto</strong></td><td>Hours</td><td>Anything</td><td>Product builds. Overkill for
+learning</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="initramfs">Method 1: initramfs, by hand</h2>
+
+<pre><code>#!/bin/sh
+# mkinitramfs.sh - a complete, working root filesystem in one
+# script. This is the one to keep.
+set -e
+
+BB_VER=1.36.1
+ARCH=arm64
+CROSS=aarch64-linux-gnu-
+ROOT=$PWD/rootfs
+
+# --- busybox, statically linked -----------------------------
+if [ ! -d busybox-$BB_VER ]; then
+    wget -q https://busybox.net/downloads/busybox-$BB_VER.tar.bz2
+    tar xf busybox-$BB_VER.tar.bz2
+fi
+cd busybox-$BB_VER
+make ARCH=$ARCH CROSS_COMPILE=$CROSS defconfig &gt;/dev/null
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config
+make ARCH=$ARCH CROSS_COMPILE=$CROSS -j$(nproc) &gt;/dev/null
+make ARCH=$ARCH CROSS_COMPILE=$CROSS CONFIG_PREFIX=$ROOT install
+cd ..
+
+# --- the directory skeleton ---------------------------------
+mkdir -p $ROOT/{proc,sys,dev,tmp,run,root,etc/init.d,lib/modules}
+
+# --- init ---------------------------------------------------
+cat &gt; $ROOT/init &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs    tmpfs    /tmp
+mkdir -p /dev/pts &amp;&amp; mount -t devpts devpts /dev/pts
+
+# load any modules we shipped
+for m in /lib/modules/*.ko; do
+        [ -e "$m" ] &amp;&amp; insmod "$m" 2&gt;/dev/null
+done
+
+# bring up loopback and the virtio NIC if present
+ip link set lo up 2&gt;/dev/null
+ip link set eth0 up 2&gt;/dev/null &amp;&amp; udhcpc -i eth0 -q 2&gt;/dev/null
+
+echo
+echo "=== rootfs up: $(uname -srm) ==="
+echo
+
+exec /bin/sh
+EOF
+chmod +x $ROOT/init
+
+# --- minimal /etc -------------------------------------------
+echo "root:x:0:0:root:/root:/bin/sh" &gt; $ROOT/etc/passwd
+echo "root:x:0:"                     &gt; $ROOT/etc/group
+echo "qemu"                          &gt; $ROOT/etc/hostname
+cat &gt; $ROOT/etc/fstab &lt;&lt;'EOF'
+proc  /proc  proc  defaults 0 0
+sysfs /sys   sysfs defaults 0 0
+EOF
+
+# --- pack ---------------------------------------------------
+( cd $ROOT &amp;&amp; find . -print0 \
+  | cpio --null -o --format=newc 2&gt;/dev/null ) | gzip -9 \
+  &gt; initramfs.cpio.gz
+
+echo "built: initramfs.cpio.gz ($(du -h initramfs.cpio.gz | cut -f1))"</code></pre>
+
+<pre><code>$ ./mkinitramfs.sh
+built: initramfs.cpio.gz (1.2M)
+
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512M -nographic \
+    -kernel Image -initrd initramfs.cpio.gz \
+    -append "console=ttyAMA0 earlycon"
+...
+=== rootfs up: Linux 6.8.0 aarch64 ===
+
+/ #
+
+# To add YOUR kernel module to the image, drop it in
+# rootfs/lib/modules/ before packing. The init script loads
+# everything it finds - which is exactly what you want while
+# developing a driver (Linux track, chapter 28).</code></pre>
+
+<div class="key">
+<b>Why static linking matters here</b>
+<p>An initramfs has no dynamic loader unless you put one there, and a dynamically linked busybox fails with
+<code>not found</code> — a message that describes the missing <em>loader</em>, not the missing binary, and
+sends people hunting for the wrong thing. Build static and the problem cannot occur.</p>
+</div>
+
+<h2 id="buildroot">Method 2: Buildroot</h2>
+
+<pre><code>$ git clone --depth=1 -b 2024.02 \
+    https://gitlab.com/buildroot.org/buildroot.git
+$ cd buildroot
+
+# There is a ready-made config for exactly our target:
+$ make qemu_aarch64_virt_defconfig
+
+# Customise:
+$ make menuconfig
+#   Target packages -> Debugging  -> gdb, strace, ltrace
+#   Target packages -> Networking -> openssh, iperf3
+#   Target packages -> Hardware   -> optee-client, optee-test
+#   Filesystem images -> ext2/3/4 root filesystem
+#                     -> cpio the root filesystem (for initramfs)
+#   Toolchain -> Build cross gdb for the host
+#   Kernel -> (leave off if you build your own)
+
+$ make -j$(nproc)          # 15-40 minutes the first time
+
+$ ls output/images/
+Image  rootfs.cpio.gz  rootfs.ext4  start-qemu.sh
+
+# Buildroot even writes the QEMU command line for you:
+$ ./output/images/start-qemu.sh
+# or run it yourself:
+$ qemu-system-aarch64 -M virt -cpu cortex-a53 -m 512M -nographic \
+    -kernel output/images/Image \
+    -drive file=output/images/rootfs.ext4,if=none,format=raw,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -append "console=ttyAMA0 root=/dev/vda rootwait"
+
+# Rebuild just one package after changing it:
+$ make optee-client-rebuild
+$ make                      # repacks the images
+
+# Buildroot is the right answer for this site's OP-TEE track
+# because it already knows how to build optee-client,
+# optee-test and the TA development kit, and puts them in the
+# right places.</code></pre>
+
+<h2 id="debootstrap">Method 3: a real Debian</h2>
+
+<pre><code># When you want apt, a package archive, and systemd.
+
+$ sudo apt install debootstrap qemu-user-static
+$ mkdir -p rootfs
+$ sudo debootstrap --arch=arm64 --foreign bookworm rootfs \
+      http://deb.debian.org/debian
+
+# Second stage runs arm64 binaries via binfmt_misc + qemu-user
+$ sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+$ sudo chroot rootfs /debootstrap/debootstrap --second-stage
+
+# Configure it before first boot
+$ sudo chroot rootfs /bin/bash &lt;&lt;'EOF'
+echo "root:root" | chpasswd
+echo qemu &gt; /etc/hostname
+apt-get update
+apt-get install -y --no-install-recommends \
+    systemd-sysv udev iproute2 openssh-server vim less
+systemctl enable serial-getty@ttyAMA0.service
+cat &gt; /etc/fstab &lt;&lt;'FSTAB'
+/dev/vda / ext4 defaults 0 1
+FSTAB
+EOF
+
+# Turn the directory into a disk image
+$ dd if=/dev/zero of=debian.ext4 bs=1M count=4096
+$ mkfs.ext4 -F debian.ext4
+$ mkdir -p mnt &amp;&amp; sudo mount -o loop debian.ext4 mnt
+$ sudo cp -a rootfs/. mnt/
+$ sudo umount mnt
+
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 2G -nographic \
+    -kernel Image \
+    -drive file=debian.ext4,if=none,format=raw,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+    -append "console=ttyAMA0 root=/dev/vda rw rootwait"</code></pre>
+
+<h2 id="container">Method 4: steal a container image</h2>
+
+<pre><code># The fastest way to a full userspace you already trust.
+
+$ docker pull --platform linux/arm64 debian:bookworm
+$ docker create --platform linux/arm64 --name tmp debian:bookworm
+$ mkdir -p rootfs &amp;&amp; docker export tmp | tar -C rootfs -xf -
+$ docker rm tmp
+
+# Container images have no init and no kernel. Add one:
+$ sudo tee rootfs/init &gt;/dev/null &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+exec /bin/bash
+EOF
+$ sudo chmod +x rootfs/init
+
+# Then pack as initramfs, or write into an ext4 image as above.
+$ ( cd rootfs &amp;&amp; sudo find . -print0 \
+    | sudo cpio --null -o --format=newc ) | gzip &gt; initramfs.cpio.gz
+
+# Podman works identically and does not need a daemon:
+$ podman pull --arch arm64 alpine
+$ podman export $(podman create --arch arm64 alpine) | tar -C rootfs -xf -</code></pre>
+
+<h2 id="image">Making a bootable disk image</h2>
+
+<pre><code># A single-partition ext4 image, which is all QEMU needs:
+$ truncate -s 2G rootfs.ext4
+$ mkfs.ext4 -d rootfs -F rootfs.ext4      # -d populates it
+                                          # directly - no
+                                          # mounting, no root!
+
+# A partitioned image, closer to a real SD card:
+$ truncate -s 4G sd.img
+$ sfdisk sd.img &lt;&lt;'EOF'
+label: dos
+start=2048, size=204800, type=c, bootable
+start=206848, type=83
+EOF
+$ LOOP=$(sudo losetup -Pf --show sd.img)
+$ sudo mkfs.vfat -F32 ${LOOP}p1
+$ sudo mkfs.ext4 -F ${LOOP}p2
+$ sudo mount ${LOOP}p2 /mnt &amp;&amp; sudo cp -a rootfs/. /mnt/ \
+  &amp;&amp; sudo umount /mnt
+$ sudo losetup -d $LOOP
+
+# Resize later, without recreating:
+$ truncate -s 8G rootfs.ext4
+$ e2fsck -f rootfs.ext4 &amp;&amp; resize2fs rootfs.ext4
+
+# Inspect an image without mounting - useful in CI:
+$ debugfs -R "ls -l /" rootfs.ext4
+$ debugfs -R "cat /etc/hostname" rootfs.ext4</code></pre>
+
+<div class="tip">
+<b><code>mkfs.ext4 -d</code> is the trick worth remembering</b>
+<p>It populates a filesystem image from a directory without mounting anything, which means no
+<code>sudo</code>, no loop devices, and it works inside an unprivileged container. Every CI pipeline that
+builds an image should use it.</p>
+</div>
+
+<h2 id="share">Getting files in and out</h2>
+
+<pre><code># 1. virtiofs - best, needs a daemon (virt chapter 15)
+$ virtiofsd --socket-path=/tmp/vfs.sock -o source=$PWD/share &amp;
+$ qemu-system-aarch64 ... \
+    -object memory-backend-file,id=mem,size=2G,mem-path=/dev/shm,share=on \
+    -M virt,memory-backend=mem \
+    -chardev socket,id=vfs,path=/tmp/vfs.sock \
+    -device vhost-user-fs-device,chardev=vfs,tag=share
+# guest: mount -t virtiofs share /mnt
+
+# 2. 9p - no daemon, slower, works everywhere
+$ qemu-system-aarch64 ... \
+    -fsdev local,id=fs0,path=$PWD/share,security_model=none \
+    -device virtio-9p-device,fsdev=fs0,mount_tag=share
+# guest: mount -t 9p -o trans=virtio,version=9p2000.L share /mnt
+
+# 3. A second disk - simplest, no guest config
+$ qemu-img create -f raw scratch.img 1G &amp;&amp; mkfs.ext4 -F scratch.img
+$ qemu-system-aarch64 ... \
+    -drive file=scratch.img,if=none,format=raw,id=s0 \
+    -device virtio-blk-device,drive=s0
+# guest: mount /dev/vdb /mnt
+
+# 4. SSH over user networking (chapter 8)
+$ qemu-system-aarch64 ... \
+    -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+    -device virtio-net-device,netdev=n0
+$ scp -P 2222 file root@localhost:/tmp/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>No working init found</code></td><td>No <code>/init</code>, not executable, or the archive was
+built from the wrong directory</td></tr>
+<tr><td><code>/init: not found</code> though the file exists</td><td>Dynamically linked binary with no loader —
+build static, or ship <code>ld-linux-aarch64.so.1</code></td></tr>
+<tr><td><code>VFS: Unable to mount root fs on unknown-block(0,0)</code></td><td>Wrong
+<code>root=</code>, or no virtio-blk driver, or missing <code>rootwait</code></td></tr>
+<tr><td>Boots to a prompt with no working commands</td><td>busybox installed but its symlinks were not created
+— run <code>busybox --install -s</code></td></tr>
+<tr><td>No <code>/dev</code> entries</td><td><code>devtmpfs</code> not mounted, or
+<code>CONFIG_DEVTMPFS</code> off</td></tr>
+<tr><td>Debian image hangs after mounting root</td><td>No getty on <code>ttyAMA0</code> —
+<code>systemctl enable serial-getty@ttyAMA0</code></td></tr>
+<tr><td>Container-derived rootfs has no <code>/proc</code></td><td>Container images omit the pseudo-filesystem
+mount points; create them</td></tr>
+<tr><td>Image full immediately</td><td><code>truncate</code> made a sparse file; the filesystem inside is still
+its original size — <code>resize2fs</code></td></tr>
+<tr><td>Buildroot rebuild does not pick up a change</td><td>Use <code>make &lt;pkg&gt;-rebuild</code>, not
+<code>make</code> alone</td></tr>
+<tr><td>9p mount fails with "no such device"</td><td>Guest kernel missing <code>CONFIG_NET_9P_VIRTIO</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the four rootfs methods and the situation each is best for.</li>
+  <li>Explain why busybox must be statically linked in a hand-built initramfs.</li>
+  <li>Write the minimum <code>/init</code> that a kernel will accept, and say what each mount is for.</li>
+  <li>Pack a directory into a <code>newc</code> cpio archive and say why that format.</li>
+  <li>Explain what <code>mkfs.ext4 -d</code> avoids.</li>
+  <li>Build a Buildroot image for <code>qemu_aarch64_virt</code> and boot it from a virtio disk.</li>
+  <li>Explain how <code>debootstrap --foreign</code> plus <code>qemu-user-static</code> builds a foreign
+  rootfs.</li>
+  <li>Give four ways to move a file between host and guest, ranked.</li>
+  <li>Diagnose <code>Unable to mount root fs on unknown-block(0,0)</code>.</li>
+  <li>Add your own kernel module to an initramfs so it loads at boot.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

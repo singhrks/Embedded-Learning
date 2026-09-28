@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Startup code: .data, .bss and the C runtime | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Startup code: .data, .bss and the C runtime</h1>
+<p class="lead">C promises that globals with initialisers hold their values and globals without them are zero.
+On a hosted system the loader keeps that promise. Here, roughly forty lines of code you own keep it — and if
+they are wrong, C stops being C.</p>
+
+<h2 id="contract">The C runtime contract</h2>
+
+<pre class="diagram">   WHAT THE C STANDARD PROMISES        WHO DELIVERS IT HERE
+
+   int a = 42;                         Reset_Handler's
+     -&gt; a == 42 at main()              copy loop
+
+   int b;                              Reset_Handler's
+     -&gt; b == 0 at main()               zero loop
+
+   static int c = 7;                   same copy loop
+     -&gt; c == 7 at main()
+
+   C++ global constructors run         Reset_Handler calling
+     before main()                     __libc_init_array
+
+   Before Reset_Handler completes, NONE of these hold. Any
+   code that runs earlier - and on some parts SystemInit()
+   does - is running in a language that merely resembles C.
+   Globals read there return whatever the SRAM powered up
+   with, which on many parts is genuinely random.</pre>
+
+<div class="danger">
+<b>The rule that follows</b>
+<p>Do not touch initialised globals before the copy and zero loops have run. This bites hardest in
+<code>SystemInit()</code>, which many vendor templates call <em>before</em> the loops so that clocks are up
+early. If <code>SystemInit()</code> writes <code>SystemCoreClock</code> — a global — the subsequent
+<code>.data</code> copy overwrites it with the flash initialiser, and every delay in your program is wrong by
+whatever ratio the reset clock differs from the configured one. It is a genuinely common bug and it looks like
+a hardware fault.</p>
+</div>
+
+<h2 id="reset">Reset_Handler, complete</h2>
+
+<pre><code>/* Portable C startup. Every symbol here comes from the
+   linker script in chapter 05.                             */
+
+extern uint32_t _sidata;   /* .data initialisers, in flash  */
+extern uint32_t _sdata;    /* .data start, in RAM           */
+extern uint32_t _edata;    /* .data end,   in RAM           */
+extern uint32_t _sbss;     /* .bss  start, in RAM           */
+extern uint32_t _ebss;     /* .bss  end,   in RAM           */
+
+extern void SystemInit(void);
+extern void __libc_init_array(void);
+extern int  main(void);
+
+__attribute__((naked, noreturn)) void Reset_Handler(void)
+{
+    /* The stack pointer is already loaded by hardware from
+       vector[0], so we may call functions immediately.
+
+       'naked' because we must not have a prologue that
+       touches a stack we have not validated, and because
+       this function never returns.                          */
+
+    /* 1. Copy .data from flash to RAM. */
+    uint32_t *src = &amp;_sidata;
+    uint32_t *dst = &amp;_sdata;
+    while (dst &lt; &amp;_edata) {
+        *dst++ = *src++;
+    }
+
+    /* 2. Zero .bss. */
+    dst = &amp;_sbss;
+    while (dst &lt; &amp;_ebss) {
+        *dst++ = 0;
+    }
+
+    /* 3. NOW globals are valid. Clocks may safely use them. */
+    SystemInit();
+
+    /* 4. Run C++ constructors and anything in .init_array.
+          Harmless in a pure C project - the array is empty. */
+    __libc_init_array();
+
+    /* 5. Go. */
+    (void) main();
+
+    /* main() returning is a bug on bare metal - there is
+       nothing to return to. Trap rather than fall off the
+       end into whatever bytes follow.                       */
+    for (;;) { }
+}
+</code></pre>
+
+<div class="note">
+<b>Why the loops are word-wide</b>
+<p>The linker script aligns every boundary to 4 bytes, so copying <code>uint32_t</code> at a time is safe and
+four times faster than bytes. If you ever change those <code>ALIGN(4)</code> directives, these loops become
+unaligned accesses — which on Cortex-M0 is a fault, and on M3 and above is merely slow. Keep the two files in
+agreement; they are one mechanism, as chapter 05 argued.</p>
+</div>
+
+<h2 id="weak">Default handlers and the weak-symbol trick</h2>
+
+<p>The vector table names a hundred handlers. You will implement three. The remaining ninety-seven still need
+addresses, and the standard mechanism is weak aliasing.</p>
+
+<pre><code>/* Every handler is declared weak and aliased to one default.
+   If you define a real one anywhere in the project, the
+   linker prefers yours; otherwise the alias stands.        */
+
+void Default_Handler(void)
+{
+    /* Deliberately NOT an empty while(1). See below. */
+    __asm volatile ("bkpt #0");   /* halt if a debugger is attached */
+    for (;;) { }
+}
+
+#define ALIAS_DEFAULT __attribute__((weak, alias("Default_Handler")))
+
+void NMI_Handler(void)          ALIAS_DEFAULT;
+void HardFault_Handler(void)    ALIAS_DEFAULT;
+void SVC_Handler(void)          ALIAS_DEFAULT;
+void PendSV_Handler(void)       ALIAS_DEFAULT;
+void SysTick_Handler(void)      ALIAS_DEFAULT;
+void USART1_IRQHandler(void)    ALIAS_DEFAULT;
+/* ... and so on for every peripheral ... */
+
+/* Now, elsewhere in the project:
+
+     void USART1_IRQHandler(void) { ... }
+
+   silently and correctly replaces the default. No
+   registration call, no table edit. This is why adding an
+   interrupt handler on Cortex-M is just defining a function
+   with the right name - and why a TYPO in that name is such
+   a nasty bug: your function is never called, the default
+   handler runs instead, and nothing warns you.
+
+   Guard against it: after enabling an interrupt, assert that
+   the vector table entry is not Default_Handler.           */
+
+void assert_handler_installed(IRQn_Type irq)
+{
+    uint32_t *vt = (uint32_t *) SCB-&gt;VTOR;
+    void (*installed)(void) = (void (*)(void)) vt[16 + irq];
+    configASSERT(installed != Default_Handler);
+}
+</code></pre>
+
+<div class="warn">
+<b>An empty <code>while(1)</code> is the worst possible default handler</b>
+<p>The chip stops, the watchdog eventually resets it, and the reset cause says "watchdog" — telling you
+nothing. A <code>bkpt</code> halts into the debugger if one is attached and is a no-op if not, so you land
+exactly at the fault with the stack intact. Better still, record the active <code>IPSR</code> to a
+<code>.noinit</code> variable first, so a field unit's next boot can report which unhandled interrupt killed
+it. <a href="mcu-15-faults.html">Chapter 15</a> builds that out.</p>
+</div>
+
+<h2 id="assembly">The same thing in assembly</h2>
+
+<p>Vendor templates usually ship assembly. It is worth being able to read it, because when the C version
+misbehaves the assembly is the reference.</p>
+
+<pre><code>    .syntax unified
+    .cpu    cortex-m4
+    .thumb
+
+    .global Reset_Handler
+    .type   Reset_Handler, %function
+Reset_Handler:
+    ldr   sp, =_estack          @ redundant - hardware did it,
+                                @ but harmless and explicit
+
+    movs  r1, #0                @ offset into .data
+    b     LoopCopyDataInit
+
+CopyDataInit:
+    ldr   r3, =_sidata          @ source base (flash)
+    ldr   r3, [r3, r1]          @ load word at source+offset
+    str   r3, [r0, r1]          @ store to dest+offset
+    adds  r1, r1, #4
+
+LoopCopyDataInit:
+    ldr   r0, =_sdata
+    ldr   r3, =_edata
+    adds  r2, r0, r1
+    cmp   r2, r3
+    bcc   CopyDataInit          @ branch if carry clear (unsigned &lt;)
+
+    ldr   r2, =_sbss
+    b     LoopFillZerobss
+
+FillZerobss:
+    movs  r3, #0
+    str   r3, [r2], #4          @ store and post-increment
+
+LoopFillZerobss:
+    ldr   r3, =_ebss
+    cmp   r2, r3
+    bcc   FillZerobss
+
+    bl    SystemInit
+    bl    __libc_init_array
+    bl    main
+    b     .                     @ trap if main returns
+
+/* Same five steps. The 'bcc' (branch if carry clear) is the
+   unsigned less-than test - a detail worth knowing because
+   using 'blt' (signed) here is a real bug on parts where
+   RAM addresses have the top bit set.                       */
+</code></pre>
+
+<h2 id="libc">Retargeting the C library</h2>
+
+<p><code>printf</code>, <code>malloc</code> and <code>assert</code> all assume an operating system. Newlib
+resolves that by calling out to a small set of stubs you must supply.</p>
+
+<pre><code>/* The minimum set to make newlib link and behave. */
+
+#include &lt;errno.h&gt;
+#include &lt;sys/stat.h&gt;
+
+/* Where printf's bytes go. */
+int _write(int fd, char *buf, int len)
+{
+    (void) fd;
+    for (int i = 0; i &lt; len; i++) {
+        uart_putc(buf[i]);
+    }
+    return len;
+}
+
+/* The heap. sbrk grows it; this version refuses to collide
+   with the stack, which the naive vendor version does not. */
+extern uint32_t _end;      /* end of .bss, from linker      */
+extern uint32_t _estack;
+
+void *_sbrk(ptrdiff_t incr)
+{
+    static char *brk = NULL;
+    if (brk == NULL) {
+        brk = (char *) &amp;_end;
+    }
+
+    char *sp = (char *) __get_MSP();
+    if (brk + incr &gt; sp - 512) {      /* keep 512 B for stack */
+        errno = ENOMEM;
+        return (void *) -1;
+    }
+
+    char *prev = brk;
+    brk += incr;
+    return prev;
+}
+
+int _close(int fd)                 { (void)fd; return -1; }
+int _fstat(int fd, struct stat *st){ (void)fd; st-&gt;st_mode = S_IFCHR; return 0; }
+int _isatty(int fd)                { (void)fd; return 1; }
+int _lseek(int fd, int p, int w)   { (void)fd;(void)p;(void)w; return 0; }
+int _read(int fd, char *b, int l)  { (void)fd;(void)b;(void)l; return 0; }
+
+/* Two things worth knowing:
+
+   1. printf with %f pulls in roughly 8-10 kB of float
+      formatting. Link with -u _printf_float only if you
+      need it, or use a tiny printf implementation. On a
+      part with 32 kB of flash this single decision can be
+      a third of your budget.
+
+   2. Use -specs=nano.specs for newlib-nano: a much smaller
+      libc with a reduced printf. Almost always the right
+      default on an MCU.                                     */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Initialised globals hold garbage</td><td>Copy loop missing, or <code>_sidata</code> wrong because the
+<code>AT&gt;</code> clause is absent</td></tr>
+<tr><td>A global set in <code>SystemInit()</code> reverts</td><td><code>SystemInit()</code> ran before the
+copy loop and was overwritten by it</td></tr>
+<tr><td>Uninitialised globals are not zero</td><td>Zero loop missing, or <code>_sbss</code>/<code>_ebss</code>
+not exported</td></tr>
+<tr><td>Every delay is wrong by a fixed ratio</td><td><code>SystemCoreClock</code> clobbered by the
+<code>.data</code> copy</td></tr>
+<tr><td>C++ objects behave as if never constructed</td><td><code>__libc_init_array()</code> not called</td></tr>
+<tr><td>An ISR you wrote is never entered</td><td>Handler name misspelled; the weak default is still
+linked</td></tr>
+<tr><td>Chip resets periodically, cause reads "watchdog"</td><td>An unhandled interrupt spinning in an empty
+default handler</td></tr>
+<tr><td>Unaligned access fault in startup</td><td>Section boundaries not 4-byte aligned but loops copy
+words</td></tr>
+<tr><td><code>malloc</code> succeeds then the stack corrupts</td><td>Vendor <code>_sbrk</code> with no stack
+collision check</td></tr>
+<tr><td>Binary grows 10 kB after adding one <code>printf</code></td><td>Float formatting pulled in; use
+newlib-nano or a tiny printf</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the five steps of <code>Reset_Handler</code> in order.</li>
+  <li>Explain what the C standard promises about globals and who delivers it here.</li>
+  <li>Say why touching globals in <code>SystemInit()</code> can be a bug.</li>
+  <li>Explain why <code>Reset_Handler</code> is declared <code>naked</code>.</li>
+  <li>Describe how weak aliasing lets you install a handler by defining a function.</li>
+  <li>Explain the failure mode of a misspelled handler name and how to detect it.</li>
+  <li>Give two reasons an empty <code>while(1)</code> is a bad default handler.</li>
+  <li>Explain why the copy loops move words rather than bytes, and what constrains that.</li>
+  <li>Name three newlib stubs and what each is for.</li>
+  <li>Say what <code>-specs=nano.specs</code> changes and why it matters on a small part.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

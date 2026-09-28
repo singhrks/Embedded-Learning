@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Static partitioning: Xen, Jailhouse and safety | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Static partitioning: Xen, Jailhouse and safety</h1>
+<p class="lead">Everything so far assumed the hypervisor should share resources cleverly. In safety-critical
+embedded systems that assumption is inverted: sharing is the hazard, and the hypervisor's job is to divide
+the machine once, at boot, and then get out of the way — ideally while executing no code at all during normal
+operation.</p>
+
+<h2 id="inversion">The inversion</h2>
+
+<p>Static partitioning inverts the usual goal: rather than sharing a machine efficiently, it divides one so that the parts cannot interfere. The design consequences follow from that single change.</p>
+
+<pre class="diagram">   CONSOLIDATING hypervisor (KVM, Xen, VMware)
+
+     goal: run N guests on M cores, N &gt; M
+     scheduler: yes, and it is the interesting part
+     memory: overcommitted, ballooned, swapped
+     devices: emulated or shared
+     failure mode: a noisy guest degrades its neighbours
+     metric: throughput per watt, density, utilisation
+
+
+   PARTITIONING hypervisor (Jailhouse, Xen dom0-less,
+                            Bao, PikeOS, QNX Hypervisor)
+
+     goal: run N guests on N disjoint sets of cores
+     scheduler: NONE. A core belongs to one guest, always.
+     memory: statically carved, never shared, never reclaimed
+     devices: statically assigned, one owner each
+     failure mode: a guest can only harm itself
+     metric: worst-case latency, certifiability, code size
+
+   The partitioning hypervisor is not a worse consolidator.
+   It is a different product, and asking it to time-share is
+   asking it to stop being what it is.</pre>
+
+<div class="key">
+<b>Why "no scheduler" is the point</b>
+<p>If the hypervisor never preempts a guest, then the guest's worst-case execution time is a property of the
+guest and the hardware alone. You can analyse it, bound it, and put it in a safety case. Add a scheduler and
+the worst case becomes a property of every other guest in the system — and that is not analysable in any
+useful sense. Certification does not reward cleverness; it rewards arguments you can finish.</p>
+</div>
+
+<h2 id="jailhouse">Jailhouse: the minimal case</h2>
+
+<p>The minimal case is instructive because it does so little — and what it declines to do is the interesting part.</p>
+
+<pre class="diagram">   Jailhouse does not boot the machine. Linux does.
+   Then Linux hands pieces of itself away.
+
+   Step 1: Linux boots normally on all 4 cores.
+           You reserve memory with the kernel command line:
+              memmap=0x4000000$0x3f000000
+
+   Step 2: load the hypervisor
+              jailhouse enable system-config.cell
+           Jailhouse installs itself at EL2 UNDER the running
+           Linux, which becomes the "root cell". Linux does not
+           notice; it keeps running, now virtualised.
+
+   Step 3: take resources away
+              jailhouse cell create rtos.cell
+              jailhouse cell load rtos 0 rtos.bin
+              jailhouse cell start rtos
+           Cores 2 and 3 are removed from Linux (offlined
+           first), the reserved memory is unmapped from the
+           root cell, and the RTOS starts on them.
+
+   AFTER THIS POINT:
+
+     +----------------------+   +---------------------+
+     | root cell: Linux     |   | cell 1: RTOS        |
+     | cores 0-1            |   | cores 2-3           |
+     | RAM 0-1 GB           |   | RAM 1.0-1.06 GB     |
+     | eth0, sd, usb        |   | CAN, one timer      |
+     +----------------------+   +---------------------+
+     +---------------------------------------------------+
+     |  Jailhouse at EL2: ~10k lines, no scheduler,      |
+     |  no dynamic memory, no drivers, no interrupts     |
+     |  of its own. Configures stage 2, the SMMU and the |
+     |  GIC, then ERETs and is essentially never         |
+     |  entered again.                                    |
+     +---------------------------------------------------+
+
+   The hypervisor's steady-state CPU consumption is ZERO,
+   because in steady state it does not run.</pre>
+
+<pre><code>/* A Jailhouse cell configuration is a C struct compiled to a
+   binary blob. This is the entire interface, and its
+   explicitness is deliberate.                              */
+
+struct { ... } config = {
+        .cell = {
+                .name = "rtos-cell",
+                .flags = JAILHOUSE_CELL_PASSIVE_COMMREG,
+                .cpu_set_size = sizeof(config.cpus),
+                .num_memory_regions = ARRAY_SIZE(config.mem_regions),
+                .num_irqchips = ARRAY_SIZE(config.irqchips),
+                .vpci_irq_base = 100,
+        },
+
+        .cpus = { 0b1100 },          /* cores 2 and 3          */
+
+        .mem_regions = {
+                /* RAM: physical == virtual, exclusively ours  */
+                {
+                        .phys_start = 0x40000000,
+                        .virt_start = 0x40000000,
+                        .size       = 0x04000000,
+                        .flags = JAILHOUSE_MEM_READ  |
+                                 JAILHOUSE_MEM_WRITE |
+                                 JAILHOUSE_MEM_EXECUTE |
+                                 JAILHOUSE_MEM_LOADABLE,
+                },
+                /* The CAN controller - ONE owner, and Linux
+                   must not have a driver bound to it.        */
+                {
+                        .phys_start = 0xff060000,
+                        .virt_start = 0xff060000,
+                        .size       = 0x1000,
+                        .flags = JAILHOUSE_MEM_READ |
+                                 JAILHOUSE_MEM_WRITE |
+                                 JAILHOUSE_MEM_IO,
+                },
+        },
+
+        .irqchips = {
+                {
+                        .address = 0xf9010000,   /* GICD       */
+                        .pin_base = 32,
+                        .pin_bitmap = { 1 &lt;&lt; (142 - 32) },
+                                        /* SPI 142 = the CAN   */
+                },
+        },
+};
+
+/* Notice what is NOT here: no memory size to grow into, no
+   share of CPU time, no priority. Everything is a fixed
+   assignment, decided before the system runs, auditable by
+   reading one file.                                         */</code></pre>
+
+<h2 id="xen">Xen on ARM, and dom0-less</h2>
+
+<p>Xen's embedded configurations have moved a long way from the datacentre model, particularly in removing the privileged domain from the boot path.</p>
+
+<pre class="diagram">   Classic Xen                    Xen dom0-less (embedded)
+
+   +-------+ +-------+ +-----+    +-------+ +-------+ +-------+
+   | dom0  | | domU  | |domU |    | dom0  | | domU1 | | domU2 |
+   | Linux | | Linux | |RTOS |    | Linux | | Linux | | RTOS  |
+   | DRIVERS AND CONTROL  |       |       | |       | |       |
+   +-------+ +-------+ +-----+    +-------+ +-------+ +-------+
+   +-------------------------+    +-------------------------+
+   |          Xen            |    |          Xen            |
+   +-------------------------+    +-------------------------+
+
+   Classic: every domU's I/O goes through dom0's drivers via
+            the split frontend/backend model. dom0 boots first,
+            everything waits for it. Boot to a working domU:
+            many seconds.
+
+   Dom0-less: Xen starts ALL domains simultaneously from the
+            device tree at boot, each with statically assigned
+            memory and passed-through devices. A safety domain
+            can be running its control loop before Linux has
+            finished decompressing.
+
+   Device tree fragment that does it:
+
+     chosen {
+         domU1 {
+             compatible = "xen,domain";
+             memory = &lt;0 0x20000000&gt;;
+             cpus = &lt;2&gt;;
+             vpl011;
+             module@50000000 {
+                 compatible = "multiboot,kernel", "multiboot,module";
+                 reg = &lt;0x50000000 0x2000000&gt;;
+                 bootargs = "console=hvc0 root=/dev/ram0";
+             };
+         };
+     };
+
+   This is the model behind Xilinx/AMD, NXP and Renesas
+   automotive stacks, and behind most "Linux plus a safety
+   island" designs shipping today.</pre>
+
+<h2 id="cache">The part everyone forgets: shared microarchitecture</h2>
+
+<p>The isolation these systems promise is defeated by hardware the partitioning does not divide, and this is the part that most often gets discovered during certification rather than design.</p>
+
+<pre class="diagram">   You have partitioned cores, memory and devices. You have
+   NOT partitioned:
+
+     the last-level cache      a Linux guest streaming data
+                               evicts the RTOS's working set
+
+     the memory controller     bandwidth and queueing delay are
+                               shared; a DMA-heavy guest adds
+                               latency to every other access
+
+     the interconnect          arbitration, and any shared
+                               buffering
+
+     shared TLB / prefetchers  on some designs
+
+   Consequence: two guests that never share a byte of memory
+   still interfere in TIME. For a throughput workload this is
+   noise. For a 100 us control loop it is the difference
+   between meeting and missing a deadline.
+
+   MITIGATIONS, in increasing order of effort:
+
+   1. CACHE COLOURING. Allocate each partition only physical
+      pages that map to disjoint cache sets. Because the cache
+      index comes from physical address bits, choosing pages
+      chooses cache regions. Jailhouse and Bao support it;
+      you pay in usable memory and in allocator complexity.
+
+   2. MPAM (ARMv8.4 Memory System Resource Partitioning and
+      Monitoring). Hardware support: tag each request with a
+      PARTID, and configure cache-capacity and bandwidth limits
+      per PARTID. This is the proper answer, and it is
+      appearing in server and automotive silicon now.
+        MPAM1_EL1 / MPAM2_EL2 hold the PARTID for each level.
+
+   3. MEASURE AND OVER-PROVISION. Run the interference
+      benchmark (a deliberately cache-hostile stressor) in the
+      Linux partition while measuring the RTOS's worst-case
+      latency. Whatever number you get IS your worst case.
+      This is what safety cases actually contain.</pre>
+
+<div class="warn">
+<b>Interference is a certification problem, not a bug</b>
+<p>ISO 26262 and DO-178C both require you to argue freedom from interference. Partitioning the address space
+gets you spatial freedom. Temporal freedom needs measurement, and often needs MPAM or colouring. A design
+review that only shows the memory map has answered half the question.</p>
+</div>
+
+<h2 id="compare">Choosing</h2>
+
+<p>The three approaches differ mainly in what they refuse to do, so the choice follows from your requirements rather than from performance.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>KVM</th><th>Xen dom0-less</th><th>Jailhouse</th><th>Bao / PikeOS / QNX</th></tr></thead>
+<tbody>
+<tr><td>Lines of code at EL2</td><td>Large (or ~10k for pKVM)</td><td>~100k</td><td>~10k</td><td>~5–50k</td></tr>
+<tr><td>Scheduler</td><td>Full</td><td>Optional (null scheduler)</td><td>None</td><td>None or
+partitioned</td></tr>
+<tr><td>Boot to first guest</td><td>Seconds</td><td>Sub-second</td><td>Linux first, then instant</td><td>Tens
+of ms</td></tr>
+<tr><td>Overcommit</td><td>Yes</td><td>Optional</td><td>No</td><td>No</td></tr>
+<tr><td>Certifiable</td><td>Not realistically</td><td>Xen has safety-certified variants</td><td>Research/
+industrial, small enough to try</td><td>Yes — that is the product</td></tr>
+<tr><td>Best for</td><td>Servers, dev boxes, Android VMs</td><td>Automotive, mixed criticality</td><td>Adding
+a real-time partition to an existing Linux</td><td>Shipping safety systems</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="try">Trying it</h2>
+
+<p>These systems can be run on ordinary hardware or under emulation, which is worth doing because the configuration files make the design philosophy explicit.</p>
+
+<pre><code># Jailhouse on QEMU's virt machine is the cheapest way to see
+# a partitioning hypervisor work.
+
+$ git clone https://github.com/siemens/jailhouse
+$ cd jailhouse
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+       KDIR=/path/to/linux
+# Configs for qemu-arm64 ship in configs/arm64/
+
+# Boot Linux under QEMU with reserved memory:
+$ qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 \
+    -smp 4 -m 1G -nographic \
+    -kernel Image -append "console=ttyAMA0 mem=768M" ...
+
+# Inside the guest Linux:
+$ insmod jailhouse.ko
+$ jailhouse enable qemu-arm64.cell
+Initializing Jailhouse hypervisor v0.12 on CPU 0
+Code location: 0x0000ffffc0200000
+Page pool usage after early setup: mem 39/993, remap 0/131072
+...
+The Jailhouse is opening.
+
+$ jailhouse cell create qemu-arm64-inmate-demo.cell
+$ jailhouse cell load 1 gic-demo.bin
+$ jailhouse cell start 1
+$ jailhouse cell list
+ID      Name                    State             Assigned CPUs
+0       qemu-arm64              running           0-2
+1       inmate-demo             running           3
+
+# Core 3 is now gone from Linux entirely:
+$ nproc
+3
+
+# And the demo inmate is printing timer ticks on the second
+# UART with a jitter of a few microseconds, regardless of what
+# Linux is doing - which is the entire point.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>jailhouse enable</code> fails with "CPU is not in EL2"</td><td>Firmware dropped to EL1 — the same
+prerequisite as KVM (<a href="virt-03-arm-el2.html">chapter 03</a>)</td></tr>
+<tr><td>Cell creation fails: memory region overlaps</td><td>The reserved region was not actually reserved from
+Linux, or two cells claim it</td></tr>
+<tr><td>Linux crashes when a cell starts</td><td>A device assigned to the cell is still bound to a Linux
+driver</td></tr>
+<tr><td>Guest partition misses deadlines only when Linux is busy</td><td>Cache and memory-bandwidth
+interference; partitioning was spatial only</td></tr>
+<tr><td>Interrupts for a cell's device arrive in the root cell</td><td>The GIC <code>pin_bitmap</code> does not
+include that SPI, or affinity routes it elsewhere</td></tr>
+<tr><td>Cell runs once and cannot be restarted</td><td>No reset path for its assigned device; it resumed with
+stale state</td></tr>
+<tr><td>Everything works until you enable the SMMU</td><td>Device StreamIDs not listed in the cell config, so
+its DMA now faults</td></tr>
+<tr><td>Worst-case latency good in the lab, bad in the field</td><td>The lab never ran the interference
+workload; measure with a deliberate stressor</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the difference in goal between a consolidating and a partitioning hypervisor.</li>
+  <li>Explain why "no scheduler" makes a safety argument tractable.</li>
+  <li>Describe how Jailhouse installs itself beneath a running Linux, in three steps.</li>
+  <li>Read a cell configuration and say which cores, memory and interrupts a partition owns.</li>
+  <li>Explain what dom0-less Xen changes about boot time and why it matters in a car.</li>
+  <li>Name four microarchitectural resources that partitioning does <em>not</em> divide.</li>
+  <li>Explain cache colouring and what it costs.</li>
+  <li>Say what MPAM provides and which registers carry the partition identity.</li>
+  <li>Distinguish spatial from temporal freedom from interference.</li>
+  <li>Choose a hypervisor for: an Android phone, a domain controller in a car, and adding a motor-control
+  loop to an existing Linux product — and justify each.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

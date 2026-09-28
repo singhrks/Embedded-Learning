@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: layer 3 — the trusted application | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: layer 3 — the trusted application</h1>
+<p class="lead">The first code in this project that runs in the secure world, and the only code that ever sees
+the private key. It is deliberately small, because everything it does is security-critical and every line is
+reachable by an attacker who controls the kernel. Complete source, the build, and the signing step that makes
+it loadable.</p>
+
+<h2 id="shape">What this TA must do, and what it must refuse</h2>
+
+<p>Before any code, the specification — because a TA is defined as much by what it declines to do as by its
+function. Each refusal below closes a specific attack.</p>
+
+<pre class="diagram">   IT WILL:
+     · on first run, generate a P-256 key pair and persist
+       it in secure storage
+     · return the PUBLIC key to anyone who asks
+     · hash a caller-supplied buffer and sign the digest
+     · run entirely within a bounded amount of memory
+
+   IT WILL REFUSE:
+     · any caller that is not the kernel        (login check)
+     · any parameter whose type is not exactly
+       what this command expects                (type check)
+     · any input longer than the agreed maximum (bounds)
+     · any output buffer smaller than a signature
+     · to export, log, or otherwise emit the private key
+       under ANY command
+
+   AND IT NEVER:
+     · trusts the length the caller put in the memref
+       without checking it against the buffer it was
+       actually given
+     · reads the caller's buffer twice - because it can
+       change between the two reads (chapter 20)</pre>
+
+<h2 id="header">The TA header and properties</h2>
+
+<p>Every trusted application declares its identity, its resource limits and its instance behaviour statically.
+These are not tuning parameters — the stack size cannot grow at run time, and the instance flags decide whether
+state can leak between callers.</p>
+
+<pre><code>/* ta/user_ta_header_defines.h */
+#ifndef USER_TA_HEADER_DEFINES_H
+#define USER_TA_HEADER_DEFINES_H
+
+#include "secsign_ta.h"
+
+#define TA_UUID  SECSIGN_TA_UUID
+
+/* SINGLE INSTANCE + MULTI SESSION: one copy of the TA serves
+   every caller, keeping the key material loaded once.
+   KEEP_ALIVE so it is not torn down between calls - which
+   also means state DOES survive, so we must be certain
+   nothing caller-specific is held globally (chapter 13). */
+#define TA_FLAGS            (TA_FLAG_SINGLE_INSTANCE | \
+                             TA_FLAG_MULTI_SESSION   | \
+                             TA_FLAG_INSTANCE_KEEP_ALIVE)
+
+/* Sized for one hash context plus the signing scratch.
+   Too small is a panic, not a slowdown.                  */
+#define TA_STACK_SIZE       (4 * 1024)
+#define TA_DATA_SIZE        (32 * 1024)
+
+#define TA_CURRENT_TA_EXT_PROPERTIES \
+    { "gp.ta.description", USER_TA_PROP_TYPE_STRING, \
+      "TEE-backed P-256 signing service" }, \
+    { "gp.ta.version", USER_TA_PROP_TYPE_U32, &amp;(const uint32_t){ 1 } }
+
+#endif</code></pre>
+
+<h2 id="source">The trusted application, in full</h2>
+
+<p>Read the validation helper first. Everything else in the file depends on it, and it is where the security
+property is actually enforced rather than merely intended.</p>
+
+<pre><code>// SPDX-License-Identifier: BSD-2-Clause
+/* ta/secsign_ta.c  —  LAYER 3 */
+
+#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include &lt;string.h&gt;
+
+#include "secsign_ta.h"
+
+#define KEY_OBJ_ID   "secsign.key.v1"
+#define KEY_BITS     256                  /* NIST P-256 */
+
+/* The one long-lived piece of state. Loaded once, never
+   exported, and freed only when the TA is destroyed.     */
+static TEE_ObjectHandle g_keypair = TEE_HANDLE_NULL;
+
+/* ---------------------------------------------------------
+   Parameter validation — the security boundary itself
+   --------------------------------------------------------- */
+
+static TEE_Result check_types(uint32_t got, uint32_t want)
+{
+        /* EXACT match. Not "close enough", not a subset:
+           a memref where a value was expected is an attack,
+           not a convenience.                              */
+        return (got == want) ? TEE_SUCCESS : TEE_ERROR_BAD_PARAMETERS;
+}
+
+static TEE_Result check_input(const TEE_Param *p)
+{
+        if (!p-&gt;memref.buffer)
+                return TEE_ERROR_BAD_PARAMETERS;
+        if (p-&gt;memref.size == 0 ||
+            p-&gt;memref.size &gt; SECSIGN_TA_MAX_DATA)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* CONFIRM THE BUFFER IS ACTUALLY READABLE AND THAT
+           IT REALLY IS NORMAL-WORLD MEMORY. Without this a
+           malicious caller could hand us a pointer into
+           SECURE memory and have us operate on it.        */
+        return TEE_CheckMemoryAccessRights(
+                TEE_MEMORY_ACCESS_READ |
+                TEE_MEMORY_ACCESS_ANY_OWNER,
+                p-&gt;memref.buffer, p-&gt;memref.size);
+}
+
+static TEE_Result check_output(const TEE_Param *p, size_t need)
+{
+        if (!p-&gt;memref.buffer || p-&gt;memref.size &lt; need)
+                return TEE_ERROR_SHORT_BUFFER;
+
+        return TEE_CheckMemoryAccessRights(
+                TEE_MEMORY_ACCESS_WRITE |
+                TEE_MEMORY_ACCESS_ANY_OWNER,
+                p-&gt;memref.buffer, p-&gt;memref.size);
+}
+
+/* ---------------------------------------------------------
+   Key management — generate once, persist, never export
+   --------------------------------------------------------- */
+
+static TEE_Result key_generate_and_store(void)
+{
+        TEE_ObjectHandle transient = TEE_HANDLE_NULL;
+        TEE_ObjectHandle persistent = TEE_HANDLE_NULL;
+        TEE_Attribute attr;
+        TEE_Result res;
+
+        res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR,
+                                          KEY_BITS, &amp;transient);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        TEE_InitValueAttribute(&amp;attr, TEE_ATTR_ECC_CURVE,
+                               TEE_ECC_CURVE_NIST_P256, 0);
+
+        res = TEE_GenerateKey(transient, KEY_BITS, &amp;attr, 1);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        /* Persist it. The storage is encrypted with a key
+           derived from the hardware unique key, so the blob
+           is useless on any other device (chapter 15/16).  */
+        res = TEE_CreatePersistentObject(
+                TEE_STORAGE_PRIVATE,
+                KEY_OBJ_ID, sizeof(KEY_OBJ_ID) - 1,
+                TEE_DATA_FLAG_ACCESS_READ |
+                TEE_DATA_FLAG_ACCESS_WRITE,
+                transient,          /* the object's attributes */
+                NULL, 0,            /* no initial data stream  */
+                &amp;persistent);
+        if (res == TEE_SUCCESS)
+                TEE_CloseObject(persistent);
+
+out:
+        TEE_FreeTransientObject(transient);
+        return res;
+}
+
+static TEE_Result key_load(void)
+{
+        TEE_Result res;
+
+        if (g_keypair != TEE_HANDLE_NULL)
+                return TEE_SUCCESS;          /* already loaded */
+
+        res = TEE_OpenPersistentObject(
+                TEE_STORAGE_PRIVATE,
+                KEY_OBJ_ID, sizeof(KEY_OBJ_ID) - 1,
+                TEE_DATA_FLAG_ACCESS_READ,
+                &amp;g_keypair);
+
+        if (res == TEE_ERROR_ITEM_NOT_FOUND) {
+                res = key_generate_and_store();
+                if (res != TEE_SUCCESS)
+                        return res;
+
+                res = TEE_OpenPersistentObject(
+                        TEE_STORAGE_PRIVATE,
+                        KEY_OBJ_ID, sizeof(KEY_OBJ_ID) - 1,
+                        TEE_DATA_FLAG_ACCESS_READ,
+                        &amp;g_keypair);
+        }
+
+        if (res != TEE_SUCCESS)
+                g_keypair = TEE_HANDLE_NULL;
+
+        return res;
+}
+
+/* ---------------------------------------------------------
+   SECSIGN_CMD_PUBKEY
+   --------------------------------------------------------- */
+
+static TEE_Result cmd_pubkey(uint32_t types, TEE_Param p[4])
+{
+        uint8_t x[32] = { 0 }, y[32] = { 0 };
+        uint32_t xlen = sizeof(x), ylen = sizeof(y);
+        TEE_Result res;
+
+        res = check_types(types, TEE_PARAM_TYPES(
+                        TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE));
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = check_output(&amp;p[0], SECSIGN_TA_PUBKEY_LEN);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = key_load();
+        if (res != TEE_SUCCESS)
+                return res;
+
+        /* ONLY the public components are ever read out.
+           TEE_ATTR_ECC_PRIVATE_VALUE is never referenced
+           anywhere in this file, which is the property we
+           want to be able to state by inspection.         */
+        res = TEE_GetObjectBufferAttribute(g_keypair,
+                        TEE_ATTR_ECC_PUBLIC_VALUE_X, x, &amp;xlen);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = TEE_GetObjectBufferAttribute(g_keypair,
+                        TEE_ATTR_ECC_PUBLIC_VALUE_Y, y, &amp;ylen);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        /* Left-pad to a fixed 32 bytes each: the attribute
+           getter returns the minimal encoding, which can be
+           SHORTER when the leading byte is zero. Assuming
+           32 here is a classic and subtle bug.            */
+        TEE_MemFill(p[0].memref.buffer, 0, SECSIGN_TA_PUBKEY_LEN);
+        TEE_MemMove((uint8_t *)p[0].memref.buffer + (32 - xlen),
+                    x, xlen);
+        TEE_MemMove((uint8_t *)p[0].memref.buffer + 32 + (32 - ylen),
+                    y, ylen);
+
+        p[0].memref.size = SECSIGN_TA_PUBKEY_LEN;
+        return TEE_SUCCESS;
+}
+
+/* ---------------------------------------------------------
+   SECSIGN_CMD_SIGN
+   --------------------------------------------------------- */
+
+static TEE_Result cmd_sign(uint32_t types, TEE_Param p[4])
+{
+        TEE_OperationHandle op = TEE_HANDLE_NULL;
+        uint8_t digest[32];
+        uint32_t digest_len = sizeof(digest);
+        uint8_t sig[SECSIGN_TA_SIG_LEN];
+        uint32_t sig_len = sizeof(sig);
+        void *copy = NULL;
+        uint32_t len;
+        TEE_Result res;
+
+        res = check_types(types, TEE_PARAM_TYPES(
+                        TEE_PARAM_TYPE_MEMREF_INPUT,
+                        TEE_PARAM_TYPE_MEMREF_OUTPUT,
+                        TEE_PARAM_TYPE_NONE,
+                        TEE_PARAM_TYPE_NONE));
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = check_input(&amp;p[0]);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        res = check_output(&amp;p[1], SECSIGN_TA_SIG_LEN);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        len = p[0].memref.size;
+
+        /* COPY OUT OF SHARED MEMORY BEFORE USING IT.
+           The normal world can still write that buffer while
+           we work. Hashing it in place would let a caller
+           change the data between the hash and anything else
+           we did with it - and, in a richer TA, between a
+           validation and a use. (chapter 20, rule 2)      */
+        copy = TEE_Malloc(len, 0);
+        if (!copy)
+                return TEE_ERROR_OUT_OF_MEMORY;
+        TEE_MemMove(copy, p[0].memref.buffer, len);
+
+        res = key_load();
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        /* --- HASH -------------------------------------- *
+         * THIS is the call that reaches layer 4. With the
+         * accelerator driver from chapter 29 registered,
+         * OP-TEE dispatches it to hardware; without it, to
+         * the software implementation. Nothing here
+         * changes either way - which is the point.        */
+        res = TEE_AllocateOperation(&amp;op, TEE_ALG_SHA256,
+                                    TEE_MODE_DIGEST, 0);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        res = TEE_DigestDoFinal(op, copy, len, digest, &amp;digest_len);
+        TEE_FreeOperation(op);
+        op = TEE_HANDLE_NULL;
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        /* --- SIGN -------------------------------------- */
+        res = TEE_AllocateOperation(&amp;op, TEE_ALG_ECDSA_P256,
+                                    TEE_MODE_SIGN, KEY_BITS);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        res = TEE_SetOperationKey(op, g_keypair);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        res = TEE_AsymmetricSignDigest(op, NULL, 0,
+                                       digest, digest_len,
+                                       sig, &amp;sig_len);
+        if (res != TEE_SUCCESS)
+                goto out;
+
+        if (sig_len != SECSIGN_TA_SIG_LEN) {
+                res = TEE_ERROR_GENERIC;
+                goto out;
+        }
+
+        TEE_MemMove(p[1].memref.buffer, sig, SECSIGN_TA_SIG_LEN);
+        p[1].memref.size = SECSIGN_TA_SIG_LEN;
+
+out:
+        if (op != TEE_HANDLE_NULL)
+                TEE_FreeOperation(op);
+
+        /* Scrub and free. The digest is not secret, but
+           making scrubbing the habit is what stops the one
+           case that matters being forgotten.              */
+        TEE_MemFill(digest, 0, sizeof(digest));
+        TEE_MemFill(sig, 0, sizeof(sig));
+        if (copy) {
+                TEE_MemFill(copy, 0, len);
+                TEE_Free(copy);
+        }
+        return res;
+}
+
+/* ---------------------------------------------------------
+   Entry points
+   --------------------------------------------------------- */
+
+TEE_Result TA_CreateEntryPoint(void)
+{
+        return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void)
+{
+        if (g_keypair != TEE_HANDLE_NULL) {
+                TEE_CloseObject(g_keypair);
+                g_keypair = TEE_HANDLE_NULL;
+        }
+}
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t types,
+                                    TEE_Param p[4] __unused,
+                                    void **sess __unused)
+{
+        uint32_t login;
+        uint32_t len = sizeof(login);
+        TEE_Result res;
+
+        if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+                                     TEE_PARAM_TYPE_NONE,
+                                     TEE_PARAM_TYPE_NONE,
+                                     TEE_PARAM_TYPE_NONE))
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* POLICY: only the kernel may open a session. A user
+           process that opens /dev/tee0 directly and tries
+           this UUID is refused here - which is what makes
+           layer 2 the sole gateway rather than merely the
+           intended one.                                    */
+        res = TEE_GetPropertyAsU32(TEE_PROPSET_CURRENT_CLIENT,
+                                   "gpd.client.identity", &amp;login);
+        if (res == TEE_SUCCESS &amp;&amp; login != TEE_LOGIN_REE_KERNEL)
+                return TEE_ERROR_ACCESS_DENIED;
+
+        return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess __unused)
+{
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess __unused,
+                                      uint32_t cmd,
+                                      uint32_t types,
+                                      TEE_Param p[4])
+{
+        switch (cmd) {
+        case SECSIGN_CMD_SIGN:
+                return cmd_sign(types, p);
+        case SECSIGN_CMD_PUBKEY:
+                return cmd_pubkey(types, p);
+        default:
+                return TEE_ERROR_NOT_SUPPORTED;
+        }
+}</code></pre>
+
+<div class="danger">
+<b>The three lines that carry the whole security property</b>
+<p><code>TEE_CheckMemoryAccessRights</code> with <code>ANY_OWNER</code> — without it, a caller can hand you a
+pointer into secure memory and have the TA read or write it on their behalf. The <code>TEE_MemMove</code> out
+of shared memory before use — without it, the buffer can change between any two things you do with it. And the
+exact parameter-type comparison — without it, a caller substitutes a value for a memref and the framework will
+happily let you dereference an integer. Everything else in this file is plumbing; these three are the
+boundary.</p>
+</div>
+
+<h2 id="build">Building and signing</h2>
+
+<p>A TA is not loadable until it is signed, and the default key is the development key that ships in the public
+source tree. Building with it is correct for now and must be changed before anything ships.</p>
+
+<pre><code># ta/Makefile
+CFG_TEE_TA_LOG_LEVEL ?= 2
+BINARY = 7a1b3c4d-5e6f-4718-9a2b-c3d4e5f60718   # = the UUID
+
+-include $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk
+
+ifeq ($(wildcard $(TA_DEV_KIT_DIR)/mk/ta_dev_kit.mk), )
+clean:
+	@echo 'Set TA_DEV_KIT_DIR to the OP-TEE TA dev kit'
+endif
+
+# ta/sub.mk
+global-incdirs-y += include
+srcs-y += secsign_ta.c</code></pre>
+
+<pre><code># Build (the dev kit comes from the OP-TEE OS build, ch. 03)
+$ export TA_DEV_KIT_DIR=$OPTEE/optee_os/out/arm/export-ta_arm64
+$ make -C ta CROSS_COMPILE=aarch64-linux-gnu-
+
+# The output is a SIGNED container, not a bare binary:
+$ ls ta/*.ta
+ta/7a1b3c4d-5e6f-4718-9a2b-c3d4e5f60718.ta
+
+# Install where the supplicant looks for it:
+$ sudo cp ta/*.ta /lib/optee_armtz/
+
+# PROVE IT LOADS, before involving the kernel driver at all.
+# optee_example_* or xtest can open it; the simplest check is
+# that the supplicant finds and OP-TEE accepts it:
+$ sudo tee-supplicant -d
+$ dmesg | grep -i optee
+
+# IF IT REFUSES TO LOAD, in order of likelihood:
+#   · filename does not match the UUID in the header
+#   · TA_DEV_KIT_DIR points at a different OP-TEE build than
+#     the one running - the dev kit and the OS must match
+#   · signed with a key the running OP-TEE does not trust</code></pre>
+
+<div class="warn">
+<b>Replace the signing key before this goes anywhere near a product</b>
+<p>The default key lives in the OP-TEE source tree and is therefore known to everyone. A device that trusts it
+will load <em>any</em> TA an attacker builds, which removes the entire point of TA signing. Generate your own,
+build OP-TEE with its public half, and keep the private half somewhere a build server can reach and a developer
+cannot — <a href="tee-14-ta-build-sign.html">chapter 14</a> covers the mechanics.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>TA will not load at all</td><td>Filename/UUID mismatch, dev-kit version mismatch, or an untrusted
+signing key</td></tr>
+<tr><td><code>TEE_ERROR_ACCESS_DENIED</code> on open</td><td>Working as designed — a non-kernel client tried to
+open the session</td></tr>
+<tr><td><code>TEE_ERROR_BAD_PARAMETERS</code> on every call</td><td>Parameter types do not match exactly; check
+both sides of seam B</td></tr>
+<tr><td><code>TEE_ERROR_SHORT_BUFFER</code></td><td>The caller's output memref is smaller than a
+signature</td></tr>
+<tr><td>Panic with almost no output</td><td>Usually stack exhaustion — raise <code>TA_STACK_SIZE</code>; see
+<a href="tee-19-debugging.html">chapter 19</a></td></tr>
+<tr><td>Signature verifies for some inputs, not others</td><td>The public key was assumed to be 32+32 bytes
+without left-padding the minimal encoding</td></tr>
+<tr><td>Key changes after reflashing the filesystem</td><td>Expected with the normal-world storage backend —
+see <a href="tee-15-secure-storage.html">chapter 15</a></td></tr>
+<tr><td>First call after boot is slow</td><td>Key generation on first run; subsequent calls load the stored
+key</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three lines that carry the security property, and what each prevents.</li>
+  <li>Explain why parameter types are compared for exact equality rather than checked loosely.</li>
+  <li>Explain what <code>TEE_MEMORY_ACCESS_ANY_OWNER</code> is guarding against.</li>
+  <li>Explain why the input is copied out of shared memory before being hashed.</li>
+  <li>Explain why the public key must be left-padded rather than assumed to be 32 bytes per coordinate.</li>
+  <li>Explain what the login check achieves, and what it does not.</li>
+  <li>Say what the instance flags mean for state surviving between callers.</li>
+  <li>Explain why the default signing key makes TA verification meaningless.</li>
+  <li>Point at the single call in this file that will reach layer 4.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

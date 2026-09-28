@@ -1,0 +1,1029 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: Linux driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<p class="crumbs"><a href="index.html">Home</a> / Chapter 10</p>
+<h1>Project — a complete Linux driver</h1>
+<p class="lead">A real, buildable character driver: a kernel-resident ring buffer with blocking reads,
+ioctls, sysfs attributes and poll support, plus a user-space test program. Then a second driver showing
+device-tree binding, MMIO and interrupts. Type it, build it, break it.</p>
+
+<div class="tip">
+<b>What you need</b>
+<p>Any Linux machine (a VM is fine) with kernel headers installed:</p>
+<pre><code># Debian / Ubuntu
+sudo apt install build-essential linux-headers-$(uname -r)
+# Fedora
+sudo dnf install kernel-devel kernel-headers gcc make</code></pre>
+<p>No hardware is required for Part 1. Part 2 needs a board or QEMU with a device tree, but reading it is
+valuable even if you cannot run it.</p>
+</div>
+
+<h2 id="spec">Part 1 — specification</h2>
+
+<p>A device <code>/dev/kringbuf0</code> that behaves like a fixed-size FIFO living in the kernel:</p>
+
+<ul>
+  <li><code>write()</code> appends bytes; if the buffer is full it blocks (or returns <code>-EAGAIN</code> with <code>O_NONBLOCK</code>).</li>
+  <li><code>read()</code> consumes bytes; if empty it blocks until data arrives.</li>
+  <li><code>poll()</code>/<code>select()</code> works, so it can be used in an event loop.</li>
+  <li><code>ioctl()</code> exposes: reset, get statistics, set the high-water mark.</li>
+  <li>sysfs exposes the current fill level and total byte counters.</li>
+  <li>Multiple readers and writers are safe.</li>
+</ul>
+
+<p>This exercises every mechanism from <a href="linux-drivers.html">chapter 09</a>: the char device
+interface, sleeping and waking, locking, user-space copies, and the ABI header.</p>
+
+<figure>
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture of the ring buffer driver showing user processes, the character device interface and the kernel ring buffer">
+  <rect class="svg-box-a" x="20" y="16" width="180" height="56" rx="7"/>
+  <text class="svg-tb" x="34" y="38">writer process</text><text class="svg-tm" x="34" y="58">write(fd, buf, n)</text>
+  <rect class="svg-box-a" x="290" y="16" width="180" height="56" rx="7"/>
+  <text class="svg-tb" x="304" y="38">reader process</text><text class="svg-tm" x="304" y="58">read(fd, buf, n)</text>
+  <rect class="svg-box-a" x="560" y="16" width="180" height="56" rx="7"/>
+  <text class="svg-tb" x="574" y="38">monitor</text><text class="svg-tm" x="574" y="58">poll() + ioctl()</text>
+
+  <rect class="svg-box-g" x="20" y="96" width="720" height="44" rx="7"/>
+  <text class="svg-tb" x="300" y="118">VFS  —  /dev/kringbuf0  (major:minor)</text>
+  <text class="svg-tm" x="270" y="134">dispatches to struct file_operations</text>
+
+  <rect class="svg-box-w" x="20" y="164" width="720" height="60" rx="7"/>
+  <text class="svg-tb" x="34" y="186">krb_open · krb_read · krb_write · krb_poll · krb_ioctl · krb_release</text>
+  <text class="svg-tm" x="34" y="210">mutex serialises access · wait queues block and wake · copy_to/from_user crosses the boundary</text>
+
+  <rect class="svg-box-d" x="20" y="248" width="480" height="60" rx="7"/>
+  <text class="svg-tb" x="34" y="270">ring buffer in kernel memory</text>
+  <text class="svg-tm" x="34" y="292">head · tail · count · capacity — kzalloc'd at module init</text>
+
+  <rect class="svg-box" x="520" y="248" width="220" height="60" rx="7"/>
+  <text class="svg-tb" x="534" y="270">sysfs attributes</text>
+  <text class="svg-tm" x="534" y="292">/sys/class/kringbuf/...</text>
+
+  <path class="svg-line" d="M110 72 L110 96 M380 72 L380 96 M650 72 L650 96 M380 140 L380 164 M260 224 L260 248 M630 224 L630 248"/>
+</svg>
+<figcaption>The driver's structure. Everything above the VFS line is user space; everything below runs at EL1.</figcaption>
+</figure>
+
+<h2 id="abi">Step 1 — the shared ABI header</h2>
+
+<p>This header is included by both the driver and user space. It is the contract, and once shipped you can
+only extend it, never change it.</p>
+
+<div class="codewrap"><div class="code-title">kringbuf.h</div>
+<pre><code>#ifndef _UAPI_KRINGBUF_H
+#define _UAPI_KRINGBUF_H
+
+#include &lt;linux/ioctl.h&gt;
+#include &lt;linux/types.h&gt;
+
+/* Statistics returned by KRB_GET_STATS.
+ * Fixed-width types and explicit padding so the layout is identical
+ * for 32-bit and 64-bit user space.
+ */
+struct krb_stats {
+        __u32 capacity;         /* total buffer size in bytes        */
+        __u32 count;            /* bytes currently stored            */
+        __u64 total_written;    /* lifetime bytes written            */
+        __u64 total_read;       /* lifetime bytes read               */
+        __u32 overruns;         /* writes rejected because it was full */
+        __u32 watermark;        /* poll reports readable at or above this */
+};
+
+#define KRB_IOC_MAGIC       'k'
+
+#define KRB_RESET           _IO(KRB_IOC_MAGIC,  0)
+#define KRB_GET_STATS       _IOR(KRB_IOC_MAGIC, 1, struct krb_stats)
+#define KRB_SET_WATERMARK   _IOW(KRB_IOC_MAGIC, 2, __u32)
+#define KRB_GET_CAPACITY    _IOR(KRB_IOC_MAGIC, 3, __u32)
+
+#define KRB_IOC_MAXNR       3
+
+#endif /* _UAPI_KRINGBUF_H */</code></pre></div>
+
+<h2 id="driver">Step 2 — the driver</h2>
+
+<div class="codewrap"><div class="code-title">kringbuf.c — part 1 of 3: state, helpers, open/release</div>
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * kringbuf - a kernel-resident ring buffer exposed as a character device.
+ *
+ * Demonstrates: char device registration, blocking I/O with wait queues,
+ * poll support, ioctl, sysfs attributes, and correct locking.
+ */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/device.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/wait.h&gt;
+#include &lt;linux/poll.h&gt;
+#include &lt;linux/sched.h&gt;
+
+#include "kringbuf.h"
+
+#define DRV_NAME        "kringbuf"
+#define DEFAULT_CAPACITY (4 * 1024)
+
+static int capacity = DEFAULT_CAPACITY;
+module_param(capacity, int, 0444);
+MODULE_PARM_DESC(capacity, "ring buffer size in bytes (default 4096)");
+
+struct krb_dev {
+        char             *buf;        /* the ring itself                   */
+        size_t            capacity;
+        size_t            head;       /* next write position               */
+        size_t            tail;       /* next read position                */
+        size_t            count;      /* bytes currently stored            */
+
+        u64               total_written;
+        u64               total_read;
+        u32               overruns;
+        u32               watermark;
+
+        struct mutex      lock;       /* protects everything above         */
+        wait_queue_head_t readq;      /* readers sleep here when empty     */
+        wait_queue_head_t writeq;     /* writers sleep here when full      */
+
+        dev_t             devt;
+        struct cdev       cdev;
+        struct device    *dev;
+        atomic_t          open_count;
+};
+
+static struct krb_dev *krb;            /* single instance for this example */
+static struct class   *krb_class;
+
+/* ---- helpers. All of these require the mutex to be held. ---- */
+
+static inline size_t krb_space(const struct krb_dev *d)
+{
+        return d-&gt;capacity - d-&gt;count;
+}
+
+/* Copy from user space into the ring, wrapping at the end. */
+static int krb_put(struct krb_dev *d, const char __user *ubuf, size_t n)
+{
+        size_t first = min(n, d-&gt;capacity - d-&gt;head);   /* until the wrap */
+
+        if (copy_from_user(d-&gt;buf + d-&gt;head, ubuf, first))
+                return -EFAULT;
+        if (n &gt; first &amp;&amp; copy_from_user(d-&gt;buf, ubuf + first, n - first))
+                return -EFAULT;
+
+        d-&gt;head   = (d-&gt;head + n) % d-&gt;capacity;
+        d-&gt;count += n;
+        d-&gt;total_written += n;
+        return 0;
+}
+
+/* Copy from the ring out to user space, wrapping at the end. */
+static int krb_get(struct krb_dev *d, char __user *ubuf, size_t n)
+{
+        size_t first = min(n, d-&gt;capacity - d-&gt;tail);
+
+        if (copy_to_user(ubuf, d-&gt;buf + d-&gt;tail, first))
+                return -EFAULT;
+        if (n &gt; first &amp;&amp; copy_to_user(ubuf + first, d-&gt;buf, n - first))
+                return -EFAULT;
+
+        d-&gt;tail   = (d-&gt;tail + n) % d-&gt;capacity;
+        d-&gt;count -= n;
+        d-&gt;total_read += n;
+        return 0;
+}
+
+/* ---- file operations ---- */
+
+static int krb_open(struct inode *inode, struct file *file)
+{
+        struct krb_dev *d = container_of(inode-&gt;i_cdev, struct krb_dev, cdev);
+
+        file-&gt;private_data = d;                  /* every later call finds it here */
+        atomic_inc(&amp;d-&gt;open_count);
+        dev_dbg(d-&gt;dev, "open by %s (pid %d), now %d open\n",
+                current-&gt;comm, current-&gt;pid, atomic_read(&amp;d-&gt;open_count));
+        return 0;
+}
+
+static int krb_release(struct inode *inode, struct file *file)
+{
+        struct krb_dev *d = file-&gt;private_data;
+
+        atomic_dec(&amp;d-&gt;open_count);
+        return 0;
+}</code></pre></div>
+
+<div class="codewrap"><div class="code-title">kringbuf.c — part 2 of 3: read, write, poll, ioctl</div>
+<pre><code>static ssize_t krb_read(struct file *file, char __user *ubuf,
+                        size_t len, loff_t *off)
+{
+        struct krb_dev *d = file-&gt;private_data;
+        size_t n;
+        int ret;
+
+        if (len == 0)
+                return 0;
+
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;
+
+        /* Wait for data. Note the loop: after waking we must re-check,
+         * because another reader may have consumed it first. */
+        while (d-&gt;count == 0) {
+                mutex_unlock(&amp;d-&gt;lock);          /* never sleep holding a lock */
+
+                if (file-&gt;f_flags &amp; O_NONBLOCK)
+                        return -EAGAIN;
+
+                if (wait_event_interruptible(d-&gt;readq, d-&gt;count &gt; 0))
+                        return -ERESTARTSYS;     /* a signal arrived */
+
+                if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                        return -ERESTARTSYS;
+        }
+
+        n = min(len, d-&gt;count);
+        ret = krb_get(d, ubuf, n);
+        mutex_unlock(&amp;d-&gt;lock);
+        if (ret)
+                return ret;
+
+        wake_up_interruptible(&amp;d-&gt;writeq);       /* space is available now */
+        return n;
+}
+
+static ssize_t krb_write(struct file *file, const char __user *ubuf,
+                         size_t len, loff_t *off)
+{
+        struct krb_dev *d = file-&gt;private_data;
+        size_t n;
+        int ret;
+
+        if (len == 0)
+                return 0;
+
+        if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                return -ERESTARTSYS;
+
+        while (krb_space(d) == 0) {
+                d-&gt;overruns++;
+                mutex_unlock(&amp;d-&gt;lock);
+
+                if (file-&gt;f_flags &amp; O_NONBLOCK)
+                        return -EAGAIN;
+
+                if (wait_event_interruptible(d-&gt;writeq, krb_space(d) &gt; 0))
+                        return -ERESTARTSYS;
+
+                if (mutex_lock_interruptible(&amp;d-&gt;lock))
+                        return -ERESTARTSYS;
+        }
+
+        n = min(len, krb_space(d));               /* short write is legal */
+        ret = krb_put(d, ubuf, n);
+        mutex_unlock(&amp;d-&gt;lock);
+        if (ret)
+                return ret;
+
+        wake_up_interruptible(&amp;d-&gt;readq);
+        return n;
+}
+
+static __poll_t krb_poll(struct file *file, struct poll_table_struct *wait)
+{
+        struct krb_dev *d = file-&gt;private_data;
+        __poll_t mask = 0;
+
+        /* Register on both queues BEFORE checking state, or you can miss
+         * a wakeup that happens between the check and the sleep. */
+        poll_wait(file, &amp;d-&gt;readq,  wait);
+        poll_wait(file, &amp;d-&gt;writeq, wait);
+
+        mutex_lock(&amp;d-&gt;lock);
+        if (d-&gt;count &gt;= d-&gt;watermark &amp;&amp; d-&gt;count &gt; 0)
+                mask |= EPOLLIN | EPOLLRDNORM;
+        if (krb_space(d) &gt; 0)
+                mask |= EPOLLOUT | EPOLLWRNORM;
+        mutex_unlock(&amp;d-&gt;lock);
+
+        return mask;
+}
+
+static long krb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+        struct krb_dev *d = file-&gt;private_data;
+        void __user *up = (void __user *)arg;
+        struct krb_stats st;
+        u32 val;
+
+        /* Always validate the command before touching anything. */
+        if (_IOC_TYPE(cmd) != KRB_IOC_MAGIC)
+                return -ENOTTY;
+        if (_IOC_NR(cmd) &gt; KRB_IOC_MAXNR)
+                return -ENOTTY;
+
+        switch (cmd) {
+        case KRB_RESET:
+                mutex_lock(&amp;d-&gt;lock);
+                d-&gt;head = d-&gt;tail = d-&gt;count = 0;
+                d-&gt;overruns = 0;
+                mutex_unlock(&amp;d-&gt;lock);
+                wake_up_interruptible(&amp;d-&gt;writeq);
+                dev_info(d-&gt;dev, "reset by pid %d\n", current-&gt;pid);
+                return 0;
+
+        case KRB_GET_STATS:
+                mutex_lock(&amp;d-&gt;lock);
+                st.capacity      = d-&gt;capacity;
+                st.count         = d-&gt;count;
+                st.total_written = d-&gt;total_written;
+                st.total_read    = d-&gt;total_read;
+                st.overruns      = d-&gt;overruns;
+                st.watermark     = d-&gt;watermark;
+                mutex_unlock(&amp;d-&gt;lock);
+
+                if (copy_to_user(up, &amp;st, sizeof(st)))
+                        return -EFAULT;
+                return 0;
+
+        case KRB_SET_WATERMARK:
+                if (copy_from_user(&amp;val, up, sizeof(val)))
+                        return -EFAULT;
+                if (val &gt; d-&gt;capacity)            /* validate! */
+                        return -EINVAL;
+                mutex_lock(&amp;d-&gt;lock);
+                d-&gt;watermark = val;
+                mutex_unlock(&amp;d-&gt;lock);
+                wake_up_interruptible(&amp;d-&gt;readq);
+                return 0;
+
+        case KRB_GET_CAPACITY:
+                val = d-&gt;capacity;
+                if (copy_to_user(up, &amp;val, sizeof(val)))
+                        return -EFAULT;
+                return 0;
+        }
+        return -ENOTTY;
+}
+
+static const struct file_operations krb_fops = {
+        .owner          = THIS_MODULE,
+        .open           = krb_open,
+        .release        = krb_release,
+        .read           = krb_read,
+        .write          = krb_write,
+        .poll           = krb_poll,
+        .unlocked_ioctl = krb_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,   /* 32-bit apps on a 64-bit kernel */
+        .llseek         = no_llseek,
+};</code></pre></div>
+
+<div class="codewrap"><div class="code-title">kringbuf.c — part 3 of 3: sysfs, init, exit</div>
+<pre><code>/* ---- sysfs attributes: /sys/class/kringbuf/kringbuf0/ ---- */
+
+static ssize_t count_show(struct device *dev,
+                          struct device_attribute *attr, char *buf)
+{
+        struct krb_dev *d = dev_get_drvdata(dev);
+        size_t n;
+
+        mutex_lock(&amp;d-&gt;lock);
+        n = d-&gt;count;
+        mutex_unlock(&amp;d-&gt;lock);
+        return sysfs_emit(buf, "%zu\n", n);
+}
+static DEVICE_ATTR_RO(count);
+
+static ssize_t capacity_show(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+        struct krb_dev *d = dev_get_drvdata(dev);
+        return sysfs_emit(buf, "%zu\n", d-&gt;capacity);
+}
+static DEVICE_ATTR_RO(capacity);
+
+static ssize_t watermark_show(struct device *dev,
+                              struct device_attribute *attr, char *buf)
+{
+        struct krb_dev *d = dev_get_drvdata(dev);
+        return sysfs_emit(buf, "%u\n", d-&gt;watermark);
+}
+static ssize_t watermark_store(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf, size_t len)
+{
+        struct krb_dev *d = dev_get_drvdata(dev);
+        u32 val;
+        int ret = kstrtou32(buf, 0, &amp;val);
+
+        if (ret)
+                return ret;
+        if (val &gt; d-&gt;capacity)
+                return -EINVAL;
+
+        mutex_lock(&amp;d-&gt;lock);
+        d-&gt;watermark = val;
+        mutex_unlock(&amp;d-&gt;lock);
+        wake_up_interruptible(&amp;d-&gt;readq);
+        return len;                       /* consumed all of it */
+}
+static DEVICE_ATTR_RW(watermark);
+
+static struct attribute *krb_attrs[] = {
+        &amp;dev_attr_count.attr,
+        &amp;dev_attr_capacity.attr,
+        &amp;dev_attr_watermark.attr,
+        NULL,
+};
+ATTRIBUTE_GROUPS(krb);
+
+/* ---- module init / exit ---- */
+
+static int __init krb_init(void)
+{
+        int ret;
+
+        if (capacity &lt; 64 || capacity &gt; (1 &lt;&lt; 20)) {
+                pr_err("capacity must be between 64 and 1048576\n");
+                return -EINVAL;
+        }
+
+        krb = kzalloc(sizeof(*krb), GFP_KERNEL);
+        if (!krb)
+                return -ENOMEM;
+
+        krb-&gt;buf = kzalloc(capacity, GFP_KERNEL);
+        if (!krb-&gt;buf) {
+                ret = -ENOMEM;
+                goto err_free_dev;
+        }
+        krb-&gt;capacity  = capacity;
+        krb-&gt;watermark = 1;
+        mutex_init(&amp;krb-&gt;lock);
+        init_waitqueue_head(&amp;krb-&gt;readq);
+        init_waitqueue_head(&amp;krb-&gt;writeq);
+        atomic_set(&amp;krb-&gt;open_count, 0);
+
+        ret = alloc_chrdev_region(&amp;krb-&gt;devt, 0, 1, DRV_NAME);
+        if (ret)
+                goto err_free_buf;
+
+        cdev_init(&amp;krb-&gt;cdev, &amp;krb_fops);
+        krb-&gt;cdev.owner = THIS_MODULE;
+        ret = cdev_add(&amp;krb-&gt;cdev, krb-&gt;devt, 1);
+        if (ret)
+                goto err_region;
+
+        /* class_create() lost its module argument in 6.4 */
+#if LINUX_VERSION_CODE &gt;= KERNEL_VERSION(6, 4, 0)
+        krb_class = class_create(DRV_NAME);
+#else
+        krb_class = class_create(THIS_MODULE, DRV_NAME);
+#endif
+        if (IS_ERR(krb_class)) {
+                ret = PTR_ERR(krb_class);
+                goto err_cdev;
+        }
+        krb_class-&gt;dev_groups = krb_groups;
+
+        krb-&gt;dev = device_create(krb_class, NULL, krb-&gt;devt, krb,
+                                 DRV_NAME "%d", 0);
+        if (IS_ERR(krb-&gt;dev)) {
+                ret = PTR_ERR(krb-&gt;dev);
+                goto err_class;
+        }
+
+        pr_info("loaded: /dev/%s0 major %d, capacity %zu bytes\n",
+                DRV_NAME, MAJOR(krb-&gt;devt), krb-&gt;capacity);
+        return 0;
+
+err_class:
+        class_destroy(krb_class);
+err_cdev:
+        cdev_del(&amp;krb-&gt;cdev);
+err_region:
+        unregister_chrdev_region(krb-&gt;devt, 1);
+err_free_buf:
+        kfree(krb-&gt;buf);
+err_free_dev:
+        kfree(krb);
+        return ret;
+}
+
+static void __exit krb_exit(void)
+{
+        device_destroy(krb_class, krb-&gt;devt);
+        class_destroy(krb_class);
+        cdev_del(&amp;krb-&gt;cdev);
+        unregister_chrdev_region(krb-&gt;devt, 1);
+        kfree(krb-&gt;buf);
+        kfree(krb);
+        pr_info("unloaded\n");
+}
+
+module_init(krb_init);
+module_exit(krb_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Embedded Learning Hub");
+MODULE_DESCRIPTION("Kernel ring buffer character device");
+MODULE_VERSION("1.0");</code></pre></div>
+
+<div class="note">
+<b>Add this include</b>
+<p>The version check needs <code>#include &lt;linux/version.h&gt;</code> at the top. If you are on a kernel
+older than 6.4, only the two-argument <code>class_create()</code> compiles.</p>
+</div>
+
+<h2 id="build">Step 3 — build it</h2>
+
+<div class="codewrap"><div class="code-title">Makefile</div>
+<pre><code>obj-m += kringbuf.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all: module krbtest
+
+module:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+krbtest: krbtest.c kringbuf.h
+	$(CC) -Wall -Wextra -O2 -o krbtest krbtest.c
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f krbtest
+
+check:
+	$(KDIR)/scripts/checkpatch.pl --no-tree --strict -f kringbuf.c
+
+load: module
+	sudo insmod kringbuf.ko
+	sudo chmod 666 /dev/kringbuf0
+
+unload:
+	sudo rmmod kringbuf
+
+.PHONY: all module clean check load unload</code></pre></div>
+
+<pre><code>make
+sudo insmod kringbuf.ko capacity=8192
+dmesg | tail -3
+#   kringbuf: loaded: /dev/kringbuf0 major 511, capacity 8192 bytes
+
+ls -l /dev/kringbuf0
+ls /sys/class/kringbuf/kringbuf0/
+#   capacity  count  watermark  dev  power  subsystem  uevent</code></pre>
+
+<h2 id="test">Step 4 — the user-space test program</h2>
+
+<div class="codewrap"><div class="code-title">krbtest.c</div>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+#include "kringbuf.h"
+
+#define DEV "/dev/kringbuf0"
+
+static void show_stats(int fd, const char *when)
+{
+        struct krb_stats st;
+
+        if (ioctl(fd, KRB_GET_STATS, &amp;st) &lt; 0) {
+                perror("KRB_GET_STATS");
+                return;
+        }
+        printf("[%s] cap=%u count=%u written=%llu read=%llu "
+               "overruns=%u watermark=%u\n", when,
+               st.capacity, st.count,
+               (unsigned long long)st.total_written,
+               (unsigned long long)st.total_read,
+               st.overruns, st.watermark);
+}
+
+int main(void)
+{
+        char out[128], in[128];
+        int fd, n;
+        unsigned int cap, wm = 8;
+
+        fd = open(DEV, O_RDWR);
+        if (fd &lt; 0) { perror("open " DEV); return 1; }
+
+        /* --- capacity --- */
+        if (ioctl(fd, KRB_GET_CAPACITY, &amp;cap) &lt; 0) { perror("cap"); return 1; }
+        printf("capacity reported by driver: %u bytes\n", cap);
+
+        /* --- start clean --- */
+        ioctl(fd, KRB_RESET);
+        show_stats(fd, "after reset");
+
+        /* --- basic write then read --- */
+        strcpy(out, "hello from user space");
+        n = write(fd, out, strlen(out));
+        printf("wrote %d bytes\n", n);
+        show_stats(fd, "after write");
+
+        memset(in, 0, sizeof(in));
+        n = read(fd, in, sizeof(in) - 1);
+        printf("read  %d bytes: \"%s\"\n", n, in);
+        show_stats(fd, "after read");
+
+        /* --- non-blocking read on an empty buffer must give EAGAIN --- */
+        {
+                int nb = open(DEV, O_RDONLY | O_NONBLOCK);
+                n = read(nb, in, sizeof(in));
+                printf("non-blocking read on empty: ret=%d errno=%s (expect EAGAIN)\n",
+                       n, strerror(errno));
+                close(nb);
+        }
+
+        /* --- watermark + poll --- */
+        ioctl(fd, KRB_SET_WATERMARK, &amp;wm);
+        printf("watermark set to %u\n", wm);
+
+        write(fd, "1234", 4);              /* below the watermark */
+        {
+                struct pollfd p = { .fd = fd, .events = POLLIN };
+                int r = poll(&amp;p, 1, 100);
+                printf("poll with 4 bytes (below watermark): %d (expect 0)\n", r);
+        }
+        write(fd, "5678", 4);              /* now at the watermark */
+        {
+                struct pollfd p = { .fd = fd, .events = POLLIN };
+                int r = poll(&amp;p, 1, 100);
+                printf("poll with 8 bytes (at watermark): %d, revents=0x%x "
+                       "(expect 1, POLLIN)\n", r, p.revents);
+        }
+
+        /* --- fill it completely and check the short write --- */
+        ioctl(fd, KRB_RESET);
+        {
+                char *big = malloc(cap + 64);
+                memset(big, 'A', cap + 64);
+                n = write(fd, big, cap + 64);
+                printf("write of %u into a %u buffer returned %d "
+                       "(expect a short write of %u)\n", cap + 64, cap, n, cap);
+                free(big);
+        }
+        show_stats(fd, "when full");
+
+        /* --- invalid ioctl must give ENOTTY --- */
+        if (ioctl(fd, _IO('Z', 99)) &lt; 0)
+                printf("bad ioctl rejected with %s (expect ENOTTY)\n",
+                       strerror(errno));
+
+        /* --- invalid watermark must give EINVAL --- */
+        wm = cap + 1;
+        if (ioctl(fd, KRB_SET_WATERMARK, &amp;wm) &lt; 0)
+                printf("oversized watermark rejected with %s (expect EINVAL)\n",
+                       strerror(errno));
+
+        close(fd);
+        return 0;
+}</code></pre></div>
+
+<pre><code>./krbtest
+
+# expected output
+capacity reported by driver: 8192 bytes
+[after reset] cap=8192 count=0 written=0 read=0 overruns=0 watermark=1
+wrote 21 bytes
+[after write] cap=8192 count=21 written=21 read=0 overruns=0 watermark=1
+read  21 bytes: "hello from user space"
+[after read] cap=8192 count=0 written=21 read=21 overruns=0 watermark=1
+non-blocking read on empty: ret=-1 errno=Resource temporarily unavailable (expect EAGAIN)
+watermark set to 8
+poll with 4 bytes (below watermark): 0 (expect 0)
+poll with 8 bytes (at watermark): 1, revents=0x1 (expect 1, POLLIN)
+write of 8256 into a 8192 buffer returned 8192 (expect a short write of 8192)
+[when full] cap=8192 count=8192 written=8213 read=21 overruns=0 watermark=8
+bad ioctl rejected with Inappropriate ioctl for device (expect ENOTTY)
+oversized watermark rejected with Invalid argument (expect EINVAL)</code></pre>
+
+<h3>Test the blocking path from the shell</h3>
+<pre><code># terminal 1: this blocks, because the buffer is empty
+sudo rmmod kringbuf; sudo insmod kringbuf.ko; sudo chmod 666 /dev/kringbuf0
+cat /dev/kringbuf0
+
+# terminal 2: unblocks terminal 1
+echo "wake up" &gt; /dev/kringbuf0
+
+# watch the state change live
+watch -n0.5 'cat /sys/class/kringbuf/kringbuf0/count'
+
+# change the watermark from the shell
+echo 32 | sudo tee /sys/class/kringbuf/kringbuf0/watermark</code></pre>
+
+<h2 id="break">Step 5 — break it deliberately</h2>
+
+<p>This is the part that teaches the most. Each experiment produces a specific, recognisable failure.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Change</th><th>What happens</th><th>Lesson</th></tr></thead>
+<tbody>
+<tr><td>Replace <code>copy_to_user()</code> with <code>memcpy()</code></td><td>Oops: "Unable to handle kernel paging request" the moment PAN is enforced</td><td>User pointers are never directly dereferenceable</td></tr>
+<tr><td>Change <code>if</code> to <code>while</code> &rarr; <code>if</code> in the wait loops</td><td>With two readers, one wakes to find the buffer already drained and reads garbage or underflows</td><td>Always re-check the condition after waking</td></tr>
+<tr><td>Hold the mutex across <code>wait_event_interruptible()</code></td><td>Instant deadlock — the writer cannot take the lock to add data</td><td>Never sleep holding a lock others need to make progress</td></tr>
+<tr><td>Remove <code>mutex_lock()</code> from <code>krb_write</code></td><td>Run two writers in a loop; <code>count</code> drifts and the ring corrupts. Enable lockdep and KASAN to see it flagged</td><td>Every shared field needs the same lock</td></tr>
+<tr><td>Delete the <code>_IOC_TYPE</code> check in ioctl</td><td>Another program's ioctl on this fd is silently accepted</td><td>Validate command encodings</td></tr>
+<tr><td>Remove the <code>val &gt; capacity</code> check in <code>KRB_SET_WATERMARK</code></td><td>Poll never reports readable — a user-space-triggered hang</td><td>Validate every input from user space</td></tr>
+<tr><td>Forget <code>cdev_del()</code> in exit</td><td>Kernel oops on the next open after unload</td><td>Unregister in exact reverse order</td></tr>
+<tr><td>Call <code>kmalloc(GFP_KERNEL)</code> inside a spinlock</td><td>"BUG: sleeping function called from invalid context" with <code>CONFIG_DEBUG_ATOMIC_SLEEP</code></td><td>Context rules are enforced, if you enable the checks</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># build with the checks that catch these
+# In menuconfig / .config:
+#   CONFIG_DEBUG_ATOMIC_SLEEP=y
+#   CONFIG_PROVE_LOCKING=y
+#   CONFIG_KASAN=y
+#   CONFIG_DEBUG_INFO=y
+
+# find the source line for an oops address
+sudo dmesg | grep -A20 'Unable to handle'
+addr2line -e kringbuf.o -f 0x148</code></pre>
+
+<h2 id="part2">Part 2 — a device-tree platform driver</h2>
+
+<p>Part 1 had no hardware. Part 2 adds the pieces you only meet on a real SoC: device-tree binding,
+MMIO registers, clocks, and a real interrupt. Build it against QEMU's <code>virt</code> machine or a
+board you own.</p>
+
+<h3>The device tree node</h3>
+<div class="codewrap"><div class="code-title">widget-overlay.dts — an overlay you can apply at runtime for testing</div>
+<pre><code>/dts-v1/;
+/plugin/;
+
+&amp;{/soc} {
+        widget0: widget@9010000 {
+                compatible = "elh,widget-v1";
+                reg = &lt;0x0 0x09010000 0x0 0x1000&gt;;
+                interrupts = &lt;GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH&gt;;
+                clocks = &lt;&amp;apb_pclk&gt;;
+                elh,fifo-depth = &lt;64&gt;;
+                elh,enable-loopback;
+                status = "okay";
+        };
+};</code></pre></div>
+
+<div class="codewrap"><div class="code-title">widget.c — a platform driver with MMIO, IRQ and debugfs</div>
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/debugfs.h&gt;
+#include &lt;linux/iopoll.h&gt;
+
+#define REG_ID          0x00
+#define REG_CTRL        0x04
+#define   CTRL_ENABLE   BIT(0)
+#define   CTRL_IRQ_EN   BIT(1)
+#define   CTRL_LOOPBACK BIT(4)
+#define REG_STATUS      0x08
+#define   ST_READY      BIT(0)
+#define   ST_IRQ        BIT(1)
+#define REG_DATA        0x0C
+
+#define EXPECTED_ID     0x57494447   /* "WIDG" */
+
+struct widget {
+        struct device    *dev;
+        void __iomem     *regs;
+        struct clk       *clk;
+        int               irq;
+        u32               fifo_depth;
+        bool              loopback;
+        atomic_t          irq_count;
+        struct dentry    *dbg;
+};
+
+static irqreturn_t widget_isr(int irq, void *data)
+{
+        struct widget *w = data;
+        u32 status = readl(w-&gt;regs + REG_STATUS);
+
+        if (!(status &amp; ST_IRQ))
+                return IRQ_NONE;          /* shared line: not ours */
+
+        writel(ST_IRQ, w-&gt;regs + REG_STATUS);   /* W1C at the source */
+        atomic_inc(&amp;w-&gt;irq_count);
+        return IRQ_HANDLED;
+}
+
+static int widget_regs_show(struct seq_file *s, void *unused)
+{
+        struct widget *w = s-&gt;private;
+
+        seq_printf(s, "ID      0x%08x\n", readl(w-&gt;regs + REG_ID));
+        seq_printf(s, "CTRL    0x%08x\n", readl(w-&gt;regs + REG_CTRL));
+        seq_printf(s, "STATUS  0x%08x\n", readl(w-&gt;regs + REG_STATUS));
+        seq_printf(s, "irqs    %d\n",     atomic_read(&amp;w-&gt;irq_count));
+        return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(widget_regs);
+
+static int widget_probe(struct platform_device *pdev)
+{
+        struct device *dev = &amp;pdev-&gt;dev;
+        struct widget *w;
+        u32 id, ctrl;
+        int ret;
+
+        w = devm_kzalloc(dev, sizeof(*w), GFP_KERNEL);
+        if (!w)
+                return -ENOMEM;
+        w-&gt;dev = dev;
+        atomic_set(&amp;w-&gt;irq_count, 0);
+
+        w-&gt;regs = devm_platform_ioremap_resource(pdev, 0);
+        if (IS_ERR(w-&gt;regs))
+                return dev_err_probe(dev, PTR_ERR(w-&gt;regs), "ioremap failed\n");
+
+        w-&gt;clk = devm_clk_get_optional(dev, NULL);
+        if (IS_ERR(w-&gt;clk))
+                return dev_err_probe(dev, PTR_ERR(w-&gt;clk), "clock lookup\n");
+        ret = clk_prepare_enable(w-&gt;clk);
+        if (ret)
+                return ret;
+
+        /* Only now is the block clocked, so only now may we read a register. */
+        id = readl(w-&gt;regs + REG_ID);
+        if (id != EXPECTED_ID) {
+                dev_err(dev, "bad ID 0x%08x, expected 0x%08x\n", id, EXPECTED_ID);
+                ret = -ENODEV;
+                goto err_clk;
+        }
+
+        if (device_property_read_u32(dev, "elh,fifo-depth", &amp;w-&gt;fifo_depth))
+                w-&gt;fifo_depth = 32;
+        w-&gt;loopback = device_property_read_bool(dev, "elh,enable-loopback");
+
+        w-&gt;irq = platform_get_irq(pdev, 0);
+        if (w-&gt;irq &lt; 0) {
+                ret = w-&gt;irq;
+                goto err_clk;
+        }
+        ret = devm_request_irq(dev, w-&gt;irq, widget_isr, IRQF_SHARED,
+                               dev_name(dev), w);
+        if (ret)
+                goto err_clk;
+
+        ctrl = CTRL_ENABLE | CTRL_IRQ_EN | (w-&gt;loopback ? CTRL_LOOPBACK : 0);
+        writel(ctrl, w-&gt;regs + REG_CTRL);
+
+        /* wait for the block to come ready, with a bounded timeout */
+        ret = readl_poll_timeout(w-&gt;regs + REG_STATUS, id, id &amp; ST_READY,
+                                 100, 10000);
+        if (ret) {
+                dev_err(dev, "timed out waiting for READY\n");
+                goto err_disable;
+        }
+
+        w-&gt;dbg = debugfs_create_dir(dev_name(dev), NULL);
+        debugfs_create_file("regs", 0444, w-&gt;dbg, w, &amp;widget_regs_fops);
+
+        platform_set_drvdata(pdev, w);
+        dev_info(dev, "ready: id 0x%08x fifo %u irq %d%s\n",
+                 id, w-&gt;fifo_depth, w-&gt;irq, w-&gt;loopback ? " loopback" : "");
+        return 0;
+
+err_disable:
+        writel(0, w-&gt;regs + REG_CTRL);
+err_clk:
+        clk_disable_unprepare(w-&gt;clk);
+        return ret;
+}
+
+static void widget_remove(struct platform_device *pdev)
+{
+        struct widget *w = platform_get_drvdata(pdev);
+
+        /* order matters: stop the hardware raising interrupts BEFORE the
+         * managed IRQ is released, and before the mapping goes away. */
+        writel(0, w-&gt;regs + REG_CTRL);
+        debugfs_remove_recursive(w-&gt;dbg);
+        clk_disable_unprepare(w-&gt;clk);
+}
+
+static const struct of_device_id widget_of_match[] = {
+        { .compatible = "elh,widget-v1" },
+        { }
+};
+MODULE_DEVICE_TABLE(of, widget_of_match);
+
+static struct platform_driver widget_driver = {
+        .probe  = widget_probe,
+        .remove = widget_remove,
+        .driver = {
+                .name           = "elh-widget",
+                .of_match_table = widget_of_match,
+        },
+};
+module_platform_driver(widget_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Example platform driver with MMIO and IRQ");</code></pre></div>
+
+<div class="note">
+<b>On older kernels</b>
+<p><code>.remove</code> took an <code>int</code> return value before 6.11 (<code>remove_new</code> during the
+transition). If your build complains about the function signature, that is why — return <code>0</code> and
+change the prototype to <code>static int</code>.</p>
+</div>
+
+<h3>Testing it</h3>
+<pre><code># build and load
+make
+sudo insmod widget.ko
+dmesg | tail
+#   elh-widget 9010000.widget: ready: id 0x57494447 fifo 64 irq 42 loopback
+
+# is it bound?
+ls -l /sys/bus/platform/drivers/elh-widget/
+#   9010000.widget -&gt; ../../../../devices/platform/9010000.widget
+
+# read the register dump
+sudo cat /sys/kernel/debug/9010000.widget/regs
+
+# are interrupts arriving?
+grep widget /proc/interrupts
+
+# exercise bind/unbind — this catches remove() bugs immediately
+echo 9010000.widget | sudo tee /sys/bus/platform/drivers/elh-widget/unbind
+echo 9010000.widget | sudo tee /sys/bus/platform/drivers/elh-widget/bind</code></pre>
+
+<div class="tip">
+<b>The unbind/bind loop is the best driver test there is</b>
+<p>Run it in a loop a hundred times with KASAN enabled. Nearly every resource leak, use-after-free and
+missing-quiesce bug in a driver shows up in that loop, and almost nowhere else.</p>
+<pre><code>for i in $(seq 100); do
+  echo 9010000.widget | sudo tee /sys/bus/platform/drivers/elh-widget/unbind &gt;/dev/null
+  echo 9010000.widget | sudo tee /sys/bus/platform/drivers/elh-widget/bind   &gt;/dev/null
+done
+dmesg | grep -iE 'kasan|use-after|leak|warn'</code></pre>
+</div>
+
+<h2 id="extend">Extensions to try</h2>
+<ol class="steps">
+  <li><strong>Multiple instances.</strong> Turn the single global <code>krb</code> into an array so
+  <code>/dev/kringbuf0</code> through <code>/dev/kringbuf3</code> all work independently. This forces you to
+  get <code>container_of</code> and per-device state right.</li>
+  <li><strong>Replace the mutex with a spinlock and an ISR.</strong> Add a kernel timer that injects a byte
+  every 100 ms; now the buffer is shared with atomic context and your locking must change.</li>
+  <li><strong>Add <code>mmap()</code>.</strong> Let user space map the ring directly and read with no copy.
+  You will have to think hard about coherency and about what a hostile user could do.</li>
+  <li><strong>Convert to <code>kfifo</code>.</strong> The kernel already has a lock-free ring buffer.
+  Rewriting on top of it teaches you how much a well-chosen kernel primitive removes.</li>
+  <li><strong>Add a netlink or char-device event channel</strong> so user space is notified asynchronously
+  instead of polling.</li>
+  <li><strong>Wire in DMA.</strong> Use <code>dma_alloc_coherent()</code> for the ring and have the platform
+  driver's hardware fill it, using everything from <a href="smmu.html">chapter 05</a>.</li>
+</ol>
+
+<h2 id="checklist">Project checklist</h2>
+<ul class="checklist">
+  <li>The module loads and unloads cleanly, repeatedly, with no dmesg warnings.</li>
+  <li><code>krbtest</code> passes every assertion, including the error cases.</li>
+  <li><code>cat</code> blocks on an empty buffer and unblocks on a write from another terminal.</li>
+  <li>sysfs shows a live, correct fill level.</li>
+  <li>You have caused at least three of the deliberate bugs above and recognised each failure signature.</li>
+  <li><code>checkpatch.pl --strict</code> is clean.</li>
+  <li>The unbind/bind loop runs 100 times with KASAN and lockdep enabled, silently.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

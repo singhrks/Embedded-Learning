@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lock-free and wait-free data structures | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Lock-free and wait-free data structures</h1>
+<p class="lead">Lock-free does not mean fast, and it does not mean easy. It means one specific progress
+guarantee, bought with a memory-reclamation problem that has no cheap solution. This chapter is mostly about
+why you should not write these, and what to do when you must.</p>
+
+<h2 id="progress">The guarantees, precisely</h2>
+
+<p>"Lock-free" is a precise term, not a synonym for "fast" or "no mutex". It is one of three progress guarantees, and knowing which one an algorithm actually provides tells you what it promises under contention and failure.</p>
+
+<pre class="diagram">   BLOCKING (a mutex)
+     If the thread holding the lock is descheduled, killed, or
+     page-faults, NOBODY makes progress.
+
+   OBSTRUCTION-FREE
+     A thread makes progress if it runs alone for long enough.
+     Weakest useful guarantee; rarely used on its own.
+
+   LOCK-FREE
+     At least ONE thread makes progress, always.
+     Individual threads may starve indefinitely.
+     -> the system never stalls because a thread was
+        descheduled at a bad moment.
+
+   WAIT-FREE
+     EVERY thread completes in a BOUNDED number of steps,
+     regardless of what other threads do.
+     -> no starvation, and a hard latency bound.
+     -> almost always slower in the common case, because
+        bounding the worst case costs work in every case.
+
+   WHAT THIS BUYS YOU, and it is narrower than the marketing:
+
+     * immunity to lock-holder preemption. Matters enormously
+       in a hypervisor guest (virtualisation chapter 08) or a
+       system with mixed priorities.
+     * usable from an interrupt handler or a signal handler,
+       where you cannot take a sleeping lock.
+     * no deadlock, ever - there is no lock to order.
+     * a real worst-case bound (wait-free only), which is why
+       hard real-time cares.
+
+   WHAT IT DOES NOT BUY
+
+     * throughput. Under contention a lock-free structure
+       does the same cache-line bouncing a spinlock does, and
+       often more, because losers retry.
+     * simplicity. See the rest of this chapter.</pre>
+
+<div class="key">
+<b>The honest recommendation</b>
+<p>Use a mutex. If profiling proves the lock is the bottleneck, first try: sharding the data, per-thread
+accumulation with a merge, a read-mostly structure (<a href="mt-10-rwlocks-rcu.html">chapter 10</a>), or an
+off-the-shelf concurrent container. Write a lock-free structure yourself only if none of those fit and you
+have a memory-reclamation scheme, a weak-hardware test rig, and a reviewer who has done it before. This is
+not conservatism — published, peer-reviewed lock-free algorithms have shipped with bugs found years
+later.</p>
+</div>
+
+<h2 id="stack">A lock-free stack, and its famous bug</h2>
+
+<p>The lock-free stack is the standard first example because it is genuinely simple — and it contains the ABA problem, which is the reason lock-free programming is harder than it looks.</p>
+
+<pre><code>/* The Treiber stack. Four lines, and one of them is wrong. */
+
+struct node { struct node *next; void *val; };
+_Atomic(struct node *) top;
+
+void push(void *v)
+{
+        struct node *n = malloc(sizeof *n);
+        n-&gt;val = v;
+        n-&gt;next = atomic_load_explicit(&amp;top, memory_order_relaxed);
+        while (!atomic_compare_exchange_weak_explicit(
+                       &amp;top, &amp;n-&gt;next, n,
+                       memory_order_release,      /* publish n */
+                       memory_order_relaxed))
+                ;                                 /* n->next was
+                                                     refreshed  */
+}
+
+void *pop(void)
+{
+        struct node *t = atomic_load_explicit(&amp;top, memory_order_acquire);
+        while (t &amp;&amp; !atomic_compare_exchange_weak_explicit(
+                       &amp;top, &amp;t, t-&gt;next,
+                       memory_order_acquire, memory_order_acquire))
+                ;
+        if (!t) return NULL;
+        void *v = t-&gt;val;
+        free(t);                    /* &lt;-- THE BUG IS HERE      */
+        return v;
+}</code></pre>
+
+<pre class="diagram">   THE ABA PROBLEM
+
+   stack:  A -> B -> C
+
+   thread 1: reads top = A, reads A->next = B.
+             about to CAS(top, A, B)...
+             ...and is preempted here.
+
+   thread 2: pop() -> gets A, frees it
+             pop() -> gets B, frees it
+             push(X)
+             push(A)      &lt;-- malloc RETURNS THE SAME ADDRESS
+
+   stack:  A -> X -> C          (B is freed!)
+
+   thread 1: resumes. CAS(top, A, B) - top IS still A, so the
+             CAS SUCCEEDS.
+
+   stack:  B -> ???             B is freed memory.
+
+   The value was A, then changed, then became A again. The CAS
+   cannot tell. Hence A-B-A.
+
+   AND NOTE the second bug hiding in the same window: thread 1
+   read `t->next` from a node thread 2 already freed. That is
+   a use-after-free even before the ABA fires.</pre>
+
+<h2 id="reclaim">The real problem: when can you free?</h2>
+
+<p>Here is the difficulty that ends most attempts at lock-free data structures: you cannot free a node while another thread might still be reading it, and without a lock there is no obvious way to know.</p>
+
+<pre><code>/* "Is any other thread still looking at this node?" has no
+   cheap answer, and every solution is a whole subsystem.    */
+
+/* 1. TAGGED POINTERS - fixes ABA, not use-after-free.
+      Pack a counter beside the pointer and CAS both at once. */
+
+struct tagged { struct node *ptr; uintptr_t tag; };
+_Atomic(struct tagged) top;          /* needs 128-bit CAS:
+                                        CMPXCHG16B / CASP     */
+/* Every store increments tag, so A-with-tag-7 never equals
+   A-with-tag-9. Cheap and effective - but a reader can still
+   dereference a node that was freed between its load and its
+   CAS. Only sufficient if nodes are never actually freed
+   (a free list you own).                                    */
+
+/* 2. HAZARD POINTERS - each thread publishes what it is
+      looking at; the reclaimer checks before freeing.       */
+
+_Atomic(struct node *) hazard[MAX_THREADS];
+
+void *pop(void)
+{
+        struct node *t;
+        do {
+                t = atomic_load(&amp;top);
+                if (!t) return NULL;
+                atomic_store(&amp;hazard[my_id], t);   /* announce  */
+                if (atomic_load(&amp;top) != t)        /* re-verify */
+                        continue;                  /* it moved  */
+        } while (!atomic_compare_exchange_weak(&amp;top, &amp;t, t-&gt;next));
+
+        atomic_store(&amp;hazard[my_id], NULL);
+        retire(t);          /* deferred: free only when no
+                               hazard[] entry points at it      */
+        return t-&gt;val;
+}
+/* Bounded memory, O(threads) scan per reclaim, and a store +
+   fence on every read. C++26 has std::hazard_pointer. */
+
+/* 3. EPOCH-BASED RECLAMATION - readers announce an epoch;
+      memory from epoch N is freed once every thread has been
+      seen in epoch N+2. This is crossbeam's approach in Rust,
+      and it is essentially userspace RCU (chapter 10).
+      Cheaper reads than hazard pointers, unbounded memory if
+      a thread stalls inside a critical section.             */
+
+/* 4. NEVER FREE - a preallocated pool and a free list.
+      The only approach that is genuinely simple, and the one
+      real-time systems actually use. Bounded, predictable,
+      and it turns the problem into capacity planning.       */
+
+/* 5. A GARBAGE COLLECTOR - which is why lock-free structures
+      are dramatically easier in Java, Go and C#. The hardest
+      part of the problem is already solved for you.         */</code></pre>
+
+<div class="danger">
+<b>Reclamation is the whole difficulty</b>
+<p>Every lock-free algorithm you read in a paper assumes garbage collection, or waves at "a safe memory
+reclamation scheme". That hand-wave is 80% of the implementation work and essentially all of the bugs. If you
+are evaluating a lock-free library, the first question is not "is the algorithm correct" — it is "which
+reclamation scheme, and what happens when a thread stalls inside a read".</p>
+</div>
+
+<h2 id="spsc">The one you should actually write</h2>
+
+<p>With exactly one producer and one consumer, a ring buffer needs no locks and no compare-and-swap at all — only correct ordering. It is by far the most useful lock-free structure in practice, and the only one most systems need.</p>
+
+<pre><code>/* A single-producer single-consumer ring buffer. Lock-free,
+   wait-free, no reclamation problem, ~30 lines, and it covers
+   a large fraction of real use cases: an audio callback, an
+   ISR to a worker, a logging thread.
+
+   It works because with exactly one producer and one consumer,
+   each index has exactly one writer.                        */
+
+#define CAP 1024                    /* power of two           */
+
+struct spsc {
+        void       *slot[CAP];
+        alignas(64) atomic_size_t head;   /* consumer writes   */
+        alignas(64) atomic_size_t tail;   /* producer writes   */
+        /* alignas(64) keeps them on separate cache lines -
+           without it the two threads fight over one line and
+           the whole thing runs at a fraction of the speed
+           (chapter 16).                                       */
+};
+
+bool spsc_push(struct spsc *q, void *v)
+{
+        size_t t = atomic_load_explicit(&amp;q-&gt;tail, memory_order_relaxed);
+        size_t h = atomic_load_explicit(&amp;q-&gt;head, memory_order_acquire);
+        if (t - h == CAP)
+                return false;                    /* full        */
+
+        q-&gt;slot[t &amp; (CAP - 1)] = v;              /* write data  */
+        atomic_store_explicit(&amp;q-&gt;tail, t + 1,
+                              memory_order_release);  /* publish */
+        return true;
+}
+
+bool spsc_pop(struct spsc *q, void **out)
+{
+        size_t h = atomic_load_explicit(&amp;q-&gt;head, memory_order_relaxed);
+        size_t t = atomic_load_explicit(&amp;q-&gt;tail, memory_order_acquire);
+        if (h == t)
+                return false;                    /* empty       */
+
+        *out = q-&gt;slot[h &amp; (CAP - 1)];
+        atomic_store_explicit(&amp;q-&gt;head, h + 1,
+                              memory_order_release);
+        return true;
+}
+
+/* Note the indices MONOTONICALLY INCREASE and are masked only
+   on use. That is what makes full and empty distinguishable
+   without wasting a slot, and unsigned wraparound is
+   well-defined so it is correct for ever.                    */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Rare corruption in a lock-free stack</td><td>ABA — a node was freed and reallocated at the same
+address</td></tr>
+<tr><td>Use-after-free reading <code>t-&gt;next</code></td><td>No reclamation scheme; the node was freed
+between the load and the CAS</td></tr>
+<tr><td>Memory grows without bound</td><td>Epoch reclamation with a thread stalled inside a critical
+section</td></tr>
+<tr><td>Lock-free version slower than the mutex</td><td>Contention causes retries; losers redo the work</td></tr>
+<tr><td>SPSC queue is 10x slower than expected</td><td>Head and tail on the same cache line — needs
+<code>alignas(64)</code></td></tr>
+<tr><td>Works on x86, corrupts on ARM</td><td>Missing acquire/release; TSO was hiding it</td></tr>
+<tr><td>One thread starves for seconds</td><td>Lock-free guarantees system progress, not per-thread — use
+wait-free if that matters</td></tr>
+<tr><td>Link error on 128-bit CAS</td><td>Tagged pointers without <code>-mcx16</code> or
+<code>-march=armv8.1-a</code></td></tr>
+<tr><td>Queue reports full when it is empty</td><td>Indices masked before comparison instead of on
+use</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define blocking, lock-free and wait-free in terms of progress guarantees.</li>
+  <li>Give three things lock-free genuinely buys and two it does not.</li>
+  <li>Walk through the ABA sequence step by step.</li>
+  <li>Identify the second bug that occurs in the same window as ABA.</li>
+  <li>Name five reclamation approaches and the cost of each.</li>
+  <li>Explain why lock-free structures are far easier in Java or Go.</li>
+  <li>Write an SPSC ring buffer with correct orderings from memory.</li>
+  <li>Explain why the SPSC queue has no reclamation problem.</li>
+  <li>Say why the indices increase monotonically and are masked only on use.</li>
+  <li>Explain the <code>alignas(64)</code> and what happens without it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

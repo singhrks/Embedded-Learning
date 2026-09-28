@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset: from power-on to your first instruction | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Reset: from power-on to your first instruction</h1>
+<p class="lead">On Linux the boot sequence is a chain of loaders you inherit. Here it is eleven microseconds
+long, entirely yours, and defined by two 32-bit words at address zero. This chapter follows the electrons
+from the power rail to <code>main()</code>.</p>
+
+<h2 id="sequence">The sequence</h2>
+
+<pre class="diagram">   POWER APPLIED
+        |
+        v
+   +----------------------+
+   | Brown-out reset holds |  The BOR circuit keeps the core
+   | the core in reset     |  in reset until VDD crosses the
+   | until VDD is stable   |  threshold. Typically 1.7-2.0 V.
+   +----------------------+
+        |
+        v
+   +----------------------+
+   | Internal oscillator   |  The chip starts on an internal
+   | starts (HSI/MSI)      |  RC oscillator - fast to start,
+   |                       |  a few percent accurate. Your
+   |                       |  crystal is not running yet.
+   +----------------------+
+        |
+        v
+   +----------------------+
+   | Option bytes / boot   |  Boot pins or option bits select
+   | pins sampled          |  what is aliased to 0x00000000:
+   |                       |  main flash, system ROM (the
+   |                       |  vendor's serial bootloader), or
+   |                       |  SRAM.
+   +----------------------+
+        |
+        v
+   +----------------------+
+   | READ TWO WORDS        |  This is the whole handoff.
+   |  [0x00000000] -&gt; MSP  |  Word 0: initial stack pointer
+   |  [0x00000004] -&gt; PC   |  Word 1: Reset_Handler address
+   +----------------------+
+        |
+        v
+   Reset_Handler executes  (chapter 06 - copy .data, zero .bss)
+        |
+        v
+   SystemInit()            (chapter 09 - clocks and PLL)
+        |
+        v
+   main()
+
+   Elapsed: microseconds. There is no bootloader, no device
+   tree, no ELF loader, no relocation. The hardware loads two
+   registers and starts fetching.</pre>
+
+<div class="key">
+<b>The first two words are the entire boot protocol</b>
+<p>Everything else — the vendor's HAL, CMSIS, your RTOS — is software convention layered on top. The
+architecture's contract is: at the address aliased to zero, put a stack pointer and an entry address. If the
+first word is not a valid, aligned, writable RAM address, the core faults before executing one instruction of
+your code, and it faults in a way that is very hard to debug because nothing of yours has run yet.</p>
+</div>
+
+<h2 id="vectortable">What actually sits at address zero</h2>
+
+<pre><code>/* The start of a real vector table, in C. The array IS the
+   boot protocol - the linker places it at the base of
+   flash, and the hardware reads it directly.               */
+
+extern uint32_t _estack;          /* from the linker script */
+void Reset_Handler(void);
+void NMI_Handler(void);
+void HardFault_Handler(void);
+
+__attribute__((section(".isr_vector"), used))
+void (* const g_vectors[])(void) = {
+    (void (*)(void)) &amp;_estack,    /* 0x00: initial MSP      */
+    Reset_Handler,                /* 0x04: entry point      */
+    NMI_Handler,                  /* 0x08                   */
+    HardFault_Handler,            /* 0x0C                   */
+    MemManage_Handler,            /* 0x10                   */
+    BusFault_Handler,             /* 0x14                   */
+    UsageFault_Handler,           /* 0x18                   */
+    0, 0, 0, 0,                   /* 0x1C-0x28 reserved     */
+    SVC_Handler,                  /* 0x2C                   */
+    DebugMon_Handler,             /* 0x30                   */
+    0,                            /* 0x34 reserved          */
+    PendSV_Handler,               /* 0x38                   */
+    SysTick_Handler,              /* 0x3C                   */
+    /* 0x40 onward: the vendor's peripheral interrupts      */
+    WWDG_IRQHandler,
+    PVD_IRQHandler,
+    /* ... typically 60-100 more ...                        */
+};
+
+/* Two things that trip people up:
+
+   1. The first entry is DATA (an address), not a function
+      pointer. The cast is a lie that keeps the array one
+      type. Some projects use a union to be honest about it.
+
+   2. Every other entry is a function pointer, and the
+      compiler automatically sets bit 0 for Thumb (chapter
+      02). Hand-writing this table in assembly means setting
+      that bit yourself, or faulting on the first interrupt.
+
+   3. `used` matters. Nothing in C refers to g_vectors, so
+      LTO or --gc-sections will happily delete it. The
+      KEEP() directive in the linker script is the other
+      half of this belt-and-braces (chapter 05).            */
+</code></pre>
+
+<h2 id="stackgrows">Why the stack pointer points at the end of RAM</h2>
+
+<pre class="diagram">   0x20010000  +------------------+  &lt;- _estack (64 kB part)
+               |                  |
+               |   STACK          |  grows DOWNWARD
+               |     |            |
+               |     v            |
+               |                  |
+               |   (free)         |
+               |                  |
+               |     ^            |
+               |     |            |
+               |   HEAP           |  grows upward, if you
+               |                  |  have one at all
+               +------------------+  &lt;- _end
+               |   .bss           |  zeroed by startup
+               +------------------+
+               |   .data          |  copied from flash
+   0x20000000  +------------------+
+
+   The stack starts at the TOP because it grows down. Set
+   _estack to the last address + 1: on a part with 64 kB of
+   SRAM at 0x20000000, that is 0x20010000, not 0x2000FFFF.
+   The SP is pre-decremented on push, so the first push
+   writes to 0x2000FFFC - inside RAM. Off-by-one here gives
+   you a fault on the very first push.
+
+   Note what is NOT here: any guard between stack and heap.
+   When they meet, they simply overwrite each other. The MPU
+   (chapter 14) is how you get a real guard.</pre>
+
+<h2 id="bootmodes">Boot mode selection</h2>
+
+<p>Almost every MCU can boot from somewhere other than your flash, and this is how a factory programs a blank
+chip and how you recover a brick.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Boot source</th><th>Selected by</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td>Main flash</td><td>Default; BOOT0 low</td><td>Normal operation</td></tr>
+<tr><td>System memory (ROM bootloader)</td><td>BOOT0 high, or an option byte</td><td>Factory programming and
+recovery over UART, USB DFU or CAN</td></tr>
+<tr><td>SRAM</td><td>Boot pins, or a debugger writing it directly</td><td>Loading code without wearing out
+flash during development</td></tr>
+<tr><td>External flash (QSPI)</td><td>Option bytes plus a memory-mapped controller</td><td>Programs too large
+for internal flash</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The ROM bootloader is your recovery path — protect access to it</b>
+<p>If your firmware disables the debug port and then fails to boot, the ROM bootloader entered via BOOT0 is
+often the only way back. Designs that route BOOT0 to a test pad rather than a hard ground are
+field-recoverable; designs that tie it low permanently and also disable SWD are one bad update away from
+scrap. This is a schematic decision made in week one that determines whether a firmware bug costs an hour or
+a production run.</p>
+</div>
+
+<h2 id="vtor">Moving the vector table</h2>
+
+<p>Address <code>0x00000000</code> is an <em>alias</em>. On most parts flash also appears at its true address
+(often <code>0x08000000</code>), and the alias points wherever the boot mode selected. Once running, you can
+relocate the table entirely with <code>VTOR</code>:</p>
+
+<pre><code>/* ARMv7-M and above. ARMv6-M has no VTOR - the table is
+   fixed at 0, and a bootloader on M0 must use other tricks
+   (usually remapping SRAM to address 0).                   */
+
+#define SCB_VTOR (*(volatile uint32_t *) 0xE000ED08)
+
+static void jump_to_application(uint32_t app_base)
+{
+    uint32_t app_sp  = *(volatile uint32_t *) (app_base + 0);
+    uint32_t app_pc  = *(volatile uint32_t *) (app_base + 4);
+
+    __disable_irq();                  /* no interrupts mid-jump   */
+    /* ... de-init every peripheral the bootloader enabled ...     */
+
+    SCB_VTOR = app_base;              /* point at the app's table  */
+    __asm volatile ("dsb");
+    __asm volatile ("isb");
+
+    __set_MSP(app_sp);                /* adopt the app's stack     */
+    ((void (*)(void)) app_pc)();      /* never returns             */
+}
+
+/* This is a complete bootloader-to-application handoff, and
+   nearly every field-update mechanism ends in these lines.
+
+   The classic bug: forgetting to de-initialise. A timer the
+   bootloader left running fires an interrupt as soon as the
+   application enables interrupts, vectors through the
+   application's table to a handler the application never
+   installed, and lands in the default infinite loop. The
+   symptom is "the app works when flashed directly but hangs
+   when launched from the bootloader" - and the cause is
+   always something left enabled.
+
+   VTOR also has an alignment requirement: the table must be
+   aligned to the next power of two above its size. For 100
+   entries (400 bytes) that means 512-byte alignment. Get it
+   wrong and the low bits are ignored, so the table lands
+   somewhere you did not intend.                             */
+</code></pre>
+
+<h2 id="debug">What the debugger does differently</h2>
+
+<p>Attaching a debugger changes the reset sequence, which is why "it works under the debugger" is such a
+common and such a misleading observation.</p>
+
+<pre><code>/* Under a debugger, a typical "load and run" does:
+
+   1. Halt the core (possibly via a reset-and-halt sequence
+      that catches the core before Reset_Handler).
+   2. Write the .text and .data sections into flash.
+   3. Set the PC and SP directly - often SKIPPING the
+      hardware's read of the first two words.
+   4. Release the core.
+
+   Consequences you will meet:
+
+   - A corrupt first word in the vector table works fine
+     under the debugger and bricks on a cold boot, because
+     the debugger set SP itself.
+
+   - Peripherals keep their state across a warm reset that
+     the debugger issues, but not across a power cycle. Code
+     that depends on a peripheral's reset value can work in
+     one and fail in the other.
+
+   - The debug unit keeps clocks running in sleep modes to
+     stay attached, so current measurements are meaningless
+     with SWD connected (chapter 13).
+
+   - Some parts hold the watchdog frozen while halted. Your
+     code passes single-stepping and resets in the field.
+
+   RULE: before believing anything about startup, power-cycle
+   the board with the debugger detached. Every startup bug
+   worth its name hides in the difference.                   */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Faults before any of your code runs</td><td>First vector-table word is not a valid, aligned RAM
+address</td></tr>
+<tr><td>Fault on the very first push</td><td><code>_estack</code> set to last address rather than last address
++ 1</td></tr>
+<tr><td>Works under debugger, dead on power-up</td><td>Debugger set SP and PC directly, masking a broken
+vector table</td></tr>
+<tr><td>Vector table missing from the binary</td><td>No <code>KEEP()</code> in the linker script and no
+<code>used</code> attribute — garbage collected</td></tr>
+<tr><td>Hard fault on the first interrupt</td><td>Hand-written table without the Thumb bit set in
+entries</td></tr>
+<tr><td>App hangs only when launched from bootloader</td><td>A peripheral or interrupt left enabled by the
+bootloader</td></tr>
+<tr><td>Setting <code>VTOR</code> partially works</td><td>Table not aligned to the next power of two above its
+size</td></tr>
+<tr><td><code>VTOR</code> does not exist</td><td>ARMv6-M core; relocate by remapping SRAM to address
+0</td></tr>
+<tr><td>Chip appears bricked after a bad update</td><td>Debug disabled and BOOT0 not accessible — the recovery
+path was designed out</td></tr>
+<tr><td>Behaviour differs between warm and cold reset</td><td>Peripheral state persists across warm reset; test
+both</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State exactly what the hardware does with the first two words at the boot address.</li>
+  <li>Explain why <code>_estack</code> is one past the last RAM address.</li>
+  <li>Say why the first vector table entry is data while the rest are function pointers.</li>
+  <li>Explain why the vector table needs <code>KEEP()</code> or <code>used</code>.</li>
+  <li>Describe how boot mode selection works and why BOOT0 access matters for recovery.</li>
+  <li>List the four steps of a bootloader-to-application handoff.</li>
+  <li>Explain the most common bootloader hand-off bug and its symptom.</li>
+  <li>State <code>VTOR</code>'s alignment requirement for a 400-byte table.</li>
+  <li>Give three ways a debugger changes the startup sequence.</li>
+  <li>Explain why you must power-cycle with the debugger detached before trusting startup code.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

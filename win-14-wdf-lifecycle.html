@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The WDF device lifecycle | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The WDF device lifecycle</h1>
+<p class="lead">Which callback runs when, what belongs in each, and what the framework guarantees about the
+order. Get this table right and PnP, power management and surprise removal all work without you writing a
+state machine.</p>
+
+<h2 id="order">The order</h2>
+
+<p>A device passes through a fixed sequence of states from discovery to removal, and your callbacks fire at defined points in it. Learning the order is what tells you where each piece of your initialisation belongs.</p>
+
+<pre class="diagram">   DriverEntry                        once, per driver load
+        |
+        v
+   EvtDriverDeviceAdd                 once PER DEVICE
+        |   create the WDFDEVICE, queues, interrupt objects
+        |   NO HARDWARE ACCESS - resources are not assigned
+        v
+   EvtDevicePrepareHardware           resources assigned
+        |   map registers, find the interrupt's descriptor
+        |   PASSIVE_LEVEL
+        v
+   EvtDeviceD0Entry                   powering up
+        |   initialise the hardware, restore state
+        |   PASSIVE_LEVEL
+        v
+   EvtDeviceD0EntryPostInterruptsEnabled
+        |   interrupts are now live; safe to start the device
+        v
+   ===== RUNNING: queues dispatch requests, ISR/DPC fire =====
+        |
+        v
+   EvtDeviceD0ExitPreInterruptsDisabled
+        |   stop the device generating interrupts
+        v
+   EvtDeviceD0Exit                    powering down
+        |   quiesce, save state. THE DEVICE IS STILL THERE.
+        v
+   EvtDeviceReleaseHardware           resources revoked
+        |   unmap. DO NOT TOUCH THE HARDWARE.
+        v
+   EvtCleanupCallback / EvtDestroyCallback
+        |
+        v
+   DriverUnload / EvtDriverUnload     once
+
+   AND THE POWER CYCLE, which happens repeatedly WITHOUT
+   PrepareHardware/ReleaseHardware:
+
+        D0Entry -&gt; running -&gt; D0Exit -&gt; (sleep) -&gt; D0Entry ...
+
+   THAT IS THE KEY ASYMMETRY: PrepareHardware runs once per
+   resource assignment; D0Entry runs on every power-up. So
+   MAPPING goes in PrepareHardware and INITIALISATION goes in
+   D0Entry - and putting initialisation in PrepareHardware
+   produces a device that works until the first sleep.</pre>
+
+<h2 id="whatgoeswhere">What belongs where</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Callback</th><th>Do</th><th>Do not</th></tr></thead>
+<tbody>
+<tr><td><code>DriverEntry</code></td><td><code>WdfDriverCreate</code>, global state</td><td>Anything per-device</td></tr>
+<tr><td><code>EvtDriverDeviceAdd</code></td><td>Create device, queues, interrupts, locks, timers; publish the interface</td><td>Touch hardware — there is none yet</td></tr>
+<tr><td><code>EvtDevicePrepareHardware</code></td><td>Map MMIO, read resource descriptors, allocate buffers sized from resources</td><td>Program the device</td></tr>
+<tr><td><code>EvtDeviceD0Entry</code></td><td>Reset, configure, restore registers, verify the ID</td><td>Enable interrupts (use the Post callback)</td></tr>
+<tr><td><code>EvtDeviceD0Exit</code></td><td>Stop the device, save state, flush</td><td>Unmap</td></tr>
+<tr><td><code>EvtDeviceReleaseHardware</code></td><td>Unmap, free what PrepareHardware allocated</td><td><strong>Touch the hardware</strong></td></tr>
+<tr><td><code>EvtDeviceSelfManagedIoInit</code></td><td>Start self-managed I/O — timers, polling threads</td><td></td></tr>
+<tr><td><code>EvtDeviceSelfManagedIoSuspend</code></td><td>Stop them, and <strong>wait</strong></td><td></td></tr>
+<tr><td><code>EvtDeviceSelfManagedIoCleanup</code></td><td>Final teardown of self-managed I/O</td><td></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The rule that prevents the worst bug</b>
+<p><code>EvtDeviceReleaseHardware</code> can run <em>after the device has physically been removed</em>. A
+register read then returns <code>0xFFFFFFFF</code>; a write may hang the bus or bugcheck. All hardware
+quiescing belongs in <code>EvtDeviceD0Exit</code>, which is guaranteed to run while the device is still
+present in the normal path — and which the framework <em>skips the hardware-touching parts of</em> on
+surprise removal.</p>
+</div>
+
+<h2 id="implement">The callbacks, implemented</h2>
+
+<p>Here are those callbacks written out, with the thing that actually belongs in each. The single most common mistake is touching hardware too early — before the system has given you the resources to touch it with.</p>
+
+<pre><code>NTSTATUS
+MyPrepareHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesRaw,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        ULONG i, count;
+        BOOLEAN foundMemory = FALSE;
+
+        PAGED_CODE();
+        UNREFERENCED_PARAMETER(ResourcesRaw);
+
+        count = WdfCmResourceListGetCount(ResourcesTranslated);
+
+        for (i = 0; i &lt; count; i++) {
+                PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
+                        WdfCmResourceListGetDescriptor(
+                                ResourcesTranslated, i);
+
+                switch (desc-&gt;Type) {
+                case CmResourceTypeMemory:
+                        if (foundMemory)
+                                break;    /* only the first */
+
+                        ctx-&gt;RegLength = desc-&gt;u.Memory.Length;
+                        ctx-&gt;RegBase = (PUCHAR)MmMapIoSpaceEx(
+                                desc-&gt;u.Memory.Start,
+                                desc-&gt;u.Memory.Length,
+                                PAGE_READWRITE | PAGE_NOCACHE);
+                        if (ctx-&gt;RegBase == NULL)
+                                return STATUS_INSUFFICIENT_RESOURCES;
+                        foundMemory = TRUE;
+                        break;
+
+                case CmResourceTypeInterrupt:
+                        /* WdfInterruptCreate in DeviceAdd
+                           already claimed it (chapter 18) */
+                        break;
+                }
+        }
+
+        if (!foundMemory)
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyD0Entry(_In_ WDFDEVICE Device,
+          _In_ WDF_POWER_DEVICE_STATE PreviousState)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        ULONG id;
+
+        UNREFERENCED_PARAMETER(PreviousState);
+
+        /* The device may have lost all state. Verify it is
+           there, then configure it from scratch.          */
+
+        id = READ_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_ID));
+        if (id != MY_EXPECTED_ID) {
+                /* 0xFFFFFFFF means it is gone */
+                return STATUS_DEVICE_NOT_CONNECTED;
+        }
+
+        /* reset */
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_CTRL),
+                             CTRL_RESET);
+        KeStallExecutionProcessor(10);
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_CTRL), 0);
+
+        /* restore our configuration */
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_RATE),
+                             ctx-&gt;SampleRate);
+
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyD0EntryPostInterruptsEnabled(_In_ WDFDEVICE Device,
+                        _In_ WDF_POWER_DEVICE_STATE PreviousState)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        UNREFERENCED_PARAMETER(PreviousState);
+
+        /* interrupts are connected NOW - safe to let the
+           device raise them                                */
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_INT_EN),
+                             INT_ALL);
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyD0ExitPreInterruptsDisabled(_In_ WDFDEVICE Device,
+                        _In_ WDF_POWER_DEVICE_STATE TargetState)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        UNREFERENCED_PARAMETER(TargetState);
+
+        /* stop the device asserting BEFORE the framework
+           disconnects the interrupt - otherwise we take one
+           with no handler                                  */
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_INT_EN),
+                             0);
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyD0Exit(_In_ WDFDEVICE Device,
+         _In_ WDF_POWER_DEVICE_STATE TargetState)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        /* quiesce. The device is still present here. */
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + REG_CTRL), 0);
+
+        /* wait for our own deferred work (chapter 11) */
+        WdfDpcCancel(ctx-&gt;Dpc, TRUE);
+        WdfTimerStop(ctx-&gt;Timer, TRUE);
+
+        if (TargetState == WdfPowerDeviceD3Final) {
+                /* the device is going away for good */
+        }
+
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyReleaseHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        PAGED_CODE();
+        UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+        /* NO HARDWARE ACCESS HERE. */
+
+        if (ctx-&gt;RegBase) {
+                MmUnmapIoSpace(ctx-&gt;RegBase, ctx-&gt;RegLength);
+                ctx-&gt;RegBase = NULL;
+        }
+        return STATUS_SUCCESS;
+}</code></pre>
+
+<h2 id="power">Power states</h2>
+
+<p>A device is not simply on or off. It moves between power states while the system is running and while the system itself sleeps, and your driver is expected to save and restore whatever the hardware forgets at each transition.</p>
+
+<pre><code>/* DEVICE states (D-states): */
+        D0   fully on
+        D1   light sleep, context preserved (rare)
+        D2   deeper (rare)
+        D3hot powered down, still in the slot
+        D3cold power removed entirely
+
+/* WDF's enumeration adds the reason: */
+        WdfPowerDeviceD0
+        WdfPowerDeviceD1 / D2 / D3
+        WdfPowerDeviceD3Final     &lt;-- the device is being
+                                      REMOVED, not just slept
+        WdfPowerDevicePrepareForHibernation
+        WdfPowerDeviceMaximum
+
+/* CHECK FOR D3Final in D0Exit: it distinguishes "going to
+   sleep, we will be back" from "goodbye". Freeing things in
+   the first case leaves you broken on resume.            */
+
+/* SYSTEM states (S-states): S0 working, S3 sleep, S4
+   hibernate, S5 off. The power manager maps a system
+   transition onto D-state transitions for each device.
+
+/* IDLE POWER MANAGEMENT - let the device sleep when unused: */
+
+        WDF_DEVICE_POWER_POLICY_IDLE_SETTINGS idleSettings;
+
+        WDF_DEVICE_POWER_POLICY_IDLE_SETTINGS_INIT(
+                &amp;idleSettings, IdleCanWakeFromS0);
+        idleSettings.IdleTimeout   = 5000;    /* ms */
+        idleSettings.UserControlOfIdleSettings =
+                        IdleAllowUserControl;
+        idleSettings.Enabled = WdfTrue;
+
+        status = WdfDeviceAssignS0IdlePolicy(device,
+                                             &amp;idleSettings);
+
+/* Then the framework calls D0Exit after 5 seconds of no
+   requests, and D0Entry when the next one arrives - stalling
+   the request until the device is up. You write nothing else.
+
+   This is the direct counterpart of Linux's runtime PM
+   (ch. 37), and it is considerably less code because the
+   framework does the reference counting through the queues
+   rather than making you bracket every access.           */
+
+/* WAKE FROM SLEEP: */
+        WDF_DEVICE_POWER_POLICY_WAKE_SETTINGS wakeSettings;
+
+        WDF_DEVICE_POWER_POLICY_WAKE_SETTINGS_INIT(
+                &amp;wakeSettings);
+        status = WdfDeviceAssignSxWakeSettings(device,
+                                               &amp;wakeSettings);</code></pre>
+
+<h2 id="selfmanaged">Self-managed I/O</h2>
+
+<p>Some work does not fit the ordinary power callbacks — a background poll that must stop before the device powers down, for instance. Self-managed I/O is the set of callbacks for exactly that case.</p>
+
+<pre><code>/* Queues are stopped and started by the framework around
+   power transitions. But work you started YOURSELF - a
+   polling timer, a system thread, a continuous DMA - is not
+   known to the framework. Self-managed I/O callbacks are
+   where you handle it.                                     */
+
+        WDF_PNPPOWER_EVENT_CALLBACKS pnpPower;
+
+        WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&amp;pnpPower);
+        pnpPower.EvtDeviceSelfManagedIoInit    = MySmIoInit;
+        pnpPower.EvtDeviceSelfManagedIoSuspend = MySmIoSuspend;
+        pnpPower.EvtDeviceSelfManagedIoRestart = MySmIoRestart;
+        pnpPower.EvtDeviceSelfManagedIoCleanup = MySmIoCleanup;
+
+NTSTATUS
+MySmIoInit(_In_ WDFDEVICE Device)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        /* runs ONCE, after the first D0Entry */
+        WdfTimerStart(ctx-&gt;PollTimer,
+                      WDF_REL_TIMEOUT_IN_MS(100));
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MySmIoSuspend(_In_ WDFDEVICE Device)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        /* STOP AND WAIT. The framework will not proceed with
+           the power transition until this returns, so
+           anything still running afterwards is a bug you
+           introduced.                                       */
+        WdfTimerStop(ctx-&gt;PollTimer, TRUE);   /* TRUE = wait */
+        WdfWorkItemFlush(ctx-&gt;WorkItem);
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MySmIoRestart(_In_ WDFDEVICE Device)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        WdfTimerStart(ctx-&gt;PollTimer,
+                      WDF_REL_TIMEOUT_IN_MS(100));
+        return STATUS_SUCCESS;
+}
+
+VOID
+MySmIoCleanup(_In_ WDFDEVICE Device)
+{
+        /* final teardown - the device is going away */
+}
+
+/* THE SEQUENCE around a sleep:
+     SelfManagedIoSuspend -&gt; D0ExitPre -&gt; D0Exit
+     ... sleep ...
+     D0Entry -&gt; D0EntryPost -&gt; SelfManagedIoRestart
+
+   IF YOU HAVE NO TIMERS OR THREADS OF YOUR OWN, you do not
+   need these callbacks at all. That is the common case - and
+   another reason to prefer queues over self-started work. */</code></pre>
+
+<h2 id="removal">Surprise removal</h2>
+
+<p>A user can unplug a device while your driver is mid-transfer. Surprise removal is that path, and it is the least-tested code in most drivers precisely because it never happens during development unless you deliberately cause it.</p>
+
+<pre><code>/* The user unplugged it. The hardware is GONE.
+
+   WHAT THE FRAMEWORK DOES:
+     · fails all new requests with STATUS_DEVICE_REMOVED
+     · calls EvtDeviceSurpriseRemoval if you registered one
+     · SKIPS D0Exit's hardware access expectations - but it
+       still CALLS D0Exit, so your code must tolerate a
+       missing device
+     · calls ReleaseHardware
+     · destroys the device
+
+   WHAT YOU MUST DO:
+     · detect the "all ones" read and stop rather than
+       retrying forever
+     · never wait for hardware without a timeout
+     · complete every pending request                      */
+
+static BOOLEAN
+MyDeviceIsPresent(PMY_CONTEXT ctx)
+{
+        ULONG id = READ_REGISTER_ULONG(
+                        (PULONG)(ctx-&gt;RegBase + REG_ID));
+
+        return (id != 0xFFFFFFFF) &amp;&amp; (id == MY_EXPECTED_ID);
+}
+
+        /* use it before any operation that would otherwise
+           poll: */
+        if (!MyDeviceIsPresent(ctx)) {
+                WdfRequestComplete(request,
+                                   STATUS_DEVICE_REMOVED);
+                return;
+        }
+
+/* TESTING IT: in Device Manager, disable the device while I/O
+   is in flight. Or, for USB, unplug it during a transfer. Or
+   use the WDK's "Device Fundamentals" tests, which do exactly
+   this automatically - and which you must pass for
+   certification anyway (chapter 22).                     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works until the first sleep, then dead</td><td>Initialisation in <code>PrepareHardware</code> instead of <code>D0Entry</code></td></tr>
+<tr><td>Bugcheck on unplug</td><td>Hardware touched in <code>ReleaseHardware</code></td></tr>
+<tr><td>Hang on unplug</td><td>Polling for hardware that is gone, with no timeout</td></tr>
+<tr><td>Spurious interrupt during power-down</td><td>Device not silenced in <code>D0ExitPreInterruptsDisabled</code></td></tr>
+<tr><td>Crash after resume in a timer callback</td><td>Timer not stopped-and-waited in self-managed I/O suspend</td></tr>
+<tr><td>Device never idles</td><td>No S0 idle policy assigned</td></tr>
+<tr><td>Device sleeps mid-operation</td><td>Work started outside a queue, so the framework does not know it is busy</td></tr>
+<tr><td>State lost on resume</td><td><code>D0Entry</code> does not restore configuration</td></tr>
+<tr><td>Freed something needed after resume</td><td>Did not check for <code>D3Final</code> in <code>D0Exit</code></td></tr>
+<tr><td>Device Manager shows Code 10</td><td><code>PrepareHardware</code> or <code>D0Entry</code> returned an error</td></tr>
+<tr><td>Registers read <code>0xFFFFFFFF</code></td><td>Surprise removal — detect and fail fast</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write out the callback order from <code>DriverEntry</code> to unload.</li>
+  <li>Explain the asymmetry between <code>PrepareHardware</code> and <code>D0Entry</code>.</li>
+  <li>Say what belongs in each of the nine callbacks, and what does not.</li>
+  <li>Explain why hardware access is forbidden in <code>ReleaseHardware</code>.</li>
+  <li>Explain the purpose of the Pre/Post interrupt callbacks.</li>
+  <li>Distinguish <code>D3</code> from <code>D3Final</code> and say why it matters.</li>
+  <li>Assign an S0 idle policy and compare it with Linux runtime PM.</li>
+  <li>Say when self-managed I/O callbacks are needed and what they must guarantee.</li>
+  <li>Write a device-present check and explain the all-ones read.</li>
+  <li>Test surprise removal deliberately.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

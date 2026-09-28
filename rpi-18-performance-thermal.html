@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance, throttling and measurement | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Performance, throttling and measurement</h1>
+<p class="lead">A Pi that gets slower after ninety seconds of load is not a mystery, and it is not your code.
+It is a thermal or electrical limit doing exactly what it was designed to do — and the board will tell you
+which, in one command, if you ask.</p>
+
+<h2 id="throttled">The one command to run first</h2>
+
+<pre><code>$ vcgencmd get_throttled
+throttled=0x0                 # healthy
+
+# The value is a BITMASK, and the two halves matter
+# differently:
+
+#   CURRENT STATE (bits 0-3)
+#     0x1     under-voltage right now
+#     0x2     ARM frequency capped right now
+#     0x4     currently throttled
+#     0x8     soft temperature limit active
+#
+#   HAS OCCURRED SINCE BOOT (bits 16-19)
+#     0x10000   under-voltage has occurred
+#     0x20000   ARM frequency capping has occurred
+#     0x40000   throttling has occurred
+#     0x80000   soft temperature limit has occurred
+
+# So:
+throttled=0x50000
+#   = 0x40000 | 0x10000
+#   = under-voltage AND throttling have both happened,
+#     but neither is happening at this instant.
+
+# THE HIGH BITS ARE THE IMPORTANT ONES. A board that is fine
+# now but under-volted an hour ago is a board with a power
+# supply problem, and that is a cause of SD corruption,
+# random reboots and "flaky hardware" that people chase in
+# software for weeks.
+
+# Decode it in a script:
+$ printf '0x%x\n' $(( $(vcgencmd get_throttled | cut -d= -f2) ))
+
+# Watch it under load:
+$ watch -n1 'vcgencmd measure_temp; vcgencmd measure_clock arm; \
+             vcgencmd get_throttled'
+</code></pre>
+
+<div class="danger">
+<b>Under-voltage is the most misdiagnosed problem on this platform</b>
+<p>A supply that sags under load produces symptoms that all look like software: filesystem corruption, USB
+devices vanishing, random reboots, Ethernet dropping, and builds that fail differently each time. Bit 0x10000
+tells you in one command. The causes, in order: a phone charger rather than a real supply; a thin or long
+USB-C cable (the cable is at fault far more often than the supply); a Pi 5 without a 5 A PD supply while
+driving USB peripherals; or too much current drawn from the 5 V header pins. Fix this before investigating
+anything else — every measurement you take on an under-volted board is worthless.</p>
+</div>
+
+<h2 id="thermal">Thermal behaviour</h2>
+
+<pre class="diagram">   The SoC reduces its own clock as it heats, in stages.
+   Exact thresholds vary by model and firmware; the SHAPE is
+   what matters.
+
+   temp        typical behaviour
+   ------------------------------------------------
+   &lt; 60 C      full speed
+   ~60-70 C    fans spin up (Pi 5 active cooler)
+   ~80 C       ARM clock begins to reduce
+   ~85 C       hard throttle: clock and voltage cut
+               sharply until temperature falls
+
+   A BARE PI 4 UNDER SUSTAINED LOAD WILL REACH 80 C in a
+   couple of minutes and stay there, running perhaps 30-40%
+   slower than its benchmark figure. A Pi 5 without the
+   active cooler does the same, faster.
+
+   THE PRACTICAL CONSEQUENCE for this track: a kernel build
+   (chapter 15) is precisely the sustained all-core load
+   that triggers this. Your "one hour" build becomes ninety
+   minutes, and the difference is a $5 heatsink.
+
+   $ vcgencmd measure_temp
+   temp=67.3'C
+   $ cat /sys/class/thermal/thermal_zone0/temp
+   67300                        # millidegrees
+
+   COOLING, in order of effectiveness per pound spent:
+     1. any airflow at all - even a slow fan
+     2. the official active cooler (Pi 5) or a fan case
+     3. a large passive heatsink
+     4. a heatsink case with no airflow: better than
+        nothing, saturates under sustained load
+
+   Track it during a long build to see the effect:
+   $ while sleep 5; do
+       echo "$(date +%T) $(vcgencmd measure_temp) \
+             $(vcgencmd measure_clock arm)"
+     done | tee thermal.log</pre>
+
+<h2 id="cpufreq">Frequency and governors</h2>
+
+<pre><code># The Pi scales its clock with load, which is good for power
+# and bad for measurement reproducibility.
+
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+ondemand
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+1500000                        # kHz
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+
+# FOR BENCHMARKING, pin it. Otherwise your first run is slow
+# (governor still ramping) and your fifth is slow again
+# (thermal), and neither number means anything:
+$ echo performance | sudo tee \
+      /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# ... and pin it back afterwards, or the board runs hot and
+# draws more power permanently:
+$ echo ondemand | sudo tee \
+      /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# A LOWER CEILING is often the right answer for a product:
+# cooler, quieter, and the last 10% of clock costs
+# disproportionate power. In config.txt (chapter 09):
+arm_freq=1800
+arm_freq_min=600
+
+# OVERCLOCKING: possible, documented, and it interacts with
+# thermal limits so the sustained gain is smaller than the
+# peak gain suggests. On some models an over_voltage setting
+# sets a permanent bit in OTP memory - read the current
+# documentation before typing, because that part is not
+# reversible.
+</code></pre>
+
+<h2 id="measure">Measuring properly</h2>
+
+<pre><code># A Pi's numbers move under you. These are the controls that
+# make a measurement mean something.
+
+# 1. PIN THE GOVERNOR (above), and record the temperature
+#    with every result.
+# 2. WARM UP, then measure - or cool down and measure only
+#    the first run. Say which you did.
+# 3. REPEAT. Report the median and the spread, never one run.
+# 4. PIN TO A CORE, so migration between cores with
+#    different thermal histories does not add noise:
+$ taskset -c 3 ./benchmark
+
+# perf works on the Pi and gives you the counters that
+# explain a result rather than just restating it:
+$ sudo apt install linux-perf
+$ sudo sysctl -w kernel.perf_event_paranoid=1
+
+$ perf stat -e cycles,instructions,cache-misses,\
+branch-misses,cpu-migrations ./app
+
+# The derived numbers are what matter:
+#   instructions / cycles          = IPC. Below ~0.5 on an
+#                                    A72/A76 means you are
+#                                    stalled on memory.
+#   cache-misses / instructions    memory-bound?
+#   branch-misses / branches       unpredictable control flow
+
+$ perf record -g ./app &amp;&amp; perf report      # where the time goes
+$ perf top                                  # live, system-wide
+
+# The computer architecture track's roofline discussion
+# applies directly: find out whether you are compute-bound
+# or memory-bound BEFORE optimising, because the two have
+# opposite fixes.
+
+# STORAGE is the bottleneck far more often than the CPU on a
+# Pi:
+$ sudo apt install fio
+$ fio --name=r --rw=randread --bs=4k --size=256M \
+      --numjobs=1 --runtime=30 --time_based --direct=1
+# A typical SD card manages a few hundred random IOPS; a
+# USB3 SSD, tens of thousands; NVMe on a Pi 5, more. If a
+# build or a database feels slow, measure this first.
+</code></pre>
+
+<div class="key">
+<b>Report the conditions, or the number is fiction</b>
+<p>"The Pi does 4200 MB/s" is meaningless without the model, the OS release, the governor, the starting
+temperature, whether a cooler was fitted, the supply, and how many runs. This sounds pedantic until two people
+compare results and differ by 40% for entirely legitimate reasons. Get into the habit of printing
+<code>vcgencmd measure_temp</code>, <code>get_throttled</code> and the governor alongside every benchmark —
+it costs one line and it makes your numbers reproducible.</p>
+</div>
+
+<h2 id="tuning">Tuning that is actually worth doing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Change</th><th>Effect</th><th>Worth it?</th></tr></thead>
+<tbody>
+<tr><td>Fit a cooler</td><td>Removes sustained throttling entirely</td><td><strong>Always.</strong> The
+highest return of anything here</td></tr>
+<tr><td>Proper supply and short cable</td><td>Eliminates under-voltage</td><td><strong>Always</strong></td></tr>
+<tr><td>Boot from SSD or NVMe</td><td>Often 5–20× on I/O-bound work</td><td>Yes, for builds and
+databases</td></tr>
+<tr><td><code>gpu_mem=16</code> headless</td><td>Frees ~50–100 MB</td><td>Only on a small-RAM board with no
+video use</td></tr>
+<tr><td><code>performance</code> governor</td><td>Removes ramp latency</td><td>For benchmarking; not
+permanently</td></tr>
+<tr><td>Disable unused services</td><td>Frees RAM and boot time</td><td>Modest; measure with
+<code>systemd-analyze</code></td></tr>
+<tr><td>Logs to tmpfs</td><td>Saves SD writes</td><td>Yes — mostly an endurance win (chapter 19)</td></tr>
+<tr><td>Overclocking</td><td>~10–20% peak</td><td>Rarely — thermal limits eat most of it</td></tr>
+<tr><td>Swap on SD</td><td>Avoids OOM</td><td>No — destroys the card. Use USB storage</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Boot time, if it matters to you:
+$ systemd-analyze
+Startup finished in 2.1s (kernel) + 8.4s (userspace) = 10.5s
+$ systemd-analyze blame | head
+$ systemd-analyze critical-chain
+
+# And the kernel side (chapter 09):
+#   initcall_debug on the command line prints every driver's
+#   init function with its duration.
+$ dmesg | grep -E "initcall.*returned" | \
+      awk '{print $NF, $0}' | sort -rn | head
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Fast for a minute, then 40% slower</td><td>Thermal throttling — check
+<code>measure_temp</code></td></tr>
+<tr><td>Random reboots and SD corruption</td><td>Under-voltage — check bit 0x10000</td></tr>
+<tr><td>USB devices disconnect under load</td><td>Supply or cable, not the device</td></tr>
+<tr><td>Benchmark varies 40% between runs</td><td>Governor and temperature not controlled</td></tr>
+<tr><td>Build slower than a colleague's identical Pi</td><td>Cooling, supply, or storage differ</td></tr>
+<tr><td>IPC below 0.5</td><td>Memory-stalled, not compute-bound — optimise access patterns</td></tr>
+<tr><td>Everything feels slow, CPU is idle</td><td>Storage — measure with <code>fio</code></td></tr>
+<tr><td>Card fails after weeks</td><td>Swap or heavy logging on the SD card</td></tr>
+<tr><td><code>perf</code> refuses to run</td><td><code>perf_event_paranoid</code> too high</td></tr>
+<tr><td>Overclock gives less than expected</td><td>Thermal limit reached sooner at higher
+voltage</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Decode <code>throttled=0x50000</code>.</li>
+  <li>Explain why the "has occurred" bits matter more than the current-state bits.</li>
+  <li>List four symptoms of under-voltage that look like software faults.</li>
+  <li>Give the most common cause of under-voltage, and it is not the supply.</li>
+  <li>Describe the throttling stages and roughly where they begin.</li>
+  <li>Explain why a kernel build is the workload most affected by cooling.</li>
+  <li>Give four controls that make a benchmark reproducible.</li>
+  <li>Say what an IPC below 0.5 tells you and what it implies about the fix.</li>
+  <li>Name the two tuning changes with the highest return.</li>
+  <li>Explain why swap on an SD card is a mistake.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

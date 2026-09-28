@@ -1,0 +1,1125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the C2PA trusted application and manifest | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the C2PA trusted application and manifest</h1>
+<p class="lead">The secure half of the capture project: a trusted application that will only sign claims
+about images it witnessed, the COSE structure that carries the signature, and a real Content Credential that
+<code>c2patool</code> validates. Plus a clear list of what still stands between this and something you could
+ship.</p>
+
+<h2 id="cose">COSE_Sign1, and a pleasant surprise</h2>
+
+<p>The signature format sounds intimidating and turns out to be pleasantly simple once the structure is clear — which is fortunate, because you have to construct it by hand.</p>
+
+<pre class="diagram">   A C2PA claim signature is a COSE_Sign1 (RFC 9052):
+
+     COSE_Sign1 = [
+        protected   : bstr,   ; a serialised CBOR map
+        unprotected : map,
+        payload     : bstr,   ; the claim CBOR
+        signature   : bstr
+     ]
+
+   The protected header, for C2PA with ES256:
+
+     {
+        1  : -7,              ; alg = ES256 (ECDSA P-256 + SHA-256)
+        33 : [ bstr, ... ]    ; x5chain - the certificate chain,
+     }                        ;   RFC 9360, leaf first
+
+   WHAT IS ACTUALLY SIGNED is not the COSE_Sign1 and not the
+   payload. It is the Sig_structure:
+
+     Sig_structure = [
+        "Signature1",         ; context
+        protected,            ; bstr, exactly as it appears above
+        external_aad,         ; bstr, empty for C2PA
+        payload               ; bstr, the claim
+     ]
+
+   Serialise that array to CBOR, SHA-256 it, sign the digest.
+
+   THE PLEASANT PART:
+
+     RFC 9053 s2.1 - "The signature value is the concatenation
+     of the R and S values", fixed width, big-endian.
+
+     So COSE wants RAW r || s. Exactly what
+     TEE_AsymmetricSignDigest produces. No DER anywhere.
+
+     Compare:
+       COSE / JOSE / CNG   -> raw r || s      (64 bytes for P-256)
+       OpenSSL / X.509 /   -> DER SEQUENCE of two INTEGERs
+         TLS / CMS
+
+     The Rust project needed a converter; this one does not.
+     The TA's output drops straight into the signature slot.</pre>
+
+<h2 id="ta">The trusted application</h2>
+
+<p>This is the code that runs inside the secure world, where the private key lives. It is an ordinary program with an unusual set of restrictions, and it never lets the key leave.</p>
+
+<pre><code>/* ta/include/c2pa_ta.h - shared with the driver. */
+
+#ifndef C2PA_TA_H
+#define C2PA_TA_H
+
+#define C2PA_TA_UUID \
+	{ 0x8b1e4d72, 0x3f5a, 0x4c26, \
+	  { 0x9d, 0x80, 0x6a, 0x7b, 0x2e, 0x14, 0xf9, 0x03 } }
+
+#define TA_CMD_GET_PUBKEY     0
+#define TA_CMD_ATTEST_CAPTURE 1
+#define TA_CMD_SIGN_CLAIM     2
+
+#define C2PA_HASH_LEN   32
+#define C2PA_SIG_LEN    64
+#define C2PA_PUBKEY_LEN 64
+
+/* How many recent captures the TA remembers. Small on purpose:
+ * see the note on the witness window below.
+ */
+#define C2PA_WITNESS_SLOTS 8
+
+#endif</code></pre>
+
+<pre><code>/* ta/user_ta_header_defines.h */
+#ifndef USER_TA_HEADER_DEFINES_H
+#define USER_TA_HEADER_DEFINES_H
+
+#include "c2pa_ta.h"
+#define TA_UUID C2PA_TA_UUID
+
+/*
+ * SINGLE_INSTANCE + KEEP_ALIVE is not a performance choice here,
+ * it is a correctness requirement: the witness ring lives in TA
+ * globals. Without KEEP_ALIVE the TA is unloaded when the last
+ * session closes and every witnessed capture is forgotten
+ * (OP-TEE chapter 13).
+ */
+#define TA_FLAGS (TA_FLAG_SINGLE_INSTANCE | TA_FLAG_INSTANCE_KEEP_ALIVE)
+
+#define TA_STACK_SIZE (8 * 1024)
+#define TA_DATA_SIZE  (64 * 1024)
+
+#define TA_CURRENT_TA_EXT_PROPERTIES \
+	{ "gp.ta.description", USER_TA_PROP_TYPE_STRING, \
+	  "C2PA capture attestation" }, \
+	{ "gp.ta.version", USER_TA_PROP_TYPE_U32, \
+	  &amp;(const uint32_t){ 0x0100 } }
+
+#endif</code></pre>
+
+<pre><code>/* ta/c2pa_ta.c */
+
+#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include &lt;string.h&gt;
+#include "c2pa_ta.h"
+
+#define KEY_OBJECT_ID     "c2pa.device-key.v1"
+#define COUNTER_OBJECT_ID "c2pa.counter.v1"
+
+/* ------------------------------------------------------------------
+ * The witness ring
+ *
+ * A small circular buffer of hashes the KERNEL told us it produced.
+ * Deliberately bounded: an unbounded list is a memory-exhaustion
+ * target reachable by anyone who can call ATTEST, and secure heap
+ * is measured in tens of kilobytes (OP-TEE chapter 6).
+ *
+ * The bound has a real consequence, and it is a design decision
+ * rather than a limitation: a claim must be signed within
+ * C2PA_WITNESS_SLOTS captures of the frame it describes. A camera
+ * signs immediately, so eight is generous. If your pipeline
+ * batches, raise it - and understand that you are widening the
+ * window in which a compromised user space may pick which
+ * witnessed frame to lie about.
+ * ------------------------------------------------------------------ */
+struct witness {
+	uint8_t  hash[C2PA_HASH_LEN];
+	uint64_t capture_id;
+	bool     used;          /* single-use: one signature per capture */
+	bool     valid;
+};
+
+static struct witness g_witness[C2PA_WITNESS_SLOTS];
+static unsigned int   g_next;
+static uint64_t       g_counter;
+static bool           g_counter_loaded;
+
+/* ------------------------------------------------------------------
+ * Monotonic counter, persisted
+ * ------------------------------------------------------------------ */
+static TEE_Result counter_load(void)
+{
+	TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+	uint32_t got = 0;
+	TEE_Result res;
+
+	if (g_counter_loaded)
+		return TEE_SUCCESS;
+
+	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+				       COUNTER_OBJECT_ID,
+				       sizeof(COUNTER_OBJECT_ID) - 1,
+				       TEE_DATA_FLAG_ACCESS_READ, &amp;obj);
+	if (res == TEE_ERROR_ITEM_NOT_FOUND) {
+		g_counter = 0;
+		g_counter_loaded = true;
+		return TEE_SUCCESS;
+	}
+	if (res != TEE_SUCCESS)
+		return res;
+
+	res = TEE_ReadObjectData(obj, &amp;g_counter, sizeof(g_counter), &amp;got);
+	TEE_CloseObject(obj);
+	if (res != TEE_SUCCESS)
+		return res;
+	if (got != sizeof(g_counter))
+		g_counter = 0;
+
+	g_counter_loaded = true;
+	return TEE_SUCCESS;
+}
+
+static TEE_Result counter_store(void)
+{
+	TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+	TEE_Result res;
+
+	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+				       COUNTER_OBJECT_ID,
+				       sizeof(COUNTER_OBJECT_ID) - 1,
+				       TEE_DATA_FLAG_ACCESS_WRITE, &amp;obj);
+	if (res == TEE_SUCCESS) {
+		res = TEE_SeekObjectData(obj, 0, TEE_DATA_SEEK_SET);
+		if (res == TEE_SUCCESS)
+			res = TEE_WriteObjectData(obj, &amp;g_counter,
+						  sizeof(g_counter));
+		TEE_CloseObject(obj);
+		return res;
+	}
+	if (res != TEE_ERROR_ITEM_NOT_FOUND)
+		return res;
+
+	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+					 COUNTER_OBJECT_ID,
+					 sizeof(COUNTER_OBJECT_ID) - 1,
+					 TEE_DATA_FLAG_ACCESS_READ |
+					 TEE_DATA_FLAG_ACCESS_WRITE |
+					 TEE_DATA_FLAG_ACCESS_WRITE_META,
+					 TEE_HANDLE_NULL,
+					 &amp;g_counter, sizeof(g_counter), &amp;obj);
+	if (res == TEE_SUCCESS)
+		TEE_CloseObject(obj);
+	return res;
+}
+
+/* ------------------------------------------------------------------
+ * The device key
+ * ------------------------------------------------------------------ */
+static TEE_Result open_or_create_key(TEE_ObjectHandle *out)
+{
+	TEE_ObjectHandle key = TEE_HANDLE_NULL;
+	TEE_Attribute curve;
+	TEE_Result res;
+
+	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+				       KEY_OBJECT_ID,
+				       sizeof(KEY_OBJECT_ID) - 1,
+				       TEE_DATA_FLAG_ACCESS_READ, out);
+	if (res == TEE_SUCCESS)
+		return TEE_SUCCESS;
+	if (res != TEE_ERROR_ITEM_NOT_FOUND)
+		return res;
+
+	IMSG("generating device key");
+
+	res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR, 256, &amp;key);
+	if (res != TEE_SUCCESS)
+		return res;
+
+	TEE_InitValueAttribute(&amp;curve, TEE_ATTR_ECC_CURVE,
+			       TEE_ECC_CURVE_NIST_P256, 0);
+
+	res = TEE_GenerateKey(key, 256, &amp;curve, 1);
+	if (res == TEE_SUCCESS)
+		res = TEE_CreatePersistentObject(
+			TEE_STORAGE_PRIVATE, KEY_OBJECT_ID,
+			sizeof(KEY_OBJECT_ID) - 1,
+			TEE_DATA_FLAG_ACCESS_READ |
+			TEE_DATA_FLAG_ACCESS_WRITE_META,
+			key, NULL, 0, out);
+
+	TEE_FreeTransientObject(key);
+	return res;
+}
+
+/* Left-pad an ECC coordinate to a fixed 32 bytes. The minimal
+ * encoding drops leading zero bytes, so about one coordinate in
+ * 256 comes back short. Writing it flush-left produces a key that
+ * works 99.6% of the time.
+ */
+static TEE_Result get_coord(TEE_ObjectHandle obj, uint32_t attr,
+			    uint8_t out[32])
+{
+	uint8_t tmp[32];
+	uint32_t len = sizeof(tmp);
+	TEE_Result res;
+
+	res = TEE_GetObjectBufferAttribute(obj, attr, tmp, &amp;len);
+	if (res != TEE_SUCCESS)
+		return res;
+	if (len &gt; 32)
+		return TEE_ERROR_BAD_STATE;
+
+	TEE_MemFill(out, 0, 32);
+	TEE_MemMove(out + (32 - len), tmp, len);
+	return TEE_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
+ * Who is calling?
+ *
+ * ATTEST may only be issued by the KERNEL. If a user process could
+ * attest, it could witness a hash of any image it liked and the
+ * entire binding argument collapses.
+ * ------------------------------------------------------------------ */
+static bool caller_is_kernel(void)
+{
+	TEE_Identity id;
+
+	if (TEE_GetPropertyAsIdentity(TEE_PROPSET_CURRENT_CLIENT,
+				      "gpd.client.identity",
+				      &amp;id) != TEE_SUCCESS)
+		return false;
+
+	return id.login == TEE_LOGIN_REE_KERNEL;
+}
+
+/* ------------------------------------------------------------------
+ * TA_CMD_GET_PUBKEY   [0] memref out, 64 bytes
+ * ------------------------------------------------------------------ */
+static TEE_Result cmd_get_pubkey(uint32_t ptypes, TEE_Param params[4])
+{
+	const uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+					     TEE_PARAM_TYPE_NONE,
+					     TEE_PARAM_TYPE_NONE,
+					     TEE_PARAM_TYPE_NONE);
+	TEE_ObjectHandle key = TEE_HANDLE_NULL;
+	uint8_t pub[C2PA_PUBKEY_LEN];
+	TEE_Result res;
+
+	if (ptypes != exp)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[0].memref.size &lt; C2PA_PUBKEY_LEN) {
+		params[0].memref.size = C2PA_PUBKEY_LEN;
+		return TEE_ERROR_SHORT_BUFFER;
+	}
+
+	res = open_or_create_key(&amp;key);
+	if (res != TEE_SUCCESS)
+		return res;
+
+	res = get_coord(key, TEE_ATTR_ECC_PUBLIC_VALUE_X, pub);
+	if (res == TEE_SUCCESS)
+		res = get_coord(key, TEE_ATTR_ECC_PUBLIC_VALUE_Y, pub + 32);
+
+	TEE_CloseObject(key);
+	if (res != TEE_SUCCESS)
+		return res;
+
+	TEE_MemMove(params[0].memref.buffer, pub, C2PA_PUBKEY_LEN);
+	params[0].memref.size = C2PA_PUBKEY_LEN;
+	return TEE_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
+ * TA_CMD_ATTEST_CAPTURE  [0] memref in, 32-byte hash
+ *                        [1] value out: capture id
+ * ------------------------------------------------------------------ */
+static TEE_Result cmd_attest(uint32_t ptypes, TEE_Param params[4])
+{
+	const uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+					     TEE_PARAM_TYPE_VALUE_OUTPUT,
+					     TEE_PARAM_TYPE_NONE,
+					     TEE_PARAM_TYPE_NONE);
+	struct witness *w;
+	TEE_Result res;
+
+	if (ptypes != exp)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	/* THE CHECK THAT MATTERS. */
+	if (!caller_is_kernel()) {
+		EMSG("attest refused: caller is not the kernel");
+		return TEE_ERROR_ACCESS_DENIED;
+	}
+
+	if (params[0].memref.size != C2PA_HASH_LEN)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	if (TEE_CheckMemoryAccessRights(TEE_MEMORY_ACCESS_READ |
+					TEE_MEMORY_ACCESS_ANY_OWNER,
+					params[0].memref.buffer,
+					C2PA_HASH_LEN) != TEE_SUCCESS)
+		return TEE_ERROR_ACCESS_DENIED;
+
+	res = counter_load();
+	if (res != TEE_SUCCESS)
+		return res;
+
+	g_counter++;
+
+	w = &amp;g_witness[g_next];
+	g_next = (g_next + 1) % C2PA_WITNESS_SLOTS;
+
+	/* ONE fetch out of shared memory, into TA memory. */
+	TEE_MemMove(w-&gt;hash, params[0].memref.buffer, C2PA_HASH_LEN);
+	w-&gt;capture_id = g_counter;
+	w-&gt;used  = false;
+	w-&gt;valid = true;
+
+	/*
+	 * Persist the counter on every capture. This is the expensive
+	 * line in the whole TA - a secure-storage write per frame - and
+	 * on a real camera you would batch it or accept a bounded
+	 * rollback. Left synchronous here because correctness is
+	 * easier to teach than the compromise.
+	 */
+	res = counter_store();
+	if (res != TEE_SUCCESS)
+		return res;
+
+	params[1].value.a = (uint32_t)(g_counter &amp; 0xffffffffu);
+	params[1].value.b = (uint32_t)(g_counter &gt;&gt; 32);
+	return TEE_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
+ * TA_CMD_SIGN_CLAIM  [0] memref in  the COSE Sig_structure
+ *                    [1] memref in  the declared binding (32 bytes)
+ *                    [2] memref out the signature (64 bytes)
+ * ------------------------------------------------------------------ */
+static TEE_Result cmd_sign_claim(uint32_t ptypes, TEE_Param params[4])
+{
+	const uint32_t exp = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+					     TEE_PARAM_TYPE_MEMREF_INPUT,
+					     TEE_PARAM_TYPE_MEMREF_OUTPUT,
+					     TEE_PARAM_TYPE_NONE);
+	TEE_ObjectHandle    key = TEE_HANDLE_NULL;
+	TEE_OperationHandle op  = TEE_HANDLE_NULL;
+	uint8_t  binding[C2PA_HASH_LEN];
+	uint8_t  digest[C2PA_HASH_LEN];
+	uint8_t  sig[C2PA_SIG_LEN];
+	uint32_t siglen = sizeof(sig);
+	uint32_t dlen = sizeof(digest);
+	uint8_t *sigstruct = NULL;
+	uint32_t sslen;
+	struct witness *match = NULL;
+	unsigned int i;
+	bool found_inline = false;
+	TEE_Result res;
+
+	if (ptypes != exp)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[1].memref.size != C2PA_HASH_LEN)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[2].memref.size &lt; C2PA_SIG_LEN) {
+		params[2].memref.size = C2PA_SIG_LEN;
+		return TEE_ERROR_SHORT_BUFFER;
+	}
+
+	sslen = params[0].memref.size;
+	if (sslen == 0 || sslen &gt; 8192)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	/* Copy BOTH inputs out of shared memory before looking at
+	 * either. The normal world can rewrite that buffer between
+	 * any two reads (OP-TEE chapter 20).
+	 */
+	sigstruct = TEE_Malloc(sslen, 0);
+	if (!sigstruct)
+		return TEE_ERROR_OUT_OF_MEMORY;
+
+	TEE_MemMove(sigstruct, params[0].memref.buffer, sslen);
+	TEE_MemMove(binding, params[1].memref.buffer, C2PA_HASH_LEN);
+
+	/* ---- CHECK 1: did we witness this image? ---- */
+	for (i = 0; i &lt; C2PA_WITNESS_SLOTS; i++) {
+		if (!g_witness[i].valid || g_witness[i].used)
+			continue;
+		if (TEE_MemCompare(g_witness[i].hash, binding,
+				   C2PA_HASH_LEN) == 0) {
+			match = &amp;g_witness[i];
+			break;
+		}
+	}
+	if (!match) {
+		EMSG("refusing to sign: binding not witnessed");
+		res = TEE_ERROR_ACCESS_DENIED;
+		goto out;
+	}
+
+	/* ---- CHECK 2: does the binding actually appear in what we
+	 * are about to sign?
+	 *
+	 * Without this, user space could declare a witnessed hash and
+	 * hand us a Sig_structure describing a completely different
+	 * image - and we would sign it.
+	 *
+	 * We do NOT parse CBOR to find it. A parser here is a large
+	 * attacker-reachable surface. A substring search over a
+	 * bounded buffer is a few lines and cannot go wrong.
+	 *
+	 * The cost of this simplicity: we prove the 32 bytes are
+	 * PRESENT, not that they occupy the c2pa.hash.data field.
+	 * A hostile user space could place them elsewhere in the
+	 * claim. Closing that gap properly means either parsing in
+	 * the TA, or having the TA build the claim itself - and the
+	 * latter is what a production camera does.
+	 */
+	if (sslen &gt;= C2PA_HASH_LEN) {
+		for (i = 0; i + C2PA_HASH_LEN &lt;= sslen; i++) {
+			if (TEE_MemCompare(sigstruct + i, binding,
+					   C2PA_HASH_LEN) == 0) {
+				found_inline = true;
+				break;
+			}
+		}
+	}
+	if (!found_inline) {
+		EMSG("refusing to sign: binding absent from the claim");
+		res = TEE_ERROR_ACCESS_DENIED;
+		goto out;
+	}
+
+	/* ---- Hash the Sig_structure, then sign the digest ---- */
+	res = TEE_AllocateOperation(&amp;op, TEE_ALG_SHA256,
+				    TEE_MODE_DIGEST, 0);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = TEE_DigestDoFinal(op, sigstruct, sslen, digest, &amp;dlen);
+	TEE_FreeOperation(op);
+	op = TEE_HANDLE_NULL;
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = open_or_create_key(&amp;key);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = TEE_AllocateOperation(&amp;op, TEE_ALG_ECDSA_P256,
+				    TEE_MODE_SIGN, 256);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = TEE_SetOperationKey(op, key);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = TEE_AsymmetricSignDigest(op, NULL, 0,
+				       digest, C2PA_HASH_LEN,
+				       sig, &amp;siglen);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	/* Single use. A witnessed capture buys exactly one signature,
+	 * so a leaked Sig_structure cannot be re-signed later.
+	 */
+	match-&gt;used = true;
+
+	/* Write the output once, at the end, on success only. */
+	TEE_MemMove(params[2].memref.buffer, sig, siglen);
+	params[2].memref.size = siglen;
+out:
+	if (op != TEE_HANDLE_NULL)
+		TEE_FreeOperation(op);
+	if (key != TEE_HANDLE_NULL)
+		TEE_CloseObject(key);
+	if (sigstruct) {
+		TEE_MemFill(sigstruct, 0, sslen);
+		TEE_Free(sigstruct);
+	}
+	return res;
+}
+
+/* ------------------------------------------------------------------
+ * Entry points
+ * ------------------------------------------------------------------ */
+TEE_Result TA_CreateEntryPoint(void)
+{
+	TEE_MemFill(g_witness, 0, sizeof(g_witness));
+	g_next = 0;
+	IMSG("c2pa TA loaded");
+	return TEE_SUCCESS;
+}
+
+void TA_DestroyEntryPoint(void)
+{
+	IMSG("c2pa TA unloaded");
+}
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t ptypes,
+				    TEE_Param params[4] __unused,
+				    void **sess __unused)
+{
+	if (ptypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+				      TEE_PARAM_TYPE_NONE,
+				      TEE_PARAM_TYPE_NONE,
+				      TEE_PARAM_TYPE_NONE))
+		return TEE_ERROR_BAD_PARAMETERS;
+	return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess __unused) { }
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess __unused, uint32_t cmd,
+				      uint32_t ptypes, TEE_Param params[4])
+{
+	switch (cmd) {
+	case TA_CMD_GET_PUBKEY:     return cmd_get_pubkey(ptypes, params);
+	case TA_CMD_ATTEST_CAPTURE: return cmd_attest(ptypes, params);
+	case TA_CMD_SIGN_CLAIM:     return cmd_sign_claim(ptypes, params);
+	default:                    return TEE_ERROR_NOT_SUPPORTED;
+	}
+}</code></pre>
+
+<div class="warn">
+<b>Be precise about what check 2 buys</b>
+<p>The substring search proves the witnessed hash is <em>somewhere</em> in the bytes being signed. It does not
+prove it is the <code>c2pa.hash.data</code> value rather than, say, a thumbnail hash the caller planted. That
+residual gap is stated in the code comment on purpose. The honest ways to close it are a CBOR parser inside
+the TA — more attack surface — or having the TA construct the claim itself, which is what a production camera
+does and what the exercises at the end suggest you try.</p>
+</div>
+
+<h2 id="userspace">Building the claim in user space</h2>
+
+<p>The parts that do not need protection are done in user space, where they are easier to write and debug. Deciding what belongs on which side of that boundary is the central design question of the whole project.</p>
+
+<pre><code>/* tools/c2pa-sign.c - a minimal CBOR/COSE encoder, and the
+ * assembly of one real Content Credential.
+ *
+ * Nothing here is secret, so it all lives in the normal world.
+ */
+
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdlib.h&gt;
+
+/* ---- a 120-line CBOR writer, which is all C2PA needs ---- */
+struct cbor {
+	uint8_t *buf;
+	size_t   len, cap;
+};
+
+static void cb_raw(struct cbor *c, const void *p, size_t n)
+{
+	if (c-&gt;len + n &gt; c-&gt;cap) {
+		c-&gt;cap = (c-&gt;len + n) * 2;
+		c-&gt;buf = realloc(c-&gt;buf, c-&gt;cap);
+	}
+	memcpy(c-&gt;buf + c-&gt;len, p, n);
+	c-&gt;len += n;
+}
+
+static void cb_byte(struct cbor *c, uint8_t b) { cb_raw(c, &amp;b, 1); }
+
+/* major type in the top 3 bits, then the argument */
+static void cb_head(struct cbor *c, uint8_t major, uint64_t val)
+{
+	major &lt;&lt;= 5;
+	if (val &lt; 24) {
+		cb_byte(c, major | (uint8_t)val);
+	} else if (val &lt; 0x100) {
+		cb_byte(c, major | 24); cb_byte(c, (uint8_t)val);
+	} else if (val &lt; 0x10000) {
+		cb_byte(c, major | 25);
+		cb_byte(c, (uint8_t)(val &gt;&gt; 8)); cb_byte(c, (uint8_t)val);
+	} else if (val &lt; 0x100000000ULL) {
+		cb_byte(c, major | 26);
+		for (int i = 3; i &gt;= 0; i--)
+			cb_byte(c, (uint8_t)(val &gt;&gt; (i * 8)));
+	} else {
+		cb_byte(c, major | 27);
+		for (int i = 7; i &gt;= 0; i--)
+			cb_byte(c, (uint8_t)(val &gt;&gt; (i * 8)));
+	}
+}
+
+static void cb_uint(struct cbor *c, uint64_t v)  { cb_head(c, 0, v); }
+static void cb_nint(struct cbor *c, uint64_t v)  { cb_head(c, 1, v); }
+static void cb_bstr(struct cbor *c, const void *p, size_t n)
+{ cb_head(c, 2, n); cb_raw(c, p, n); }
+static void cb_tstr(struct cbor *c, const char *s)
+{ cb_head(c, 3, strlen(s)); cb_raw(c, s, strlen(s)); }
+static void cb_array(struct cbor *c, size_t n)   { cb_head(c, 4, n); }
+static void cb_map(struct cbor *c, size_t n)     { cb_head(c, 5, n); }
+
+/* ---- the protected header ----
+ *   { 1: -7, 33: [ cert ] }
+ * CBOR negative integers encode as -1 - n, so -7 is nint(6).
+ */
+static void build_protected(struct cbor *out,
+			    const uint8_t *cert, size_t certlen)
+{
+	cb_map(out, 2);
+	cb_uint(out, 1);   cb_nint(out, 6);        /* alg = ES256    */
+	cb_uint(out, 33);                          /* x5chain        */
+	cb_array(out, 1);  cb_bstr(out, cert, certlen);
+}
+
+/* ---- the Sig_structure ----
+ *   [ "Signature1", protected, external_aad, payload ]
+ * THIS is what gets hashed and signed. Not the claim alone.
+ */
+static void build_sigstruct(struct cbor *out,
+			    const uint8_t *prot, size_t protlen,
+			    const uint8_t *claim, size_t claimlen)
+{
+	cb_array(out, 4);
+	cb_tstr(out, "Signature1");
+	cb_bstr(out, prot, protlen);
+	cb_bstr(out, "", 0);              /* external_aad: empty     */
+	cb_bstr(out, claim, claimlen);
+}
+
+/* ---- the claim ----
+ * A minimal but structurally correct C2PA claim. A real generator
+ * emits more assertions; the fields below are the ones a verifier
+ * requires.
+ */
+static void build_claim(struct cbor *out,
+			const uint8_t *binding,
+			const uint8_t *assertion_hash)
+{
+	cb_map(out, 6);
+
+	cb_tstr(out, "dc:title");
+	cb_tstr(out, "capture.jpg");
+
+	cb_tstr(out, "dc:format");
+	cb_tstr(out, "image/jpeg");
+
+	cb_tstr(out, "instanceID");
+	cb_tstr(out, "xmp:iid:6b3f0e12-1c44-4a9e-9f77-0c2b8d4e51a7");
+
+	cb_tstr(out, "claim_generator");
+	cb_tstr(out, "elh-c2pa-capture/0.1");
+
+	cb_tstr(out, "alg");
+	cb_tstr(out, "sha256");
+
+	/* Each assertion is referenced by a hashed URI: where it is,
+	 * and what it hashes to. Tamper with an assertion and this
+	 * hash stops matching.
+	 */
+	cb_tstr(out, "assertions");
+	cb_array(out, 1);
+	  cb_map(out, 3);
+	  cb_tstr(out, "url");
+	  cb_tstr(out, "self#jumbf=c2pa.assertions/c2pa.hash.data");
+	  cb_tstr(out, "alg");  cb_tstr(out, "sha256");
+	  cb_tstr(out, "hash"); cb_bstr(out, assertion_hash, 32);
+
+	(void)binding;   /* it lives inside the assertion, below */
+}
+
+/* ---- the c2pa.hash.data assertion ----
+ * The hard binding. `exclusions` names the byte ranges that are
+ * NOT covered - which must include the manifest itself, or the
+ * hash would have to contain its own value.
+ */
+static void build_hash_assertion(struct cbor *out,
+				 uint64_t excl_start, uint64_t excl_len,
+				 const uint8_t *binding)
+{
+	cb_map(out, 4);
+
+	cb_tstr(out, "exclusions");
+	cb_array(out, 1);
+	  cb_map(out, 2);
+	  cb_tstr(out, "start");  cb_uint(out, excl_start);
+	  cb_tstr(out, "length"); cb_uint(out, excl_len);
+
+	cb_tstr(out, "name"); cb_tstr(out, "jumbf manifest");
+	cb_tstr(out, "alg");  cb_tstr(out, "sha256");
+	cb_tstr(out, "hash"); cb_bstr(out, binding, 32);
+}
+
+/* ---- COSE_Sign1 ----
+ *   [ protected, {}, payload, signature ]
+ * The signature slot takes the TA's raw r||s unchanged.
+ */
+static void build_cose_sign1(struct cbor *out,
+			     const uint8_t *prot, size_t protlen,
+			     const uint8_t *claim, size_t claimlen,
+			     const uint8_t sig[64])
+{
+	cb_array(out, 4);
+	cb_bstr(out, prot, protlen);
+	cb_map(out, 0);                    /* unprotected: empty     */
+	cb_bstr(out, claim, claimlen);
+	cb_bstr(out, sig, 64);
+}</code></pre>
+
+<pre><code>/* tools/c2pa-sign.c, continued - the flow */
+
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;openssl/sha.h&gt;
+#include "c2pa_capture.h"
+
+int main(void)
+{
+	int fd = open("/dev/c2pa0", O_RDWR);
+	if (fd &lt; 0) { perror("/dev/c2pa0"); return 1; }
+
+	/* 1. Capture. The kernel hashes and the TA witnesses, before
+	 *    we see a single pixel.
+	 */
+	uint8_t *frame = malloc(640 * 480 * 3);
+	struct c2pa_capture cap = {
+		.version   = C2PA_ABI_VERSION,
+		.frame_len = 640 * 480 * 3,
+		.frame     = (uint64_t)(uintptr_t)frame,
+	};
+	if (ioctl(fd, C2PA_IOC_CAPTURE, &amp;cap)) { perror("CAPTURE"); return 1; }
+
+	/* 2. Build the assertion that carries the binding, and hash it.
+	 *
+	 *    NOTE the simplification: the hard binding here is the hash
+	 *    of the RAW FRAME, which is what the kernel witnessed. A
+	 *    real generator hashes the ENCODED FILE with the manifest
+	 *    range excluded - so a real pipeline must either encode in
+	 *    the kernel too, or add a c2pa.actions assertion recording
+	 *    the encode step and accept that the encoder is trusted.
+	 *    This is the single biggest gap between this project and a
+	 *    shipping camera, and it is worth understanding before you
+	 *    quote the design to anyone.
+	 */
+	struct cbor assertion = {0};
+	build_hash_assertion(&amp;assertion, 0, 0, cap.hash);
+
+	uint8_t assertion_hash[32];
+	SHA256(assertion.buf, assertion.len, assertion_hash);
+
+	/* 3. The claim, referencing that assertion. */
+	struct cbor claim = {0};
+	build_claim(&amp;claim, cap.hash, assertion_hash);
+
+	/* 4. The certificate. On QEMU this is self-signed - see the
+	 *    trust-list note below.
+	 */
+	size_t certlen;
+	uint8_t *cert = load_file("device-cert.der", &amp;certlen);
+
+	struct cbor prot = {0};
+	build_protected(&amp;prot, cert, certlen);
+
+	/* 5. The Sig_structure - what actually gets signed. */
+	struct cbor ss = {0};
+	build_sigstruct(&amp;ss, prot.buf, prot.len, claim.buf, claim.len);
+
+	/* 6. Sign it, in the secure world. We DECLARE the binding; the
+	 *    TA checks it against what the kernel witnessed and against
+	 *    the bytes we are asking it to sign.
+	 */
+	struct c2pa_sign sr = {
+		.version       = C2PA_ABI_VERSION,
+		.sigstruct_len = (uint32_t)ss.len,
+		.sigstruct     = (uint64_t)(uintptr_t)ss.buf,
+	};
+	memcpy(sr.binding, cap.hash, C2PA_HASH_LEN);
+
+	if (ioctl(fd, C2PA_IOC_SIGN, &amp;sr)) {
+		perror("SIGN");
+		fprintf(stderr, "EACCES here means the TA refused - "
+				"either the binding was not witnessed, or "
+				"it is absent from the claim\n");
+		return 1;
+	}
+
+	/* 7. Assemble COSE_Sign1 with the raw r||s straight from the
+	 *    TA. No DER conversion: COSE wants exactly this form.
+	 */
+	struct cbor cose = {0};
+	build_cose_sign1(&amp;cose, prot.buf, prot.len,
+			 claim.buf, claim.len, sr.signature);
+
+	write_file("claim.cbor",      claim.buf,     claim.len);
+	write_file("assertion.cbor",  assertion.buf, assertion.len);
+	write_file("signature.cose",  cose.buf,      cose.len);
+	write_file("capture.raw",     frame,         cap.frame_len);
+
+	printf("capture id %llu, %u bytes of COSE_Sign1\n",
+	       (unsigned long long)cap.capture_id, (unsigned)cose.len);
+	close(fd);
+	return 0;
+}</code></pre>
+
+<h2 id="jumbf">The manifest container</h2>
+
+<p>The signed claim has to be embedded in the image file in a standard container, so that ordinary tools can find it and unaware tools ignore it.</p>
+
+<pre class="diagram">   The three CBOR blobs above must be packed into JUMBF boxes
+   and embedded in the file:
+
+   JPEG file
+    +-- SOI
+    +-- APP11  "JP"  &lt;- JUMBF superbox, split across segments
+    |    +-- c2pa   (manifest store)
+    |         +-- &lt;manifest label&gt;
+    |              +-- c2pa.assertions
+    |              |    +-- c2pa.hash.data   &lt;- assertion.cbor
+    |              +-- c2pa.claim            &lt;- claim.cbor
+    |              +-- c2pa.signature        &lt;- signature.cose
+    +-- ... the actual image data ...
+    +-- EOI
+
+   Hand-rolling this is possible and tedious: box headers, UUIDs
+   per box type, label strings, and the APP11 segmentation rules
+   for payloads over 64 KB.
+
+   DO NOT hand-roll it for anything real. Use c2pa-rs, which is
+   the reference implementation, and plug the TEE in as a SIGNER
+   rather than reimplementing the container:
+
+     c2pa-rs exposes a `Signer` trait whose whole job is
+
+         fn sign(&amp;self, data: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;&gt;
+
+     where `data` is precisely the Sig_structure our TA already
+     signs. Implement it over /dev/c2pa0 and the SDK does the
+     claim, the assertions, the JUMBF and the embedding.
+
+   That is the integration this project is really for: the SDK
+   handles the format, and the TEE handles the only part that
+   must not be forgeable.</pre>
+
+<h2 id="verify">Verifying</h2>
+
+<p>A signature you cannot verify independently is not evidence of anything. This is the check from the outside, using tooling that knows nothing about your implementation.</p>
+
+<pre><code># Build and install everything (OP-TEE chapter 4 for the tree).
+$ cd ~/c2pa/ta &amp;&amp; make CROSS_COMPILE=aarch64-linux-gnu- \
+      TA_DEV_KIT_DIR=~/optee/optee_os/out/arm-plat-vexpress/export-ta_arm64
+$ cp *.ta ~/optee/out-br/target/lib/optee_armtz/
+$ cp ~/c2pa/driver/c2pa_capture.ko ~/c2pa/tools/c2pa-sign \
+     ~/optee/out-br/target/root/
+$ cd ~/optee/build &amp;&amp; make buildroot run-only
+
+# In the guest:
+# insmod c2pa_capture.ko
+[   14.221408] c2pa-capture: /dev/c2pa0 ready
+# ./c2pa-sign
+capture id 1, 412 bytes of COSE_Sign1
+
+# Secure console:
+I/TA: c2pa TA loaded
+I/TA: generating device key
+
+# --- Verify the COSE signature by hand, on the host ---------------
+# Reconstruct the Sig_structure, hash it, check the signature
+# against the device public key. This is the whole cryptographic
+# claim, checked without any C2PA tooling at all.
+
+$ python3 &lt;&lt;'EOF'
+import hashlib, binascii
+from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives import hashes
+
+pub = bytes.fromhex(open("pubkey.hex").read().strip())
+key = ec.EllipticCurvePublicNumbers(
+        int.from_bytes(pub[:32], "big"),
+        int.from_bytes(pub[32:], "big"),
+        ec.SECP256R1()).public_key()
+
+ss  = open("sigstruct.cbor", "rb").read()
+raw = open("signature.raw", "rb").read()      # 64 bytes, r||s
+der = utils.encode_dss_signature(
+        int.from_bytes(raw[:32], "big"),
+        int.from_bytes(raw[32:], "big"))
+
+key.verify(der, ss, ec.ECDSA(hashes.SHA256()))
+print("COSE signature verifies")
+EOF
+COSE signature verifies
+
+# Note the conversion on the Python side: `cryptography`, like
+# OpenSSL, wants DER. COSE and the TA speak raw r||s. Same
+# mathematics, two conventions.
+
+# --- And with the reference tooling -------------------------------
+$ cargo install c2patool
+$ c2patool capture.jpg
+{
+  "manifests": {
+    "urn:uuid:...": {
+      "claim_generator": "elh-c2pa-capture/0.1",
+      "format": "image/jpeg",
+      "assertions": [ { "label": "c2pa.hash.data" } ],
+      "signature_info": {
+        "alg": "Es256",
+        "issuer": "elh test device",
+        "cert_serial_number": "..."
+      }
+    }
+  },
+  "validation_status": [
+    {
+      "code": "signingCredential.untrusted",
+      "explanation": "signing certificate is not on the trust list"
+    }
+  ]
+}
+
+# signingCredential.untrusted is EXPECTED and CORRECT here. The
+# signature is valid; the certificate is self-signed and chains
+# to nothing anyone trusts. See below.</code></pre>
+
+<div class="danger">
+<b>What still stands between this and a shippable camera</b>
+<p><strong>1. A real certificate.</strong> C2PA validators check the leaf against a trust list of accepted
+CAs, and require specific extended key usages. A self-signed cert produces
+<code>signingCredential.untrusted</code> for ever. Getting on the list is a commercial and audit process, not
+a code change. <strong>2. A trusted timestamp.</strong> Without an RFC 3161 <code>sigTst</code>, a credential
+stops validating when the signing certificate expires. The TA's monotonic counter is <em>not</em> a timestamp
+— it proves ordering, not time. <strong>3. Binding to the encoded file, not the raw frame</strong> — see the
+comment in <code>c2pa-sign.c</code>. <strong>4. A hardened key.</strong> On QEMU the HUK is a fixed test
+value, so secure storage is not device-bound (<a href="tee-15-secure-storage.html">OP-TEE chapter
+15</a>).</p>
+</div>
+
+<h2 id="attack">Testing the property, not the happy path</h2>
+
+<p>The most valuable tests are the ones that try to break the property rather than confirm it works. If any of these succeed, the project is decoration — so write them before you trust it.</p>
+
+<pre><code># A working demo proves nothing. These four tests are the ones
+# that matter, and all four must behave as shown.
+
+# 1. Sign a claim about an image the kernel never produced.
+#    Craft a Sig_structure containing a hash of your own choosing.
+# ./c2pa-attack --forge-binding
+SIGN: Permission denied
+#    TA log: E/TA: refusing to sign: binding not witnessed
+
+# 2. Declare a witnessed binding, but sign a DIFFERENT claim.
+# ./c2pa-attack --swap-claim
+SIGN: Permission denied
+#    TA log: E/TA: refusing to sign: binding absent from the claim
+
+# 3. Replay: sign the same capture twice.
+# ./c2pa-attack --replay
+first  signature ok
+second SIGN: Permission denied
+#    Single-use witness slots.
+
+# 4. Attest from user space, bypassing the kernel.
+#    Open a session directly with libteec and call ATTEST.
+# ./c2pa-attack --user-attest
+TEEC_InvokeCommand: 0xffff000f
+#    ACCESS_DENIED - the TA saw LOGIN_USER, not LOGIN_REE_KERNEL.
+
+# If any of these SUCCEEDS, the project is decoration. Write
+# them before you write the manifest code, not after.</code></pre>
+
+<h2 id="extend">Extensions worth doing</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Exercise</th><th>What it teaches</th></tr></thead>
+<tbody>
+<tr><td>Implement the <code>c2pa-rs</code> <code>Signer</code> trait over <code>/dev/c2pa0</code></td><td>The
+real integration path, and how little of the SDK you have to touch</td></tr>
+<tr><td>Move JPEG encoding into the kernel and bind to the encoded bytes</td><td>Closes the biggest gap in the
+design</td></tr>
+<tr><td>Have the TA build the claim CBOR itself</td><td>Removes the residual gap in check 2, at the cost of
+CBOR in the TA</td></tr>
+<tr><td>Add an RFC 3161 timestamp to the COSE unprotected header</td><td>Why signatures outlive
+certificates</td></tr>
+<tr><td>Add <code>c2pa.actions</code> and an ingredient referencing a parent asset</td><td>How edit chains
+work, which is most of what C2PA is for</td></tr>
+<tr><td>Replace the test pattern with a V4L2 <code>vivid</code> device</td><td>A realistic capture path
+(<a href="lx-29-project-platform.html">chapter 37</a>)</td></tr>
+<tr><td>Store the witness ring in secure storage instead of TA globals</td><td>Survives TA unload; costs a
+write per capture</td></tr>
+<tr><td>Run the hostile client from <a href="tee-20-ta-security.html">OP-TEE chapter 20</a> against the
+TA</td><td>Whether the parameter validation is real</td></tr>
+<tr><td>Measure the per-frame cost of the synchronous counter write</td><td>Why real cameras batch, and what
+they give up</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Signing always returns <code>-EACCES</code></td><td>The declared binding does not match any witnessed
+hash — check that <code>CAPTURE</code> ran first and the hash was not modified</td></tr>
+<tr><td><code>-EACCES</code> with the right binding, after many frames</td><td>The witness slot aged out of
+the ring; sign sooner or enlarge <code>C2PA_WITNESS_SLOTS</code></td></tr>
+<tr><td>Second signature over one capture fails</td><td>Correct — witness slots are single-use</td></tr>
+<tr><td>All witnessed captures vanish between runs</td><td><code>TA_FLAG_INSTANCE_KEEP_ALIVE</code>
+missing</td></tr>
+<tr><td>User-space attest succeeds</td><td><strong>The property is broken.</strong> The login check is absent
+or the driver is not using <code>LOGIN_REE_KERNEL</code></td></tr>
+<tr><td><code>c2patool</code>: <code>signingCredential.untrusted</code></td><td>Expected on a self-signed
+certificate</td></tr>
+<tr><td><code>c2patool</code>: <code>claimSignature.mismatch</code></td><td>The Sig_structure you signed is not
+the one you embedded — most often the protected header was re-encoded between signing and
+assembly</td></tr>
+<tr><td><code>c2patool</code>: <code>assertion.hashedURI.mismatch</code></td><td>The assertion bytes changed
+after its hash went into the claim</td></tr>
+<tr><td><code>c2patool</code>: <code>assertion.dataHash.mismatch</code></td><td>The hard binding does not match
+the file — the exclusion range is wrong, or you bound to the raw frame and embedded a JPEG</td></tr>
+<tr><td>Signature verifies in Python, rejected by <code>c2patool</code></td><td>DER versus raw r&#124;&#124;s
+confusion in the COSE signature slot</td></tr>
+<tr><td>Verification fails about 1 time in 128</td><td>ECC coordinates not left-padded to 32 bytes</td></tr>
+<tr><td>Counter resets on reboot</td><td>Secure storage on a volatile rootfs, or no RPMB
+(<a href="tee-17-time-rollback.html">OP-TEE chapter 17</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write out a <code>Sig_structure</code> and say which of its four elements is hashed and signed.</li>
+  <li>State which signature encoding COSE uses and contrast it with OpenSSL's.</li>
+  <li>Explain why <code>ATTEST</code> is restricted to <code>LOGIN_REE_KERNEL</code>.</li>
+  <li>Give the two checks the TA performs before signing, and what each one alone would fail to
+  prevent.</li>
+  <li>State precisely what check 2 does <em>not</em> prove, and two ways to close that gap.</li>
+  <li>Explain why the witness ring is bounded and what the bound costs.</li>
+  <li>Explain why witness slots are single-use.</li>
+  <li>Describe the difference between binding to the raw frame and binding to the encoded file, and why it
+  matters.</li>
+  <li>Explain what <code>signingCredential.untrusted</code> means and why it is expected here.</li>
+  <li>Say why a monotonic counter is not a substitute for an RFC 3161 timestamp.</li>
+  <li>Run all four attack tests and confirm each is refused for the stated reason.</li>
+  <li>Describe how you would plug this TA into <code>c2pa-rs</code> instead of hand-rolling JUMBF.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

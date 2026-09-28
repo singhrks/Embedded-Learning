@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The block layer: bio, request_queue and blk-mq | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The block layer: bio, request_queue and blk-mq</h1>
+<p class="lead"><a href="lx-37-page-cache.html">Chapter 42</a> ended with writeback pushing dirty pages down to
+"the underlying storage" without saying how they actually get there. This chapter is that path: the layer
+between a filesystem and a physical disk that turns page-cache-sized I/O into requests a device can execute,
+and that gives a spinning disk, an SSD and an NVMe drive the same interface to sit behind.</p>
+
+<h2 id="bio">The bio: one I/O operation, described structurally</h2>
+
+<p>Between a filesystem and a storage driver, an I/O request travels as a data structure rather than a function call. Understanding what that structure contains explains how one request can gather data from pages scattered all over memory.</p>
+
+<pre class="diagram">   A struct bio (BLOCK I/O) DESCRIBES ONE I/O OPERATION AS
+   DATA, not as a function call: which device, which
+   direction (read or write), which sectors, and a list of
+   the actual memory pages involved. Filesystems and the page
+   cache build bios and hand them to the block layer; they
+   never talk to a disk driver directly.
+
+     struct bio {
+        bi_bdev      -&gt; which block device
+        bi_opf        -&gt; REQ_OP_READ / REQ_OP_WRITE / ...
+        bi_iter       -&gt; current position: sector, size
+        bi_io_vec[]   -&gt; a list of (page, offset, length) -
+                         the ACTUAL PHYSICAL MEMORY this I/O
+                         reads into or writes from, which may
+                         be SEVERAL NON-CONTIGUOUS PAGES for
+                         one logical I/O (this is a "vector"
+                         of I/O the same way readv()/writev()
+                         are - a single bio can gather or
+                         scatter across many pages, which is
+                         exactly what makes a page-cache-
+                         backed write of many separate pages
+                         into one efficient bio possible)
+        bi_end_io     -&gt; a callback invoked when the I/O
+                         COMPLETES - block I/O is fundamentally
+                         ASYNCHRONOUS; nothing blocks waiting
+                         for a bio synchronously except by
+                         explicitly choosing to
+     }</pre>
+
+<h2 id="pipeline">From a bio to a completed I/O: the pipeline</h2>
+
+<p>A request does not go straight from the filesystem to the device. It passes through several stages that combine it with other pending requests, order them sensibly, and hand them to the hardware in parallel — each of which exists to compensate for a real limitation of storage devices.</p>
+
+<pre class="diagram">   FILESYSTEM / PAGE CACHE
+        |  builds a bio: "write these 4 pages to sector N"
+        v
+   THE REQUEST QUEUE  (per block device)
+        |  MERGING: a bio adjacent to one already queued gets
+        |  COMBINED into a single, larger request - writing
+        |  sectors 100-107 right after queuing sectors 108-115
+        |  becomes ONE 100-115 request, because one larger
+        |  operation is cheaper for the device than two small
+        |  ones, especially on a spinning disk where seek time
+        |  dominates
+        |
+        |  SCHEDULING: multiple pending requests are ordered
+        |  by an I/O SCHEDULER (below) before being issued
+        v
+   blk-mq  (multi-queue block layer)
+        |  DISPATCHES requests onto PER-CPU SOFTWARE QUEUES,
+        |  which map onto the device's OWN HARDWARE QUEUES -
+        |  modern NVMe devices expose dozens to thousands of
+        |  independent hardware queues specifically so that
+        |  many CPUs can submit I/O in parallel with NO shared
+        |  lock between them, the single biggest reason blk-mq
+        |  replaced the older single-queue block layer: a
+        |  single queue with one lock became the actual
+        |  bottleneck once devices got fast enough that the
+        |  LOCK, not the storage medium, was the slowest part
+        |  of the path
+        v
+   THE DEVICE DRIVER submits the request to hardware and,
+   later, an INTERRUPT (chapter 16) signals completion
+        |
+        v
+   bi_end_io() RUNS, and whoever issued the original bio
+   (the filesystem, direct I/O, page-cache writeback) is
+   notified the operation is done.</pre>
+
+<h2 id="schedulers">I/O schedulers: reordering requests on purpose</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Scheduler</th><th>Optimises for</th><th>Best fit</th></tr></thead>
+<tbody>
+<tr><td><code>none</code></td><td>No reordering — issue in submission order</td><td>NVMe, where the device's
+own many hardware queues already parallelise better than software reordering could help</td></tr>
+<tr><td><code>mq-deadline</code></td><td>Bounding worst-case latency — every request gets a deadline it must be
+serviced by</td><td>General-purpose SSDs and spinning disks; the sensible embedded default</td></tr>
+<tr><td><code>bfq</code></td><td>Fairness between processes issuing I/O, and interactive responsiveness</td>
+<td>Desktop-like workloads where one background I/O hog should not starve interactive reads</td></tr>
+<tr><td><code>kyber</code></td><td>Latency targets, tuned automatically at runtime</td><td>Fast SSDs under mixed
+read/write load</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The right scheduler follows directly from what the underlying device actually needs help with: a spinning
+disk benefits enormously from reordering requests to minimise seek distance, which is the entire reason I/O
+schedulers were invented in the first place, while an NVMe SSD has no seek penalty at all and enough parallel
+hardware queues that software reordering usually only adds latency without buying anything back — which is
+exactly why <code>none</code> is the typical default there.</p>
+
+<pre><code># See and change the scheduler for a device:
+cat /sys/block/nvme0n1/queue/scheduler
+    [none] mq-deadline
+cat /sys/block/sda/queue/scheduler
+    mq-deadline [bfq] none
+
+echo mq-deadline &gt; /sys/block/sda/queue/scheduler
+
+# Merging and queue depth, live:
+cat /sys/block/sda/queue/nr_requests
+cat /sys/block/sda/queue/max_sectors_kb</code></pre>
+
+<h2 id="writing">A minimal block driver's shape</h2>
+
+<p>Most engineers never write a block driver, but seeing its shape completes the picture: it is the same driver-core pattern as everything else in this track, with one callback that turns a queued request into hardware activity.</p>
+
+<pre><code>/* A block driver's central job is implementing ONE callback
+   that turns a REQUEST (already merged and scheduled) into
+   actual hardware activity: */
+
+static blk_status_t my_queue_rq(struct blk_mq_hw_ctx *hctx,
+                                 const struct blk_mq_queue_data *bd)
+{
+        struct request *rq = bd->rq;
+
+        blk_mq_start_request(rq);
+
+        /* Walk the request's bios/segments, program the
+           hardware's DMA descriptors (chapter 30's DMA API)
+           to move data to/from the addresses described, kick
+           the device off.                                   */
+
+        return BLK_STS_OK;
+        /* Completion, later, from an interrupt handler:
+                blk_mq_end_request(rq, BLK_STS_OK);           */
+}
+
+static const struct blk_mq_ops my_mq_ops = {
+        .queue_rq = my_queue_rq,
+};
+
+/* Registration, roughly: */
+disk = blk_mq_alloc_disk(&amp;tag_set, NULL);
+disk->fops = &amp;my_block_fops;      /* open/release/ioctl, the
+                                     block-device equivalent of
+                                     chapter 22's char device
+                                     file_operations            */
+set_capacity(disk, nr_sectors);
+device_add_disk(dev, disk, NULL);
+</code></pre>
+
+<div class="note">
+<b>Why most driver authors never write this directly</b>
+<p>A genuinely new block driver is rare compared with character and platform drivers, because most storage
+hardware (NVMe, SCSI, MMC/SD, USB mass storage) already has a generic upstream driver that talks to the block
+layer correctly, and a new piece of hardware usually just needs a thin transport-specific layer underneath one
+of those, not a fresh <code>blk_mq_ops</code> implementation from scratch. Understanding this pipeline matters
+anyway, because every filesystem operation, every <code>fsync()</code> from <a href="lx-37-page-cache.html">the
+previous chapter</a>, and every I/O-latency number you will ever be asked to explain passes through exactly
+this path.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Many small, adjacent writes show up as fewer, larger I/Os in <code>iostat</code></td><td>Expected —
+request-queue merging combined them before dispatch</td></tr>
+<tr><td>Switching an NVMe drive's scheduler from <code>none</code> to <code>mq-deadline</code> hurts
+throughput</td><td>Expected — software reordering adds overhead a device with many hardware queues does not
+need</td></tr>
+<tr><td>A background <code>dd</code> makes interactive disk access sluggish</td><td>The current scheduler is
+not prioritising fairness — try <code>bfq</code></td></tr>
+<tr><td>I/O completion happens long after the driver's submit function returns</td><td>Expected — block I/O is
+asynchronous; completion arrives later via <code>bi_end_io</code> / <code>blk_mq_end_request</code> from an
+interrupt</td></tr>
+<tr><td>A new storage chip needs only a small driver, not a full block driver</td><td>Likely correct — it can
+probably sit under an existing generic driver (NVMe, SCSI, MMC) instead of implementing
+<code>blk_mq_ops</code> directly</td></tr>
+<tr><td>Per-CPU I/O submission scales well on a fast NVMe device but not on an older SATA SSD</td><td>Expected —
+the benefit of multi-queue dispatch is bounded by how many hardware queues the device itself actually
+exposes</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what a <code>bio</code> describes and why it can reference several non-contiguous pages.</li>
+  <li>Explain request merging and why it matters more for spinning disks than for NVMe.</li>
+  <li>Explain why blk-mq's per-CPU software queues replaced a single shared queue.</li>
+  <li>Choose an I/O scheduler for a given device and workload, and justify the choice.</li>
+  <li>Describe the shape of a minimal blk-mq driver's submit and completion path.</li>
+  <li>Explain why most new storage hardware does not need a brand-new block driver.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

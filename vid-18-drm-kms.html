@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DRM/KMS, planes and zero-copy display | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>DRM/KMS, planes and zero-copy display</h1>
+<p class="lead">The last stage of the pipeline, and the one that decides whether video playback costs half a
+watt or five. The display controller can scan out NV12 directly, scale it, convert its colour and composite
+it — if you ask correctly. If you do not, the GPU does all of that instead, at ten times the power.</p>
+
+<h2 id="objects">The KMS object model</h2>
+
+<pre class="diagram">   Kernel Mode Setting exposes the display hardware as five
+   object types. Every display configuration is a set of
+   properties on these.
+
+   FRAMEBUFFER    a buffer plus its format and modifier
+        |         (chapter 4). Wraps a DMABUF or GEM object.
+        v
+   PLANE          a hardware scanout engine. Reads a
+        |         framebuffer, optionally scales it, converts
+        |         its colour, and positions it.
+        |           PRIMARY  the main one, one per CRTC
+        |           OVERLAY  extra planes for compositing
+        |           CURSOR   small, always on top
+        v
+   CRTC           the scanout engine proper. Owns the mode
+        |         (resolution, refresh, timings), blends the
+        |         planes, and generates the pixel clock.
+        v
+   ENCODER        converts the pixel stream to a signal -
+        |         HDMI, DisplayPort, MIPI DSI, LVDS.
+        v
+   CONNECTOR      the physical port and the attached display.
+                  Carries EDID: what the monitor supports.
+
+   THE CHAIN: framebuffer -> plane -> CRTC -> encoder ->
+   connector -> the screen.
+
+   PLANES ARE THE POINT OF THIS CHAPTER. A hardware plane can
+   do, for free and in the display controller:
+     * YUV to RGB conversion
+     * scaling
+     * positioning and cropping
+     * alpha blending with the other planes
+     * (sometimes) rotation and colour management
+
+   That is exactly the work a GPU composite would otherwise
+   do, and the display controller does it while reading the
+   pixels it has to read anyway - so it costs no extra memory
+   bandwidth at all.</pre>
+
+<div class="key">
+<b>The video plane is why phones can play 4K for hours</b>
+<p>Put decoded NV12 on an overlay plane and the pipeline is: decoder writes the frame once, display controller
+reads it once. The GPU is never involved and can stay powered down. Composite the same frame with the GPU
+instead and you add a texture read, a colour conversion, a render pass and a write — several hundred megabytes
+per second at 4K60, and the GPU cannot idle. On mobile that is the difference between a warm phone and a hot
+one.</p>
+</div>
+
+<h2 id="atomic">Atomic modesetting</h2>
+
+<pre><code>/* The old API set one thing at a time - mode, then plane,
+   then cursor - and each could fail halfway, leaving the
+   display in a broken intermediate state. The ATOMIC API
+   submits every change as ONE transaction that either applies
+   completely or not at all.                                */
+
+#include &lt;xf86drm.h&gt;
+#include &lt;xf86drmMode.h&gt;
+
+int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+
+/* You must ask for the modern capabilities explicitly. */
+drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+
+/* Build a request from property changes. */
+drmModeAtomicReq *req = drmModeAtomicAlloc();
+
+drmModeAtomicAddProperty(req, plane_id, prop_fb_id,   fb_id);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_id, crtc_id);
+/* SRC coordinates are 16.16 FIXED POINT - the source
+   rectangle within the framebuffer. */
+drmModeAtomicAddProperty(req, plane_id, prop_src_x, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_src_y, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_src_w, 1920 &lt;&lt; 16);
+drmModeAtomicAddProperty(req, plane_id, prop_src_h, 1080 &lt;&lt; 16);
+/* CRTC coordinates are plain integers - where it lands on
+   screen. Different units for source and destination, in the
+   same call, is a reliable source of bugs. */
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_x, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_y, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_w, 3840);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_h, 2160);
+/* src != crtc size means the plane SCALES - for free. */
+
+/* TEST_ONLY asks "would this work?" without changing
+   anything. This is the single most useful feature of the
+   atomic API: probe your configuration, fall back if the
+   hardware cannot do it, and never leave the display broken. */
+int ret = drmModeAtomicCommit(fd, req,
+                              DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+if (ret == 0)
+        drmModeAtomicCommit(fd, req,
+                            DRM_MODE_ATOMIC_NONBLOCK |
+                            DRM_MODE_PAGE_FLIP_EVENT, user_data);
+else
+        fallback_to_gpu_composite();
+
+drmModeAtomicFree(req);
+
+/* PAGE_FLIP_EVENT means the commit happens at the next
+   VBLANK and you get an event on the fd when it has. That is
+   how you avoid tearing and how you pace your rendering -
+   read the event, then draw the next frame. */</code></pre>
+
+<h2 id="planes">Getting video onto a plane</h2>
+
+<pre class="diagram">   THE FULL ZERO-COPY PATH (chapter 16):
+
+     V4L2 decoder
+       VIDIOC_EXPBUF  ->  dmabuf fd
+            |
+            v
+     drmPrimeFDToHandle(fd, dmabuf_fd, &amp;gem_handle)
+            |
+            v
+     drmModeAddFB2WithModifiers(
+            fd, w, h, DRM_FORMAT_NV12,
+            handles,      /* the same handle for both planes */
+            pitches,      /* per-plane stride                */
+            offsets,      /* per-plane offset into the buffer*/
+            modifiers,    /* THE TILING - must match!        */
+            &amp;fb_id, DRM_MODE_FB_MODIFIERS)
+            |
+            v
+     atomic commit: put fb_id on an overlay plane
+            |
+            v
+     the display controller scans it out, converting NV12 to
+     RGB in hardware.
+
+   THE FOUR THINGS THAT MUST LINE UP, and any one of them
+   failing sends you back to a GPU composite:
+
+     1. FORMAT   the plane must advertise NV12 (or P010 for
+                 10-bit). Query IN_FORMATS on the plane.
+     2. MODIFIER the exact tiling the decoder produced must be
+                 one the plane accepts (chapter 4).
+     3. SCALING  the plane's min/max scale factors. Many
+                 overlay planes cannot scale at all, and some
+                 cannot scale down below 1:2.
+     4. BANDWIDTH the display controller has a fixed budget.
+                 Two 4K planes may simply exceed it, and the
+                 commit fails at TEST_ONLY.
+
+   AND COLOUR: a YUV plane needs its properties set, or you
+   get the washed-out or crushed picture of chapter 2:
+     COLOR_ENCODING  ITU-R BT.601 / BT.709 / BT.2020
+     COLOR_RANGE     YCbCr limited range / YCbCr full range
+   Defaults are usually BT.601 limited, which is wrong for
+   almost all modern content.</pre>
+
+<pre><code># What planes does this hardware have, and what can they do?
+$ sudo modetest -M i915 -p
+Planes:
+id      crtc    fb      CRTC x,y   x,y    gamma size    possible crtcs
+31      0       0       0,0        0,0    0               0x00000001
+  formats: XR24 AR24 NV12 P010 YUYV
+  props:
+        6 IN_FORMATS:
+                flags: immutable blob
+                value blob = 42
+                        NV12: LINEAR, I915_FORMAT_MOD_Y_TILED,
+                              I915_FORMAT_MOD_4_TILED
+        20 type: OVERLAY               &lt;-- an overlay plane
+        68 COLOR_ENCODING: ITU-R BT.709
+        69 COLOR_RANGE: YCbCr limited range
+
+# The whole display topology:
+$ sudo modetest -M i915 -c        # connectors and modes
+$ sudo modetest -M i915 -e        # encoders
+$ sudo modetest -M i915 -a -s 32@31:1920x1080   # test a mode
+
+# Is the compositor actually using a plane, or falling back?
+$ sudo cat /sys/kernel/debug/dri/0/i915_display_info
+$ sudo cat /sys/kernel/debug/dri/0/state
+plane[31]: plane 1B
+        crtc-pos: 3840x2160+0+0
+        src-pos: 1920.000000x1080.000000+0.000000+0.000000
+        format=NV12 modifier=0x100000000000002
+        color-encoding=ITU-R BT.709
+#  ^ NV12 on a plane, scaled 1920 -> 3840. This is the fast
+#    path working.
+
+# On Wayland, ask the compositor:
+$ WAYLAND_DEBUG=1 mpv --gpu-context=wayland video.mp4 2>&amp;1 \
+    | grep -i 'dmabuf\|plane'
+$ sudo cat /sys/kernel/debug/dri/0/state | grep -c 'format=NV12'
+# 0 means every frame is being composited by the GPU.</code></pre>
+
+<div class="warn">
+<b>Plane assignment is a negotiation you can lose silently</b>
+<p>A compositor tries to put your video on a hardware plane and falls back to GPU composition when it cannot —
+because another window overlaps it, because the scaling factor is out of range, because a rounded corner needs
+alpha, or because bandwidth is exhausted. Nothing tells you. The picture is identical; the power draw
+triples. On Linux the way to know is <code>/sys/kernel/debug/dri/0/state</code>; on Android it is
+<code>dumpsys SurfaceFlinger</code> and the <code>DEVICE</code> versus <code>CLIENT</code> composition
+column.</p>
+</div>
+
+<h2 id="vsync">Tearing, vblank and presentation</h2>
+
+<pre><code>/* TEARING: the scanout reads the framebuffer while you are
+   writing it, so the top of the screen shows the old frame
+   and the bottom the new one.
+
+   THE FIX: DOUBLE BUFFERING plus a flip at VBLANK - the
+   interval between the last line of one frame and the first
+   of the next, when nothing is being read.                 */
+
+  drmModePageFlip(fd, crtc, new_fb, DRM_MODE_PAGE_FLIP_EVENT,
+                  user_data);
+  /* returns immediately; the flip happens at the next vblank */
+
+  struct pollfd p = { .fd = drm_fd, .events = POLLIN };
+  poll(&amp;p, 1, -1);
+  drmHandleEvent(drm_fd, &amp;evctx);    /* your page_flip_handler
+                                        runs; now the old
+                                        buffer is free to
+                                        reuse               */
+
+/* THE RULE: do not touch a buffer until you have been told
+   the flip completed. It is exactly the fence discipline of
+   GPU chapter 16, in a different API.
+
+/* VARIABLE REFRESH RATE - the display waits for you instead
+   of the other way round. FreeSync/G-Sync/HDMI VRR, exposed
+   as the CRTC's VRR_ENABLED property. Removes judder when
+   the content rate does not divide the refresh rate.
+
+/* AND THE CADENCE PROBLEM, which VRR was invented for:
+     24 fps film on a 60 Hz display needs 3:2 PULLDOWN -
+     frame A for 3 refreshes, frame B for 2, alternating.
+     The uneven timing is visible as JUDDER on slow pans.
+     A 120 Hz display divides evenly by both 24 and 30, which
+     is why 120 Hz panels matter more for film than for games.
+
+/* MULTIPLE PLANES, ONE COMMIT: the atomic API lets you flip
+   the UI plane and the video plane in the same transaction,
+   so they change together. Flipping them separately means one
+   frame where the subtitle belongs to the previous video
+   frame - a subtle artefact that is very hard to attribute.*/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Video playback drains the battery</td><td>GPU compositing instead of a hardware plane</td></tr>
+<tr><td>Washed-out or crushed video</td><td><code>COLOR_ENCODING</code>/<code>COLOR_RANGE</code> plane
+properties not set (<a href="vid-02-colour-and-gamma.html">chapter 2</a>)</td></tr>
+<tr><td>Atomic commit fails with <code>EINVAL</code></td><td>Format, modifier, scaling range or bandwidth —
+use <code>TEST_ONLY</code> to find out which</td></tr>
+<tr><td>Fast path works alone, stops when a UI element overlaps</td><td>The compositor fell back; nothing
+reports it</td></tr>
+<tr><td>Horizontal tear across the picture</td><td>Writing the scanout buffer without waiting for
+vblank</td></tr>
+<tr><td>Video and subtitles are one frame out of step</td><td>Planes flipped in separate commits</td></tr>
+<tr><td>Judder on slow pans</td><td>3:2 pulldown — 24 fps on a 60 Hz display</td></tr>
+<tr><td>Scrambled rectangles on screen</td><td>Modifier mismatch between decoder and plane</td></tr>
+<tr><td>Second display cannot be enabled at full resolution</td><td>Display controller bandwidth
+exhausted</td></tr>
+<tr><td>Works on one SoC, falls back on another</td><td>Different plane capabilities — query
+<code>IN_FORMATS</code>, never assume</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five KMS object types and the chain from buffer to screen.</li>
+  <li>List five things a hardware plane does for free, and say why they cost no extra bandwidth.</li>
+  <li>Explain why atomic modesetting replaced the legacy API.</li>
+  <li>Say what <code>TEST_ONLY</code> is for and why it is the most useful part of the API.</li>
+  <li>Explain the units of the source and destination rectangles and the bug from confusing them.</li>
+  <li>Trace a decoded frame from V4L2 to a plane, naming each call.</li>
+  <li>Give the four conditions that must hold for the zero-copy path.</li>
+  <li>Say which colour properties a YUV plane needs and what the defaults usually are.</li>
+  <li>Explain the vblank flip discipline and what must not be touched until the event arrives.</li>
+  <li>Determine from a running Linux system whether video is on a plane or being composited.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

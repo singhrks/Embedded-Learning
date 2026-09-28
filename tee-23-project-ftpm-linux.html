@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: driving the fTPM from Linux | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: driving the fTPM from Linux</h1>
+<p class="lead">The trusted application from the previous chapter is useless until something speaks to it.
+This chapter closes the loop: the kernel driver that presents a TA as <code>/dev/tpm0</code>, the userspace
+tools that then work unmodified, and three real exercises — extending PCRs, sealing a secret to boot state,
+and attesting to a remote party.</p>
+
+<h2 id="driver">The driver that makes a TA look like a chip</h2>
+
+<p>Linux already has a TPM subsystem, so the firmware TPM needs only a driver that routes commands through the TEE rather than to a physical chip.</p>
+
+<pre class="diagram">   The whole trick is that Linux's TPM subsystem already
+   abstracts the transport. A TPM driver's job is to move
+   bytes; where they go is its own business.
+
+     tpm_tis.c      -> bytes over memory-mapped registers
+     tpm_i2c_*.c    -> bytes over I2C
+     tpm_vtpm_proxy -> bytes to a userspace process
+     tpm_ftpm_tee.c -> bytes to a TRUSTED APPLICATION
+
+   All four register a struct tpm_chip and implement send()
+   and recv(). Everything above - the TPM 2.0 command layer,
+   /dev/tpm0, the resource manager, the integrity subsystem -
+   is shared and unmodified.
+
+   So tpm2-tools, systemd-cryptenroll, Clevis, IMA and
+   everything else work against an fTPM with no changes at
+   all. That is the payoff of a narrow, protocol-shaped TA
+   interface (chapter 22).</pre>
+
+<pre><code>/* drivers/char/tpm/tpm_ftpm_tee.c - upstream, ~350 lines.
+   This is the annotated core of it.                        */
+
+#define TA_FTPM_UUID UUID_INIT(0xbc50d971, 0xd4c9, 0x42c4, \
+                               0x82, 0xcb, 0x34, 0x3f, \
+                               0xb7, 0xf3, 0x78, 0x96)
+
+#define FTPM_OPTEE_TA_SUBMIT_COMMAND  (0)
+#define MAX_COMMAND_SIZE   4096
+#define MAX_RESPONSE_SIZE  4096
+
+struct ftpm_tee_private {
+        struct tpm_chip    *chip;
+        struct tee_context *ctx;
+        u32                 session;
+        struct tee_shm     *shm;
+};
+
+/* --- send: hand a TPM command to the TA ----------------- */
+static int ftpm_tee_tpm_op_send(struct tpm_chip *chip,
+                                u8 *buf, size_t len)
+{
+        struct ftpm_tee_private *pvt = dev_get_drvdata(&amp;chip-&gt;dev);
+        struct tee_ioctl_invoke_arg transceive_args = {
+                .func       = FTPM_OPTEE_TA_SUBMIT_COMMAND,
+                .session    = pvt-&gt;session,
+                .num_params = 4,
+        };
+        struct tee_param command_params[4] = {0};
+        size_t resp_len;
+        u8    *temp_buf;
+        int    rc;
+
+        if (len &gt; MAX_COMMAND_SIZE)
+                return -EIO;
+
+        temp_buf = tee_shm_get_va(pvt-&gt;shm, 0);
+        if (IS_ERR(temp_buf))
+                return PTR_ERR(temp_buf);
+
+        /* Command in at offset 0, response out at offset
+           MAX_COMMAND_SIZE. One shared buffer, carved with
+           partial memrefs (chapter 11).                    */
+        memset(temp_buf, 0, MAX_COMMAND_SIZE);
+        memcpy(temp_buf, buf, len);
+
+        command_params[0] = (struct tee_param) {
+                .attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT,
+                .u.memref = { .shm = pvt-&gt;shm,
+                              .size = len, .shm_offs = 0 },
+        };
+        command_params[1] = (struct tee_param) {
+                .attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT,
+                .u.memref = { .shm = pvt-&gt;shm,
+                              .size = MAX_RESPONSE_SIZE,
+                              .shm_offs = MAX_COMMAND_SIZE },
+        };
+
+        rc = tee_client_invoke_func(pvt-&gt;ctx, &amp;transceive_args,
+                                    command_params);
+        if (rc &lt; 0 || transceive_args.ret != 0) {
+                dev_err(&amp;chip-&gt;dev, "invoke failed %d 0x%x\n",
+                        rc, transceive_args.ret);
+                return rc ? rc : -EIO;
+        }
+
+        resp_len = command_params[1].u.memref.size;
+
+        /* The TPM response header carries its own length -
+           sanity-check the TA's claim against it. */
+        if (resp_len &gt; MAX_RESPONSE_SIZE)
+                return -EIO;
+
+        temp_buf = tee_shm_get_va(pvt-&gt;shm, MAX_COMMAND_SIZE);
+        if (IS_ERR(temp_buf))
+                return PTR_ERR(temp_buf);
+
+        memcpy(buf, temp_buf, resp_len);
+        return 0;
+}
+
+/* --- recv: the response is already in buf --------------- */
+static int ftpm_tee_tpm_op_recv(struct tpm_chip *chip,
+                                u8 *buf, size_t count)
+{
+        /* send() was synchronous and left the response in
+           place, so there is nothing to do. This is why the
+           TEE transport is simpler than a real bus: there is
+           no polling, no interrupt, no status register.    */
+        return 0;
+}
+
+static const struct tpm_class_ops ftpm_tee_tpm_ops = {
+        .flags     = TPM_OPS_AUTO_STARTUP,
+        .recv      = ftpm_tee_tpm_op_recv,
+        .send      = ftpm_tee_tpm_op_send,
+        .cancel    = ftpm_tee_tpm_op_cancel,
+        .status    = ftpm_tee_tpm_op_status,
+        .req_complete_mask = 0,
+        .req_complete_val  = 0,
+        .req_canceled      = ftpm_tee_tpm_req_canceled,
+};
+
+/* --- probe: open the session, register the chip --------- */
+static int ftpm_tee_probe(struct device *dev)
+{
+        struct ftpm_tee_private *pvt;
+        struct tee_ioctl_open_session_arg sess_arg = {0};
+        struct tpm_chip *chip;
+        int rc;
+
+        pvt = devm_kzalloc(dev, sizeof(*pvt), GFP_KERNEL);
+        if (!pvt)
+                return -ENOMEM;
+        dev_set_drvdata(dev, pvt);
+
+        /* 1. A TEE context (chapter 10). */
+        pvt-&gt;ctx = tee_client_open_context(NULL, ftpm_tee_match,
+                                           NULL, NULL);
+        if (IS_ERR(pvt-&gt;ctx))
+                return PTR_ERR(pvt-&gt;ctx) == -ENOENT
+                        ? -EPROBE_DEFER : PTR_ERR(pvt-&gt;ctx);
+
+        /* 2. A session to the fTPM TA. */
+        export_uuid(sess_arg.uuid, &amp;ftpm_ta_uuid);
+        sess_arg.clnt_login = TEE_IOCTL_LOGIN_REE_KERNEL;
+        rc = tee_client_open_session(pvt-&gt;ctx, &amp;sess_arg, NULL);
+        if (rc &lt; 0 || sess_arg.ret != 0)
+                goto out_ctx;
+        pvt-&gt;session = sess_arg.session;
+
+        /* 3. One shared buffer, for the life of the driver. */
+        pvt-&gt;shm = tee_shm_alloc_kernel_buf(pvt-&gt;ctx,
+                        MAX_COMMAND_SIZE + MAX_RESPONSE_SIZE);
+        if (IS_ERR(pvt-&gt;shm)) {
+                rc = -ENOMEM;
+                goto out_sess;
+        }
+
+        /* 4. Register as a TPM chip. From here on, the rest of
+              Linux does not know or care that this is a TA. */
+        chip = tpm_chip_alloc(dev, &amp;ftpm_tee_tpm_ops);
+        if (IS_ERR(chip)) {
+                rc = PTR_ERR(chip);
+                goto out_shm;
+        }
+        chip-&gt;flags |= TPM_CHIP_FLAG_TPM2;
+        pvt-&gt;chip = chip;
+        dev_set_drvdata(&amp;chip-&gt;dev, pvt);
+
+        rc = tpm_chip_register(chip);
+        if (rc)
+                goto out_shm;
+        return 0;
+
+out_shm:  tee_shm_free(pvt-&gt;shm);
+out_sess: tee_client_close_session(pvt-&gt;ctx, pvt-&gt;session);
+out_ctx:  tee_client_close_context(pvt-&gt;ctx);
+        return rc;
+}
+
+/* Bound by UUID on the TEE bus (chapter 10) - so the TA must
+   have TA_FLAG_DEVICE_ENUM set, or no device appears and this
+   driver never probes.                                     */
+static const struct tee_client_device_id ftpm_tee_id_table[] = {
+        { TA_FTPM_UUID },
+        { }
+};
+MODULE_DEVICE_TABLE(tee, ftpm_tee_id_table);</code></pre>
+
+<h2 id="enable">Enabling it</h2>
+
+<p>Getting the kernel to find and bind that driver is a configuration and device-tree exercise, and it fails silently in the usual ways when either is wrong.</p>
+
+<pre><code># Kernel config:
+CONFIG_TEE=y
+CONFIG_OPTEE=y
+CONFIG_TCG_TPM=y
+CONFIG_TCG_FTPM_TEE=y          # the driver above
+CONFIG_HW_RANDOM_TPM=y
+CONFIG_SECURITYFS=y
+
+# Optional but useful:
+CONFIG_IMA=y                   # measure files into PCR 10
+CONFIG_IMA_MEASURE_PCR_IDX=10
+CONFIG_TCG_TPM2_HMAC=y         # encrypted TPM sessions
+
+$ scripts/config --enable TCG_TPM --enable TCG_FTPM_TEE \
+                 --enable HW_RANDOM_TPM
+$ make -j$(nproc) Image modules
+
+# On the target:
+$ dmesg | grep -iE 'tpm|optee'
+optee: probing for conduit method.
+optee: revision 4.1
+optee: dynamic shared memory is enabled
+optee: initialized driver
+tpm_ftpm_tee optee-ta-bc50d971-d4c9-42c4-82cb-343fb7f37896: \
+    ftpm_tee_probe: TPM chip registered
+
+$ ls -l /dev/tpm*
+crw-rw---- 1 tss root  10, 224 /dev/tpm0      # raw
+crw-rw---- 1 tss tss  253,  65 /dev/tpmrm0    # resource manager
+
+$ ls /sys/class/tpm/tpm0/
+tpm_version_major  pcr-sha256/  ppi/  ...
+$ cat /sys/class/tpm/tpm0/tpm_version_major
+2</code></pre>
+
+<div class="key">
+<b>Use <code>/dev/tpmrm0</code>, not <code>/dev/tpm0</code></b>
+<p>A TPM has room for only a few loaded objects and sessions at a time — three, typically. The resource
+manager virtualises that: it swaps objects in and out so several processes can use the TPM concurrently
+without colliding. <code>/dev/tpm0</code> is exclusive and unmanaged. Every tool should target
+<code>tpmrm0</code>; if two things fight over the TPM, this is why.</p>
+</div>
+
+<h2 id="exercise1">Exercise 1: PCRs and measurement</h2>
+
+<p>The first check is simply that the device appears and answers — which confirms the whole path from user space through the kernel into the secure world.</p>
+
+<pre><code>$ apt install tpm2-tools     # or: buildroot -> tpm2-tools
+$ export TPM2TOOLS_TCTI=device:/dev/tpmrm0
+
+# What are the PCRs now?
+$ tpm2_pcrread sha256
+sha256:
+  0 : 0x0000000000000000000000000000000000000000000000000000000000000000
+  1 : 0x0000...
+  ...
+# All zero, because on QEMU nothing measured the boot chain
+# into them. On a real platform with measured boot, PCRs 0-7
+# are populated by firmware before Linux starts.
+
+# Extend one by hand and watch it change:
+$ echo -n "hello" | sha256sum
+2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+
+$ tpm2_pcrextend 23:sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+$ tpm2_pcrread sha256:23
+  23: 0xF5A5FD42D16A20302798EF6ED309979B43003D2320D9F0E8EA9831A92759FB4B
+
+# Verify the extend rule yourself - PCR_new = SHA256(0^32 || d)
+$ python3 -c "
+import hashlib, binascii
+old = b'\x00'*32
+d = binascii.unhexlify('2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824')
+print(hashlib.sha256(old+d).hexdigest())
+"
+f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b
+# Matches. The TA really is computing the extend correctly.
+
+# Extend again with the SAME value - a different result,
+# because extend is order- and history-dependent:
+$ tpm2_pcrextend 23:sha256=2cf24dba...
+$ tpm2_pcrread sha256:23
+  23: 0x9B54...      # different again
+
+# Only a reboot resets it:
+$ tpm2_pcrreset 23         # allowed for PCR 16 and 23 only;
+                           # 0-15 are reset-protected, which is
+                           # what makes them trustworthy.
+
+# Let the kernel measure files into PCR 10:
+$ mount -t securityfs securityfs /sys/kernel/security
+$ cat /sys/kernel/security/ima/ascii_runtime_measurements | head -3
+10 8f4a... ima-ng sha256:e3b0... boot_aggregate
+10 c1d2... ima-ng sha256:9f86... /init
+$ tpm2_pcrread sha256:10</code></pre>
+
+<h2 id="exercise2">Exercise 2: sealing a secret to boot state</h2>
+
+<p>With basic communication working, using the TPM for its actual purpose exercises the storage and cryptography underneath it.</p>
+
+<pre><code># This is BitLocker, in miniature: a secret that can only be
+# recovered if the machine boots the same software.
+
+# 1. Establish a known state.
+$ tpm2_pcrreset 23
+$ tpm2_pcrextend 23:sha256=$(echo -n "my-boot-state" | sha256sum | cut -d' ' -f1)
+$ tpm2_pcrread sha256:23
+  23: 0x4EF7...
+
+# 2. Create a primary key in the owner hierarchy.
+$ tpm2_createprimary -C o -g sha256 -G ecc -c primary.ctx
+
+# 3. Build a policy: "only when PCR 23 has its current value".
+$ tpm2_startauthsession -S session.ctx
+$ tpm2_policypcr -S session.ctx -l sha256:23 -L policy.digest
+$ tpm2_flushcontext session.ctx
+$ xxd policy.digest
+
+# 4. Seal a secret under that policy.
+$ echo -n "the launch codes" &gt; secret.txt
+$ tpm2_create -C primary.ctx -i secret.txt \
+      -u sealed.pub -r sealed.priv -L policy.digest \
+      -a "fixedtpm|fixedparent"
+$ tpm2_load -C primary.ctx -u sealed.pub -r sealed.priv -c sealed.ctx
+
+#   fixedtpm    this object can never be duplicated to another
+#               TPM. The secret is bound to THIS device.
+#   fixedparent it cannot be rewrapped under a different parent.
+
+# 5. Unseal - with the policy satisfied.
+$ tpm2_startauthsession --policy-session -S session.ctx
+$ tpm2_policypcr -S session.ctx -l sha256:23
+$ tpm2_unseal -p session:session.ctx -c sealed.ctx
+the launch codes
+$ tpm2_flushcontext session.ctx
+
+# 6. NOW CHANGE THE BOOT STATE and try again.
+$ tpm2_pcrextend 23:sha256=$(echo -n "tampered" | sha256sum | cut -d' ' -f1)
+
+$ tpm2_startauthsession --policy-session -S session.ctx
+$ tpm2_policypcr -S session.ctx -l sha256:23
+$ tpm2_unseal -p session:session.ctx -c sealed.ctx
+ERROR: Esys_Unseal(0x99D) - tpm:session(1):a policy check failed
+$ tpm2_flushcontext session.ctx
+
+# The sealed blob is on the normal-world filesystem, readable
+# by anyone. It is useless to them: the decryption key lives in
+# the TPM and the TPM will not use it unless the PCRs match.
+#
+# And on this system the "TPM" is a trusted application. The
+# whole guarantee rests on the secure world's isolation - which
+# is exactly the claim chapter 1 started with.</code></pre>
+
+<div class="warn">
+<b>Sealing to PCRs is a support burden</b>
+<p>Every firmware update changes PCRs 0–7 and every sealed secret becomes unrecoverable. That is not a bug;
+it is the entire point. Real systems handle it by sealing to a policy signed by the vendor
+(<code>tpm2_policyauthorize</code>) so a new signed PCR set can be authorised after an update, and by always
+keeping a recovery path. Seal to raw PCR values only for experiments.</p>
+</div>
+
+<h2 id="exercise3">Exercise 3: attestation</h2>
+
+<p>The final exercise uses the measurement facilities, which is what connects this project back to the secure boot material earlier in the track.</p>
+
+<pre><code># Prove to a remote party what this machine booted - without
+# trusting anything the machine says about itself.
+
+# --- On the device ---
+# 1. An attestation key, restricted to signing TPM-internal
+#    data. Restricted means it CANNOT sign arbitrary bytes,
+#    so a quote cannot be forged by asking the TPM to sign a
+#    fabricated one.
+$ tpm2_createprimary -C e -g sha256 -G ecc -c ek.ctx
+$ tpm2_create -C ek.ctx -G ecc -u ak.pub -r ak.priv \
+      -a "fixedtpm|fixedparent|sensitivedataorigin|\
+userwithauth|restricted|sign"
+$ tpm2_load -C ek.ctx -u ak.pub -r ak.priv -c ak.ctx
+$ tpm2_readpublic -c ak.ctx -o ak.pem -f pem
+
+# 2. The verifier sends a random nonce. Freshness matters:
+#    without it, a quote can be replayed (chapter 17).
+$ NONCE=$(openssl rand -hex 20)
+
+# 3. Quote: the TPM signs {PCR digest, nonce, clock, firmware
+#    version} with the AK.
+$ tpm2_quote -c ak.ctx -l sha256:0,1,2,3,4,5,6,7,10 \
+      -q $NONCE -m quote.msg -s quote.sig -o pcrs.out -g sha256
+
+# --- Send ak.pem, quote.msg, quote.sig, pcrs.out to the
+#     verifier ---
+
+# --- On the verifier ---
+$ tpm2_checkquote -u ak.pem -m quote.msg -s quote.sig \
+      -f pcrs.out -g sha256 -q $NONCE
+pcrs:
+  sha256:
+    0 : 0x0000...
+    10: 0x3F5A...
+sig: signature is valid
+
+# The verifier now knows:
+#   - a genuine TPM produced this (if the AK chains to an EK
+#     certificate from a manufacturer it trusts)
+#   - these were the PCR values at quote time
+#   - the quote is fresh (the nonce matches)
+#
+# It does NOT know the PCRs are "good" - that requires a
+# reference set of expected values. Attestation proves WHAT
+# ran; deciding whether that is acceptable is policy, and it
+# is the hard part of every attestation system.
+
+# THE MISSING PIECE ON QEMU: the EK has no certificate, and
+# every emulated device shares a seed (chapter 22). So this
+# proves the mechanism works, not that the device is genuine.
+# A product provisions an EK certificate at manufacture.</code></pre>
+
+<h2 id="realuse">What this is actually for</h2>
+
+<p>What a firmware TPM is genuinely used for in shipping products, and where its guarantees differ from a discrete chip — which matters for deciding whether it fits a requirement.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Use</th><th>Command</th></tr></thead>
+<tbody>
+<tr><td>Unlock a disk if the boot chain is unchanged</td><td><code>systemd-cryptenroll --tpm2-device=auto
+--tpm2-pcrs=0+2+7</code></td></tr>
+<tr><td>Same, on other distributions</td><td><code>clevis luks bind -d /dev/sda2 tpm2 '{"pcr_ids":"7"}'</code></td></tr>
+<tr><td>SSH keys the machine cannot export</td><td><code>tpm2-pkcs11</code>, then
+<code>ssh-keygen -D /usr/lib/libtpm2_pkcs11.so</code></td></tr>
+<tr><td>TLS client certificates bound to hardware</td><td><code>tpm2-openssl</code> or
+<code>tpm2-tss-engine</code></td></tr>
+<tr><td>Runtime file integrity measurement</td><td>IMA, into PCR 10</td></tr>
+<tr><td>Hardware entropy for the kernel</td><td><code>CONFIG_HW_RANDOM_TPM</code></td></tr>
+<tr><td>Remote device health attestation</td><td><code>tpm2_quote</code> plus a verifier</td></tr>
+<tr><td>Anti-rollback for application state</td><td>TPM NV counters —
+<code>tpm2_nvdefine -a "nt=counter"</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># The one worth trying end to end, because it is a real
+# workflow people actually deploy:
+
+$ systemd-cryptenroll /dev/sda2 --tpm2-device=/dev/tpmrm0 \
+      --tpm2-pcrs=7
+$ reboot
+# The disk unlocks with no password - unless PCR 7 changed,
+# in which case it asks for the recovery passphrase.
+#
+# On this system, "the TPM" is a trusted application running
+# beside Linux in the secure world. Nothing above it knows.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No <code>/dev/tpm0</code></td><td><code>CONFIG_TCG_FTPM_TEE</code> off, TA not installed, or the TA
+lacks <code>TA_FLAG_DEVICE_ENUM</code></td></tr>
+<tr><td>Driver probes then fails</td><td>Session open failed — check the secure console; usually the TA is
+missing or unsigned</td></tr>
+<tr><td><code>tpm2_*</code> hangs or errors with a TCTI failure</td><td>Pointing at
+<code>/dev/tpm0</code> while something else holds it. Use <code>tpmrm0</code></td></tr>
+<tr><td>Permission denied</td><td>Not in the <code>tss</code> group</td></tr>
+<tr><td><code>out of memory for object contexts</code></td><td>Too many loaded objects — use
+<code>tpmrm0</code>, or <code>tpm2_flushcontext -t</code></td></tr>
+<tr><td>PCRs all zero on a real board</td><td>Firmware is not doing measured boot; the fTPM is fine</td></tr>
+<tr><td>PCRs reset without a reboot</td><td>The TA unloaded — needs
+<code>TA_FLAG_INSTANCE_KEEP_ALIVE</code></td></tr>
+<tr><td>Unseal fails after an update</td><td>PCRs changed. Correct behaviour; use a signed policy</td></tr>
+<tr><td>TPM state lost across reboot</td><td>NV commit not persisting (<a href="tee-22-project-ftpm-arch.html">chapter
+22</a>)</td></tr>
+<tr><td><code>tpm2_checkquote</code> fails</td><td>Nonce mismatch, wrong PCR selection, or the AK is not
+restricted</td></tr>
+<tr><td>Attestation rejected by a real verifier</td><td>No EK certificate — expected on QEMU</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain how one driver makes a TA indistinguishable from a TPM chip, and why nothing above it
+  changes.</li>
+  <li>Point to the <code>send()</code> path and say how command and response share one buffer.</li>
+  <li>Explain why <code>recv()</code> has nothing to do.</li>
+  <li>Say what the resource manager does and why tools should use <code>/dev/tpmrm0</code>.</li>
+  <li>Verify the PCR extend rule by hand against the TPM's output.</li>
+  <li>Explain why PCRs 0–15 cannot be reset and what that buys.</li>
+  <li>Seal a secret to a PCR value and demonstrate that changing the PCR prevents unsealing.</li>
+  <li>Explain what <code>fixedtpm</code> and <code>fixedparent</code> guarantee.</li>
+  <li>Explain why an attestation key must be <em>restricted</em>, and what the nonce prevents.</li>
+  <li>State what a quote proves and what it does not.</li>
+  <li>Enrol a disk with <code>systemd-cryptenroll</code> against the fTPM and explain what happens after a
+  firmware update.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

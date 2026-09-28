@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardware resources and interrupts in WDF | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Hardware resources and interrupts in WDF</h1>
+<p class="lead">How your driver learns where its registers are and which interrupt is its own, how to map
+and access them safely, and the WDF interrupt object that connects the ISR and DPC from
+<a href="win-10-isr-dpc.html">chapter 11</a> to real silicon.</p>
+
+<h2 id="resources">The resource list</h2>
+
+<p>Your driver does not choose its own registers or interrupt line; the PnP manager assigns them and hands you a list at start-up. Reading that list correctly — and not assuming its contents — is the first step of talking to real hardware.</p>
+
+<pre><code>/* PnP assigns resources and hands you two lists in
+   EvtDevicePrepareHardware (chapter 15):
+
+     ResourcesRaw         bus-relative addresses, as the
+                          device sees them
+     ResourcesTranslated  system addresses the CPU can use
+
+   USE THE TRANSLATED LIST for mapping. Use the RAW list only
+   when you must program a bus-relative value into the device
+   itself - which is rare on modern systems.              */
+
+NTSTATUS
+MyPrepareHardware(_In_ WDFDEVICE Device,
+                  _In_ WDFCMRESLIST ResourcesRaw,
+                  _In_ WDFCMRESLIST ResourcesTranslated)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+        ULONG i, count;
+
+        PAGED_CODE();
+        UNREFERENCED_PARAMETER(ResourcesRaw);
+
+        count = WdfCmResourceListGetCount(ResourcesTranslated);
+
+        for (i = 0; i &lt; count; i++) {
+                PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
+                        WdfCmResourceListGetDescriptor(
+                                ResourcesTranslated, i);
+
+                switch (desc-&gt;Type) {
+
+                case CmResourceTypeMemory:
+                case CmResourceTypeMemoryLarge:
+                        /* desc-&gt;u.Memory.Start   PHYSICAL_ADDRESS
+                           desc-&gt;u.Memory.Length  ULONG          */
+                        if (ctx-&gt;RegBase == NULL) {
+                                ctx-&gt;RegLength =
+                                        desc-&gt;u.Memory.Length;
+                                ctx-&gt;RegBase = (PUCHAR)
+                                        MmMapIoSpaceEx(
+                                          desc-&gt;u.Memory.Start,
+                                          desc-&gt;u.Memory.Length,
+                                          PAGE_READWRITE |
+                                          PAGE_NOCACHE);
+                                if (!ctx-&gt;RegBase)
+                                        return STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                        break;
+
+                case CmResourceTypePort:
+                        /* legacy I/O ports - x86 only */
+                        ctx-&gt;PortBase =
+                                (PUCHAR)(ULONG_PTR)
+                                desc-&gt;u.Port.Start.QuadPart;
+                        break;
+
+                case CmResourceTypeInterrupt:
+                        /* the WDFINTERRUPT created in
+                           EvtDeviceAdd is matched to this
+                           automatically - nothing to do   */
+                        ctx-&gt;InterruptVector =
+                                desc-&gt;u.Interrupt.Vector;
+                        break;
+
+                case CmResourceTypeDma:
+                        break;      /* chapter 19 */
+
+                case CmResourceTypeConnection:
+                        /* a GPIO, I2C or SPI connection, on
+                           ACPI-enumerated ARM64 systems.
+                           u.Connection.IdLowPart /
+                           IdHighPart form a resource hub ID
+                           you open with a target
+                           (chapter 13's WDFIOTARGET).      */
+                        ctx-&gt;ConnectionId.LowPart =
+                                desc-&gt;u.Connection.IdLowPart;
+                        ctx-&gt;ConnectionId.HighPart =
+                                desc-&gt;u.Connection.IdHighPart;
+                        break;
+                }
+        }
+
+        if (ctx-&gt;RegBase == NULL)
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+
+        return STATUS_SUCCESS;
+}
+
+/* NEVER ASSUME THE ORDER OR COUNT of descriptors. A device
+   with two memory ranges may report them in either order on
+   different firmware. Match on what you find, and fail
+   cleanly if something expected is absent - that is what
+   turns a mysterious later crash into a clear Code 10 at
+   install time.                                            */</code></pre>
+
+<h2 id="register">Register access</h2>
+
+<p>Device registers are not memory. They must be accessed with specific functions that prevent the compiler and processor from caching, reordering or combining the accesses, all of which would be catastrophic.</p>
+
+<pre><code>/* Use the READ_/WRITE_REGISTER_* macros, not raw pointer
+   dereferences - the same argument as Linux's readl/writel
+   (ch. 25): they guarantee width, ordering and no compiler
+   reordering.                                              */
+
+        UCHAR  b = READ_REGISTER_UCHAR (ctx-&gt;RegBase + 0x00);
+        USHORT w = READ_REGISTER_USHORT((PUSHORT)(ctx-&gt;RegBase + 0x02));
+        ULONG  l = READ_REGISTER_ULONG ((PULONG)(ctx-&gt;RegBase + 0x04));
+        ULONG64 q= READ_REGISTER_ULONG64((PULONG64)(ctx-&gt;RegBase + 0x08));
+
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + 0x04), value);
+
+        /* bulk, for FIFOs: */
+        READ_REGISTER_BUFFER_ULONG((PULONG)(ctx-&gt;RegBase + FIFO),
+                                   buffer, count);
+        WRITE_REGISTER_BUFFER_ULONG((PULONG)(ctx-&gt;RegBase + FIFO),
+                                    buffer, count);
+
+/* FOR LEGACY I/O PORTS: */
+        READ_PORT_ULONG(), WRITE_PORT_ULONG(), and the
+        _BUFFER_ variants.
+
+/* MEMORY BARRIERS, when ordering matters beyond a single
+   access: */
+        KeMemoryBarrier();           /* full */
+        MemoryBarrier();
+        _ReadWriteBarrier();         /* compiler only */
+
+/* AND THE DMA CASE: after filling a buffer and before the
+   doorbell write, you need the data visible to the device
+   first. On Windows the DMA API's flush routines handle this
+   (chapter 19); for a common buffer, KeMemoryBarrier() before
+   the doorbell is the portable form.                     */
+
+/* A HELPER PAIR worth writing, because it makes every call
+   site readable: */
+static FORCEINLINE ULONG
+MyRd(PMY_CONTEXT ctx, ULONG reg)
+{
+        return READ_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + reg));
+}
+
+static FORCEINLINE VOID
+MyWr(PMY_CONTEXT ctx, ULONG reg, ULONG val)
+{
+        WRITE_REGISTER_ULONG((PULONG)(ctx-&gt;RegBase + reg), val);
+}</code></pre>
+
+<h2 id="interrupt">Creating the interrupt object</h2>
+
+<p>Creating the interrupt object is what connects your ISR to the hardware line the resource list named. It also establishes the lock that protects data shared between your ISR and everything else.</p>
+
+<pre><code>/* In EvtDeviceAdd - BEFORE resources are assigned. WDF
+   matches it to the interrupt descriptor later.           */
+
+        WDF_INTERRUPT_CONFIG interruptConfig;
+        WDF_OBJECT_ATTRIBUTES attributes;
+
+        WDF_INTERRUPT_CONFIG_INIT(&amp;interruptConfig,
+                                  MyEvtInterruptIsr,
+                                  MyEvtInterruptDpc);
+
+        /* optional enable/disable callbacks, called around
+           power transitions (chapter 15) */
+        interruptConfig.EvtInterruptEnable  = MyIntEnable;
+        interruptConfig.EvtInterruptDisable = MyIntDisable;
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&amp;attributes,
+                                        MY_INTERRUPT_CONTEXT);
+
+        status = WdfInterruptCreate(device, &amp;interruptConfig,
+                                    &amp;attributes,
+                                    &amp;ctx-&gt;Interrupt);
+
+/* THE ENABLE/DISABLE CALLBACKS run at DIRQL with the
+   interrupt lock held, and are the right place to touch the
+   device's interrupt-enable register: */
+
+NTSTATUS
+MyIntEnable(_In_ WDFINTERRUPT Interrupt, _In_ WDFDEVICE Device)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        MyWr(ctx, REG_INT_ENABLE, INT_ALL);
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS
+MyIntDisable(_In_ WDFINTERRUPT Interrupt, _In_ WDFDEVICE Device)
+{
+        PMY_CONTEXT ctx = MyGetContext(Device);
+
+        MyWr(ctx, REG_INT_ENABLE, 0);
+        return STATUS_SUCCESS;
+}
+
+/* WDF calls Enable after connecting the interrupt and Disable
+   before disconnecting it - which is exactly the ordering
+   that avoids a spurious interrupt with no handler
+   (chapter 15).                                            */</code></pre>
+
+<h2 id="msi">Message-signalled interrupts</h2>
+
+<p>Modern buses do not use dedicated interrupt wires. They signal by writing to a special memory address, which allows many more interrupt vectors per device and removes the sharing problems that plagued line-based interrupts.</p>
+
+<pre><code>/* MSI/MSI-X: a PCIe device signals by WRITING to a special
+   address rather than asserting a line.
+
+   ADVANTAGES:
+     · no sharing, so no "is it mine?" check needed
+     · several messages per device, each with its own ISR -
+       one per queue, one per channel
+     · inherently ordered with respect to the DMA writes that
+       preceded them, which removes a whole class of
+       "interrupt arrived before the data" races           */
+
+/* THE INF requests them: */
+        [MyDevice_AddReg]
+        HKR,"Interrupt Management",,0x00000010
+        HKR,"Interrupt Management\MessageSignaledInterruptProperties",,0x00000010
+        HKR,"Interrupt Management\MessageSignaledInterruptProperties",\
+            MSISupported,0x00010001,1
+        HKR,"Interrupt Management\MessageSignaledInterruptProperties",\
+            MessageNumberLimit,0x00010001,4
+
+/* AND THE DRIVER creates one WDFINTERRUPT PER MESSAGE: */
+        for (i = 0; i &lt; MY_NUM_MESSAGES; i++) {
+                WDF_INTERRUPT_CONFIG_INIT(&amp;interruptConfig,
+                                MyEvtInterruptIsr,
+                                MyEvtInterruptDpc);
+
+                status = WdfInterruptCreate(device,
+                                &amp;interruptConfig, &amp;attributes,
+                                &amp;ctx-&gt;Interrupts[i]);
+                if (!NT_SUCCESS(status))
+                        return status;
+
+                ictx = MyGetInterruptContext(ctx-&gt;Interrupts[i]);
+                ictx-&gt;MessageIndex = i;
+        }
+
+/* The ISR receives the message id: */
+BOOLEAN
+MyEvtInterruptIsr(_In_ WDFINTERRUPT Interrupt,
+                  _In_ ULONG MessageID)
+{
+        /* With MSI, MessageID identifies WHICH message fired -
+           so you often need no status-register read at all,
+           which makes the ISR dramatically cheaper.       */
+        ...
+}
+
+/* IF FEWER MESSAGES ARE GRANTED than you asked for, the
+   remaining ones map onto message 0. Handle that: check
+   WdfInterruptGetInfo() for what you actually got, and do not
+   assume the count.                                       */
+
+        WDF_INTERRUPT_INFO info;
+
+        WDF_INTERRUPT_INFO_INIT(&amp;info);
+        WdfInterruptGetInfo(ctx-&gt;Interrupts[0], &amp;info);
+        /* info.MessageSignaled, info.MessageNumber,
+           info.Vector, info.Irql, info.TargetProcessorSet  */</code></pre>
+
+<div class="key">
+<b>MSI removes the shared-line problem</b>
+<p>A line-based interrupt may be shared, so every ISR must read a status register to ask "is this mine?" —
+and that read can cost microseconds on PCIe. An MSI is by definition yours, and the message number tells you
+what happened. On any device where you control the hardware design or the interrupt count, MSI-X with one
+message per queue is both faster and simpler.</p>
+</div>
+
+<h2 id="sync">Synchronising with the ISR</h2>
+
+<p>Data touched by an ISR cannot be protected by an ordinary lock, because the ISR runs above the level such a lock raises to. The framework provides a way to run a small piece of code at the ISR's own level instead.</p>
+
+<pre><code>/* Data shared between the ISR and everything else needs the
+   interrupt lock (chapter 10).                            */
+
+/* Option 1: acquire it around a section */
+        WdfInterruptAcquireLock(ctx-&gt;Interrupt);
+        ctx-&gt;SharedState = newValue;
+        MyWr(ctx, REG_CONFIG, newValue);
+        WdfInterruptReleaseLock(ctx-&gt;Interrupt);
+
+/* Option 2 - PREFERRED: run a small function at DIRQL with
+   the lock held: */
+static BOOLEAN
+MySetEnableSync(_In_ WDFINTERRUPT Interrupt,
+                _In_ WDFCONTEXT Context)
+{
+        PMY_CONTEXT ctx = (PMY_CONTEXT)Context;
+
+        ctx-&gt;Enabled = TRUE;
+        MyWr(ctx, REG_INT_ENABLE, INT_ALL);
+        return TRUE;
+}
+
+        WdfInterruptSynchronize(ctx-&gt;Interrupt,
+                                MySetEnableSync, ctx);
+
+/* WHY OPTION 2 IS BETTER: the critical section is a named
+   function whose entire body is visible, so it is obvious it
+   is short and does nothing forbidden at DIRQL. An
+   Acquire/Release pair invites someone to add a line in the
+   middle later.                                            */
+
+/* NOTE: with a PASSIVE-LEVEL interrupt (chapter 11), the
+   interrupt "lock" is a passive-level lock and you MAY sleep
+   inside it. WdfInterruptSynchronize still works and still
+   serialises correctly.                                   */</code></pre>
+
+<h2 id="affinity">Interrupt affinity and policy</h2>
+
+<p>On a multiprocessor machine you can influence which processors service your interrupt. This matters for latency-sensitive devices, and like most such controls it makes things worse about as easily as better.</p>
+
+<pre><code>/* Which CPU handles the interrupt, and at what priority.
+   Set from the INF, not from code - it is a system policy
+   decision, and the administrator may override it.        */
+
+        [MyDevice_AddReg]
+        HKR,"Interrupt Management\Affinity Policy",\
+            DevicePolicy,0x00010001,5    ; IrqPolicySpreadMessagesAcrossAllProcessors
+        HKR,"Interrupt Management\Affinity Policy",\
+            DevicePriority,0x00010001,3  ; IrqPriorityHigh
+
+/* THE POLICIES:
+     0  MachineDefault
+     1  AllCloseProcessors
+     2  OneCloseProcessor
+     3  AllProcessorsInMachine
+     4  SpecifiedProcessors
+     5  SpreadMessagesAcrossAllProcessors   &lt;-- for MSI-X
+
+/* SPREADING MSI-X MESSAGES across CPUs is what lets a
+   multi-queue device scale: each message's DPC runs on a
+   different core, so DPC processing is parallel rather than
+   serialised on one CPU (chapter 11).
+
+/* FROM CODE, if you must: */
+        WdfInterruptSetPolicy(ctx-&gt;Interrupt,
+                        WdfIrqPolicySpecifiedProcessors,
+                        WdfIrqPriorityNormal,
+                        1 &lt;&lt; 2);        /* CPU 2 */
+
+/* And read what you got: */
+        WdfInterruptGetInfo(interrupt, &amp;info);
+        /* info.TargetProcessorSet */</code></pre>
+
+<h2 id="debug">Debugging resources and interrupts</h2>
+
+<p>When an interrupt never fires, the debugger can show you what the PnP manager actually assigned and whether your ISR is connected — which distinguishes a driver bug from a firmware or INF problem.</p>
+
+<pre><code># --- Device Manager ---
+#   Properties -&gt; Resources tab: exactly what was assigned.
+#   If a range or IRQ you expect is missing, the problem is in
+#   the firmware or the INF, not your driver.
+
+# --- WinDbg ---
+    !devnode 0 1 mydriver           the PnP node
+    !devobj ffff8a0c...             the device object
+    !arbiter 4                      the resource arbiters -
+                                    who owns which ranges
+    !idt                            the interrupt dispatch
+                                    table: which vector goes
+                                    where
+    !wdfkd.wdfdriverinfo mydriver 0x10   WDF's view of the
+                                    interrupt objects
+
+# --- Is my interrupt firing at all? ---
+#   Add a counter in the ISR and expose it in a debug IOCTL or
+#   read it with WinDbg. If it never increments:
+#     · the device is not enabled - check REG_INT_ENABLE
+#     · the interrupt was never connected - check the
+#       WdfInterruptCreate return
+#     · the resource descriptor was absent - check
+#       PrepareHardware
+#     · the device is not clocked or not out of reset
+#     · MSI was requested but not granted, and you assumed it
+#
+#   THE SAME CHECKLIST as Linux chapter 16, in a different
+#   dialect.
+
+# --- ETW tracing of interrupts and DPCs ---
+    wpr -start GeneralProfile -start DeviceIO
+    ... reproduce ...
+    wpr -stop trace.etl
+    wpa trace.etl
+# The "DPC/ISR" graph shows every ISR and DPC with durations.
+# It is the tool for "why is this system's latency bad", and
+# it will show your DPC's cost next to everyone else's.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Code 10 at start</td><td><code>PrepareHardware</code> returned an error — usually a missing expected resource</td></tr>
+<tr><td>Registers read <code>0xFFFFFFFF</code></td><td>Wrong range mapped, device not powered, or surprise-removed</td></tr>
+<tr><td>Mapped the wrong range</td><td>Assumed descriptor order — match on type and index deliberately</td></tr>
+<tr><td>Interrupt never fires</td><td>Device's interrupt enable not set, or the resource was absent</td></tr>
+<tr><td>Interrupt storm</td><td>ISR not acknowledging the device</td></tr>
+<tr><td>Spurious interrupt during power-down</td><td>Device not silenced before disconnect — use <code>EvtInterruptDisable</code></td></tr>
+<tr><td>Only message 0 ever fires</td><td>Fewer MSI messages granted than requested</td></tr>
+<tr><td>All DPCs on one CPU</td><td>No affinity policy — MSI-X messages not spread</td></tr>
+<tr><td>Corruption between ISR and normal code</td><td>Interrupt lock not used</td></tr>
+<tr><td>Bugcheck 0xA in the ISR</td><td>Paged memory or a paged-pool allocation at DIRQL</td></tr>
+<tr><td>Works on one machine, Code 12 on another</td><td>Resource conflict — the arbiter could not satisfy the request</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish raw from translated resources and say which to map.</li>
+  <li>Walk a resource list and handle five descriptor types.</li>
+  <li>Explain why you must not assume descriptor order or count.</li>
+  <li>Use the register access macros and say why a raw dereference is wrong.</li>
+  <li>Create a WDF interrupt object with enable and disable callbacks, and explain the ordering they
+  give.</li>
+  <li>Explain what MSI changes about ISR design.</li>
+  <li>Request MSI-X from an INF and handle getting fewer messages than asked.</li>
+  <li>Use <code>WdfInterruptSynchronize</code> and say why it beats an acquire/release pair.</li>
+  <li>Set an interrupt affinity policy and explain why spreading MSI-X matters.</li>
+  <li>Work the checklist for an interrupt that never fires.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

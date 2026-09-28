@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The registry: hives, cells and the configuration manager | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The registry: hives, cells and the configuration manager</h1>
+<p class="lead">The registry looks like a tree of folders and values in RegEdit, but underneath it is a
+purpose-built database with its own file format, its own transaction log, and its own object-manager
+integration — the <strong>Configuration Manager</strong> (the <code>Cm</code> prefix from
+<a href="win-28-nt-layers.html">chapter 27</a>'s naming table). This chapter is what actually happens when a
+driver's INF file (<a href="win-19-inf.html">chapter 20</a>) writes a value, and why the registry survives a
+power cut in the middle of a write.</p>
+
+<h2 id="hives">Hives: the registry's actual files on disk</h2>
+
+<p>The registry looks like one unified tree in RegEdit, but underneath it is a set of separate files — plus one branch that exists only in memory and is rebuilt at every boot. Knowing which is which explains what survives a reboot and what does not.</p>
+
+<pre class="diagram">   WHAT REGEDIT SHOWS AS "HKEY_LOCAL_MACHINE\SYSTEM" IS,
+   ON DISK, A SINGLE BINARY FILE:
+
+     C:\Windows\System32\config\SYSTEM
+
+   Each of these top-level roots (and several less visible
+   ones) is backed by its own HIVE FILE:
+
+     HKLM\SYSTEM              config\SYSTEM
+     HKLM\SOFTWARE            config\SOFTWARE
+     HKLM\SAM                 config\SAM        (locked down
+                                                  hard - the
+                                                  local
+                                                  account
+                                                  database)
+     HKLM\SECURITY            config\SECURITY
+     HKEY_USERS\&lt;SID&gt;         %USERPROFILE%\NTUSER.DAT
+                                                  (one per
+                                                  logged-on
+                                                  user)
+     HKLM\HARDWARE            NOT a file at all - built
+                              entirely in memory at boot from
+                              hardware enumeration, and gone
+                              on every reboot
+
+   THE VOLATILE ROOT is the giveaway that "the registry" is
+   not one uniform thing: some of it is genuinely persistent
+   binary data on disk, and some of it is a convenient
+   registry-shaped VIEW over transient, in-memory state that
+   the configuration manager happens to expose through the
+   same API.</pre>
+
+<h2 id="cells">Cells: the registry's version of a filesystem's blocks</h2>
+
+<p>Inside a hive file, data is organised into fixed structures called <strong>cells</strong> — small,
+variable-length blocks that hold a key node, a value entry, a value's data, or a security descriptor. This is
+structurally the same idea as a filesystem allocating data in blocks and linking them together with pointers,
+except the "pointers" here are offsets into the hive file, and the whole structure is a tree, exactly mirroring
+the key hierarchy you see in RegEdit. A key node cell points at its subkeys' cells and its values' cells; the
+configuration manager's job, given a path like
+<code>HKLM\SYSTEM\CurrentControlSet\Services\mydriver</code>, is to walk this on-disk tree of cells one
+component at a time, essentially performing the registry's equivalent of a filesystem path lookup.</p>
+
+<div class="key">
+<b>Why hives are memory-mapped rather than read with ordinary file I/O</b>
+<p>The configuration manager memory-maps a loaded hive's file into kernel address space and manipulates cells
+directly as in-memory data structures, which is what makes registry reads extremely fast compared with a
+generic file format — there is no parsing step, the on-disk layout <em>is</em> the in-memory layout the code
+walks. This is also precisely why registry corruption from an improperly terminated write historically mattered
+so much, and why the logging mechanism below exists: a torn write to a memory-mapped structure that other code
+is actively walking is a much sharper class of bug than a torn write to a sequential file format that gets
+re-parsed on every open.</p>
+</div>
+
+<h2 id="transactions">Surviving a power cut mid-write: the transaction log</h2>
+
+<p>The registry is modified constantly, including during shutdown, and a machine can lose power at any moment. The mechanism that keeps it intact is the same one journalling filesystems use, and it is worth recognising in both places.</p>
+
+<pre class="diagram">   MODIFYING THE REGISTRY IS NOT "WRITE THE NEW BYTES AND
+   HOPE" - it follows a WRITE-AHEAD LOGGING discipline that
+   should look familiar from any journalled filesystem
+   (the os track's filesystems chapter covers the general
+   pattern).
+
+   1. The configuration manager writes the intended change
+      to a SEPARATE LOG FILE (a .LOG or, on modern Windows,
+      a pair of alternating .LOG1/.LOG2 files) FIRST, and
+      flushes it to disk.
+
+   2. Only then does it apply the change to the actual hive
+      file's cells.
+
+   3. If power is lost between steps 1 and 2, the NEXT BOOT
+      detects an unfinished log entry and REPLAYS it against
+      the hive, completing the write that was interrupted -
+      exactly the recovery a journalling filesystem performs
+      after an unclean shutdown.
+
+   THIS IS WHY A REGISTRY WRITE THAT WAS "IN FLIGHT" DURING
+   A CRASH DOES NOT TYPICALLY CORRUPT THE HIVE: the log
+   guarantees the write either completes fully on the next
+   boot or never happened at all, from the hive's point of
+   view - never a half-applied cell.</pre>
+
+<h2 id="loading">Loading and unloading hives, and why SYSTEM cannot be unloaded</h2>
+
+<p>Hives are ordinary files, which means a hive belonging to a different, non-running Windows installation can be mounted and edited. That is the basis of every offline-repair and forensic tool — and there are specific hives this can never be done to.</p>
+
+<pre><code>/* Most hives are loaded automatically at boot, but a
+   process (with the right privilege) can load an arbitrary
+   hive file into the namespace at a chosen key - this is
+   exactly what tools do to inspect an OFFLINE system's
+   registry, or what a driver's OWN service key setup can
+   rely on existing once the SYSTEM hive is loaded.        */
+
+reg load HKLM\OfflineSystem D:\Windows\System32\config\SYSTEM
+/* Now HKLM\OfflineSystem is a live, browsable, WRITABLE
+   view into a hive file that belongs to a DIFFERENT,
+   currently non-running installation - the basis of many
+   offline-repair and forensic tools.                      */
+
+reg unload HKLM\OfflineSystem
+
+/* SYSTEM, SOFTWARE, SAM, SECURITY and the currently logged-
+   on user's hive CANNOT be unloaded while Windows is
+   running on them, for the obvious reason that the running
+   kernel and every running process are actively reading
+   from and depending on them existing. This is why offline
+   registry editing (booting from another medium, or loading
+   the hive from a different, non-booted installation as
+   above) is the standard technique for repairing a registry
+   problem severe enough to prevent normal boot.           */
+</code></pre>
+
+<h2 id="driver-view">What a driver's registry key setup actually creates</h2>
+
+<p>This is where the chapter connects back to your own work: the settings your INF writes and your driver reads are cells in one of these hives, under a key the Plug and Play manager created for you.</p>
+
+<pre><code>; A typical driver INF's AddReg section (chapter 20 covers
+; INF files in full):
+
+[MyDriver.AddReg]
+HKR,,"AttachToDeviceStack",0x00010001,1
+HKR,Parameters,"BufferSize",0x00010001,4096
+
+/* HKR means "relative to this driver's own service key",
+   which the Plug and Play manager creates automatically at:
+
+     HKLM\SYSTEM\CurrentControlSet\Services\MyDriver
+
+   This key is where WDF and WDM both look for driver-
+   specific configuration - WdfDeviceOpenRegistryKey and
+   IoOpenDeviceRegistryKey both resolve, ultimately, to a
+   cell walk starting from exactly this path.
+
+   THE "CurrentControlSet" PART IS ITSELF A SYMBOLIC-LINK-
+   LIKE INDIRECTION: the SYSTEM hive actually contains
+   ControlSet001, ControlSet002, and so on - full,
+   independent copies of the control set data, one per boot
+   configuration - and CurrentControlSet is a runtime alias
+   resolved to whichever one actually booted. This is the
+   mechanism behind "Last Known Good Configuration" recovery:
+   an older control set is simply still sitting there,
+   untouched, ready to be booted from if the current one is
+   broken.                                                  */
+
+/* Reading it from a driver, in kernel mode: */
+RTL_QUERY_REGISTRY_TABLE table[2] = {0};
+table[0].Flags = RTL_QUERY_REGISTRY_DIRECT;
+table[0].Name  = L"BufferSize";
+table[0].EntryContext = &amp;bufferSize;
+table[0].DefaultType  = REG_DWORD;
+table[0].DefaultData  = &amp;defaultSize;
+table[0].DefaultLength= sizeof(ULONG);
+
+RtlQueryRegistryValues(RTL_REGISTRY_SERVICE, L"MyDriver\\Parameters",
+                       table, NULL, NULL);
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Registry survives a hard power cut with no visible corruption</td><td>Working as designed — the
+transaction log replayed the interrupted write on next boot</td></tr>
+<tr><td>HKLM\HARDWARE has no on-disk file</td><td>It is the volatile root, rebuilt from enumeration on every
+boot</td></tr>
+<tr><td>Cannot unload the SYSTEM or SOFTWARE hive while running</td><td>Expected — the running kernel actively
+depends on them</td></tr>
+<tr><td>Driver's registry values are missing after a rollback</td><td>Values written under the wrong control
+set, or CurrentControlSet resolved to an older set</td></tr>
+<tr><td>Offline registry edit did not take effect on next boot</td><td>Edited a hive that was not actually the
+one the system boots from — check which ControlSet is current</td></tr>
+<tr><td>Registry reads are fast even under heavy load</td><td>Hives are memory-mapped; there is no parsing
+step on each access</td></tr>
+<tr><td>Driver's HKR key does not exist</td><td>The service key is created by the Plug and Play manager at
+install, not by the driver itself — check the INF's AddReg section</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the on-disk files backing HKLM\SYSTEM and HKEY_USERS, and explain why HKLM\HARDWARE has none.</li>
+  <li>Explain what a cell is and how it relates to the tree structure RegEdit displays.</li>
+  <li>Explain why hives are memory-mapped rather than read with ordinary file I/O.</li>
+  <li>Describe the write-ahead logging sequence that protects a registry write from a power cut.</li>
+  <li>Explain why some hives cannot be unloaded while Windows is running, and what offline editing does
+  instead.</li>
+  <li>Explain what CurrentControlSet actually is, and how it relates to Last Known Good recovery.</li>
+  <li>Say where a driver's INF AddReg entries actually end up, and how the driver reads them back.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

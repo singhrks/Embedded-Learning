@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a Pi actually boots | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>How a Pi actually boots</h1>
+<p class="lead">The Pi does not boot the way a PC or a typical embedded board does. The ARM cores are not even
+the first processor to run, there is no U-Boot, and the thing that loads your kernel is closed-source firmware
+in an EEPROM. Understanding this sequence is what lets you fix a Pi that will not start.</p>
+
+<h2 id="sequence">The sequence</h2>
+
+<pre class="diagram">   POWER APPLIED
+        |
+        v
+   +--------------------------------------------------+
+   | 1. The VideoCore starts, NOT the ARM cores.       |
+   |    The GPU/VPU block is the boot processor. The   |
+   |    A72/A76 cores are held in reset.               |
+   |                                                   |
+   |    This is backwards from every other ARM SoC you |
+   |    will meet, and it is a historical artefact of  |
+   |    the chip's origins as a set-top-box part.      |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 2. Small mask ROM inside the SoC runs. It knows   |
+   |    only enough to find the next stage.            |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 3. BOOTLOADER FROM SPI EEPROM  (Pi 4 and Pi 5)    |
+   |    An on-board flash chip, NOT the SD card.       |
+   |    - initialises DRAM                             |
+   |    - reads the BOOT_ORDER setting                 |
+   |    - finds a boot device: SD, USB, NVMe, network  |
+   |                                                   |
+   |    Older Pis (Pi 3 and earlier) read bootcode.bin |
+   |    from the SD card instead. On a Pi 4/5 the SD   |
+   |    card is NOT required to start the bootloader,  |
+   |    which is why USB and NVMe boot work at all.    |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 4. FIRMWARE from the boot partition               |
+   |    start4.elf / start.elf (Pi 4), or the Pi 5     |
+   |    equivalent. Runs on the VideoCore.             |
+   |    - parses config.txt        (chapter 09)        |
+   |    - loads the device tree .dtb                   |
+   |    - applies dtoverlay / dtparam  (chapter 10)    |
+   |    - splits RAM between CPU and GPU               |
+   |    - loads the kernel image into RAM              |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 5. ARM cores RELEASED FROM RESET, at EL2.         |
+   |    Core 0 enters the kernel with x0 = the address |
+   |    of the device tree blob. Cores 1-3 spin in a   |
+   |    holding pen waiting for a mailbox write.       |
+   +--------------------------------------------------+
+        |
+        v
+   +--------------------------------------------------+
+   | 6. Linux: start_kernel, then init/systemd.        |
+   |    -> Linux track, chapters 03-04                 |
+   +--------------------------------------------------+
+
+   NOTE WHAT IS ABSENT: there is no U-Boot, no UEFI, no
+   GRUB, and no second-stage bootloader you control. The
+   firmware goes straight from EEPROM to your kernel.</pre>
+
+<div class="key">
+<b>Why this matters practically</b>
+<p>Three things follow directly. First, <strong>a Pi that shows no output at all is usually a
+firmware-stage failure</strong> — bad card, bad power, or a corrupt boot partition — and the kernel never ran,
+so kernel debugging is pointless. Second, <strong><code>config.txt</code> is read by firmware, not by
+Linux</strong>, which is why its syntax is unlike anything else and why errors in it fail silently. Third,
+<strong>you cannot put a bootloader in front of the kernel</strong> the way you would with U-Boot on another
+board — if you want one, you load U-Boot <em>as</em> the kernel and chain from there.</p>
+</div>
+
+<h2 id="bootpart">The boot partition</h2>
+
+<pre><code># The first partition is FAT32 and readable from any machine.
+# THIS IS YOUR RECOVERY MECHANISM: pull the card, edit files
+# on your laptop, put it back.
+
+# On Raspberry Pi OS Bookworm and later it is mounted at:
+/boot/firmware/
+
+# On older releases it was:
+/boot/
+
+# This move broke a great many tutorials and scripts. Check
+# which you have before editing anything:
+$ mount | grep -E "boot"
+/dev/mmcblk0p1 on /boot/firmware type vfat (rw,...)
+
+# What lives there:
+$ ls /boot/firmware/
+config.txt          # firmware configuration    (chapter 09)
+cmdline.txt         # kernel command line, ONE line
+bcm2711-rpi-4-b.dtb # device tree for this board
+bcm2712-rpi-5-b.dtb
+overlays/           # .dtbo overlay files       (chapter 10)
+kernel8.img         # the 64-bit kernel (Pi 4)
+kernel_2712.img     # Pi 5 kernel
+start4.elf          # VideoCore firmware
+fixup4.dat          # memory split data
+initramfs8          # initial ramdisk, if used
+
+# cmdline.txt is ONE LINE. A newline in it silently
+# truncates the arguments after it, and the usual symptom is
+# a kernel that boots but cannot find its root filesystem.
+$ cat /boot/firmware/cmdline.txt
+console=serial0,115200 console=tty1 root=PARTUUID=xxxx-02 \
+  rootfstype=ext4 fsck.repair=yes rootwait
+</code></pre>
+
+<h2 id="bootorder">Boot order and where it lives</h2>
+
+<pre><code># BOOT_ORDER is stored in the EEPROM, not on the card. It is
+# read right-to-left (the last digit is tried first).
+
+$ rpi-eeprom-config
+[all]
+BOOT_UART=1
+BOOT_ORDER=0xf41
+
+#   1 = SD card
+#   2 = network (TFTP)
+#   3 = USB mass storage
+#   4 = USB 2.0 boot / NVMe on Pi 5
+#   6 = NVMe (Pi 5)
+#   e = stop and display an error pattern
+#   f = restart the sequence (loop forever)
+
+# 0xf41 reads as: try 1 (SD), then 4 (USB), then f (repeat).
+
+# Change it - this survives reimaging the card, which is
+# both the useful part and the confusing part:
+$ sudo -E rpi-eeprom-config --edit
+$ sudo rpi-eeprom-update -a     # apply on next boot
+
+# BOOT_UART=1 makes the BOOTLOADER print diagnostics to the
+# serial console (chapter 05) BEFORE any kernel runs. When a
+# Pi will not boot, this is the single most useful setting
+# on the board.
+</code></pre>
+
+<div class="warn">
+<b>The EEPROM is not on the SD card</b>
+<p>Reimaging the card does not reset boot configuration, and a Pi with a broken <code>BOOT_ORDER</code> or a
+bad EEPROM update will refuse to boot from a perfectly good card. Recovery is a dedicated
+<em>recovery image</em> written to a card, which reflashes the EEPROM on boot. Keep one on a spare card
+alongside your known-good OS image — the day you need it, you will not be able to download it from the
+machine that is broken.</p>
+</div>
+
+<h2 id="leds">Reading the failure without a console</h2>
+
+<pre class="diagram">   The green activity LED blinks a diagnostic pattern when
+   the firmware cannot proceed. Long flashes then short
+   flashes encode the error.
+
+   LED PATTERN                MEANING
+   ------------------------------------------------------
+   steady green, no blink     firmware not found / card
+                              unreadable
+   4 long, 4 short            start*.elf not found
+   4 long, 5 short            .elf not launched
+   7 flashes                  kernel image not found
+   8 flashes                  SDRAM failure
+   continuous flashing        generally SD or power
+
+   THE PATTERN LIST VARIES BY FIRMWARE VERSION. Treat this
+   as "there is a code, go look it up in the current
+   documentation" rather than as a table to memorise.
+
+   MUCH BETTER: set BOOT_UART=1 and attach a serial adapter
+   (chapter 05). The bootloader then TELLS you, in English,
+   what it tried and what failed. Counting LED blinks is
+   what you do when you have not fitted the console.
+
+   ORDER OF SUSPICION for a Pi that will not boot:
+     1. Power supply and cable. By a wide margin the most
+        common cause, and it presents as anything.
+     2. SD card. They fail constantly. Try another.
+     3. config.txt syntax error from your last edit.
+     4. A dtoverlay that does not exist or conflicts.
+     5. cmdline.txt with a wrong PARTUUID or a newline.
+     6. EEPROM boot order.
+     7. Actual hardware failure. Rare.</pre>
+
+<h2 id="el2">Where your kernel starts</h2>
+
+<pre><code># The firmware releases the ARM cores at EL2 by default on
+# 64-bit, which is what makes KVM possible (virtualisation
+# track). You can see it:
+
+$ dmesg | head -20 | grep -iE "EL2|Booting"
+[    0.000000] Booting Linux on physical CPU 0x0000000000
+[    0.000000] CPU: All CPU(s) started at EL2
+
+# config.txt can change this:
+#   arm_64bit=1      64-bit kernel (default on modern images)
+#   arm_control=...  legacy, do not use
+#   kernel=myimg.img boot something other than the default -
+#                    this is the hook chapter 20 uses to run
+#                    bare metal, and how you would chain to
+#                    U-Boot if you wanted a real bootloader.
+
+# THE SECONDARY CORES: cores 1-3 are parked in a spin table
+# in firmware-reserved memory, polling a mailbox address.
+# Linux writes each core's entry point there to start it.
+# The device tree records the method:
+
+$ dtc -I fs /sys/firmware/devicetree/base 2&gt;/dev/null | \
+    grep -A2 "enable-method"
+        enable-method = "spin-table";
+        cpu-release-addr = &lt;0x00 0xd8&gt;;
+
+# "spin-table" rather than "psci" is unusual - most ARM
+# platforms use PSCI firmware calls (ARM track, chapter 33).
+# The Pi's holding-pen approach is simpler and older, and it
+# is one reason CPU hotplug and suspend behave differently
+# here than on a typical ARM server.
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>No output at all, LED patterns only</td><td>Firmware stage — the kernel never ran; power, card or
+<code>config.txt</code></td></tr>
+<tr><td>Boots fine, then hangs before login</td><td>Kernel stage — different problem entirely, use the console
+log</td></tr>
+<tr><td>Edits to <code>config.txt</code> have no effect</td><td>Editing <code>/boot</code> on a Bookworm image
+where it is <code>/boot/firmware</code></td></tr>
+<tr><td>Kernel boots but cannot mount root</td><td>Wrong PARTUUID, or a newline in
+<code>cmdline.txt</code></td></tr>
+<tr><td>Good card refuses to boot</td><td>EEPROM boot order — reimaging the card does not reset it</td></tr>
+<tr><td>Works from SD, will not boot from USB or NVMe</td><td><code>BOOT_ORDER</code> does not include that
+device</td></tr>
+<tr><td>Random boot failures that come and go</td><td>Power supply, before anything else</td></tr>
+<tr><td>KVM unavailable</td><td>Kernel entered at EL1 rather than EL2</td></tr>
+<tr><td>Cannot chain a bootloader before the kernel</td><td>By design — load U-Boot <em>as</em> the
+kernel</td></tr>
+<tr><td>No serial output during early boot</td><td><code>BOOT_UART=1</code> not set in the EEPROM</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the processor that runs first on a Pi, and say why that is unusual.</li>
+  <li>State where the Pi 4/5 bootloader lives, and why that enables USB and NVMe boot.</li>
+  <li>List what the firmware does between EEPROM and releasing the ARM cores.</li>
+  <li>Explain why <code>config.txt</code> errors fail silently.</li>
+  <li>Say where the boot partition is mounted on current and older OS releases.</li>
+  <li>Explain the consequence of a newline in <code>cmdline.txt</code>.</li>
+  <li>Decode <code>BOOT_ORDER=0xf41</code>.</li>
+  <li>Explain why reimaging the SD card cannot fix a boot-order problem.</li>
+  <li>Give the setting that makes the bootloader talk to a serial console.</li>
+  <li>Say what exception level the kernel starts at, and why it matters.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

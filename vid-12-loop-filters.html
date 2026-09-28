@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>In-loop filters and post-processing | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>In-loop filters and post-processing</h1>
+<p class="lead">Block-based coding produces block-shaped artefacts. Filtering them away is worth 5–10% of
+bitrate — but only if the filter runs <em>inside</em> the coding loop, so that the cleaned frame is what
+future frames predict from. That word "in-loop" is the whole idea.</p>
+
+<h2 id="inloop">In-loop versus post-processing</h2>
+
+<pre class="diagram">   POST-PROCESSING - filter on the way to the screen
+
+     decode -> reconstruct -> [reference buffer]
+                          \-> FILTER -> display
+
+     The reference is UNFILTERED. Every future frame predicts
+     from blocky data, so the artefacts propagate and the
+     filter has to remove them again, every frame.
+     It is also OPTIONAL, so two decoders show different
+     pictures. MPEG-2 worked this way.
+
+   IN-LOOP - filter before storing as a reference
+
+     decode -> reconstruct -> FILTER -> [reference buffer]
+                                    \-> display
+
+     The reference is CLEAN. Prediction from it is better, so
+     residuals are smaller, so you spend fewer bits - 5-10%
+     at the same quality.
+     And it is NORMATIVE: every decoder must apply exactly
+     the same filter, or drift (chapter 11).
+
+   THIS IS WHY IN-LOOP FILTERING IS NOT COSMETIC. It changes
+   what the encoder can predict from, which changes the
+   bitrate. Turning deblocking off does not just look worse -
+   it costs bits.</pre>
+
+<h2 id="deblock">The deblocking filter</h2>
+
+<pre><code>/* Blocking happens because each block is quantised
+   independently, so two neighbours' DC levels can differ by a
+   step even though the original was smooth. The filter
+   smooths ACROSS block edges - and only where the
+   discontinuity looks like an artefact rather than real
+   content.                                                 */
+
+  FOR EACH EDGE, decide a BOUNDARY STRENGTH (bS):
+
+    bS = 4   one side is intra-coded AND the edge is a
+             macroblock boundary        -> strongest filter
+    bS = 3   one side is intra-coded
+    bS = 2   either side has non-zero transform coefficients
+    bS = 1   different reference frames, or motion vectors
+             differing by >= 1 pixel
+    bS = 0   nothing differs                -> DO NOT FILTER
+
+  THEN a content test, and this is the clever part:
+
+    filter only if
+        |p0 - q0| &lt; alpha  AND
+        |p1 - p0| &lt; beta   AND
+        |q1 - q0| &lt; beta
+
+    where p are pixels left of the edge and q right of it,
+    and alpha/beta scale with QP.
+
+  THE LOGIC: a SMALL step across the edge with FLAT sides is
+  almost certainly an artefact - smooth it. A LARGE step is
+  almost certainly a real edge in the picture - leave it
+  alone. That single heuristic is why deblocking does not
+  turn everything to mush.
+
+  AND alpha/beta SCALE WITH QP: at low QP the quantisation
+  error is small, so only tiny steps get filtered. At high QP
+  the filter works much harder. The filter strength follows
+  the artefact severity automatically.
+
+/* TUNING, in x264: */
+    --deblock -1:-1     sharper, more blocking. Good for
+                        high-bitrate, detailed content.
+    --deblock 0:0       the default.
+    --deblock 1:1       softer, less blocking. Good for
+                        low-bitrate or animation.
+/* The two numbers are alpha and beta offsets. Film grain and
+   detailed live action usually want negative; flat animation
+   and low bitrates want positive.                          */</code></pre>
+
+<div class="key">
+<b>Deblocking is a large fraction of decode time</b>
+<p>It touches every pixel, several times, with data-dependent branches — typically 15–30% of a software
+decoder's runtime, comparable to motion compensation. It is always hand-written SIMD, and it is one of the
+first things a hardware decoder implements as a fixed-function block. When profiling a decoder,
+<code>ff_h264_filter_mb</code> or its equivalent near the top of the profile is normal, not a bug.</p>
+</div>
+
+<h2 id="more">The filters that came after</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Filter</th><th>Fixes</th><th>In</th></tr></thead>
+<tbody>
+<tr><td><strong>Deblocking</strong></td><td>Block-edge discontinuities</td><td>H.264, HEVC, AV1, VVC</td></tr>
+<tr><td><strong>SAO</strong> — sample adaptive offset</td><td>Ringing and banding. Adds a small
+per-category offset to samples, with the offsets sent in the bitstream</td><td>HEVC</td></tr>
+<tr><td><strong>CDEF</strong> — constrained directional enhancement</td><td>Ringing, while
+<em>preserving</em> edges — it detects the dominant direction in each block and filters along it</td><td>AV1</td></tr>
+<tr><td><strong>Loop restoration</strong></td><td>Wiener and self-guided filters that restore detail lost to
+quantisation, with parameters chosen per unit by the encoder</td><td>AV1</td></tr>
+<tr><td><strong>ALF</strong> — adaptive loop filter</td><td>A Wiener filter whose coefficients are computed
+per frame by the encoder to minimise error against the source</td><td>VVC</td></tr>
+<tr><td><strong>LMCS</strong> — luma mapping with chroma scaling</td><td>Redistributes code values to suit
+the content, particularly HDR</td><td>VVC</td></tr>
+<tr><td><strong>Film grain synthesis</strong></td><td>Not a filter — grain is <em>removed</em> before
+encoding and <em>re-generated</em> from parameters at playback</td><td>AV1, H.264 SEI, VVC</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* SAO, because it shows the general shape of the newer
+   filters: the ENCODER measures the error and SENDS a
+   correction.                                              */
+
+  BAND OFFSET
+    Split the sample range into 32 bands. For four chosen
+    bands, send an offset. Applied to every sample in those
+    bands.
+    -> fixes BANDING in gradients, because it can nudge one
+       band's level without touching the others.
+
+  EDGE OFFSET
+    Classify each sample against two neighbours in one of four
+    directions (0deg, 90deg, 135deg, 45deg):
+
+       category 0:  local minimum      -> add offset[0]
+       category 1:  edge, falling      -> add offset[1]
+       category 2:  edge, rising       -> add offset[2]
+       category 3:  local maximum      -> add offset[3]
+
+    -> fixes RINGING, by pulling overshoots back toward their
+       neighbours.
+
+  The offsets are chosen by the ENCODER to minimise error
+  against the ORIGINAL frame - so unlike deblocking, which is
+  a fixed heuristic, SAO is a measured correction. That is
+  why it works on artefacts deblocking cannot see.
+
+/* CDEF in AV1 goes further: it estimates the DOMINANT
+   DIRECTION of each 8x8 block, then applies a nonlinear
+   filter ALONG that direction (which preserves the edge) and
+   a weaker one across it (which removes the ringing). The
+   direction search is why it costs more than SAO and why it
+   looks better on detailed content.                        */</code></pre>
+
+<h2 id="post">Post-processing, outside the loop</h2>
+
+<pre><code># Filters the player or the display applies. NOT normative -
+# they change the picture, not the bitstream, and every
+# device does something different.
+
+  DEINTERLACING     for legacy interlaced sources. yadif,
+                    bwdif, or a motion-compensated filter.
+                    Getting it wrong gives combing on motion.
+  DEBANDING         adds dither or gradient reconstruction.
+                    gradfun, deband.
+  UPSCALING         Lanczos, or a learned model (DLSS,
+                    FSR, NVIDIA VSR, Apple's neural scaler).
+  SHARPENING        popular, and it amplifies compression
+                    artefacts as enthusiastically as detail.
+  FRAME INTERPOLATION  "motion smoothing" on TVs. Produces the
+                    soap-opera effect, and 60-120 ms of
+                    latency - which is why every TV has a
+                    "game mode" that turns it off.
+  TONE MAPPING      HDR to SDR (chapter 5).
+
+# In practice:
+$ ffplay -vf "bwdif=mode=send_field,gradfun=1.2:8" input.mkv
+
+# THE ORDER MATTERS, and the general rule is:
+#   deinterlace -> denoise/deband -> scale -> sharpen
+# Scaling interlaced content before deinterlacing destroys the
+# field structure and cannot be undone. Sharpening before
+# scaling amplifies what the scaler then smears.
+
+# AND THE HONEST WARNING: post-processing cannot recover
+# information. A deband filter is guessing what the gradient
+# should have been; an upscaler is inventing detail. Both can
+# look better and neither is more correct. If you control the
+# encode, fix it there - more bits, higher bit depth, better
+# rate control - because that is the only place the
+# information still exists.</code></pre>
+
+<div class="warn">
+<b>Do not sharpen before measuring quality</b>
+<p>Sharpening reliably raises perceived detail and reliably <em>lowers</em> PSNR and SSIM while often raising
+VMAF — which is why "VMAF hacking" with a sharpening filter is a known way to produce encoders that score well
+and look worse (<a href="vid-06-why-compression-works.html">chapter 6</a>). If you are comparing encoders,
+disable every post-process on both sides, or you are measuring the filter.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Visible block edges at moderate bitrate</td><td>Deblocking disabled or offsets too negative</td></tr>
+<tr><td>Picture looks soft and smeared</td><td>Deblocking too strong — try negative offsets</td></tr>
+<tr><td>Bitrate rose after disabling deblocking</td><td>Expected — references are dirtier, so residuals
+grow</td></tr>
+<tr><td>Two decoders show different pictures</td><td>A post-process filter, not an in-loop one — in-loop is
+normative</td></tr>
+<tr><td>Ringing around text that deblocking does not fix</td><td>Needs SAO or CDEF; deblocking only sees block
+edges</td></tr>
+<tr><td>Banding in gradients despite enough bits</td><td>SAO band offset disabled, or 8-bit
+throughout</td></tr>
+<tr><td>Decoder profile dominated by the filter</td><td>Normal — deblocking is 15–30% of decode</td></tr>
+<tr><td>Combing artefacts on motion</td><td>Interlaced source not deinterlaced, or the wrong field
+order</td></tr>
+<tr><td>Grain looks wrong or absent on AV1</td><td>Film grain synthesis not applied by the decoder</td></tr>
+<tr><td>TV adds noticeable input lag</td><td>Frame interpolation; use game mode</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the difference between in-loop and post-processing filtering, and why it affects
+  bitrate.</li>
+  <li>Say why in-loop filters must be normative.</li>
+  <li>Describe how boundary strength is decided and what <code>bS = 0</code> means.</li>
+  <li>Explain the content test that stops deblocking smoothing real edges.</li>
+  <li>Say why the filter thresholds scale with QP.</li>
+  <li>Explain what SAO band offset and edge offset each fix.</li>
+  <li>Say what makes SAO different in kind from deblocking.</li>
+  <li>Explain what CDEF adds over SAO.</li>
+  <li>Explain AV1 film grain synthesis and why it saves bits.</li>
+  <li>Give the correct order for a post-processing chain and one ordering mistake.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

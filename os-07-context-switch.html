@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Context switching, step by step | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Context switching, step by step</h1>
+<p class="lead">The mechanism that creates the illusion of concurrency. It is conceptually simple — save one
+thread's state, restore another's — and the details of what counts as "state", and what it costs beyond the
+registers, determine the performance of the entire system.</p>
+
+<h2 id="when">When a switch happens</h2>
+
+<p>Switching between tasks does not happen at arbitrary moments. There is a defined set of events that can trigger it, and knowing them tells you why a task did or did not get the processor.</p>
+
+<pre class="diagram">Only ever from inside the kernel, and only for three reasons —
+matching the three ways the kernel gains control (chapter 01):
+
+  1. THE THREAD BLOCKS            voluntary
+     read() with no data ready, lock contended, sleep(), wait()
+     → mark it not-runnable, pick someone else
+
+  2. A TIMER INTERRUPT FIRES      involuntary, preemption
+     the quantum expired, or a higher-priority task woke
+     → the scheduler is invoked on the way out of the interrupt
+
+  3. A THREAD BECOMES RUNNABLE    involuntary, preemption
+     an interrupt completes I/O and wakes a higher-priority thread
+     → preempt immediately, if the policy allows
+
+Linux marks the current task with TIF_NEED_RESCHED rather than
+switching immediately. The actual switch happens at the next safe
+point — on the way back to user space, or when a preemption-disabled
+region ends. That is why PREEMPT_NONE vs PREEMPT changes latency
+without changing the mechanism.</pre>
+
+<h2 id="what">What "context" means</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>State</th><th>Saved by</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>General-purpose registers</td><td>Software (the switch routine)</td><td>~30 stores + 30 loads</td></tr>
+<tr><td>PC and stack pointer</td><td>Software</td><td>Included above</td></tr>
+<tr><td>PSTATE / flags</td><td>Hardware on exception entry</td><td>Free</td></tr>
+<tr><td>FP / SIMD registers</td><td>Software, usually <strong>lazily</strong></td><td>512+ bytes; deferred until used</td></tr>
+<tr><td>Page tables (<code>TTBR0</code>)</td><td>Software, only on <em>process</em> switch</td><td>One register write, plus TLB effects</td></tr>
+<tr><td>Thread-local base (<code>TPIDR_EL0</code>)</td><td>Software</td><td>One register</td></tr>
+<tr><td>Kernel stack pointer</td><td>Software</td><td>One register</td></tr>
+<tr><td><strong>Caches and TLBs</strong></td><td><strong>Nobody</strong> — they are just wrong afterwards</td><td><strong>The dominant cost</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The register save is not the expensive part</b>
+<p>Saving and restoring 31 registers is perhaps 100 cycles. The real cost is that the new thread arrives to
+find the caches full of the <em>old</em> thread's data, the branch predictor trained on the old thread's
+branches, and possibly a cold TLB. Refilling those costs thousands of cycles and does not appear anywhere in
+the switch routine. This is why the measured cost of a context switch ranges from ~1 µs to ~50 µs depending
+entirely on working-set size.</p>
+</div>
+
+<h2 id="thread-vs-process">Thread switch versus process switch</h2>
+
+<p>Switching between two threads of one process is substantially cheaper than switching between processes, and the reason is a single thing that does not need to change.</p>
+
+<pre class="diagram">SAME PROCESS (thread → thread)          DIFFERENT PROCESS
+  save/restore registers                  save/restore registers
+  swap kernel stack                       swap kernel stack
+  swap TLS register                       swap TLS register
+  — page tables UNCHANGED —               SWAP TTBR0_EL1
+  — TLB stays valid —                     TLB entries now belong to
+  — caches stay warm-ish —                  another ASID
+                                          caches likely cold
+
+  ~1-2 µs                                 ~2-5 µs, plus a much
+                                          larger refill penalty
+
+This is the concrete reason threads are "cheaper" than processes,
+and why thread pools beat process pools for fine-grained work.</pre>
+
+<h3>ASIDs make process switches survivable</h3>
+
+<pre><code>/* Without address space identifiers, changing TTBR0 would require
+   flushing the entire TLB — and the new process would then take
+   hundreds of TLB misses warming it back up.
+
+   With ASIDs (ARM) / PCIDs (x86), each TLB entry is tagged with
+   its owning address space. A switch changes the current ASID;
+   entries from BOTH processes coexist. No flush.              */
+
+msr     ttbr0_el1, x0        /* x0[63:48] holds the ASID */
+isb
+
+/* Kernel mappings are marked GLOBAL (nG=0), so they match under any
+   ASID and survive every switch — which is why a syscall does not
+   disturb the TLB at all.                                       */
+
+/* ASIDs are a limited resource (8 or 16 bits). When they are
+   exhausted the kernel rolls over the generation and DOES flush
+   everything. This is rare and shows up as a periodic latency
+   blip on systems with very many processes.                    */</code></pre>
+
+<div class="warn">
+<b>KPTI made this worse</b>
+<p>Kernel Page Table Isolation, the Meltdown mitigation, gives the kernel a <em>separate</em> page table so
+that kernel addresses are not mapped while user code runs. Every system call and every interrupt therefore
+switches address space twice. On affected CPUs this added roughly 5–30% to syscall-heavy workloads. ARM
+cores were mostly not vulnerable and do not pay this; most x86 cores do, unless mitigated in hardware.</p>
+</div>
+
+<h2 id="code">The switch itself</h2>
+
+<p>The actual switch is a short piece of architecture-specific assembly that saves one context and restores another. Reading it once removes most of the mystery from the concept.</p>
+
+<pre><code>/* Linux arm64, simplified from arch/arm64/kernel/entry.S.
+   Only the CALLEE-SAVED registers need saving here — this runs as
+   an ordinary C function call, so the caller already saved the
+   volatile ones per the ABI (C chapter 11).                     */
+
+SYM_FUNC_START(cpu_switch_to)
+        /* x0 = prev task, x1 = next task */
+        mov     x10, #THREAD_CPU_CONTEXT
+        add     x8, x0, x10                  /* &amp;prev->thread.cpu_context */
+        mov     x9, sp
+
+        stp     x19, x20, [x8], #16          /* save callee-saved */
+        stp     x21, x22, [x8], #16
+        stp     x23, x24, [x8], #16
+        stp     x25, x26, [x8], #16
+        stp     x27, x28, [x8], #16
+        stp     x29, x9,  [x8], #16          /* FP and SP         */
+        str     lr, [x8]                      /* return address    */
+
+        add     x8, x1, x10                  /* &amp;next->thread.cpu_context */
+        ldp     x19, x20, [x8], #16          /* restore           */
+        ldp     x21, x22, [x8], #16
+        ldp     x23, x24, [x8], #16
+        ldp     x25, x26, [x8], #16
+        ldp     x27, x28, [x8], #16
+        ldp     x29, x9,  [x8], #16
+        ldr     lr, [x8]
+        mov     sp, x9
+
+        msr     sp_el0, x1                   /* `current` for the new task */
+        ret                                   /* returns into NEXT's flow */
+SYM_FUNC_END(cpu_switch_to)</code></pre>
+
+<div class="note">
+<b>The trick worth appreciating</b>
+<p><code>cpu_switch_to</code> is called by one thread and <em>returns into a different one</em>. The
+<code>ret</code> at the end jumps to the link register restored from the next task's saved context — which
+is wherever <em>that</em> thread last called this function. Every thread's stack is paused mid-call in the
+same place. A newly created thread has its saved context hand-crafted so that this <code>ret</code> lands on
+its entry function instead.</p>
+</div>
+
+<h2 id="lazy-fpu">Lazy FPU switching</h2>
+
+<p>The vector and floating-point registers are large and most tasks do not use them. Saving them only when necessary is a worthwhile optimisation that has historically also been a source of security vulnerabilities.</p>
+
+<pre><code>/* FP/SIMD state is large — 32 x 128-bit V registers, or far more
+   with SVE (up to 2048 bits each). Saving it on every switch would
+   dominate the cost, and most threads never touch it.        */
+
+/* The optimisation:
+     1. on switch, DISABLE FP access for the incoming thread
+        (CPACR_EL1.FPEN = 0)
+     2. if it never uses FP, nothing was saved or restored — free
+     3. if it executes an FP instruction, a trap fires; the kernel
+        then saves the previous owner's state, restores this
+        thread's, enables FP, and retries the instruction     */
+
+/* Consequences you can observe:
+     · the FIRST FP instruction after a switch is expensive
+     · in the kernel, FP is FORBIDDEN by default precisely because
+       its state is not saved on kernel entry (C chapter 16).
+       Kernel code that needs it must bracket it explicitly:  */
+kernel_neon_begin();
+    /* SIMD-accelerated crypto or checksum here */
+kernel_neon_end();</code></pre>
+
+<h2 id="cost">Measuring the cost</h2>
+
+<p>A context switch costs far more than the register copying suggests, because the real expense is the caches and TLB the new task arrives to find cold.</p>
+
+<pre class="diagram">Direct cost — the switch routine itself
+    save/restore registers            ~100 cycles
+    scheduler decision (EEVDF)        ~200-500 cycles
+    page table swap (process switch)  ~50 cycles + barriers
+
+Indirect cost — the part nobody counts, and the part that matters
+    cold L1/L2 for the new working set   100s-1000s of cycles
+    TLB refill                            100s of cycles
+    branch predictor retraining           100s of cycles
+
+  Measured end to end:
+    thread ↔ thread, tiny working set      ~1 µs
+    process ↔ process, tiny working set    ~2 µs
+    process ↔ process, 1 MB working set    ~10-50 µs
+
+The variance IS the point: the switch has a fixed cost and a
+working-set-dependent cost, and the second one dominates.</pre>
+
+<pre><code># count them
+vmstat 1                        # cs column: switches per second
+pidstat -w -p PID 1             # voluntary vs involuntary, per task
+perf stat -e context-switches,cpu-migrations ./program
+cat /proc/PID/status | grep ctxt
+
+# see them
+perf sched record ./workload &amp;&amp; perf sched timehist
+trace-cmd record -e sched:sched_switch -- ./workload
+
+# measure the raw cost on your machine
+perf bench sched pipe           # ping-pong through a pipe
+perf bench sched messaging
+
+# a rough rule: if `cs` is above ~50,000/s on a few cores, switching
+# itself is a measurable fraction of your CPU budget.</code></pre>
+
+<h2 id="reducing">Reducing switch cost</h2>
+
+<p>If switches are hurting a workload, there are several distinct ways to have fewer of them — and which applies depends on why they are happening in the first place.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><strong>Fewer threads</strong> — a pool sized to core count</td><td>Removes switching that exists only because of oversubscription</td></tr>
+<tr><td><strong>Batch I/O</strong> — <code>io_uring</code>, <code>readv</code></td><td>Fewer blocking points, so fewer voluntary switches</td></tr>
+<tr><td><strong>Async / coroutines</strong></td><td>Switching in user space costs ~20 ns, not ~1 µs — no kernel involved</td></tr>
+<tr><td><strong>CPU pinning</strong> (<code>taskset</code>)</td><td>Prevents migration, preserves cache affinity</td></tr>
+<tr><td><strong>Longer quanta</strong> for batch work</td><td>Fewer preemptions; hurts latency</td></tr>
+<tr><td><strong>Spin briefly before blocking</strong></td><td>Adaptive mutexes: if the lock will be free within ~1 µs, spinning is cheaper than switching twice</td></tr>
+<tr><td><strong>Busy-poll</strong> for ultra-low latency</td><td>Never sleep at all — burns a core to remove the wake-up path entirely</td></tr>
+<tr><td><strong>Huge pages</strong></td><td>Fewer TLB entries to refill after a switch</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Adaptive mutexes make the spin-versus-block decision automatically:
+   spin while the lock HOLDER IS RUNNING on another CPU (it will
+   likely release soon), block if the holder is descheduled (it
+   will not).                                                    */
+
+/* glibc: */
+pthread_mutexattr_settype(&amp;a, PTHREAD_MUTEX_ADAPTIVE_NP);
+
+/* This is why uncontended and briefly-contended mutexes are
+   nearly free, and heavily-contended ones are catastrophic —
+   the cost cliff is exactly one context switch pair.         */</code></pre>
+
+<h2 id="rtos">Context switching in an RTOS</h2>
+
+<p>A small real-time kernel switches contexts very differently from a general-purpose one, and comparing the two shows exactly which costs are essential and which are the price of generality.</p>
+
+<pre><code>/* On a Cortex-M with no MMU, a switch is far simpler and far
+   faster — typically 50-200 cycles.                          */
+
+void PendSV_Handler(void)      /* the standard RTOS switch hook */
+{
+        /* hardware already stacked R0-R3, R12, LR, PC, xPSR */
+        __asm volatile (
+        "   mrs   r0, psp            \n"   /* process stack pointer */
+        "   stmdb r0!, {r4-r11}      \n"   /* save the rest         */
+        "   ldr   r1, =current_tcb   \n"
+        "   ldr   r2, [r1]           \n"
+        "   str   r0, [r2]           \n"   /* save SP into the TCB  */
+        "   bl    select_next_task   \n"
+        "   ldr   r2, [r1]           \n"
+        "   ldr   r0, [r2]           \n"   /* new SP                */
+        "   ldmia r0!, {r4-r11}      \n"
+        "   msr   psp, r0            \n"
+        "   bx    lr                 \n"); /* hardware unstacks     */
+}
+
+/* Why it is so much cheaper:
+     · no page tables, no TLB, no ASID
+     · caches are small or absent, so little to lose
+     · the hardware stacks half the registers for you
+     · no scheduler tree — often a simple priority bitmap
+
+   PendSV is used because it is the LOWEST-priority exception, so
+   the switch happens only after all pending interrupts are handled.
+   Switching from inside an ISR would otherwise nest badly.     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Throughput falls as threads exceed core count</td><td>Switching overhead and cache thrashing</td></tr>
+<tr><td>Very high <code>cs</code> in <code>vmstat</code></td><td>Oversubscription, or a lock ping-ponging between threads</td></tr>
+<tr><td>High <em>voluntary</em> switches</td><td>Blocking frequently — batch the I/O</td></tr>
+<tr><td>High <em>involuntary</em> switches</td><td>CPU contention — reduce thread count or pin</td></tr>
+<tr><td>Latency improves dramatically after pinning</td><td>Migration was destroying cache affinity</td></tr>
+<tr><td>Syscall-heavy workload slowed after a kernel update</td><td>KPTI: two address-space switches per syscall</td></tr>
+<tr><td>First floating-point operation after a switch is slow</td><td>Lazy FPU restore trap</td></tr>
+<tr><td>Async runtime far outperforms threads on I/O</td><td>User-space switching is ~50× cheaper</td></tr>
+<tr><td>Periodic latency blip on a many-process system</td><td>ASID rollover forcing a full TLB flush</td></tr>
+<tr><td>Kernel oops after using floating point in a driver</td><td>FP state not saved on kernel entry; use <code>kernel_neon_begin()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three events that cause a context switch and which are voluntary.</li>
+  <li>List what is saved on a switch and identify the item nobody saves.</li>
+  <li>Explain why the register save is not the dominant cost.</li>
+  <li>Give the difference between a thread switch and a process switch.</li>
+  <li>Explain what ASIDs do and what happens when they run out.</li>
+  <li>Explain lazy FPU switching and why kernel code cannot use floating point freely.</li>
+  <li>Explain how <code>cpu_switch_to</code> can return into a different thread.</li>
+  <li>Give four ways to reduce context-switch cost, and when each applies.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

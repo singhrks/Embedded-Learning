@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The MMU and the address space split | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The MMU and the address space split</h1>
+<p class="lead"><a href="ca-16-virtual-memory.html">CA chapter 16</a> covered virtual memory as an idea. This
+chapter covers ARM's specific realisation of it: two translation table base registers, a split address space,
+and the configuration register that ties them together.</p>
+
+<h2 id="split">Two base registers, one address space</h2>
+
+<p>AArch64 uses two translation table base registers rather than one, splitting the address space in half. That single decision is why the kernel does not need to be re-mapped on every context switch.</p>
+
+<pre class="diagram">   0xFFFF_FFFF_FFFF_FFFF  ┌──────────────────────────┐
+                          │                          │
+                          │   KERNEL SPACE           │  translated by
+                          │   translated by TTBR1    │  TTBR1_EL1
+                          │                          │
+   0xFFFF_0000_0000_0000  ├──────────────────────────┤
+                          │                          │
+                          │   NON-CANONICAL HOLE     │  any access
+                          │   — nothing is mapped     │  faults
+                          │                          │
+   0x0000_FFFF_FFFF_FFFF  ├──────────────────────────┤
+                          │                          │
+                          │   USER SPACE             │  translated by
+                          │   translated by TTBR0    │  TTBR0_EL1
+                          │                          │
+   0x0000_0000_0000_0000  └──────────────────────────┘
+
+  The hardware selects the table by the TOP BITS of the address:
+     VA[55] (or VA[63], depending on TCR) == 0  →  TTBR0
+                                          == 1  →  TTBR1
+
+  Bits above the configured VA size must be all-zeros or all-ones
+  ("canonical"). Anything else is a translation fault — which is
+  why a corrupted pointer with garbage in the top bits produces a
+  clean fault rather than a wild access.</pre>
+
+<div class="key">
+<b>Why two registers is the elegant part</b>
+<p>The kernel mapping lives in <code>TTBR1_EL1</code> and never changes. A context switch only rewrites
+<code>TTBR0_EL1</code>. So the kernel stays mapped across every switch, a system call needs no table change at
+all, and the kernel's TLB entries survive — marked Global so they match under any ASID
+(<a href="arm-15-tlb-asid.html">chapter 15</a>).</p>
+<p>x86-64 has one table root and must place the kernel inside every process's page tables, which is exactly
+what made Meltdown mitigation (KPTI) so expensive there. ARM's split makes the same isolation nearly free.</p>
+</div>
+
+<h2 id="tcr">TCR_EL1: the configuration register</h2>
+
+<p>One register configures nearly everything about translation: address sizes, granule sizes, cacheability of the tables themselves, and which features are on. Early MMU bring-up problems are very often a wrong field here.</p>
+
+<pre class="diagram">TCR_EL1 controls almost everything about translation. The fields
+you will actually set:
+
+   T0SZ  [5:0]     size of the TTBR0 region: VA bits = 64 - T0SZ
+                     T0SZ = 16  →  48-bit VA  →  256 TB
+                     T0SZ = 25  →  39-bit VA  →  512 GB (3-level)
+   T1SZ  [21:16]   the same, for TTBR1
+
+   TG0   [15:14]   TTBR0 granule:  00 = 4KB, 01 = 64KB, 10 = 16KB
+   TG1   [31:30]   TTBR1 granule:  10 = 4KB, 11 = 64KB, 01 = 16KB
+                     ← note the encodings DIFFER between TG0 and TG1.
+                       A classic boot bug.
+
+   IRGN0 [9:8]     cacheability of TTBR0 table WALKS, inner
+   ORGN0 [11:10]   ...outer
+   SH0   [13:12]   shareability of table walks
+   IRGN1/ORGN1/SH1 the same for TTBR1
+
+   IPS   [34:32]   intermediate physical address size
+                     000 = 32 bits, 101 = 48 bits, 110 = 52 bits
+
+   TBI0  [37]      Top Byte Ignore — the top 8 bits of a VA are
+   TBI1  [38]      not used for translation. This is what makes
+                   pointer tagging, HWASAN and MTE possible.
+
+   A1    [22]      which TTBR holds the ASID (0 = TTBR0)
+   EPD0  [7]       disable TTBR0 walks entirely
+   HA/HD [39:40]   hardware management of Access and Dirty bits</pre>
+
+<pre><code>/* Why walk cacheability matters: a 4-level walk is up to four
+   memory accesses. If the tables themselves are uncached, every
+   TLB miss costs four DRAM round trips instead of four cache
+   hits. Setting IRGN/ORGN to write-back is one of the highest-
+   impact single settings in early boot — and forgetting it
+   produces a system that boots but is inexplicably slow.    */
+
+#define TCR_T0SZ(x)     ((64 - (x)) &lt;&lt; 0)    /* x = VA bits */
+#define TCR_T1SZ(x)     ((64 - (x)) &lt;&lt; 16)
+#define TCR_IRGN_WBWA   ((1UL &lt;&lt; 8)  | (1UL &lt;&lt; 24))
+#define TCR_ORGN_WBWA   ((1UL &lt;&lt; 10) | (1UL &lt;&lt; 26))
+#define TCR_SH_INNER    ((3UL &lt;&lt; 12) | (3UL &lt;&lt; 28))
+#define TCR_TG0_4K      (0UL &lt;&lt; 14)
+#define TCR_TG1_4K      (2UL &lt;&lt; 30)          /* NOT the same value */
+#define TCR_IPS_48      (5UL &lt;&lt; 32)
+
+        uint64_t tcr = TCR_T0SZ(48) | TCR_T1SZ(48)
+                     | TCR_IRGN_WBWA | TCR_ORGN_WBWA | TCR_SH_INNER
+                     | TCR_TG0_4K | TCR_TG1_4K | TCR_IPS_48;
+        asm volatile("msr tcr_el1, %0" :: "r"(tcr));</code></pre>
+
+<h2 id="granules">Granule size</h2>
+
+<p>The granule is the smallest unit of memory a page table entry can map — the architecture's equivalent of
+"page size" — and it is chosen once, at boot, and baked into every level of the page table format that
+follows. The trade it controls is a straightforward one: a larger granule means fewer, bigger page-table
+entries covering the same address space, so a TLB entry covers more memory and you take fewer TLB misses, but
+any allocation smaller than the granule wastes the leftover space (internal fragmentation), and a granule the
+hardware does not implement will not boot at all.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Granule</th><th>Levels for 48-bit VA</th><th>Block sizes</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>4 KB</strong></td><td>4 (L0–L3)</td><td>1 GB (L1), 2 MB (L2), 4 KB (L3)</td><td>Universal. What Linux uses by default.</td></tr>
+<tr><td><strong>16 KB</strong></td><td>4 (L0–L3)</td><td>32 MB (L2), 16 KB (L3)</td><td>Apple platforms; good TLB reach with modest waste</td></tr>
+<tr><td><strong>64 KB</strong></td><td>3 (L1–L3)</td><td>512 MB (L2), 64 KB (L3)</td><td>Fewer levels, best TLB reach, most internal fragmentation</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Granule support is optional per implementation — query <code>ID_AA64MMFR0_EL1</code> before selecting one.
+A kernel configured for 64 KB pages will not boot on a core that only implements 4 KB.</p>
+
+<h2 id="va-size">Choosing the VA size</h2>
+
+<p>How many bits of virtual address you use is configurable, and the choice trades address space against the number of table levels a walk must traverse — which is a direct cost on every TLB miss.</p>
+
+<pre><code>/* Reducing the VA size removes a whole LEVEL of the page walk. */
+
+   T0SZ = 16  →  48-bit VA  →  L0, L1, L2, L3   (4 levels)
+   T0SZ = 25  →  39-bit VA  →  L1, L2, L3       (3 levels)
+   T0SZ = 34  →  30-bit VA  →  L2, L3           (2 levels)
+
+/* Trade-off:
+     fewer levels  → cheaper TLB miss (fewer memory accesses),
+                     smaller tables
+     smaller VA    → less address space per process
+
+   Linux offers CONFIG_ARM64_VA_BITS of 39, 42, 47, 48 and 52.
+   39 bits (512 GB) is common on embedded systems and saves a
+   level; 48 is the desktop/server default.
+
+   Note the kernel and user sizes are configured INDEPENDENTLY
+   (T0SZ vs T1SZ), so you can have a large kernel space and a
+   small user space, or vice versa.                          */</code></pre>
+
+<h2 id="enable">Turning the MMU on</h2>
+
+<div class="danger">
+<b>The most delicate sequence in boot code</b>
+<p>The instruction that enables the MMU is fetched with the MMU <em>off</em>, and the instruction after it may
+be fetched with the MMU <em>on</em>. If the currently executing code is not mapped at the same address in the
+new tables, execution falls off a cliff with no diagnostic whatsoever.</p>
+<p>The standard solution is an <strong>identity map</strong>: a temporary mapping where VA equals PA covering
+the enabling code itself. Enable the MMU, then branch to the final virtual address, then discard the identity
+map.</p>
+</div>
+
+<pre><code>/* The sequence, with every step justified */
+
+        /* 1. the tables must be VISIBLE to the table walker before
+              it is told to use them. The walker reads memory, and
+              our writes may still be in a store buffer.        */
+        dsb     ish
+
+        /* 2. install the roots and the configuration */
+        msr     ttbr0_el1, x0           /* identity map          */
+        msr     ttbr1_el1, x1           /* kernel map            */
+        msr     tcr_el1, x2
+        msr     mair_el1, x3
+
+        /* 3. these must take effect before SCTLR is written    */
+        isb
+
+        /* 4. invalidate stale TLB entries from before the MMU
+              was configured — there may be entries from a
+              previous boot stage                                */
+        tlbi    vmalle1
+        dsb     nsh
+        isb
+
+        /* 5. enable: M (MMU), C (data cache), I (instruction cache) */
+        mrs     x4, sctlr_el1
+        orr     x4, x4, #(1 &lt;&lt; 0)       /* M */
+        orr     x4, x4, #(1 &lt;&lt; 2)       /* C */
+        orr     x4, x4, #(1 &lt;&lt; 12)      /* I */
+        msr     sctlr_el1, x4
+
+        /* 6. the pipeline must be flushed so subsequent fetches
+              are translated                                     */
+        isb
+
+        /* 7. now jump to the FINAL virtual address. Until this
+              branch, we are running on the identity map.       */
+        ldr     x5, =virtual_entry
+        br      x5
+
+virtual_entry:
+        /* the identity map can now be removed */</code></pre>
+
+<h2 id="tbi">Top Byte Ignore and pointer tagging</h2>
+
+<p>The processor can be told to ignore the top byte of an address, which frees eight bits for software to use as a tag. Several major features, including memory tagging and some sanitizers, depend on it.</p>
+
+<pre><code>/* With TCR.TBI set, bits [63:56] of a virtual address are IGNORED
+   for translation. Software may store anything there.       */
+
+   0xFF00_1234_5678_9ABC
+     ^^ ignored by the MMU
+
+/* This enables several important features:                  */
+
+/* HWASAN — hardware-assisted AddressSanitizer. A tag in the
+   pointer is compared against a shadow-memory tag on each
+   access. Far cheaper than classic ASan's redzones.        */
+
+/* MTE — Memory Tagging Extension (ARMv8.5). The comparison moves
+   into HARDWARE: each 16-byte granule of memory has a 4-bit tag,
+   and the CPU checks it against the pointer's tag on every
+   access. Use-after-free and buffer overflow detection at a few
+   percent overhead — cheap enough for production. Android
+   ships it.                                                 */
+
+/* Pointer authentication also lives in these bits when TBI is
+   enabled (chapter 09).                                     */
+
+/* The catch: any code that COMPARES pointers or uses them as
+   hash keys must strip the tag first, or logically identical
+   pointers compare unequal. This is why introducing tagging into
+   an existing codebase surfaces latent pointer-arithmetic bugs. */</code></pre>
+
+<h2 id="asid">Where the ASID lives</h2>
+
+<p>Without address space identifiers, every context switch would require flushing the whole TLB. The ASID is what allows entries from several processes to coexist safely, and mismanaging it produces spectacularly confusing bugs.</p>
+
+<pre><code>/* The ASID is stored in the TOP 16 BITS of TTBR0_EL1 (or TTBR1,
+   if TCR.A1 is set — but nobody does that).                */
+
+        ttbr0 = page_table_pa | ((uint64_t)asid &lt;&lt; 48);
+        msr   ttbr0_el1, x0
+
+/* So a context switch is ONE register write that changes both
+   the translation tables and the address-space identity. The
+   TLB keeps entries from both processes, tagged by ASID, and
+   nothing needs flushing (chapter 15).                     */
+
+/* ASID width is 8 or 16 bits, reported by ID_AA64MMFR0_EL1.ASIDBits.
+   Linux uses a generation-rollover scheme: when ASIDs are
+   exhausted it bumps a generation counter and flushes, which is
+   rare but shows up as a periodic latency blip on systems with
+   very many processes.                                     */</code></pre>
+
+<h2 id="regimes">Translation regimes</h2>
+
+<p>There is not one translation scheme but several, depending on which exception level and security state is executing. Knowing which regime applies tells you which registers actually control the translation you are looking at.</p>
+
+<pre class="diagram">Each exception level has its OWN translation configuration.
+These are entirely separate sets of registers:
+
+   EL1&amp;0 regime     TTBR0_EL1, TTBR1_EL1, TCR_EL1, MAIR_EL1
+                    used by EL0 and EL1 — one regime covering both,
+                    which is why the split by top bit works
+
+   EL2 regime       TTBR0_EL2, TCR_EL2, MAIR_EL2
+                    the hypervisor's own mappings.
+                    With VHE (ARMv8.1), EL2 gains TTBR1_EL2 and
+                    behaves like EL1&0 — which is what lets a host
+                    kernel run at EL2 unmodified.
+
+   EL2 stage 2      VTTBR_EL2, VTCR_EL2
+                    translates guest IPAs to PAs (chapter 16)
+
+   EL3 regime       TTBR0_EL3, TCR_EL3, MAIR_EL3
+                    single-level, no TTBR1 — the monitor's map
+
+   Secure and Non-secure EL1&0 are also SEPARATE regimes, with
+   independent register banks selected by SCR_EL3.NS. So the
+   secure world has its own page tables entirely.</pre>
+
+<h2 id="debug">Inspecting translation</h2>
+
+<p>When translation misbehaves, reading the configuration registers directly settles most questions immediately — including the common one of whether the MMU is even enabled.</p>
+
+<pre><code>/* The AT instruction: ask the hardware to translate an address
+   and report the result. The single most useful MMU debugging
+   tool.                                                      */
+
+        at      s1e1r, x0        /* stage 1, EL1, read        */
+        at      s1e1w, x0        /* stage 1, EL1, write       */
+        at      s1e0r, x0        /* as if from EL0            */
+        at      s12e1r, x0       /* both stages               */
+        isb
+        mrs     x1, par_el1
+
+/* PAR_EL1 on SUCCESS:
+        bit 0    F = 0
+        [51:12]  physical address
+        [63:56]  memory attributes (the MAIR value applied)
+        [9:8]    shareability
+
+   PAR_EL1 on FAILURE:
+        bit 0    F = 1
+        [6:1]    FST — fault status, same encoding as ESR.DFSC
+        bit 8    stage: 0 = stage 1, 1 = stage 2               */
+
+static void dump_translation(unsigned long va)
+{
+        unsigned long par;
+        asm volatile("at s1e1r, %0\n\tisb" :: "r"(va));
+        asm volatile("mrs %0, par_el1" : "=r"(par));
+
+        if (par &amp; 1)
+                pr_err("VA %lx: FAULT, FST=%lx\n", va, (par &gt;&gt; 1) &amp; 0x3F);
+        else
+                pr_info("VA %lx → PA %lx, attrs %02lx\n",
+                        va, (par &amp; 0xFFFFFFFFF000UL) | (va &amp; 0xFFF),
+                        par &gt;&gt; 56);
+}</code></pre>
+
+<pre><code># Linux side
+cat /proc/self/maps                    # the VMAs (OS chapter 12)
+cat /proc/kpageflags                   # per-physical-page state
+cat /sys/kernel/debug/kernel_page_tables   # needs CONFIG_PTDUMP_DEBUGFS
+#   ---[ Linear Mapping ]---
+#   0xffff000000000000-0xffff000040000000  1G  PMD  RW NX SHD AF ...
+#   — the definitive dump of what the kernel actually mapped
+
+dmesg | grep -i 'Virtual kernel memory layout'</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hangs immediately on enabling the MMU</td><td>No identity map covering the enabling code</td></tr>
+<tr><td>Boots but everything is slow</td><td>Table walks configured non-cacheable in TCR</td></tr>
+<tr><td>Kernel boots on one core, hangs on another</td><td>Missing <code>ISB</code> after the <code>SCTLR</code> write</td></tr>
+<tr><td>Wrong granule accepted at build, faults at run</td><td>TG0 and TG1 use different encodings for the same size</td></tr>
+<tr><td>Kernel will not boot on a particular SoC</td><td>Granule size not implemented — check <code>ID_AA64MMFR0_EL1</code></td></tr>
+<tr><td>Pointer comparisons fail after enabling tagging</td><td>Tags not stripped before comparison</td></tr>
+<tr><td>Access to a high address faults unexpectedly</td><td>Non-canonical — bits above the VA size are not all-ones</td></tr>
+<tr><td>Periodic latency blip with many processes</td><td>ASID rollover forcing a full TLB flush</td></tr>
+<tr><td>Guest translation works, host cannot see the mapping</td><td>Different translation regimes — separate register banks</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain how the hardware chooses between TTBR0 and TTBR1.</li>
+  <li>Give two advantages of the two-register split over a single root.</li>
+  <li>Name five <code>TCR_EL1</code> fields and what each controls.</li>
+  <li>Explain why walk cacheability matters and what happens if you get it wrong.</li>
+  <li>Say how reducing the VA size changes the page walk.</li>
+  <li>Explain why enabling the MMU needs an identity map.</li>
+  <li>Explain what Top Byte Ignore enables and one bug it exposes.</li>
+  <li>Describe what <code>AT</code> plus <code>PAR_EL1</code> tells you, in both success and failure cases.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

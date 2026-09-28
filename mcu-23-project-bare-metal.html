@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: bare-metal bring-up, every register explained | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: bare-metal bring-up, every register explained</h1>
+<p class="lead">A complete firmware image with no vendor HAL, no CMSIS beyond the register definitions, and no
+library you did not write. It boots, configures its clocks, drives a UART, samples an ADC over DMA, and
+reports. Roughly 400 lines, and every one of them is explainable.</p>
+
+<h2 id="what">What it does, and what to run it on</h2>
+
+<pre class="diagram">   TARGET: STM32F411 "Black Pill" or any Nucleo-F4. The
+   register names below are F4-family; the STRUCTURE ports
+   to any Cortex-M with a page of renaming.
+
+   NO HARDWARE? QEMU emulates several Cortex-M boards:
+
+     qemu-system-arm -M netduinoplus2 -cpu cortex-m4 \
+                     -nographic -kernel firmware.elf
+
+   The QEMU model implements the core, NVIC, SysTick and
+   USART faithfully. It does NOT model the RCC clock tree
+   or the ADC properly, so parts 3 and 6 need real silicon
+   to be meaningful. Everything else runs.
+
+   BEHAVIOUR:
+     - boots to a 100 MHz PLL clock
+     - blinks an LED at exactly 1 Hz from SysTick
+     - prints a banner and a reading once a second over
+       UART at 115200
+     - samples an internal temperature sensor via DMA
+     - reports its own stack high-water mark
+     - decodes and reports any fault, then resets
+
+   BUILD:
+     $ make
+     $ arm-none-eabi-size firmware.elf
+     $ st-flash write firmware.bin 0x08000000</pre>
+
+<h2 id="layout">The files</h2>
+
+<pre><code>project/
+  Makefile
+  linker.ld          chapter 05
+  startup.c          chapters 04, 06 - vectors + Reset_Handler
+  main.c             the application
+  clock.c            chapter 09
+  uart.c             chapters 10, 12
+  adc_dma.c          chapter 12
+  fault.c            chapter 15
+  stm32f411.h        register definitions (from CMSIS, or
+                     write the handful you need)
+
+/* Makefile - the whole thing. */
+CROSS   = arm-none-eabi-
+CFLAGS  = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+          -Og -g3 -Wall -Wextra -Werror \
+          -ffunction-sections -fdata-sections \
+          -fstack-usage -std=c11
+LDFLAGS = -T linker.ld -nostartfiles -Wl,--gc-sections \
+          -Wl,-Map=firmware.map -specs=nano.specs
+
+OBJS = startup.o main.o clock.o uart.o adc_dma.o fault.o
+
+firmware.elf: $(OBJS) linker.ld
+	$(CROSS)gcc $(CFLAGS) $(LDFLAGS) $(OBJS) -o $@
+	$(CROSS)objcopy -O binary $@ firmware.bin
+	$(CROSS)size $@
+
+%.o: %.c
+	$(CROSS)gcc $(CFLAGS) -c $&lt; -o $@
+
+/* -Werror is deliberate. On bare metal a warning about an
+   uninitialised variable or a discarded qualifier is
+   usually a real bug, and there is no runtime to catch it.
+   -fstack-usage produces the .su files chapter 20 uses.   */
+</code></pre>
+
+<h2 id="startup">Part 1: startup</h2>
+
+<pre><code>/* startup.c - chapters 04 and 06, condensed. */
+
+#include &lt;stdint.h&gt;
+
+extern uint32_t _sidata, _sdata, _edata, _sbss, _ebss, _estack;
+extern int main(void);
+void SystemInit(void);
+
+void Default_Handler(void) { __asm volatile ("bkpt #0"); for(;;){} }
+
+#define WEAK_DEF __attribute__((weak, alias("Default_Handler")))
+void NMI_Handler(void)        WEAK_DEF;
+void HardFault_Handler(void)  WEAK_DEF;
+void MemManage_Handler(void)  WEAK_DEF;
+void BusFault_Handler(void)   WEAK_DEF;
+void UsageFault_Handler(void) WEAK_DEF;
+void SVC_Handler(void)        WEAK_DEF;
+void PendSV_Handler(void)     WEAK_DEF;
+void SysTick_Handler(void)    WEAK_DEF;
+void USART2_IRQHandler(void)  WEAK_DEF;
+void DMA2_Stream0_IRQHandler(void) WEAK_DEF;
+
+__attribute__((noreturn)) void Reset_Handler(void)
+{
+    uint32_t *src = &amp;_sidata, *dst = &amp;_sdata;
+    while (dst &lt; &amp;_edata) { *dst++ = *src++; }   /* .data     */
+    dst = &amp;_sbss;
+    while (dst &lt; &amp;_ebss)  { *dst++ = 0; }        /* .bss      */
+
+    /* Fill the unused stack with a pattern so we can measure
+       the high-water mark later (chapter 20). We are running
+       ON this stack, so stop short of the current SP.        */
+    extern uint32_t _sstack;
+    uint32_t sp = __get_MSP();
+    for (uint32_t *p = &amp;_sstack; p &lt; (uint32_t *)(sp - 64); p++) {
+        *p = 0xA5A5A5A5u;
+    }
+
+    SystemInit();          /* AFTER .data - chapter 06        */
+    (void) main();
+    for (;;) { }
+}
+
+__attribute__((section(".isr_vector"), used))
+void (* const g_vectors[])(void) = {
+    (void (*)(void)) &amp;_estack,
+    Reset_Handler,  NMI_Handler,       HardFault_Handler,
+    MemManage_Handler, BusFault_Handler, UsageFault_Handler,
+    0, 0, 0, 0,
+    SVC_Handler,    Default_Handler,   0,
+    PendSV_Handler, SysTick_Handler,
+    /* IRQ 0.. - only the two we use are named; the rest
+       default. Index = IRQ + 16 (chapter 07).               */
+    [16 + 38] = USART2_IRQHandler,
+    [16 + 56] = DMA2_Stream0_IRQHandler,
+};
+
+/* The designated-initialiser syntax [16 + 38] = ... is a
+   C99 feature that saves listing eighty zeros, and it makes
+   the IRQ-to-slot arithmetic explicit in the source.       */
+</code></pre>
+
+<h2 id="clock">Part 2: clocks, with a fallback</h2>
+
+<pre><code>/* clock.c - chapter 09, including the timeout that chapter
+   insisted on.                                             */
+
+uint32_t SystemCoreClock = 16000000u;   /* HSI, until proven */
+volatile uint8_t g_clock_degraded;
+
+static int wait_flag(volatile uint32_t *reg, uint32_t mask,
+                     uint32_t tries)
+{
+    while (!(*reg &amp; mask)) {
+        if (--tries == 0u) { return -1; }
+    }
+    return 0;
+}
+
+void SystemInit(void)
+{
+    /* FPU on, before any float code. Barriers required.    */
+    SCB-&gt;CPACR |= (0xFu &lt;&lt; 20);
+    __DSB(); __ISB();
+
+    /* Enable the specific faults - chapter 15's first move. */
+    SCB-&gt;SHCSR |= SCB_SHCSR_USGFAULTENA_Msk
+               |  SCB_SHCSR_BUSFAULTENA_Msk
+               |  SCB_SHCSR_MEMFAULTENA_Msk;
+
+    RCC-&gt;CR |= RCC_CR_HSEON;
+    if (wait_flag(&amp;RCC-&gt;CR, RCC_CR_HSERDY, 100000u) &lt; 0) {
+        g_clock_degraded = 1;      /* run on HSI at 16 MHz  */
+        return;                    /* the board still boots */
+    }
+
+    FLASH-&gt;ACR = FLASH_ACR_LATENCY_3WS | FLASH_ACR_PRFTEN
+               | FLASH_ACR_ICEN | FLASH_ACR_DCEN;
+
+    RCC-&gt;CFGR |= RCC_CFGR_PPRE1_DIV2;   /* APB1 = 50 MHz    */
+
+    /* 25 MHz HSE: /25 = 1 MHz, x200 = 200 MHz, /2 = 100 MHz */
+    RCC-&gt;PLLCFGR = 25u | (200u &lt;&lt; 6) | (0u &lt;&lt; 16)
+                 | RCC_PLLCFGR_PLLSRC_HSE | (4u &lt;&lt; 24);
+    RCC-&gt;CR |= RCC_CR_PLLON;
+    if (wait_flag(&amp;RCC-&gt;CR, RCC_CR_PLLRDY, 100000u) &lt; 0) {
+        g_clock_degraded = 1;
+        return;
+    }
+
+    RCC-&gt;CFGR = (RCC-&gt;CFGR &amp; ~RCC_CFGR_SW) | RCC_CFGR_SW_PLL;
+    while ((RCC-&gt;CFGR &amp; RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) { }
+
+    SystemCoreClock = 100000000u;
+}
+
+/* A field unit whose crystal has cracked now boots at 16 MHz
+   with g_clock_degraded set, prints a warning over its UART
+   (at a baud rate computed from the ACTUAL clock, so it is
+   still readable) and keeps working. Compare with hanging
+   forever in a wait loop.                                  */
+</code></pre>
+
+<h2 id="uart">Part 3: UART, with a lock-free ring</h2>
+
+<pre><code>/* uart.c - chapters 10, 12, 17. */
+
+#define TXBUF 256                          /* power of two   */
+static volatile uint8_t txb[TXBUF];
+static volatile uint16_t txhead, txtail;
+
+void uart_init(uint32_t baud)
+{
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC-&gt;APB1ENR |= RCC_APB1ENR_USART2EN;
+    (void) RCC-&gt;APB1ENR;                   /* read back      */
+
+    /* PA2 = TX, AF7. Chapter 10's sequence.                 */
+    GPIOA-&gt;MODER   = (GPIOA-&gt;MODER   &amp; ~(3u &lt;&lt; 4)) | (2u &lt;&lt; 4);
+    GPIOA-&gt;OSPEEDR |= (3u &lt;&lt; 4);
+    GPIOA-&gt;AFR[0]  = (GPIOA-&gt;AFR[0]  &amp; ~(0xFu &lt;&lt; 8)) | (7u &lt;&lt; 8);
+
+    /* APB1 is SystemCoreClock/2, and USART2 lives on APB1.
+       Using the variable means a degraded clock still gives
+       a correct baud rate.                                  */
+    USART2-&gt;BRR = ((SystemCoreClock / 2u) + baud / 2u) / baud;
+    USART2-&gt;CR1 = USART_CR1_TE | USART_CR1_UE;
+
+    NVIC_SetPriority(USART2_IRQn, 6);
+    NVIC_EnableIRQ(USART2_IRQn);
+}
+
+void uart_putc(char c)
+{
+    uint16_t next = (uint16_t)((txhead + 1u) &amp; (TXBUF - 1u));
+    while (next == txtail) { }      /* full: wait for the ISR */
+    txb[txhead] = (uint8_t) c;
+    txhead = next;                  /* publish AFTER the data */
+    USART2-&gt;CR1 |= USART_CR1_TXEIE; /* kick the ISR           */
+}
+
+void USART2_IRQHandler(void)
+{
+    if (USART2-&gt;SR &amp; USART_SR_TXE) {
+        if (txtail != txhead) {
+            USART2-&gt;DR = txb[txtail];
+            txtail = (uint16_t)((txtail + 1u) &amp; (TXBUF - 1u));
+        } else {
+            USART2-&gt;CR1 &amp;= ~USART_CR1_TXEIE;   /* nothing left */
+        }
+    }
+}
+
+/* uart_putc returns in nanoseconds unless the buffer is
+   full, so main() is never blocked by 87 us per character.
+   The single-producer/single-consumer argument from chapter
+   17 applies: one writer of txhead, one of txtail.        */
+</code></pre>
+
+<h2 id="main">Part 4: main</h2>
+
+<pre><code>/* main.c */
+
+volatile uint32_t g_ms;
+void SysTick_Handler(void) { g_ms++; }
+
+int main(void)
+{
+    /* SysTick: 1 kHz from whatever clock we ended up with. */
+    SysTick-&gt;LOAD = (SystemCoreClock / 1000u) - 1u;
+    SysTick-&gt;VAL  = 0;
+    SysTick-&gt;CTRL = 7u;      /* core clock | tick int | enable */
+
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    (void) RCC-&gt;AHB1ENR;
+    GPIOC-&gt;MODER = (GPIOC-&gt;MODER &amp; ~(3u &lt;&lt; 26)) | (1u &lt;&lt; 26);
+
+    uart_init(115200);
+    adc_dma_init();
+
+    fault_report_previous();     /* chapter 15's .noinit log */
+
+    uart_puts("\r\n=== bare-metal bring-up ===\r\n");
+    if (g_clock_degraded) {
+        uart_puts("WARNING: HSE failed, running on HSI\r\n");
+    }
+    uart_printf("SYSCLK  %lu Hz\r\n", SystemCoreClock);
+
+    uint32_t next = 0;
+    for (;;) {
+        if ((int32_t)(g_ms - next) &gt;= 0) {   /* wrap-safe    */
+            next += 500u;
+            GPIOC-&gt;ODR ^= (1u &lt;&lt; 13);       /* 1 Hz square   */
+
+            uart_printf("t=%lus  temp=%d.%02u C  stack_free=%u\r\n",
+                        g_ms / 1000u,
+                        adc_temperature_c() / 100,
+                        (unsigned)(adc_temperature_c() % 100),
+                        (unsigned) stack_unused_bytes());
+        }
+        __WFI();      /* sleep until SysTick or the UART ISR */
+    }
+}
+
+/* The __WFI() is the point. This loop uses well under 1% of
+   the CPU: everything is interrupt- or DMA-driven, and the
+   core sleeps between events. That is what all twenty-two
+   preceding chapters were building toward.                 */
+</code></pre>
+
+<h2 id="exercises">Exercises, in order of difficulty</h2>
+
+<ul>
+  <li><strong>Verify the clock.</strong> Route MCO to a pin and confirm 100 MHz with a scope, or time the LED
+  against a stopwatch for 60 seconds. Do not trust <code>SystemCoreClock</code>.</li>
+  <li><strong>Break the vector table.</strong> Corrupt the first word, flash it, and observe the difference
+  between running under the debugger and cold booting (chapter 04).</li>
+  <li><strong>Provoke each fault.</strong> Write to address 0, execute from RAM, divide by zero with
+  <code>DIV_0_TRP</code> set. Confirm your handler decodes each correctly (chapter 15).</li>
+  <li><strong>Measure the ISR.</strong> Toggle a spare pin at the top and bottom of the UART handler and read
+  its duration on a scope. Then compute the maximum baud rate this design supports.</li>
+  <li><strong>Add the MPU stack guard</strong> from chapter 14, then deliberately recurse until it fires.</li>
+  <li><strong>Convert the UART to DMA</strong> (chapter 12) and compare CPU load at 921600 baud.</li>
+  <li><strong>Make it sleep properly.</strong> Move to STOP mode between samples with an RTC wake-up, and
+  measure the average current. Aim for under 10 µA.</li>
+</ul>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Nothing at all happens</td><td>Vector table missing — check <code>KEEP()</code> and the map
+file</td></tr>
+<tr><td>Works under debugger, dead on power-up</td><td>Vector table word 0 wrong; the debugger set SP
+itself</td></tr>
+<tr><td>UART emits garbage</td><td><code>BRR</code> computed from the wrong clock — check the APB
+prescaler</td></tr>
+<tr><td>UART emits nothing</td><td>GPIO alternate function number wrong; verify AF7 in the
+<em>datasheet</em></td></tr>
+<tr><td>LED blinks at half or double rate</td><td><code>SystemCoreClock</code> does not match reality; measure
+it</td></tr>
+<tr><td>Board hangs before the banner</td><td>A wait loop with no timeout — this project's
+<code>wait_flag</code> exists for that</td></tr>
+<tr><td>Fault handler itself faults</td><td>It called <code>uart_printf</code>, which touches a peripheral;
+log to <code>.noinit</code> instead</td></tr>
+<tr><td>Stack free reads as the whole stack</td><td>Fill pattern written after the stack was already
+used</td></tr>
+<tr><td>ADC reads a constant value</td><td>DMA buffer in unreachable RAM, or the ADC clock is
+gated</td></tr>
+<tr><td>Everything works, current is 20 mA</td><td>No <code>__WFI()</code>, or a debugger still
+attached</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain every line of the vector table, including the designated initialisers.</li>
+  <li>Say why <code>SystemInit()</code> is called after the <code>.data</code> copy.</li>
+  <li>Explain how a cracked crystal leaves this firmware still able to report the fault.</li>
+  <li>Justify computing <code>BRR</code> from <code>SystemCoreClock</code> rather than a constant.</li>
+  <li>Explain why <code>uart_putc</code> does not block in normal operation.</li>
+  <li>Explain why <code>txhead</code> is published after the data byte is stored.</li>
+  <li>Explain the wrap-safe comparison in the main loop.</li>
+  <li>Say what <code>__WFI()</code> achieves here and what would break without it.</li>
+  <li>Explain why <code>-Werror</code> is a reasonable default on bare metal.</li>
+  <li>Describe how you would verify the clock frequency without trusting any variable.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

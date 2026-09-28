@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RPC and tee-supplicant | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>RPC and tee-supplicant</h1>
+<p class="lead">The secure world has no filesystem, no network and no way to allocate normal-world memory. So
+when it needs those things it asks — by returning from the very SMC that invoked it, with "not finished, do
+this first". That inversion is elegant, it is why OP-TEE stays small, and it is the source of the deadlock in
+chapter 5.</p>
+
+<h2 id="inversion">Returning in order to ask</h2>
+
+<p>The secure world sometimes needs something only the normal world can do — read a file, allocate memory, get the time. That inversion of trust is deliberate, and carefully constrained, because it lets untrusted code influence trusted execution.</p>
+
+<pre class="diagram">   The secure world cannot CALL the normal world. There is no
+   such instruction: SMC goes up in privilege, never down.
+
+   So OP-TEE uses the only channel it has - the return value of
+   the call it is currently servicing.
+
+     normal world:   SMC(CALL_WITH_ARG, msg)
+                          |
+                          v
+     OP-TEE:         thread allocated, TA runs
+                     TA calls TEE_OpenPersistentObject()
+                          |
+                          |  "I need a file. I cannot open
+                          |   files."
+                          v
+                     SAVE the thread's full state
+                     write an RPC request into shared memory
+                     return to the normal world with
+                        x0 = OPTEE_SMC_RETURN_RPC_CMD
+                          |
+                          v
+     driver:         "this is not a result, it is a request"
+                     hand it to tee-supplicant
+                          |
+                          v
+     tee-supplicant: open("/data/tee/...")
+                     read the data into shared memory
+                     reply
+                          |
+                          v
+     driver:         SMC(CALL_RETURN_FROM_RPC, thread_id, ...)
+                          |
+                          v
+     OP-TEE:         find the saved thread, RESTORE it,
+                     TEE_OpenPersistentObject() returns
+                     TA continues as if nothing happened
+                          |
+                          ... eventually ...
+                          v
+                     return OPTEE_SMC_RETURN_OK
+
+   The TA sees an ordinary blocking function call. Underneath,
+   control left the secure world entirely and came back.
+
+   THE THREAD IS HELD THROUGHOUT. That is the whole design
+   constraint (chapter 5).</pre>
+
+<h2 id="kinds">The RPC requests</h2>
+
+<p>The requests the secure world can make of the normal world are a fixed, small set. Knowing them is what tells you what a trusted application can and cannot depend on.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Return code</th><th>Meaning</th><th>Serviced by</th></tr></thead>
+<tbody>
+<tr><td><code>RPC_ALLOC</code></td><td>Allocate shared memory for me</td><td>The kernel driver</td></tr>
+<tr><td><code>RPC_FREE</code></td><td>Free it</td><td>The kernel driver</td></tr>
+<tr><td><code>RPC_FOREIGN_INTR</code></td><td>A normal-world interrupt is pending; go and service
+it</td><td>The kernel, implicitly</td></tr>
+<tr><td><code>RPC_CMD</code></td><td>A real request — see the command table below</td><td>Mostly
+<code>tee-supplicant</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The RPC_CMD sub-commands: */
+
+#define OPTEE_RPC_CMD_LOAD_TA         0  /* read a .ta file    */
+#define OPTEE_RPC_CMD_RPMB            1  /* an RPMB frame      */
+#define OPTEE_RPC_CMD_FS              2  /* REE filesystem op  */
+#define OPTEE_RPC_CMD_GET_TIME        3  /* wall-clock time    */
+#define OPTEE_RPC_CMD_NOTIFICATION    4  /* wait/wake a thread */
+#define OPTEE_RPC_CMD_SUSPEND         5  /* sleep              */
+#define OPTEE_RPC_CMD_SHM_ALLOC       6
+#define OPTEE_RPC_CMD_SHM_FREE        7
+#define OPTEE_RPC_CMD_SQL_FS          8
+#define OPTEE_RPC_CMD_GPROF           9
+#define OPTEE_RPC_CMD_SOCKET         10  /* network!            */
+#define OPTEE_RPC_CMD_BENCH_REG      20
+#define OPTEE_RPC_CMD_FTRACE         21
+#define OPTEE_RPC_CMD_I2C_TRANSFER   22
+
+/* Two of these deserve a second look.
+
+   LOAD_TA - the secure world asks the normal world to give it
+   a trusted application. The normal world is untrusted. So
+   OP-TEE VERIFIES THE SIGNATURE of whatever it receives
+   (chapter 14). An attacker who substitutes a different .ta
+   gets TEEC_ERROR_SECURITY, not code execution. This is the
+   design pattern: accept data from an untrusted source, then
+   verify it yourself.
+
+   SOCKET - yes, a TA can open a TCP connection, tunnelled
+   through tee-supplicant. Whether it SHOULD is another
+   question: the normal world sees and can modify every byte
+   unless you run TLS end-to-end inside the TA.            */</code></pre>
+
+<div class="key">
+<b>The security pattern that makes this safe</b>
+<p>Every RPC hands work to an untrusted party. The rule that keeps it sound: <strong>the secure world never
+trusts the result</strong>. TA binaries are signature-checked. Secure storage is encrypted and
+authenticated, so a modified file fails its MAC. RPMB frames are MACed with a key the normal world does not
+have. Time is explicitly labelled untrusted. Where verification is impossible — as with wall-clock time —
+the API says so, and <a href="tee-17-time-rollback.html">chapter 17</a> covers what to do instead.</p>
+</div>
+
+<h2 id="supplicant">tee-supplicant</h2>
+
+<p>A user-space daemon services those requests. If it is missing or unprivileged, secure-world operations fail in ways whose symptoms point nowhere near it.</p>
+
+<pre><code>/* A normal user-space daemon, ~2000 lines. Its whole life:  */
+
+int main(void)
+{
+        int fd = open("/dev/teepriv0", O_RDWR);
+
+        for (;;) {
+                struct tee_ioctl_supp_recv_arg arg;
+
+                /* Blocks until OP-TEE needs something. */
+                ioctl(fd, TEE_IOC_SUPPL_RECV, &amp;arg);
+
+                switch (arg.func) {
+                case OPTEE_RPC_CMD_LOAD_TA:
+                        load_ta(&amp;arg);      /* read
+                                               /lib/optee_armtz/
+                                               &lt;uuid&gt;.ta      */
+                        break;
+                case OPTEE_RPC_CMD_FS:
+                        tee_supp_fs(&amp;arg);  /* open/read/write/
+                                               unlink under
+                                               /data/tee/      */
+                        break;
+                case OPTEE_RPC_CMD_RPMB:
+                        rpmb_process(&amp;arg); /* ioctl to the
+                                               eMMC             */
+                        break;
+                case OPTEE_RPC_CMD_GET_TIME:
+                        get_time(&amp;arg);
+                        break;
+                case OPTEE_RPC_CMD_I2C_TRANSFER:
+                        i2c_transfer(&amp;arg);
+                        break;
+                ...
+                }
+
+                ioctl(fd, TEE_IOC_SUPPL_SEND, &amp;arg);
+        }
+}
+
+/* Where it keeps things: */
+    /lib/optee_armtz/&lt;uuid&gt;.ta    trusted applications
+    /data/tee/                    secure storage files
+                                  (encrypted; the normal world
+                                   can delete them but not read
+                                   or forge them)
+
+/* Running it: */
+$ tee-supplicant -d              # daemonise
+$ tee-supplicant -f              # foreground, prints errors
+$ tee-supplicant -f /dev/teepriv0
+$ systemctl status tee-supplicant
+
+/* WITHOUT IT:
+     TEEC_OpenSession -> TEEC_ERROR_ITEM_NOT_FOUND, because
+     nothing can load the TA binary.
+   And a TA already loaded that tries to use secure storage
+   will BLOCK, holding a thread, until the supplicant returns
+   or the call is cancelled.                                */</code></pre>
+
+<h2 id="notif">Asynchronous notification</h2>
+
+<p>The secure world also needs to signal the normal world asynchronously, which is a different mechanism from answering a request and is how interrupt-driven trusted applications work.</p>
+
+<pre><code>/* A problem the RPC model does not solve: the secure world
+   needs to tell the normal world something when it is NOT
+   servicing a call. A secure interrupt arrived; a background
+   task finished.
+
+   With plain RPC there is no channel - OP-TEE only runs when
+   called.
+
+   CFG_CORE_ASYNC_NOTIF=y adds one:
+
+     OP-TEE raises a dedicated non-secure interrupt.
+       |
+       v
+     Linux's optee driver takes it, and issues
+       SMC(OPTEE_SMC_GET_ASYNC_NOTIF_VALUE)
+       to ask what happened.
+       |
+       v
+     OP-TEE returns a notification value.
+       |
+       v
+     The driver wakes whatever was waiting, or schedules
+       OPTEE_MSG_CMD_DO_BOTTOM_HALF so OP-TEE can run
+       deferred work.
+
+   Confirm it:
+     $ dmesg | grep optee
+     optee: Asynchronous notifications enabled
+
+   Without it, a TA that wants to wait for a secure interrupt
+   must poll, holding a thread - which is exactly the pattern
+   that exhausts the pool.                                  */</code></pre>
+
+<h2 id="deadlock">The deadlock, in full</h2>
+
+<p>Because the secure world can call out while the normal world is calling in, the two can wait on each other. The rules that prevent that are worth knowing before you design a protocol.</p>
+
+<pre class="diagram">   CFG_NUM_THREADS = 4. Four application threads each invoke a
+   TA that writes to secure storage.
+
+     thread 1  in OP-TEE, blocked on RPC_CMD_FS
+     thread 2  in OP-TEE, blocked on RPC_CMD_FS
+     thread 3  in OP-TEE, blocked on RPC_CMD_FS
+     thread 4  in OP-TEE, blocked on RPC_CMD_FS
+
+   All four OP-TEE threads are held. Every one is waiting for
+   tee-supplicant.
+
+   tee-supplicant CAN service them - one at a time - and
+   normally does, and everything is merely slow.
+
+   It deadlocks when tee-supplicant itself cannot run:
+
+     * tee-supplicant's own thread tries to invoke a TA
+       (never do this)
+     * the storage it must write to is on a filesystem that is
+       itself waiting on something blocked in the TEE
+     * an out-of-memory condition stops it being scheduled
+     * a single-threaded supplicant is servicing a request that
+       blocks on a device that is unresponsive
+
+   Symptom: total silence. No error, no timeout, no log line.
+   Every client hangs in ioctl(). The secure console shows
+   nothing because OP-TEE is not running.
+
+   DIAGNOSING IT:
+     $ cat /proc/&lt;client-pid&gt;/stack        # blocked in optee
+     $ cat /proc/&lt;supplicant-pid&gt;/stack    # what is IT waiting
+                                             for?
+     $ echo t &gt; /proc/sysrq-trigger        # all task stacks
+
+   AVOIDING IT:
+     * never call into the TEE from a process that services the
+       TEE
+     * set CFG_NUM_THREADS comfortably above your peak
+       concurrency
+     * keep RPC-using operations (secure storage) off hot paths
+     * give tee-supplicant a favourable scheduling class if it
+       is on a loaded system
+     * cancel long operations with TEEC_RequestCancellation
+       from a watchdog thread</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>TEEC_ERROR_ITEM_NOT_FOUND</code> on every session</td><td><code>tee-supplicant</code> not
+running</td></tr>
+<tr><td>Everything hangs with no error</td><td>Thread-exhaustion deadlock; check the supplicant's own
+stack</td></tr>
+<tr><td>Secure storage operations extremely slow</td><td>Every one is an RPC round trip through a user-space
+daemon. Expected — batch them</td></tr>
+<tr><td>TA works, then fails after the supplicant restarts</td><td>Sessions holding state the supplicant was
+mid-way through servicing</td></tr>
+<tr><td><code>TEEC_ERROR_SECURITY</code> loading a TA</td><td>The supplicant delivered a binary whose signature
+did not verify — working as designed</td></tr>
+<tr><td>Secure storage file deleted, TA still works</td><td>Deletion is possible from the normal world;
+confidentiality and integrity are protected, availability is not</td></tr>
+<tr><td>Time from a TA is wrong or moves backwards</td><td><code>TEE_GetREETime</code> comes from the normal
+world and is not trustworthy</td></tr>
+<tr><td>A TA cannot wait for a secure interrupt without spinning</td><td>Async notification not
+enabled</td></tr>
+<tr><td>Deadlock only under load</td><td><code>CFG_NUM_THREADS</code> too small for peak
+concurrency</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the secure world cannot call the normal world, and what it does instead.</li>
+  <li>Trace a <code>TEE_OpenPersistentObject</code> call out to <code>tee-supplicant</code> and back.</li>
+  <li>Say what happens to the OP-TEE thread during an RPC.</li>
+  <li>Name six RPC commands and who services each.</li>
+  <li>Explain why loading a TA from an untrusted source is safe, and what makes it so.</li>
+  <li>State the general pattern that makes every RPC safe, and name one case where it cannot
+  apply.</li>
+  <li>Describe what <code>tee-supplicant</code> does and the two directories it owns.</li>
+  <li>Explain what asynchronous notification adds and what it replaces.</li>
+  <li>Describe the thread-exhaustion deadlock precisely and give four ways to avoid it.</li>
+  <li>Diagnose a total hang: name the two <code>/proc</code> files you would read first.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

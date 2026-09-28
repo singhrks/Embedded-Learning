@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-head attention and positional encoding | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Multi-head attention and positional encoding</h1>
+<p class="lead">Two details that the previous chapter glossed over, and both matter more than their size
+suggests. One gives attention its expressive power; the other is the only thing telling the model that
+word order exists.</p>
+
+<h2 id="multihead">Multi-head attention</h2>
+
+<p>Running attention several times in parallel with different projections sounds redundant and turns out to be essential, for a reason that is easy to state once the single-head version is clear.</p>
+
+<pre class="diagram">   ONE ATTENTION HEAD PRODUCES ONE WEIGHTED AVERAGE. But a
+   token often needs several unrelated things at once:
+
+     "The bank by the river was steep."
+
+     · what is the SUBJECT of "was"?          -> "bank"
+     · which sense of "bank" is this?         -> "river"
+     · what is the previous token?            -> "was"
+
+   THREE DIFFERENT QUESTIONS, THREE DIFFERENT WEIGHTINGS.
+   One softmax-weighted average cannot express all of them -
+   whatever it emphasises, it de-emphasises the rest.
+
+   THE SOLUTION: RUN h ATTENTION OPERATIONS IN PARALLEL,
+   EACH IN A LOWER-DIMENSIONAL SUBSPACE, AND CONCATENATE.
+
+        d_head = d_model / h
+
+     x --> [W_Q1,W_K1,W_V1] --> attention --> head_1 \
+       --> [W_Q2,W_K2,W_V2] --> attention --> head_2  \
+       --> ...                                         >-- concat --> W_O --> out
+       --> [W_Qh,W_Kh,W_Vh] --> attention --> head_h  /
+
+   THE PARAMETER COUNT IS UNCHANGED. Splitting 768
+   dimensions into 12 heads of 64 costs exactly the same as
+   one head of 768 - you are reshaping, not adding.
+
+   WHAT YOU BUY: h INDEPENDENT ATTENTION PATTERNS instead
+   of one. Empirically this matters a great deal; ablating
+   to a single head degrades models badly.
+
+   AND THE OUTPUT PROJECTION W_O IS NOT DECORATION. The
+   concatenated heads are just stacked subspaces; W_O mixes
+   them back into the residual stream and decides how each
+   head's contribution is written. Interpretability work
+   often factors attention as (W_Q W_K^T) for "where to
+   look" and (W_V W_O) for "what to write".
+
+   TYPICAL: d_head is 64 or 128, essentially always. Models
+   grow by adding HEADS and LAYERS, not by widening heads.</pre>
+
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout=0.1):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.d_head = d_model // n_head
+        # ONE fused projection for Q, K, V (chapter 04:
+        # one big matmul beats three small ones)
+        self.qkv  = nn.Linear(d_model, 3 * d_model,
+                              bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = dropout
+
+    def forward(self, x, is_causal=True):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+
+        # THE RESHAPE THAT MAKES HEADS WORK:
+        # (B, T, C) -> (B, n_head, T, d_head)
+        # The head dimension becomes a BATCH dimension, so
+        # one batched matmul runs every head simultaneously.
+        def split(t):
+            return t.view(B, T, self.n_head,
+                          self.d_head).transpose(1, 2)
+        q, k, v = split(q), split(k), split(v)
+
+        y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal,
+                dropout_p=self.dropout if self.training
+                          else 0.0)
+
+        # (B, n_head, T, d_head) -> (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+
+# THE .contiguous() IS NOT OPTIONAL. transpose() returns a
+# VIEW with permuted strides; view() requires contiguous
+# memory. Omitting it raises an error - and if you use
+# reshape() instead, it silently copies, which works but
+# hides the cost.
+
+# --- GROUPED-QUERY ATTENTION (chapter 19) ---
+class GQA(nn.Module):
+    """n_head query heads, n_kv_head key/value heads.
+       n_kv_head = n_head    -> standard MHA
+       n_kv_head = 1         -> multi-query
+       in between            -> GQA, what Llama uses"""
+    def __init__(self, d_model, n_head, n_kv_head):
+        super().__init__()
+        self.n_head, self.n_kv_head = n_head, n_kv_head
+        self.d_head = d_model // n_head
+        self.q = nn.Linear(d_model, n_head * self.d_head,
+                           bias=False)
+        self.k = nn.Linear(d_model, n_kv_head * self.d_head,
+                           bias=False)
+        self.v = nn.Linear(d_model, n_kv_head * self.d_head,
+                           bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q = self.q(x).view(B, T, self.n_head,
+                           self.d_head).transpose(1, 2)
+        k = self.k(x).view(B, T, self.n_kv_head,
+                           self.d_head).transpose(1, 2)
+        v = self.v(x).view(B, T, self.n_kv_head,
+                           self.d_head).transpose(1, 2)
+
+        # REPEAT the KV heads to match the query heads.
+        # No extra parameters, and the CACHE only stores
+        # n_kv_head copies - which is the entire point.
+        rep = self.n_head // self.n_kv_head
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+
+        y = F.scaled_dot_product_attention(q, k, v,
+                                           is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)</code></pre>
+
+<h2 id="position">Why position must be added</h2>
+
+<p>Attention is blind to order, which means a transformer without positional information cannot distinguish a sentence from its own shuffling. How that information is injected has become a design decision with real consequences.</p>
+
+<pre><code>/* ATTENTION IS PERMUTATION-EQUIVARIANT.
+
+   Shuffle the input tokens and the outputs shuffle
+   identically - the VALUES do not change. Look at the
+   equation (chapter 19): it is a set of dot products and a
+   weighted sum. NOTHING IN IT REFERS TO POSITION.
+
+   So without positional information:
+
+        "dog bites man"  ==  "man bites dog"
+
+   The model literally cannot distinguish them. POSITION
+   MUST BE INJECTED EXPLICITLY, and how you do it turns out
+   to determine how far the model can extrapolate beyond its
+   training length.                                       */
+
+/* --- 1. LEARNED ABSOLUTE (GPT-2, BERT) --- */
+    self.wpe = nn.Embedding(max_len, d_model)
+    x = self.wte(idx) + self.wpe(positions)
+
+    A lookup table, one vector per position, learned like
+    any other parameter.
+      + simple, and it works
+      - HARD LIMIT at max_len. Position 1025 has no
+        embedding. Cannot extrapolate at all.
+      - positions are learned independently, so nothing
+        forces position 5 and position 6 to be related
+
+/* --- 2. SINUSOIDAL (the 2017 paper) --- */
+    PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+    PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+
+    Different dimensions oscillate at different frequencies -
+    a binary-counter-like encoding in continuous form. The
+    intended property: PE(pos+k) is a LINEAR FUNCTION of
+    PE(pos), so relative offsets are learnable.
+      + no parameters, defined for any position
+      - extrapolation is poor in practice despite the theory
+
+/* --- 3. ROPE: ROTARY POSITION EMBEDDING. THE STANDARD. --- */
+
+    THE IDEA: do not ADD anything to the embeddings. ROTATE
+    the query and key vectors by an angle proportional to
+    their position.
+
+      Treat each pair of dimensions as a 2-D vector and
+      rotate it by (position * theta_i), with theta_i
+      decreasing across dimension pairs.
+
+    WHY IT IS ELEGANT: after rotation, the dot product
+    between a query at position m and a key at position n
+    depends only on (m - n).
+
+        q_m · k_n  =  f(q, k, m - n)
+
+    RELATIVE POSITION FALLS OUT OF THE ARITHMETIC. No
+    relative-position bias table, no extra parameters, and
+    it applies to Q and K only - the values and the residual
+    stream are untouched.
+
+    · used by Llama, Mistral, Gemma, Qwen, and essentially
+      every recent open model
+    · extrapolates better than the alternatives
+    · and CONTEXT EXTENSION IS POSSIBLE AFTER TRAINING by
+      scaling the frequencies - "NTK-aware" scaling, YaRN,
+      position interpolation. This is how an 8k model
+      becomes a 128k model with modest fine-tuning, and it
+      is the main reason context lengths grew so fast.
+
+def rope(x, positions, base=10000.0):
+    """x: (B, n_head, T, d_head), d_head even."""
+    B, H, T, D = x.shape
+    half = D // 2
+    freqs = 1.0 / (base ** (torch.arange(0, half,
+                    device=x.device).float() / half))
+    angles = positions[:, None].float() * freqs[None, :]
+    cos, sin = angles.cos(), angles.sin()      # (T, half)
+
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin,
+                      x1 * sin + x2 * cos], dim=-1)
+
+# APPLY TO Q AND K ONLY, NOT V:
+#     q = rope(q, pos);  k = rope(k, pos)
+
+/* --- 4. ALiBi --- */
+    Add a linear penalty to the attention scores based on
+    distance, with a different slope per head:
+        score = q·k - m_head * |i - j|
+    No embeddings at all. Extrapolates well; nearer tokens
+    are simply favoured. Used by BLOOM and MPT.
+
+/* --- 5. NoPE --- */
+    And a genuinely surprising result: DECODER-ONLY models
+    with NO POSITIONAL ENCODING AT ALL still learn position,
+    because the causal mask itself is positional information
+    - position i can see exactly i+1 tokens, and that count
+    is recoverable. Performance is competitive at small
+    scale. A good reminder that architectural "necessities"
+    deserve testing.                                       */</code></pre>
+
+<div class="key">
+<b>What to use</b>
+<pre>new model, any size        -> RoPE
+need long extrapolation    -> RoPE with frequency
+                              scaling, or ALiBi
+reproducing GPT-2/BERT     -> learned absolute
+encoder for fixed-length
+  classification           -> learned absolute is fine
+tiny embedded model,
+  short sequences          -> learned absolute; it is one
+                              small table and the cheapest
+                              to run</pre>
+</div>
+
+<h2 id="heads">What the heads do</h2>
+
+<p>Individual heads can be inspected, and some of them turn out to do recognisable, nameable jobs. This is among the more concrete results in interpretability.</p>
+
+<pre><code>/* HEADS SPECIALISE, without being told to. The patterns
+   from chapter 19, seen through the multi-head lens:
+
+     · POSITIONAL heads   attend to the previous token, or
+                          n back. Early layers.
+     · SYNTACTIC heads    subject-verb, adjective-noun,
+                          matching brackets
+     · COREFERENCE heads  pronoun to antecedent
+     · INDUCTION heads    copy a pattern seen earlier in
+                          context. Requires TWO heads
+                          working together across layers -
+                          one to record "what followed this
+                          token last time", one to use it.
+                          Their formation coincides with
+                          in-context learning appearing.
+     · SINK heads         dump attention on token 0
+
+/* --- HEAD REDUNDANCY --- */
+    A well-known result: MANY HEADS CAN BE PRUNED with
+    little loss. Some layers work fine with a single head.
+    Others have one critical head whose removal breaks a
+    capability entirely.
+
+    THIS IS PRACTICALLY USEFUL: head pruning is a real
+    compression technique (chapter 26), and it is structured
+    - removing a whole head removes whole rows and columns,
+    which actually speeds up the matmul, unlike unstructured
+    sparsity (chapter 03).
+
+/* --- INSPECTING THEM --- */
+    def get_attention_maps(model, ids):
+        maps = []
+        def hook(mod, inp, out):
+            q, k, _ = mod.qkv(inp[0]).chunk(3, dim=-1)
+            # recompute the scores just to look at them
+            ...
+            maps.append(weights.detach())
+        handles = [b.attn.register_forward_hook(hook)
+                   for b in model.blocks]
+        model(ids)
+        for h in handles: h.remove()
+        return maps       # (n_layer, B, n_head, T, T)
+
+    AND THE CAVEAT FROM CHAPTER 19 STILL APPLIES: an
+    attention map shows where a head LOOKED, not what the
+    model USED. Treat it as a hypothesis generator, not
+    evidence.                                             */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Word order has no effect on output</td><td>No positional encoding</td></tr>
+<tr><td>Crash at sequence length above the trained maximum</td><td>Learned absolute positions — no embedding exists</td></tr>
+<tr><td>Quality collapses beyond the training length</td><td>Poor extrapolation — use RoPE with scaling or ALiBi</td></tr>
+<tr><td><code>view size is not compatible</code></td><td>Missing <code>.contiguous()</code> after <code>transpose</code></td></tr>
+<tr><td>Heads produce identical patterns</td><td>Initialisation or a reshape bug collapsing the head dimension</td></tr>
+<tr><td>Output is scrambled across heads</td><td>Wrong reshape order — check <code>(B, T, H, D)</code> then transpose</td></tr>
+<tr><td>RoPE applied to values</td><td>It belongs on Q and K only</td></tr>
+<tr><td>KV cache far larger than expected</td><td>Full MHA rather than GQA</td></tr>
+<tr><td>Extended context degrades badly</td><td>Frequencies not rescaled for the new length</td></tr>
+<tr><td>Pruning heads gives no speedup</td><td>Masked rather than physically removed</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why one attention head is insufficient, with a concrete sentence.</li>
+  <li>Show that multi-head attention costs the same parameters as single-head.</li>
+  <li>Explain what <code>W_O</code> does and the (W_Q W_K) / (W_V W_O) factorisation.</li>
+  <li>Write the reshape that turns heads into a batch dimension, and say why <code>.contiguous()</code> is needed.</li>
+  <li>Explain GQA's repeat step and what it saves.</li>
+  <li>Explain why attention is permutation-equivariant and what that implies.</li>
+  <li>Compare learned absolute, sinusoidal, RoPE and ALiBi.</li>
+  <li>State RoPE's key property and why it gives relative position for free.</li>
+  <li>Explain how context extension works after training.</li>
+  <li>Say why decoder-only models can work with no positional encoding at all.</li>
+  <li>Name five head specialisations and say what induction heads require.</li>
+  <li>Explain why head pruning is structured sparsity and why that matters.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

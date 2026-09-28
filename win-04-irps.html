@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The I/O manager and IRPs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The I/O manager and IRPs</h1>
+<p class="lead">Every I/O operation in Windows is an I/O Request Packet travelling down a stack of drivers.
+One data structure carries reads, writes, IOCTLs, power transitions and PnP events alike — and understanding
+its lifecycle is understanding Windows I/O.</p>
+
+<h2 id="irp">What an IRP is</h2>
+
+<p>The I/O Request Packet is the unit of work in Windows. Every read, write and IOCTL becomes one, and it travels down through the drivers stacked on a device and back up again — so understanding its shape explains how driver layering works at all.</p>
+
+<pre class="diagram">   +-------------------------------------------+
+   |  IRP HEADER                               |
+   |    MdlAddress        for DIRECT I/O       |
+   |    AssociatedIrp.SystemBuffer  BUFFERED   |
+   |    UserBuffer        METHOD_NEITHER       |
+   |    IoStatus.Status   the result           |
+   |    IoStatus.Information  bytes transferred|
+   |    RequestorMode     UserMode / KernelMode|
+   |    Cancel, CancelRoutine                  |
+   |    CurrentLocation                        |
+   +-------------------------------------------+
+   |  IO_STACK_LOCATION  [n-1]  bottom driver  |
+   |  IO_STACK_LOCATION  [n-2]                 |
+   |  ...                                      |
+   |  IO_STACK_LOCATION  [0]    top driver     |
+   +-------------------------------------------+
+
+  ONE STACK LOCATION PER DRIVER in the device stack. Each
+  holds THAT driver's view of the request:
+
+     MajorFunction     IRP_MJ_READ, IRP_MJ_DEVICE_CONTROL, ...
+     MinorFunction     for PnP and power
+     Parameters        a union: Read, Write, DeviceIoControl,
+                       QueryDeviceRelations, Power, ...
+     DeviceObject      which device
+     FileObject        which open instance
+     CompletionRoutine to run when a lower driver finishes
+
+  YOU GET YOURS WITH:
+        PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+
+  AND THE ONE BELOW YOU WITH:
+        IoGetNextIrpStackLocation(irp)
+
+  THE DESIGN IDEA: the IRP is a self-contained request that
+  can be queued, cancelled, passed between drivers, and
+  completed asynchronously from any context. Linux has no
+  single equivalent - it has bio for block, urb for USB, skb
+  for network, and ad-hoc structures elsewhere. Windows pays
+  more machinery for one uniform mechanism.</pre>
+
+<h2 id="major">The major function codes</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Code</th><th>From</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>IRP_MJ_CREATE</code></td><td><code>CreateFile</code></td><td>An open. Your chance to refuse.</td></tr>
+<tr><td><code>IRP_MJ_CLOSE</code></td><td>Last handle closed</td><td>Tear down per-open state</td></tr>
+<tr><td><code>IRP_MJ_CLEANUP</code></td><td>Last handle in a process closed</td><td><strong>Cancel pending I/O here</strong></td></tr>
+<tr><td><code>IRP_MJ_READ</code> / <code>_WRITE</code></td><td><code>ReadFile</code>/<code>WriteFile</code></td><td>The data path</td></tr>
+<tr><td><code>IRP_MJ_DEVICE_CONTROL</code></td><td><code>DeviceIoControl</code></td><td>IOCTLs (<a href="win-16-ioctls.html">ch. 17</a>)</td></tr>
+<tr><td><code>IRP_MJ_INTERNAL_DEVICE_CONTROL</code></td><td>Kernel callers only</td><td>Driver-to-driver</td></tr>
+<tr><td><code>IRP_MJ_PNP</code></td><td>The PnP manager</td><td>Start, stop, remove, query (<a href="win-05-device-stack.html">ch. 06</a>)</td></tr>
+<tr><td><code>IRP_MJ_POWER</code></td><td>The power manager</td><td>D-states, S-states</td></tr>
+<tr><td><code>IRP_MJ_SYSTEM_CONTROL</code></td><td>WMI</td><td>Instrumentation</td></tr>
+<tr><td><code>IRP_MJ_FLUSH_BUFFERS</code></td><td><code>FlushFileBuffers</code></td><td></td></tr>
+<tr><td><code>IRP_MJ_QUERY_INFORMATION</code></td><td>File size etc.</td><td></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b><code>CLEANUP</code> versus <code>CLOSE</code> — the distinction that matters</b>
+<p><code>IRP_MJ_CLEANUP</code> arrives when the <em>last handle in a process</em> is closed, while the file
+object still exists. <code>IRP_MJ_CLOSE</code> arrives when the <em>last reference</em> to the file object
+goes away, which may be much later. Cancel and complete pending requests in <strong>CLEANUP</strong>: if
+you wait for CLOSE, a process that exits with I/O outstanding hangs in termination, because the file object
+cannot be released while your driver still holds its IRPs.</p>
+</div>
+
+<h2 id="dispatch">A dispatch routine</h2>
+
+<p>A dispatch routine is what the I/O manager calls when a request of a given type arrives for your device. This is the raw WDM form; KMDF hides most of it later, but the shape underneath is exactly this.</p>
+
+<pre><code>NTSTATUS
+MyRead(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_DEVICE_EXTENSION ext = DeviceObject-&gt;DeviceExtension;
+        PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+        ULONG length = sp-&gt;Parameters.Read.Length;
+        PVOID buffer;
+        NTSTATUS status;
+        ULONG_PTR info = 0;
+
+        /* For METHOD_BUFFERED the I/O manager already copied
+           the user buffer somewhere safe (chapter 08):     */
+        buffer = Irp-&gt;AssociatedIrp.SystemBuffer;
+
+        if (length &lt; sizeof(ULONG)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                goto complete;
+        }
+
+        status = MyReadData(ext, buffer, length, &amp;info);
+
+complete:
+        Irp-&gt;IoStatus.Status = status;
+        Irp-&gt;IoStatus.Information = info;   /* BYTES
+                                               TRANSFERRED  */
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+}
+
+/* THREE RULES, and each has a specific consequence:
+
+   1. SET BOTH IoStatus FIELDS. `Information` is what
+      ReadFile reports as bytes read. Leaving it uninitialised
+      makes userspace read uninitialised stack contents as a
+      length - and act on it.
+
+   2. THE RETURN VALUE MUST MATCH IoStatus.Status, except that
+      you return STATUS_PENDING when you did not complete it.
+
+   3. ONCE YOU CALL IoCompleteRequest, THE IRP IS GONE.
+      Touching it afterwards is a use-after-free. Not "may
+      be" - the I/O manager may have freed it before the call
+      returns.                                             */
+
+/* IO_NO_INCREMENT vs a priority boost: the second argument
+   boosts the waiting thread's priority on completion. Use
+   IO_NO_INCREMENT unless the request took long enough that
+   the thread deserves to run promptly (IO_DISK_INCREMENT and
+   friends). Getting it wrong is a performance issue, not a
+   correctness one.                                        */</code></pre>
+
+<h2 id="pending">Asynchronous completion</h2>
+
+<p>Hardware is slow, so most drivers cannot finish a request before returning. Saying "not finished yet" correctly is a small protocol with strict rules, and getting it subtly wrong produces hangs and double completions.</p>
+
+<pre><code>/* The interesting case: you cannot complete now, so you queue
+   the IRP and return.                                       */
+
+NTSTATUS
+MyRead(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_DEVICE_EXTENSION ext = DeviceObject-&gt;DeviceExtension;
+
+        /* 1. MARK IT PENDING BEFORE QUEUEING. If you queue it
+              first, another thread can complete it before you
+              mark it - and marking a completed IRP is a
+              use-after-free.                               */
+        IoMarkIrpPending(Irp);
+
+        /* 2. set a cancel routine, so the request can be
+              abandoned (below)                             */
+        IoSetCancelRoutine(Irp, MyCancelRoutine);
+
+        /* 3. queue it */
+        ExInterlockedInsertTailList(&amp;ext-&gt;PendingIrps,
+                                    &amp;Irp-&gt;Tail.Overlay.ListEntry,
+                                    &amp;ext-&gt;QueueLock);
+
+        /* 4. return PENDING. The IRP now belongs to your
+              queue; do NOT touch it after this point without
+              the queue lock.                               */
+        return STATUS_PENDING;
+}
+
+/* LATER - in the DPC when the hardware finishes: */
+        PIRP irp = DequeueNextIrp(ext);
+
+        if (irp) {
+                irp-&gt;IoStatus.Status = STATUS_SUCCESS;
+                irp-&gt;IoStatus.Information = bytesRead;
+                IoCompleteRequest(irp, IO_NO_INCREMENT);
+        }
+
+/* AND THE USER SEES: ReadFile returns FALSE with
+   GetLastError() == ERROR_IO_PENDING if the handle was opened
+   with FILE_FLAG_OVERLAPPED, and the OVERLAPPED event is
+   signalled at completion. Without FILE_FLAG_OVERLAPPED, the
+   I/O manager blocks the thread for them and ReadFile appears
+   synchronous.
+
+   THIS IS ALL THE MACHINERY WDF QUEUES REMOVE (chapter 16).
+   You should understand it once; you should not write it. */</code></pre>
+
+<h2 id="cancel">Cancellation</h2>
+
+<p>An application can go away — or time out — while your driver is still holding its request. Cancellation is the mechanism for that, and it is the single hardest part of raw WDM because it races with your own completion path by design.</p>
+
+<pre><code>/* A queued IRP can be cancelled at any moment - the thread
+   called CancelIo, the process is exiting, the handle closed.
+   Getting this right in raw WDM is genuinely hard.         */
+
+VOID
+MyCancelRoutine(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_DEVICE_EXTENSION ext = DeviceObject-&gt;DeviceExtension;
+        KIRQL oldIrql;
+
+        /* The I/O manager called us holding the GLOBAL cancel
+           spinlock, at DISPATCH_LEVEL. RELEASE IT FIRST -
+           holding it while taking our own lock is a lock
+           ordering violation and a system-wide bottleneck. */
+        IoReleaseCancelSpinLock(Irp-&gt;CancelIrql);
+
+        KeAcquireSpinLock(&amp;ext-&gt;QueueLock, &amp;oldIrql);
+        RemoveEntryList(&amp;Irp-&gt;Tail.Overlay.ListEntry);
+        KeReleaseSpinLock(&amp;ext-&gt;QueueLock, oldIrql);
+
+        Irp-&gt;IoStatus.Status = STATUS_CANCELLED;
+        Irp-&gt;IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+}
+
+/* AND THE RACE, which is the whole difficulty:
+
+     the cancel routine can fire at ANY time after
+     IoSetCancelRoutine, including WHILE you are dequeuing the
+     same IRP to complete it normally.
+
+   THE PROTOCOL: whoever successfully clears the cancel
+   routine owns the IRP.
+
+        /* dequeuing normally: */
+        KeAcquireSpinLock(&amp;ext-&gt;QueueLock, &amp;oldIrql);
+        irp = DequeueOne(ext);
+        if (irp &amp;&amp; IoSetCancelRoutine(irp, NULL) == NULL) {
+                /* the cancel routine ALREADY fired and owns
+                   this IRP - do not touch it */
+                irp = NULL;
+        }
+        KeReleaseSpinLock(&amp;ext-&gt;QueueLock, oldIrql);
+
+   Every raw-WDM driver must get this exactly right, on every
+   queue, and most of the historical cancellation bugs in
+   Windows drivers are here.                              */</code></pre>
+
+<div class="warn">
+<b>This is the strongest argument for WDF</b>
+<p>A WDF queue (<a href="win-15-wdf-queues.html">chapter 16</a>) handles pending, cancellation, the
+cancel-routine race, power-state stalling, and per-file-object cleanup — correctly, once, for everyone. The
+code above exists in this chapter so you can read and debug legacy drivers, and so that you understand what
+the framework is doing on your behalf. <strong>Write new drivers in KMDF.</strong></p>
+</div>
+
+<h2 id="stack">Passing an IRP down</h2>
+
+<p>Most devices are served by several stacked drivers, each with its own view of the same request. Passing a request down means deciding what your layer wants to know about the result, which is what the stack locations and completion routines are for.</p>
+
+<pre><code>/* A filter driver, or any driver with something below it. */
+
+/* --- pass it down and forget about it -------------------- */
+NTSTATUS
+MyPassThrough(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_DEVICE_EXTENSION ext = DeviceObject-&gt;DeviceExtension;
+
+        IoSkipCurrentIrpStackLocation(Irp);   /* reuse OUR slot -
+                                                 we want no
+                                                 completion
+                                                 callback      */
+        return IoCallDriver(ext-&gt;LowerDevice, Irp);
+}
+
+/* --- pass it down and see the result --------------------- */
+NTSTATUS
+MyFilter(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PMY_DEVICE_EXTENSION ext = DeviceObject-&gt;DeviceExtension;
+
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        IoSetCompletionRoutine(Irp, MyCompletion, ext,
+                               TRUE,    /* on success */
+                               TRUE,    /* on error   */
+                               TRUE);   /* on cancel  */
+        return IoCallDriver(ext-&gt;LowerDevice, Irp);
+}
+
+NTSTATUS
+MyCompletion(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp,
+             _In_ PVOID Context)
+{
+        /* Runs at &lt;= DISPATCH_LEVEL, in an ARBITRARY thread.
+           Do not assume you are in the requesting process. */
+
+        if (Irp-&gt;PendingReturned)
+                IoMarkIrpPending(Irp);   /* propagate it up -
+                                            REQUIRED         */
+
+        /* inspect or modify Irp->IoStatus here */
+
+        return STATUS_CONTINUE_COMPLETION;
+        /* or STATUS_MORE_PROCESSING_REQUIRED to STOP the
+           completion and take ownership of the IRP - then you
+           must complete it yourself later.               */
+}
+
+/* THE SKIP vs COPY DISTINCTION:
+     IoSkipCurrentIrpStackLocation   reuses your slot for the
+                                     next driver. Cheaper. No
+                                     completion routine
+                                     possible.
+     IoCopyCurrentIrpStackLocationToNext  gives the next
+                                     driver its own copy, and
+                                     leaves yours free for the
+                                     completion routine.
+
+   Using Skip and then setting a completion routine corrupts
+   the stack - a classic filter-driver bug that bugchecks
+   randomly.                                                */</code></pre>
+
+<h2 id="lifecycle">The full lifecycle</h2>
+
+<p>With the pieces covered, here is the whole journey in one place — allocation to completion — which is worth reading once end to end before moving on to the framework that automates it.</p>
+
+<pre class="diagram">   ReadFile()
+       |
+   I/O manager: IoAllocateIrp / IoBuildSynchronousFsdRequest
+       |  fills IoStatus, RequestorMode, the buffer fields
+       |  sets up stack location [0] for the top driver
+       v
+   IoCallDriver(top)
+       |
+   +---v---------------------+
+   | top driver              |  IoSkip/IoCopy, IoCallDriver
+   +---+---------------------+
+       |
+   +---v---------------------+
+   | function driver (you)   |  complete now, or
+   |                         |  IoMarkIrpPending + queue
+   +---+---------------------+       |
+       |                             | later, from a DPC
+       v                             v
+   IoCompleteRequest(irp, boost)
+       |
+       |  walk UP the stack, running each completion routine
+       |  bottom-first
+       v
+   the I/O manager:
+       · copies SystemBuffer back to the user buffer
+         (METHOD_BUFFERED)
+       · unlocks and frees the MDL (DIRECT)
+       · sets the OVERLAPPED / event
+       · wakes the waiting thread
+       · FREES THE IRP
+       v
+   ReadFile returns
+
+  THE INVARIANT: an IRP is completed EXACTLY ONCE, by exactly
+  one driver. Completing twice is a bugcheck; never completing
+  it hangs the caller forever.</pre>
+
+<h2 id="debug">Debugging IRPs</h2>
+
+<p>When a request goes missing, the debugger can show you exactly where it stopped and who is holding it, which is almost always faster than reasoning about the code.</p>
+
+<pre><code># In WinDbg (chapter 23):
+
+    !irp ffff8a0c12345678
+      Irp is active with 3 stacks, 2 is current
+       cmd flg cl Device  File   Completion-Context
+       [IRP_MJ_READ(3), N/A(0)]
+         0  0  ffff8a0c...  ffff8a0c...   00000000-00000000
+                \Driver\MyDriver
+                Args: 00001000 00000000 00000000 00000000
+
+    !irpfind                    every IRP in the system
+    !irpfind -v 0 0 device ffff8a0c12345678
+                                IRPs for one device
+    !devstack ffff8a0c12345678  the whole device stack
+    !devobj ffff8a0c12345678    one device object
+
+# WHY !irpfind IS THE TOOL FOR A HANG: a thread stuck in
+# ReadFile has an IRP that nobody completed. Find it, see
+# which driver holds the current stack location, and you have
+# named the culprit.
+
+# LIVE TRACING: the I/O verifier option in Driver Verifier
+# (chapter 22) checks IRP handling rules aggressively - double
+# completion, touching a completed IRP, wrong IRQL at
+# completion, missing PendingReturned propagation. Turn it on;
+# these are exactly the bugs that are otherwise
+# unreproducible.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0x44 MULTIPLE_IRP_COMPLETE_REQUESTS</td><td>Completed the same IRP twice</td></tr>
+<tr><td>Application hangs in <code>ReadFile</code> forever</td><td>IRP queued and never completed — find it with <code>!irpfind</code></td></tr>
+<tr><td>Process will not terminate</td><td>Pending I/O not cancelled in <code>IRP_MJ_CLEANUP</code></td></tr>
+<tr><td>Crash after completing a request</td><td>Touched the IRP after <code>IoCompleteRequest</code></td></tr>
+<tr><td><code>ReadFile</code> reports a wrong byte count</td><td><code>IoStatus.Information</code> not set</td></tr>
+<tr><td>Userspace acts on garbage length</td><td>Same — uninitialised <code>Information</code></td></tr>
+<tr><td>Random bugcheck in a filter driver</td><td><code>IoSkipCurrentIrpStackLocation</code> plus a completion routine</td></tr>
+<tr><td>Asynchronous request never signals</td><td><code>PendingReturned</code> not propagated in the completion routine</td></tr>
+<tr><td>Deadlock during cancellation</td><td>Cancel spinlock not released before taking your own</td></tr>
+<tr><td>Cancelled IRP completed twice</td><td>Lost the cancel-routine race — the <code>IoSetCancelRoutine(NULL)</code> protocol</td></tr>
+<tr><td>Verifier reports an IRP rule violation</td><td>A real bug it made deterministic</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe an IRP's header and stack locations, and how you get yours.</li>
+  <li>Name eight major function codes and what triggers each.</li>
+  <li>Explain the difference between CLEANUP and CLOSE, and which cancels pending I/O.</li>
+  <li>Write a synchronous dispatch routine and state the three completion rules.</li>
+  <li>Explain why <code>IoMarkIrpPending</code> must precede queueing.</li>
+  <li>Write a cancel routine and explain the ownership protocol.</li>
+  <li>Distinguish Skip from Copy and say what breaks if you mix them up.</li>
+  <li>Explain why a completion routine must propagate <code>PendingReturned</code>.</li>
+  <li>Trace an IRP's full lifecycle and state the completed-exactly-once invariant.</li>
+  <li>Use <code>!irpfind</code> to diagnose a hung application.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

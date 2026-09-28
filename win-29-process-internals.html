@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Process internals: EPROCESS and the address space | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Process internals: EPROCESS and the address space</h1>
+<p class="lead">A Windows process is not a Win32 concept — Win32 is a thin, optional personality painted on top
+of something the kernel defines itself. This chapter is what a process actually is underneath: the structure
+that represents it, the address space it owns, and the two mechanisms — jobs and protected processes — that
+let Windows control groups of them and defend individual ones.</p>
+
+<h2 id="eprocess">EPROCESS: the kernel's own idea of a process</h2>
+
+<p>A process as an application sees it — a handle and a process ID — is a thin façade over a large kernel structure that holds the real state. Knowing what is in it explains a surprising number of behaviours, including why some of it is deliberately undocumented.</p>
+
+<pre class="diagram">   EPROCESS (opaque, undocumented layout - changes every
+   release) roughly contains:
+
+     Pcb              a KPROCESS - the KERNEL's view: the
+                      page directory base, the list of
+                      threads, kernel-level scheduling data
+
+     UniqueProcessId  the PID everyone sees in Task Manager
+
+     ObjectTable      a pointer to the HANDLE TABLE - every
+                      open handle this process holds
+                      (chapter 31 covers the object side)
+
+     Token            the SECURITY TOKEN - who this process
+                      is, for access-check purposes
+                      (chapter 36)
+
+     Vm               working-set and virtual-memory
+                      accounting for THIS process (chapter 30
+                      covers the memory manager in general)
+
+     VadRoot          the root of this process's VAD tree -
+                      every mapped region of its address
+                      space (below)
+
+     ActiveProcessLinks  a doubly linked list threading every
+                      EPROCESS in the system together - this
+                      is what PsGetNextProcess walks, and what
+                      certain rootkits historically UNLINKED
+                      to hide a process from enumeration
+                      (which is why modern detection also
+                      cross-checks via other lists, such as
+                      the scheduler's own).
+
+   NOTHING HERE MENTIONS WIN32. A process with an EPROCESS
+   and nothing else is a bare, functioning NT process - the
+   Win32 identity (window station, desktop, console) is
+   layered on afterward by CSRSS.</pre>
+
+<div class="key">
+<b>Why EPROCESS is deliberately undocumented</b>
+<p>Microsoft has never published the layout of <code>EPROCESS</code>, and it changes between builds. This is
+intentional: if third-party code (drivers, especially anti-cheat and antivirus software) hard-coded field
+offsets, every Windows update would risk breaking every such driver. The supported way to inspect a process is
+through documented APIs — <code>PsGetProcessId</code>, <code>PsGetProcessImageFileName</code>,
+<code>ZwQuerySystemInformation</code> — which the kernel keeps stable across releases even as the underlying
+structure shifts. Kernel debugging with WinDbg's public symbols can still show you the layout for a specific
+build (<code>dt nt!_EPROCESS</code>), which is why that command works for diagnosis but should never appear in
+shipping driver code.</p>
+</div>
+
+<h2 id="addressspace">The address space, and why 4 GB was never really 4 GB</h2>
+
+<p>Every process gets its own view of memory, and the way that space is divided has changed substantially between 32-bit and 64-bit Windows. The historical detail matters because assumptions from the 32-bit era still appear in code and documentation today.</p>
+
+<pre class="diagram">   A 64-bit process's user address space (simplified,
+   actual layout varies by build and mitigation settings):
+
+   0x00000000`00000000  +-----------------------------+
+                        |  NULL page - deliberately    |
+                        |  unmapped, to catch NULL      |
+                        |  pointer bugs                |
+                        +-------------------------------+
+                        |  executable image, heaps,    |
+                        |  stacks, mapped files,       |
+                        |  loaded DLLs...              |
+                        |  (this is what a VAD tree      |
+                        |   below describes)             |
+   0x00007FFF`FFFFFFFF  +-------------------------------+
+                          <- user/kernel boundary (on
+                             64-bit, an astronomically
+                             larger gap than 32-bit's
+                             famous 2GB/2GB or 3GB/1GB
+                             split ever allowed)
+   0xFFFF8000`00000000  +-------------------------------+
+                        |  KERNEL address space -       |
+                        |  shared identically across    |
+                        |  every process, and invisible |
+                        |  to user-mode code entirely   |
+                        +-------------------------------+
+
+   ON 32-BIT WINDOWS the split was famously tight: 2 GB
+   user / 2 GB kernel by default, adjustable to 3 GB/1 GB
+   with /3GB in boot.ini for applications (databases,
+   mostly) that needed more address space than data. This
+   entire class of constraint disappeared with 64-bit,
+   which is the real reason large-address-space-hungry
+   server software moved to 64-bit long before most
+   client software did.</pre>
+
+<h2 id="vad">VADs: how the memory manager knows what is mapped where</h2>
+
+<p>Every region of a process's address space — an image section, a heap, a memory-mapped file, a thread's
+stack — is described by a <strong>Virtual Address Descriptor</strong>, and the memory manager keeps every
+VAD belonging to one process in a self-balancing binary tree rooted at <code>EPROCESS.VadRoot</code>. This is
+the structure a page fault handler consults first: given a faulting address, it walks the VAD tree to find
+which descriptor (if any) covers that address, and the descriptor says what should be there — a file-backed
+mapping to satisfy from disk, a private committed page to zero-fill, or nothing at all, in which case the fault
+is a genuine access violation.</p>
+
+<pre><code>kd&gt; !vad @@(nt!_EPROCESS*)(@$proc) 1
+VAD             level      start        end          commit
+ffffc001`a2b3c0  6  fffff8f8`00000000 fffff8f8`00000fff       1 Mapped   READONLY
+ffffc001`a2b410  5  00007ff6`b8720000 00007ff6`b874afff       0 Mapped Exe READWRITE
+ffffc001`a2b460  4  00007ff6`c0000000 00007ff6`c0020fff       2 Private  READWRITE
+
+/* Each row is one VAD: an address range, a commit charge
+   (how many pages of backing store/pagefile this range has
+   reserved), and its protection and type.
+
+   THIS IS WHAT VirtualAlloc AND VirtualProtect ACTUALLY
+   MANIPULATE - they do not touch page tables directly, they
+   create, split, merge and modify VAD nodes, and the memory
+   manager's fault handler makes the page tables agree with
+   the VAD tree lazily, on demand.
+
+   THE PRACTICAL CONSEQUENCE: reserving 1 TB of address space
+   with MEM_RESERVE costs almost nothing - one VAD node, no
+   physical memory, no page-table entries below the top
+   level. This is exactly how a 64-bit process can casually
+   reserve a huge, sparse virtual range for something like a
+   hash table or an allocator arena without any real cost
+   until pages are actually touched.                       */
+</code></pre>
+
+<h2 id="workingset">The working set: how much of your address space is actually resident</h2>
+
+<p>A process's <em>address space</em> can be enormous; its <strong>working set</strong> is the much smaller
+set of pages that are currently resident in physical RAM. The memory manager tracks a working set per process
+and trims it under memory pressure — removing pages that have not been touched recently, converting them to
+"standby" list pages that can be reused by another process or reclaimed instantly if this process touches them
+again (a <strong>soft fault</strong>, resolved without any disk I/O) rather than paged all the way out to disk
+(a <strong>hard fault</strong>, which does need disk I/O and is the expensive case). Task Manager's "Working
+Set" and "Commit Size" columns are exactly these two different numbers — commit is a promise the memory
+manager has made about backing-store availability, working set is what is actually sitting in RAM right now —
+and the gap between them for an idle process is normal and healthy, not a leak.</p>
+
+<h2 id="jobs">Job objects: managing a process as a group</h2>
+
+<p>Sometimes you need to treat a group of processes as one unit — limit their memory collectively, or make sure they all die together. A job object is the kernel mechanism for that, and it underpins most sandboxing on Windows.</p>
+
+<pre><code>/* A job object groups several processes so limits and
+   accounting apply to the whole group, not one process at
+   a time - the mechanism containers on Windows are built
+   from, well before "container" was a marketing term.    */
+
+HANDLE hJob = CreateJobObjectW(NULL, NULL);
+
+JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+limits.ProcessMemoryLimit = 256 * 1024 * 1024;   /* 256 MB  */
+limits.BasicLimitInformation.ActiveProcessLimit = 4;
+
+SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                        &amp;limits, sizeof(limits));
+
+/* Any process assigned to this job - and any CHILD it
+   spawns, which inherits job membership automatically -
+   is bounded by these limits collectively. KILL_ON_JOB_CLOSE
+   means closing the job's last handle terminates every
+   process still in it: the standard way a launcher ensures
+   a misbehaving child (and everything IT spawned) cannot
+   outlive the parent, which a plain TerminateProcess on the
+   direct child alone would not guarantee.                 */
+
+AssignProcessToJobObject(hJob, hChildProcess);
+
+/* This exact mechanism is what Windows Sandbox, App-V, and
+   Docker's Windows containers are built on top of.        */
+</code></pre>
+
+<h2 id="ppl">Protected processes: defending a process from other admin code</h2>
+
+<p>An ordinary administrator-level process can open a handle to almost any other process on the system with
+enough access to read its memory, inject a thread, or terminate it — which is a real problem for anything that
+needs to defend itself even from a compromised admin account, such as an antimalware engine or DRM component.
+<strong>Protected Process Light (PPL)</strong> is the mechanism Windows added to solve this: a process launched
+with a specific signer level can only be opened, with full access, by another process at an equal or higher
+protection level. An ordinary process — even running as Administrator — that tries to open a PPL process for
+anything beyond a very limited set of query rights simply gets <code>ACCESS_DENIED</code>, no matter how
+privileged the caller's token is.</p>
+
+<div class="warn">
+<b>PPL is an anti-tampering boundary, not a security boundary against the kernel</b>
+<p>PPL defends a process against other <em>user-mode</em> code, including code running as SYSTEM. It does
+nothing against kernel-mode code — any signed driver running in the kernel can still access a PPL process's
+memory directly, because kernel mode is above the boundary PPL enforces. This is precisely why kernel driver
+signing (<a href="win-20-signing.html">chapter 21</a>) matters so much on modern Windows: it is the actual
+trust boundary that protects PPL processes, LSASS's credential guard, and similar defended components from
+being bypassed by loading an arbitrary unsigned driver.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Committed memory far exceeds working set</td><td>Normal — commit is a backing-store promise, working
+set is resident pages; not a leak by itself</td></tr>
+<tr><td>Allocating a huge address range costs almost nothing</td><td><code>MEM_RESERVE</code> only creates a
+VAD node — no physical pages until touched</td></tr>
+<tr><td>A child process survives after the launcher exits</td><td>Not placed in a job object with
+<code>KILL_ON_JOB_CLOSE</code></td></tr>
+<tr><td>Admin-level code cannot open a protected process</td><td>Working as intended — PPL blocks it
+regardless of token privilege</td></tr>
+<tr><td>A driver can still tamper with a PPL process</td><td>PPL is a user-mode boundary; kernel code is above
+it — this is why driver signing matters</td></tr>
+<tr><td>Debugger's <code>_EPROCESS</code> layout looks wrong on a newer build</td><td>The structure is
+intentionally undocumented and changes between releases — use documented APIs in real code</td></tr>
+<tr><td>A "hidden" process still gets scheduled CPU time</td><td>Unlinking <code>ActiveProcessLinks</code>
+alone does not remove it from the scheduler's own lists — a classic rootkit tell</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what EPROCESS represents and why its exact layout is intentionally undocumented.</li>
+  <li>Describe what a VAD is and how the page fault handler uses the VAD tree.</li>
+  <li>Explain the difference between commit size and working set, and why a large gap is normal.</li>
+  <li>Distinguish a soft fault from a hard fault.</li>
+  <li>Explain what a job object is for and what <code>KILL_ON_JOB_CLOSE</code> guarantees.</li>
+  <li>Explain what Protected Process Light defends against, and what it does not.</li>
+  <li>Say why unlinking <code>ActiveProcessLinks</code> alone does not fully hide a process.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

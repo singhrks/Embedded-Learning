@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Processes and the process control block | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Processes and the process control block</h1>
+<p class="lead">A process is a program plus everything the OS must remember about it. This chapter covers what
+that state actually is, how processes are created and destroyed, and the lifecycle bugs — zombies, orphans,
+fork-in-a-threaded-program — that come from getting it wrong.</p>
+
+<h2 id="what">What a process is</h2>
+
+<div class="key">
+<b>Program versus process</b>
+<p>A <strong>program</strong> is a file on disk: instructions and initial data. A <strong>process</strong> is
+a program in execution, together with all the state the OS maintains on its behalf. One program can back many
+processes; each has its own private state.</p>
+</div>
+
+<pre class="diagram">A process is the sum of:
+
+  ADDRESS SPACE          its private virtual memory map
+    text                 code, read-only, shared between instances
+    data + bss           initialised and zeroed globals
+    heap                 grows upward, via brk/mmap
+    memory mappings      files, shared libraries, anonymous regions
+    stack(s)             one per thread, grows downward
+
+  EXECUTION STATE        registers, PC, stack pointer, flags
+                         (per thread — see chapter 05)
+
+  KERNEL RESOURCES       open file descriptors
+                         current working directory, root directory
+                         signal handlers and masks
+                         timers
+                         namespaces, cgroup membership
+
+  IDENTITY               PID, PPID, UID/GID, capabilities,
+                         security label (SELinux, AppArmor)
+
+  ACCOUNTING             CPU time used, memory usage, priority,
+                         start time, resource limits</pre>
+
+<h2 id="pcb">The process control block</h2>
+
+<p>All of that lives in one kernel structure: <code>task_struct</code> in Linux, <code>EPROCESS</code> plus
+<code>KPROCESS</code> in Windows. It is the definitive answer to "what does the kernel know about this
+program?".</p>
+
+<pre><code>/* Linux: include/linux/sched.h — several hundred fields. The ones
+   that matter for understanding the model:                     */
+
+struct task_struct {
+        /* ---- scheduling ---- */
+        unsigned int          __state;        /* RUNNING, INTERRUPTIBLE... */
+        int                   prio, static_prio, normal_prio;
+        const struct sched_class *sched_class;
+        struct sched_entity   se;             /* CFS/EEVDF bookkeeping */
+        cpumask_t             cpus_mask;      /* affinity              */
+
+        /* ---- memory ---- */
+        struct mm_struct     *mm;             /* NULL for kernel threads */
+        struct mm_struct     *active_mm;
+
+        /* ---- identity and relationships ---- */
+        pid_t                 pid, tgid;      /* thread id, THREAD GROUP id */
+        struct task_struct __rcu *real_parent;
+        struct list_head      children, sibling;
+        const struct cred    *cred;           /* uid, gid, capabilities */
+
+        /* ---- resources ---- */
+        struct files_struct  *files;          /* fd table              */
+        struct fs_struct     *fs;             /* cwd, root             */
+        struct signal_struct *signal;
+        struct sighand_struct *sighand;
+
+        /* ---- kernel-side execution ---- */
+        void                 *stack;          /* 8-16 KB kernel stack  */
+        struct thread_struct  thread;         /* saved registers       */
+
+        char                  comm[16];       /* the name in `ps`      */
+};
+
+/* `current` is a macro giving the running task. On arm64 it reads
+   SP_EL0, which the kernel repurposes to hold the task pointer —
+   so it is a single register read, not a lookup.               */</code></pre>
+
+<div class="note">
+<b>The key structural insight</b>
+<p>In Linux there is <strong>no separate process structure</strong>. A process is a group of
+<code>task_struct</code>s sharing a <code>tgid</code>, an <code>mm_struct</code> and a
+<code>files_struct</code>. Threads and processes are the same object with different sharing. This is why
+<code>getpid()</code> returns <code>tgid</code> while <code>gettid()</code> returns <code>pid</code>, and it
+is the single most important thing to understand about the Linux model
+(<a href="os-05-threads.html">chapter 05</a>).</p>
+<p>Windows takes the opposite approach: <code>EPROCESS</code> owns the address space and handle table, and
+<code>ETHREAD</code> objects belong to it. Both designs work; the Linux one is simpler internally, the
+Windows one maps more directly onto the conceptual model.</p>
+</div>
+
+<h2 id="states">Process states</h2>
+
+<p>A process is not simply running or not. It moves through a defined set of states, and the distinctions between the non-running ones are exactly what you need when diagnosing something that appears stuck.</p>
+
+<pre class="diagram">                    ┌──────────┐
+        created ───►│   NEW    │
+                    └────┬─────┘
+                         │ admitted
+                    ┌────▼─────┐  scheduled  ┌──────────┐
+                    │  READY   │────────────►│ RUNNING  │
+                    │(runqueue)│◄────────────│          │
+                    └────▲─────┘  preempted  └────┬─────┘
+                         │                        │ blocks on I/O,
+              event      │                        │ lock, or sleep
+              occurs     │                        ▼
+                    ┌────┴─────┐            ┌──────────┐
+                    │ WAITING  │◄───────────│ BLOCKED  │
+                    └──────────┘            └──────────┘
+                                                 │ exit()
+                                            ┌────▼─────┐
+                                            │TERMINATED│ ← zombie until
+                                            └──────────┘   the parent reaps
+
+Linux state names, and what they mean in `ps`:
+
+  R  TASK_RUNNING            running OR ready — the runqueue
+  S  TASK_INTERRUPTIBLE      sleeping; a signal will wake it
+  D  TASK_UNINTERRUPTIBLE    sleeping; signals will NOT wake it
+                             usually blocked on disk or NFS.
+                             A process stuck in D cannot be killed —
+                             not even by SIGKILL. This is why
+                             "unkillable process" happens.
+  T  TASK_STOPPED            SIGSTOP / ptrace
+  Z  EXIT_ZOMBIE             finished, awaiting reaping
+  I  TASK_IDLE               idle kernel thread</pre>
+
+<h2 id="creation">Creating a process</h2>
+
+<p>Unix creates processes by duplicating an existing one and then replacing its contents — two steps rather than one. That split looks odd and turns out to be what makes shell redirection and pipes possible.</p>
+
+<h3>Unix: fork + exec</h3>
+
+<pre><code>pid_t pid = fork();          /* duplicate the calling process */
+
+if (pid &lt; 0) {
+        perror("fork");                     /* failed              */
+} else if (pid == 0) {
+        /* CHILD: fork returns 0 here */
+        execl("/bin/ls", "ls", "-l", (char *)NULL);
+        _exit(127);                          /* only if exec failed */
+} else {
+        /* PARENT: fork returns the child's pid */
+        int status;
+        waitpid(pid, &amp;status, 0);
+}</code></pre>
+
+<pre class="diagram">Why two calls instead of one "spawn"?
+
+  Because the gap between fork and exec is where you configure the
+  child, using ORDINARY code rather than a hundred spawn() flags:
+
+      pid = fork();
+      if (pid == 0) {
+              close(0);  open("input.txt", O_RDONLY);   /* redirect */
+              dup2(pipefd[1], 1);                        /* pipe out */
+              setuid(nobody);                            /* drop privs */
+              chdir("/srv");
+              setrlimit(RLIMIT_CPU, &amp;lim);
+              execv(path, argv);
+      }
+
+  That is the entire design of the Unix shell — pipes, redirection
+  and job control all live in that gap. Windows' CreateProcess takes
+  a large parameter block instead, and cannot express arbitrary
+  setup.
+
+Cost, and why it is not as bad as it sounds:
+  fork does NOT copy memory. It marks every page COPY-ON-WRITE and
+  copies page TABLES only (chapter 13). Pages are duplicated lazily,
+  on first write — and exec discards the address space immediately
+  anyway, so most are never copied at all.
+
+  posix_spawn() and vfork() exist for the case where even that is
+  too much; posix_spawn is the portable choice.</pre>
+
+<div class="danger">
+<b>fork() in a threaded program</b>
+<p>Only the calling thread survives into the child. Every other thread vanishes <em>mid-operation</em> —
+including any that held a lock. If a thread was inside <code>malloc</code> when you forked, the child's heap
+lock is held by a thread that does not exist, and the next allocation deadlocks forever.</p>
+<p>Between <code>fork</code> and <code>exec</code> in a multithreaded process you may call only
+<strong>async-signal-safe</strong> functions — a short list that excludes <code>malloc</code>,
+<code>printf</code> and most of libc. In practice: fork, immediately exec, and use
+<code>posix_spawn()</code> if you can, which handles this correctly.</p>
+</div>
+
+<h3>Windows: CreateProcess</h3>
+
+<pre><code>STARTUPINFO si = { .cb = sizeof si };
+PROCESS_INFORMATION pi;
+
+/* one call creates and starts a NEW program — no fork equivalent */
+CreateProcess(
+        L"C:\\Windows\\System32\\cmd.exe",   /* image        */
+        cmdline,                              /* command line */
+        NULL, NULL,                           /* security     */
+        TRUE,                                 /* inherit handles */
+        0, NULL, NULL,
+        &amp;si, &amp;pi);
+
+WaitForSingleObject(pi.hProcess, INFINITE);
+CloseHandle(pi.hThread);
+CloseHandle(pi.hProcess);      /* handles are refcounted — close both */</code></pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>fork + exec</th><th>CreateProcess</th></tr></thead>
+<tbody>
+<tr><td>Configuration</td><td>Arbitrary code between the two calls</td><td>A fixed parameter block</td></tr>
+<tr><td>Cost</td><td>Two syscalls; COW page-table copy</td><td>One call, no duplication</td></tr>
+<tr><td>Inheritance</td><td>Everything, then close what you do not want</td><td>Opt in, per handle</td></tr>
+<tr><td>Threads</td><td>Dangerous — only the caller survives</td><td>No issue</td></tr>
+<tr><td>Expressiveness</td><td>Higher: pipes, redirection, privilege drop</td><td>Lower, but safer by default</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="termination">Termination, zombies and orphans</h2>
+
+<p>A process ending is more involved than it sounds: its exit status must be kept until someone collects it, and what happens if nobody does is the origin of zombie processes.</p>
+
+<pre><code>exit(0);       /* flushes stdio, runs atexit handlers, then _exit  */
+_exit(0);      /* immediate; no cleanup — correct after a failed exec */
+
+/* Kernel-side, exit() does:
+     · close all file descriptors
+     · release the address space
+     · send SIGCHLD to the parent
+     · re-parent any children to init (or the nearest subreaper)
+     · become a ZOMBIE, keeping only the exit status  */</code></pre>
+
+<pre class="diagram">ZOMBIE — finished, but not yet reaped
+
+  A dead process keeps a task_struct alive purely so the parent can
+  read its exit status. It holds no memory, no fds, no CPU — but it
+  does hold a PID.
+
+  It is reaped when the parent calls wait()/waitpid(). If the parent
+  never does, zombies accumulate until the PID space is exhausted
+  and no process can be created system-wide.
+
+  ps aux | grep 'Z'          <- state Z, "&lt;defunct&gt;"
+
+  Fixes, in order of preference:
+    · call waitpid() — ideally from a SIGCHLD handler, in a loop:
+          while (waitpid(-1, &amp;st, WNOHANG) &gt; 0) ;
+    · signal(SIGCHLD, SIG_IGN)  — the kernel reaps automatically
+    · double-fork, so the grandchild is orphaned to init
+
+
+ORPHAN — parent died first
+
+  The child is re-parented to PID 1 (or the nearest process that
+  called PR_SET_CHILD_SUBREAPER). init reaps continuously, so
+  orphans are harmless. This is the normal way daemons detach.</pre>
+
+<h2 id="hierarchy">The process tree</h2>
+
+<p>Processes form a tree, and that structure determines who gets told when one dies and what happens to the children of a process that exits first.</p>
+
+<pre><code>pstree -p                  # the whole hierarchy
+ps -ef --forest
+ps -o pid,ppid,pgid,sid,tty,stat,cmd
+
+/* Four grouping levels, each with a purpose: */
+PID      one process (in Linux, one thread group)
+PGID     process group — a pipeline. Ctrl+C signals the whole group.
+SID      session — a login. Has one controlling terminal.
+         Detaching from it (setsid) is how a daemon is born.
+Namespace  a private view of PIDs, mounts, network, users.
+           This is the mechanism containers are built from.</code></pre>
+
+<pre><code>/* Classic daemonisation, and what each step is for */
+if (fork() &gt; 0) _exit(0);      /* parent exits; child is orphaned  */
+setsid();                       /* new session: no controlling tty  */
+if (fork() &gt; 0) _exit(0);      /* second fork: cannot ever reacquire
+                                   a terminal                       */
+chdir("/");                     /* do not pin a filesystem          */
+umask(0);
+close(0); close(1); close(2);   /* reopen on /dev/null              */
+
+/* Modern systems: do NOT do this. Let systemd manage the lifecycle
+   (Type=simple) and log to stdout. The double-fork dance exists to
+   solve problems a service manager already solves.               */</code></pre>
+
+<h2 id="inspect">Inspecting a process</h2>
+
+<p>Everything above is visible on a running system, and knowing where to look turns questions about a misbehaving process into observations rather than theories.</p>
+
+<pre><code># everything the kernel knows, as files
+ls /proc/self/
+cat /proc/PID/status        # state, threads, uid, memory summary
+cat /proc/PID/maps          # the virtual address space
+cat /proc/PID/smaps         # per-mapping RSS, PSS, dirty pages
+ls  /proc/PID/fd/           # open file descriptors, as symlinks
+cat /proc/PID/cmdline       # NUL-separated argv
+cat /proc/PID/environ
+cat /proc/PID/limits        # rlimits
+cat /proc/PID/stack         # kernel stack — WHY is it in D state?
+ls  /proc/PID/task/         # one directory per thread
+
+# resource usage
+ps -o pid,ppid,stat,%cpu,%mem,rss,vsz,etime,cmd -p PID
+top -H -p PID               # per-thread view
+/usr/bin/time -v ./program  # peak RSS, faults, context switches
+
+# limits
+ulimit -a
+prlimit --pid PID
+cat /sys/fs/cgroup/.../memory.max</code></pre>
+
+<div class="tip">
+<b>Diagnosing an unkillable process</b>
+<p>A process in state <strong>D</strong> ignores <code>SIGKILL</code> because it is blocked in the kernel in
+a non-interruptible sleep. Read <code>/proc/PID/stack</code> and <code>/proc/PID/wchan</code> to see exactly
+which kernel function it is waiting in — almost always a storage or network filesystem call. The fix is to
+address the underlying I/O (a hung NFS mount, a failing disk), not the process.</p>
+</div>
+
+<h2 id="limits">Resource limits</h2>
+
+<p>The kernel caps what a single process may consume — memory, open files, processes of its own. These limits are the first thing to check when something fails at scale but works in testing.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Limit</th><th>Controls</th><th>Typical symptom when hit</th></tr></thead>
+<tbody>
+<tr><td><code>RLIMIT_NOFILE</code></td><td>Open file descriptors</td><td><code>EMFILE</code>: "too many open files" — usually an fd leak</td></tr>
+<tr><td><code>RLIMIT_NPROC</code></td><td>Processes per user</td><td><code>EAGAIN</code> from <code>fork</code>; often a fork bomb or leak</td></tr>
+<tr><td><code>RLIMIT_STACK</code></td><td>Stack size</td><td><code>SIGSEGV</code> on deep recursion</td></tr>
+<tr><td><code>RLIMIT_AS</code></td><td>Total virtual address space</td><td><code>malloc</code> returns NULL</td></tr>
+<tr><td><code>RLIMIT_CORE</code></td><td>Core dump size</td><td>No core file after a crash</td></tr>
+<tr><td>cgroup <code>memory.max</code></td><td>Physical memory (containers)</td><td>OOM kill of the container</td></tr>
+<tr><td>cgroup <code>cpu.max</code></td><td>CPU bandwidth</td><td>Throttling; latency spikes</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hundreds of <code>&lt;defunct&gt;</code> processes</td><td>Parent never calls <code>wait()</code></td></tr>
+<tr><td>"Cannot fork: resource temporarily unavailable"</td><td>PID exhaustion from zombies, or <code>RLIMIT_NPROC</code></td></tr>
+<tr><td>Process ignores <code>SIGKILL</code></td><td>State D — uninterruptible I/O; check <code>/proc/PID/stack</code></td></tr>
+<tr><td>Child deadlocks after <code>fork</code> in a threaded program</td><td>Inherited a lock held by a thread that no longer exists</td></tr>
+<tr><td>"Too many open files"</td><td>fd leak; check <code>ls /proc/PID/fd | wc -l</code></td></tr>
+<tr><td>Daemon dies when the terminal closes</td><td>Never called <code>setsid()</code>; still in the session</td></tr>
+<tr><td>Child inherits an fd it should not have</td><td>Missing <code>O_CLOEXEC</code> / <code>FD_CLOEXEC</code></td></tr>
+<tr><td>Exit status is 0 despite a failure</td><td>Only the low 8 bits are returned; use the <code>WIFEXITED</code> macros</td></tr>
+<tr><td>Memory usage looks doubled after <code>fork</code></td><td>Shared COW pages counted twice; read PSS in <code>smaps</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish a program from a process and list four categories of process state.</li>
+  <li>Explain why Linux has no separate process structure, and what <code>tgid</code> means.</li>
+  <li>Name the Linux process states and explain why D-state processes cannot be killed.</li>
+  <li>Explain what the gap between <code>fork</code> and <code>exec</code> is for, with two examples.</li>
+  <li>Explain why <code>fork</code> is cheap despite duplicating a process.</li>
+  <li>Explain why <code>fork</code> in a threaded program is dangerous, and the safe rule.</li>
+  <li>Define zombie and orphan, and give two ways to prevent zombie accumulation.</li>
+  <li>Explain what each of PID, PGID, SID and namespace groups, and what each is used for.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

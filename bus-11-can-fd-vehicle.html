@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAN FD, and CAN in a vehicle | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>CAN FD, and CAN in a vehicle</h1>
+<p class="lead">Classical CAN carries 8 bytes at 500 kbit/s, which was generous in 1991 and is not now. CAN FD
+raises both limits without giving up arbitration — and the higher-layer protocols built on top are where an
+embedded engineer actually works.</p>
+
+<h2 id="fd">What CAN FD changes</h2>
+
+<pre class="diagram">   TWO CHANGES, and the first is the clever one.
+
+   1. DUAL BIT RATE. Arbitration happens at the classical
+      rate; the data phase switches to a faster one.
+
+      |&lt;-- arbitration --&gt;|&lt;--- data ---&gt;|&lt;-- ack --&gt;|
+      |     500 kbit/s    |   2-8 Mbit/s  | 500 kbit/s|
+      +-------------------+---------------+-----------+
+       ID, RTR, control    DATA + CRC      ACK, EOF
+
+      WHY THIS WORKS: the round-trip constraint (chapter 09)
+      applies only while several nodes might be driving at
+      once - during arbitration. Once one node has won, it
+      is alone on the bus and no round trip is needed, so
+      the bit time can shrink to whatever the physical layer
+      supports.
+
+      A genuinely elegant piece of protocol design: it
+      removes the bandwidth limit without touching the
+      property that made CAN worth using.
+
+   2. LONGER FRAMES. Up to 64 bytes rather than 8. DLC
+      values above 8 are encoded non-linearly:
+        9-15 mean 12, 16, 20, 24, 32, 48, 64 bytes.
+      So the jump is 8, 12, 16, 20, 24, 32, 48, 64 - you
+      cannot ask for 40.
+
+   ALSO: a stronger CRC (17 or 21 bit), and no RTR frames.
+
+   THROUGHPUT: 8 bytes at 500 kbit/s is about 3.6 kB/s of
+   payload after overhead. 64 bytes with a 2 Mbit/s data
+   phase is roughly 25x that, and it means a firmware
+   update over CAN goes from hours to minutes.</pre>
+
+<div class="warn">
+<b>Classical and FD nodes cannot share a bus</b>
+<p>A classical CAN controller sees an FD frame's control bits as a form error and transmits an error frame,
+destroying it — so one legacy node makes FD traffic impossible. Some transceivers and controllers support
+"CAN FD tolerant" mode, where classical nodes ignore FD frames instead of objecting, but this must be
+supported by every node on the bus. In practice a vehicle migrates one whole bus segment at a time, with a
+gateway translating between them.</p>
+</div>
+
+<h2 id="layers">The higher-layer protocols</h2>
+
+<pre class="diagram">   Raw CAN gives you 8 (or 64) bytes with an identifier.
+   Everything else is a protocol on top, and you will
+   almost always be implementing one of these:
+
+   ISO-TP (ISO 15765-2) - TRANSPORT
+     Segments messages longer than one frame, up to 4095
+     bytes, with flow control. The foundation of diagnostics.
+
+       SINGLE FRAME    [0x0n][ up to 7 bytes ]
+       FIRST FRAME     [0x1L][LL][ 6 bytes ]
+       FLOW CONTROL    [0x30][BS][STmin]     &lt;- receiver
+       CONSECUTIVE     [0x2n][ 7 bytes ]        controls
+                                                the rate
+
+     The receiver dictates block size and minimum separation
+     time, so a slow ECU can throttle a fast tester. This is
+     the piece people re-implement badly; use a library.
+
+   UDS (ISO 14229) - DIAGNOSTICS
+     Request/response services over ISO-TP. Read fault
+     codes, read data by identifier, flash firmware, run
+     routines. Service 0x22 (ReadDataByIdentifier) and 0x2E
+     (WriteDataByIdentifier) are most of what a tool does.
+
+   J1939 - HEAVY VEHICLES
+     29-bit IDs carrying structured meaning: priority,
+     PGN (parameter group number), source address. Standard
+     PGNs mean engine speed is the same message on every
+     truck, regardless of manufacturer.
+
+   CANopen - INDUSTRIAL
+     Object dictionary, PDOs for real-time data, SDOs for
+     configuration, standard device profiles. Common in
+     motion control and industrial automation.
+
+   AUTOSAR - AUTOMOTIVE SOFTWARE ARCHITECTURE
+     Not a CAN protocol as such, but the framework most
+     automotive ECU software is written inside, with CAN as
+     one of its communication stacks.</pre>
+
+<h2 id="isotp">ISO-TP, because you will meet it</h2>
+
+<pre><code>/* Receiving a multi-frame message. The state machine is
+   small; the timeouts are what make it correct.           */
+
+typedef enum { TP_IDLE, TP_RECEIVING } tp_state_t;
+
+typedef struct {
+    tp_state_t state;
+    uint8_t    buf[4095];
+    uint16_t   expected, received;
+    uint8_t    next_sn;          /* sequence number 0-15   */
+    uint32_t   last_frame_ms;
+} tp_rx_t;
+
+void tp_on_frame(tp_rx_t *tp, const uint8_t *d, uint8_t len)
+{
+    uint8_t type = d[0] &gt;&gt; 4;
+
+    switch (type) {
+    case 0x0:                                  /* SINGLE   */
+        deliver(&amp;d[1], d[0] &amp; 0x0F);
+        tp-&gt;state = TP_IDLE;
+        break;
+
+    case 0x1:                                  /* FIRST    */
+        tp-&gt;expected = (uint16_t)(((d[0] &amp; 0x0F) &lt;&lt; 8) | d[1]);
+        if (tp-&gt;expected &gt; sizeof(tp-&gt;buf)) {
+            tp_send_fc_overflow();             /* refuse    */
+            return;
+        }
+        memcpy(tp-&gt;buf, &amp;d[2], 6);
+        tp-&gt;received = 6;
+        tp-&gt;next_sn  = 1;
+        tp-&gt;state    = TP_RECEIVING;
+        tp-&gt;last_frame_ms = g_ms;
+        tp_send_flow_control(0 /* BS: unlimited */, 0 /* STmin */);
+        break;
+
+    case 0x2: {                                /* CONSEC   */
+        if (tp-&gt;state != TP_RECEIVING) { return; }  /* stray */
+
+        uint8_t sn = d[0] &amp; 0x0F;
+        if (sn != tp-&gt;next_sn) {
+            /* A frame was LOST. The sequence number exists
+               precisely to detect this; abort rather than
+               deliver a message with a hole in it.        */
+            stats.tp_sequence_errors++;
+            tp-&gt;state = TP_IDLE;
+            return;
+        }
+        tp-&gt;next_sn = (uint8_t)((sn + 1u) &amp; 0x0F);
+
+        uint16_t n = tp-&gt;expected - tp-&gt;received;
+        if (n &gt; 7) { n = 7; }
+        memcpy(&amp;tp-&gt;buf[tp-&gt;received], &amp;d[1], n);
+        tp-&gt;received += n;
+        tp-&gt;last_frame_ms = g_ms;
+
+        if (tp-&gt;received &gt;= tp-&gt;expected) {
+            deliver(tp-&gt;buf, tp-&gt;expected);
+            tp-&gt;state = TP_IDLE;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* THE TIMEOUT IS NOT OPTIONAL. If the sender dies mid
+   message, this state machine waits forever holding a 4 kB
+   buffer. ISO 15765-2 specifies N_Cr = 1000 ms between
+   consecutive frames.                                     */
+void tp_poll(tp_rx_t *tp)
+{
+    if (tp-&gt;state == TP_RECEIVING &amp;&amp;
+        (int32_t)(g_ms - tp-&gt;last_frame_ms - 1000) &gt;= 0) {
+        stats.tp_timeouts++;
+        tp-&gt;state = TP_IDLE;
+    }
+}
+</code></pre>
+
+<h2 id="vehicle">What a vehicle bus actually looks like</h2>
+
+<pre class="diagram">   A car has SEVERAL buses, segregated by criticality, with
+   a gateway between them.
+
+   +----------------------------------------------------+
+   |                     GATEWAY ECU                     |
+   +--+--------------+--------------+-------------+-----+
+      |              |              |             |
+   POWERTRAIN     CHASSIS         BODY         DIAGNOSTIC
+   500 kbit/s     500 kbit/s      125 kbit/s   OBD-II port
+   or CAN FD                      or LIN
+      |              |              |
+   engine ECU     ABS            doors, lights
+   transmission   steering       climate, seats
+                  airbag
+
+   WHY SEGREGATED:
+     - a fault on the body bus must not affect braking
+     - bandwidth: the powertrain bus carries 10 ms cyclic
+       messages; the body bus can be far slower and cheaper
+     - SECURITY: the OBD-II port is physically accessible
+       to anyone, so the gateway is a firewall. The famous
+       2015 Jeep Cherokee remote attack pivoted from the
+       infotainment system onto the CAN bus - after which
+       the protocol offers no defence at all, because CAN
+       has NO AUTHENTICATION WHATSOEVER.
+
+   THIS IS THE SECURITY REALITY OF CAN: any node can
+   transmit any identifier. There is no source
+   authentication, no encryption, and no way for a receiver
+   to know a frame is genuine. Security must come from:
+     - segmentation and a gateway that filters
+     - SecOC (AUTOSAR Secure Onboard Communication), which
+       adds a truncated MAC and a freshness counter to
+       critical messages
+     - physical access control
+
+   If you are designing a CAN system today and it carries
+   anything that matters, assume the bus is hostile and
+   authenticate at the application layer. The cryptography
+   track's MAC chapter is directly relevant.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>FD frames destroyed by error frames</td><td>A classical node on the bus objecting to FD control
+bits</td></tr>
+<tr><td>Cannot request a 40-byte frame</td><td>FD lengths are quantised: 32 then 48</td></tr>
+<tr><td>FD works at low data rate, fails at 5 Mbit/s</td><td>Transceiver not rated for it, or stub lengths too
+long</td></tr>
+<tr><td>Multi-frame messages truncated</td><td>Sequence number wrap not handled — it is modulo 16</td></tr>
+<tr><td>ISO-TP holds a buffer forever</td><td>No N_Cr timeout between consecutive frames</td></tr>
+<tr><td>Fast tester overruns a slow ECU</td><td>Flow control STmin ignored by the sender</td></tr>
+<tr><td>Diagnostics work on one tool, not another</td><td>Block size or separation time handling
+differs</td></tr>
+<tr><td>Firmware update over CAN takes hours</td><td>Classical CAN at 500 kbit/s — this is what FD is
+for</td></tr>
+<tr><td>Spoofed messages accepted as genuine</td><td>CAN has no authentication; add SecOC or authenticate at
+the application layer</td></tr>
+<tr><td>A body-bus fault affects the powertrain</td><td>Buses not segregated, or the gateway is not
+filtering</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why CAN FD can use a faster bit rate during the data phase.</li>
+  <li>State the two limits CAN FD raises and by how much.</li>
+  <li>Explain why FD data lengths above 8 bytes are quantised.</li>
+  <li>Say what happens when a classical node shares a bus with FD traffic.</li>
+  <li>Name the four ISO-TP frame types and what each carries.</li>
+  <li>Explain what flow control lets the receiver dictate, and why that matters.</li>
+  <li>Explain the purpose of the sequence number and the correct response to a gap.</li>
+  <li>Say why the N_Cr timeout is required and what it protects.</li>
+  <li>Give two reasons a vehicle has several segregated CAN buses.</li>
+  <li>State CAN's security properties and name two ways to compensate.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

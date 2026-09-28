@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: a firmware TPM as a trusted application | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: a firmware TPM as a trusted application</h1>
+<p class="lead">A TPM is a small state machine with keys, counters and measurement registers, spoken to over a
+byte-stream protocol. That description does not require a chip — it requires isolation, and the secure world
+provides it. Microsoft's fTPM does exactly this, ships on real products, and is the most instructive TA in
+existence.</p>
+
+<h2 id="why">Why a TPM in software is a reasonable idea</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Discrete TPM (dTPM)</th><th>Firmware TPM (fTPM)</th></tr></thead>
+<tbody>
+<tr><td>Where it runs</td><td>A separate chip on the SPI or LPC bus</td><td>A trusted application in the secure
+world</td></tr>
+<tr><td>Bill of materials</td><td>A part, a footprint, routing</td><td>Nothing</td></tr>
+<tr><td>Bus interception</td><td><strong>Possible</strong> — the SPI bus is on the board and can be
+probed</td><td>Not applicable; there is no bus</td></tr>
+<tr><td>Physical attack on the part</td><td>Hard — the chip is hardened, often certified</td><td>As hard as
+attacking the SoC, which is usually less hard</td></tr>
+<tr><td>Shares fate with the CPU</td><td>No</td><td><strong>Yes</strong> — an SoC compromise is a TPM
+compromise</td></tr>
+<tr><td>Certification</td><td>Common Criteria, FIPS</td><td>Possible but harder</td></tr>
+<tr><td>Updatable</td><td>Rarely</td><td>Yes, with the firmware</td></tr>
+<tr><td>Performance</td><td>Slow bus, slow part</td><td>Fast — it is the application processor</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The honest summary: an fTPM removes bus-probing attacks and costs nothing, at the price of sharing its
+fate with the SoC. For a phone or a laptop where the SoC is already the root of trust, that trade is clearly
+right — which is why Windows on ARM, most Android devices and AMD's fTPM all take it. For a system where the
+threat model includes an attacker with unlimited physical access and the CPU is not hardened, a discrete part
+still wins.</p>
+
+<h2 id="what">What a TPM actually is</h2>
+
+<p>A firmware TPM implements in software, inside the secure world, what is normally a discrete chip on the board. Understanding what that buys and what it gives up is the point of the project.</p>
+
+<pre class="diagram">   Strip away the specification and a TPM 2.0 is four things:
+
+   1. PCRs - Platform Configuration Registers
+        24 registers, each holding a hash. You cannot WRITE
+        them; you can only EXTEND them:
+
+            PCR[i] = SHA256( PCR[i] || new_measurement )
+
+        One-way and order-dependent. Reset to zero only on
+        reboot. So the value of PCR[4] after boot is a
+        fingerprint of exactly which bootloader ran, in which
+        order - and no software can fake a value it did not
+        actually reach.
+
+   2. A KEY HIERARCHY
+        Primary keys derived from persistent SEEDS:
+          Endorsement Seed  -> the device's identity, set at
+                               manufacture, never changes
+          Storage Seed      -> the owner's key hierarchy
+          Platform Seed     -> firmware's own hierarchy
+        Child keys are created under a parent and stored
+        OUTSIDE the TPM as encrypted blobs, loaded back on
+        demand. That is how a TPM with 64 KB of storage
+        manages thousands of keys.
+
+   3. NV STORAGE
+        A few kilobytes of indexed, attribute-controlled
+        space. Certificates, counters, policy data.
+        Monotonic counters live here.
+
+   4. POLICY
+        A session-based language for "this key may be used
+        only if...". Conditions include PCR values, a
+        password, a signature, a time, or a counter.
+        This is what makes SEALING work.
+
+   SEALING, the flagship use, in one line:
+
+     encrypt a secret so that it can only be decrypted when
+     PCR[0..7] have exactly the values they had at seal time
+
+   which means: "decrypt only if the machine booted the same
+   software it did when I sealed this". That is BitLocker,
+   and it is the reason PCRs exist.</pre>
+
+<h2 id="stack">The fTPM stack</h2>
+
+<p>The arrangement has more layers than the previous project, spanning a reference implementation, the trusted OS and the normal-world stack. Fixing the picture first makes the rest navigable.</p>
+
+<pre class="diagram">   NORMAL WORLD                        SECURE WORLD
+
+   tpm2-tools, systemd-cryptenroll,
+   Windows, Clevis, ...
+        |
+        |  /dev/tpm0, /dev/tpmrm0
+        v
+   +-------------------------+
+   | Linux TPM subsystem     |
+   |   drivers/char/tpm/     |
+   |   tpm-chip.c, tpm2-cmd.c|
+   +-------------------------+
+        |
+        |  tpm_ftpm_tee.c  - a TPM "chip" driver whose
+        |                    transport is the TEE
+        v
+   +-------------------------+
+   | TEE subsystem (ch. 10)  |
+   |   tee_client_invoke_func|
+   +-------------------------+
+        |  SMC
+        v
+   EL3 TF-A ------------------&gt; +---------------------------+
+                                | fTPM TA        S-EL0      |
+                                |                           |
+                                |  ONE command:             |
+                                |   FTPM_TA_SUBMIT_COMMAND  |
+                                |   in:  a TPM2 command blob|
+                                |   out: a TPM2 response    |
+                                |                           |
+                                |  inside:                  |
+                                |   the TCG reference       |
+                                |   implementation, ~40k    |
+                                |   lines of C, unmodified  |
+                                |                           |
+                                |  platform layer maps its  |
+                                |  NV store onto OP-TEE     |
+                                |  secure storage (ch. 15)  |
+                                |  and its RNG onto         |
+                                |  TEE_GenerateRandom       |
+                                +---------------------------+
+
+   THE KEY INSIGHT: the TA's interface is ONE command that
+   takes an opaque byte string and returns another. All the
+   complexity is inside, and the TEE boundary carries a
+   protocol that was already designed to cross an untrusted
+   bus.
+
+   That is why the fTPM is such a good TA: the TPM 2.0 command
+   protocol was designed on the assumption that the transport
+   is hostile. Every command is self-contained, sessions are
+   authenticated, and nothing depends on the caller being
+   trustworthy. A TEE is exactly that transport.</pre>
+
+<div class="key">
+<b>The design lesson worth taking away</b>
+<p>A good TA interface is <em>narrow and self-authenticating</em>. The fTPM has one command and the payload
+carries its own authorisation. Compare a TA with forty commands, each with pointer parameters and implicit
+state — every one is an attack surface needing its own validation
+(<a href="tee-20-ta-security.html">chapter 20</a>). If you can express your service as a protocol rather than
+an API, do it.</p>
+</div>
+
+<h2 id="get">Getting the source</h2>
+
+<p>The TPM implementation comes from a reference codebase rather than being written here, so the work is integration rather than cryptography — which is the realistic shape of this kind of project.</p>
+
+<pre><code>$ git clone https://github.com/microsoft/ms-tpm-20-ref.git
+$ cd ms-tpm-20-ref
+
+# Two things live here:
+#   TPMCmd/           the TCG reference implementation. This
+#                     is the actual TPM 2.0 specification,
+#                     rendered as C, maintained by Microsoft.
+#   Samples/ARM32-FirmwareTPM/optee_ta/
+#                     the OP-TEE glue: entry points, the
+#                     platform layer, the build.
+
+$ ls Samples/ARM32-FirmwareTPM/optee_ta/
+fTPM/          the TA itself
+Makefile
+README.md
+
+$ ls Samples/ARM32-FirmwareTPM/optee_ta/fTPM/
+Android.mk  Makefile  sub.mk
+include/    reference/    platform/
+user_ta_header_defines.h
+
+# The UUID, which you will meet again in chapter 23:
+$ grep -r "TA_FTPM_UUID" --include=*.h | head -2
+#define TA_FTPM_UUID { 0xbc50d971, 0xd4c9, 0x42c4, \
+        { 0x82, 0xcb, 0x34, 0x3f, 0xb7, 0xf3, 0x78, 0x96 } }</code></pre>
+
+<h2 id="interface">The TA interface, in full</h2>
+
+<p>The TPM has a standardised command interface, and the trusted application's job is to carry those commands across the world boundary without interpreting them.</p>
+
+<pre><code>/* fTPM/ftpm_ta.c - the entire command surface.             */
+
+#define TA_FTPM_SUBMIT_COMMAND   (0)
+#define TA_FTPM_EMULATE_PPI      (1)   /* physical presence   */
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx __unused,
+                                      uint32_t cmd_id,
+                                      uint32_t param_types,
+                                      TEE_Param params[4])
+{
+        switch (cmd_id) {
+        case TA_FTPM_SUBMIT_COMMAND:
+                return ftpm_submit_command(param_types, params);
+        case TA_FTPM_EMULATE_PPI:
+                return ftpm_emulate_ppi(param_types, params);
+        default:
+                return TEE_ERROR_BAD_PARAMETERS;
+        }
+}
+
+static TEE_Result ftpm_submit_command(uint32_t param_types,
+                                      TEE_Param params[4])
+{
+        uint32_t exp_param_types =
+                TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+                                TEE_PARAM_TYPE_MEMREF_INOUT,
+                                TEE_PARAM_TYPE_NONE,
+                                TEE_PARAM_TYPE_NONE);
+        uint8_t  *cmd_buf;
+        uint32_t  cmd_len;
+        uint8_t  *resp_buf;
+        uint32_t  resp_len;
+
+        if (param_types != exp_param_types)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        cmd_len  = params[0].memref.size;
+        cmd_buf  = params[0].memref.buffer;
+        resp_len = params[1].memref.size;
+        resp_buf = params[1].memref.buffer;
+
+        if (cmd_len &gt; MAX_COMMAND_SIZE ||
+            resp_len &lt; MAX_RESPONSE_SIZE)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        /* Copy the command into TA memory - one fetch
+           (chapter 20). The reference implementation then
+           works entirely on its own buffers.               */
+        memcpy(pCommandBuffer, cmd_buf, cmd_len);
+
+        /* THE WHOLE TPM. One call into the reference code. */
+        _plat__RunCommand(cmd_len, pCommandBuffer,
+                          &amp;respLen, &amp;respBuf);
+
+        if (respLen &gt; resp_len)
+                return TEE_ERROR_SHORT_BUFFER;
+
+        memcpy(resp_buf, respBuf, respLen);
+        params[1].memref.size = respLen;
+        return TEE_SUCCESS;
+}
+
+/* That is it. One entry point, one memcpy in, one call, one
+   memcpy out. Forty thousand lines of TPM behind a twenty-line
+   function.                                                */</code></pre>
+
+<h2 id="platform">The platform layer: where the porting work is</h2>
+
+<p>The reference implementation expects a set of platform services — storage, entropy, time — that must be mapped onto what the secure world actually provides.</p>
+
+<pre><code>/* The reference implementation calls out to a platform layer
+   for everything the specification leaves to the
+   implementer. Porting a TPM to a new environment IS writing
+   this layer, and OP-TEE makes it short.                   */
+
+/* --- NV STORAGE: the TPM's persistent state ------------- */
+/* platform/NVMem.c                                         */
+
+int _plat__NvCommit(void)
+{
+        /* The TPM's entire NV image is one blob, written back
+           to OP-TEE secure storage (chapter 15).           */
+        return NvFileCommit();   /* -> TEE_WriteObjectData   */
+}
+
+void _plat__NvMemoryRead(unsigned int startOffset,
+                         unsigned int size, void *data)
+{
+        memcpy(data, &amp;s_NV[startOffset], size);
+}
+
+/* The whole NV area is held in RAM and flushed on commit.
+   Consequences:
+     - a power cut between a state change and the commit loses
+       that change. The TPM specification anticipates this and
+       defines which operations must be committed
+       synchronously.
+     - the NV area is a few tens of kilobytes, so this is
+       affordable.
+     - REE FS gives no rollback protection. An fTPM that
+       matters should be built with CFG_RPMB_FS=y, or its NV
+       counters can be rewound (chapter 17). THIS IS THE
+       SINGLE MOST IMPORTANT DEPLOYMENT DECISION HERE.     */
+
+/* --- ENTROPY -------------------------------------------- */
+int32_t _plat__GetEntropy(unsigned char *entropy, uint32_t amount)
+{
+        TEE_GenerateRandom(entropy, amount);
+        return (int32_t)amount;
+        /* Backed by the platform's TRNG where one exists.
+           On QEMU it is not a real TRNG, which is one more
+           reason the QEMU build is for development only. */
+}
+
+/* --- TIME ----------------------------------------------- */
+uint64_t _plat__TimerRead(void)
+{
+        TEE_Time t;
+        TEE_GetSystemTime(&amp;t);      /* MONOTONIC, secure -
+                                       not TEE_GetREETime.
+                                       The TPM's clock must
+                                       not be attacker-
+                                       controlled (ch. 17). */
+        return (uint64_t)t.seconds * 1000 + t.millis;
+}
+
+/* --- UNIQUE VALUES: where the seeds come from ------------ */
+/* The Endorsement Primary Seed is the device's identity. It
+   must be:
+     - different on every device
+     - stable for the life of the device
+     - never derivable from outside the secure world
+
+   Options, best first:
+     1. TEE_GetHUKDerivedKey with a fixed label - derived from
+        fuses, per-device, needs no storage (chapter 16).
+     2. generated once with TEE_GenerateRandom and persisted
+        to RPMB.
+     3. provisioned at manufacture from an HSM, along with an
+        EK certificate signed by your CA.
+
+   Option 3 is what a product does, because an Endorsement Key
+   is only useful for attestation if a relying party can chain
+   it to a manufacturer they trust.
+
+   The QEMU/development build uses a FIXED seed. Every
+   "device" then has the same EK, which is fine for testing
+   and completely useless for attestation.               */
+
+/* --- PHYSICAL PRESENCE ---------------------------------- */
+/* On a PC this is a person pressing a key during POST. In a
+   TA there is nobody to ask, so the platform layer decides -
+   usually by asserting presence for operations the platform
+   owner is allowed to perform, and refusing otherwise.
+   Getting this wrong lets the normal world clear the TPM.  */</code></pre>
+
+<h2 id="build">Building it</h2>
+
+<p>Integrating a foreign codebase into the trusted-application build is most of the practical work, and the friction points are predictable.</p>
+
+<pre><code>$ cd ms-tpm-20-ref/Samples/ARM32-FirmwareTPM/optee_ta
+
+$ export TA_DEV_KIT_DIR=~/optee/optee_os/out/arm-plat-vexpress/export-ta_arm64
+$ export CROSS_COMPILE=aarch64-linux-gnu-
+$ export TA_CPU=cortex-a53
+
+$ make CFG_FTPM_USE_WOLF=y \
+       CFG_TA_DEBUG=y \
+       CFG_TEE_TA_LOG_LEVEL=3
+
+#   CFG_FTPM_USE_WOLF=y   use wolfSSL for crypto. The
+#                         alternative is OpenSSL, which is
+#                         larger. Neither uses OP-TEE's own
+#                         crypto API - the reference
+#                         implementation brings its own, and
+#                         that is a deliberate choice by the
+#                         TCG so the TPM's crypto is
+#                         auditable independently.
+
+$ ls out/
+bc50d971-d4c9-42c4-82cb-343fb7f37896.ta        # ~400 KB
+bc50d971-d4c9-42c4-82cb-343fb7f37896.elf       # keep this for
+                                               # panics (ch. 19)
+
+# It is large. Check it fits:
+#   TA_DATA_SIZE  must accommodate the NV image plus wolfSSL's
+#                 working set
+#   TA_RAM        must accommodate the whole mapped TA
+# In fTPM/user_ta_header_defines.h:
+#   #define TA_DATA_SIZE   (2 * 1024 * 1024)
+# which is why TZDRAM_SIZE (chapter 6) needs to be generous.
+
+$ cp out/*.ta ~/optee/out-br/target/lib/optee_armtz/
+$ cd ~/optee/build &amp;&amp; make buildroot run-only</code></pre>
+
+<div class="warn">
+<b>Size is the first thing that will bite you</b>
+<p>The fTPM is by far the largest TA most people will deploy: a 400 KB binary with a 2 MB heap. On QEMU with
+48 MB of secure DRAM that is comfortable. On a real SoC with 4 MB of secure SRAM and a pager
+(<a href="tee-05-core-architecture.html">chapter 5</a>) it is a genuine engineering problem, and it is why
+the paged build exists. Budget the memory before you promise the feature.</p>
+</div>
+
+<h2 id="minimal">A minimal TPM, if you want to understand rather than integrate</h2>
+
+<p>Before the full implementation, a minimal version that answers one command proves the plumbing works — which is the right place to stop and verify.</p>
+
+<pre><code>/* Building the real fTPM teaches you integration. Writing a
+   tiny one teaches you what a TPM IS. This implements four
+   commands in about 200 lines, and it is a genuinely useful
+   exercise before chapter 23.                             */
+
+#define TPM_ST_NO_SESSIONS   0x8001
+#define TPM_RC_SUCCESS       0x0000
+#define TPM_RC_COMMAND_CODE  0x0143
+#define TPM_CC_PCR_Extend    0x00000182
+#define TPM_CC_PCR_Read      0x0000017E
+#define TPM_CC_GetRandom     0x0000017B
+#define TPM_CC_Startup       0x00000144
+
+#define NUM_PCR   24
+#define PCR_LEN   32
+
+static uint8_t g_pcr[NUM_PCR][PCR_LEN];   /* zeroed at reset */
+
+/* Big-endian helpers - TPM structures are all big-endian. */
+static uint32_t be32(const uint8_t *p)
+{
+        return ((uint32_t)p[0] &lt;&lt; 24) | ((uint32_t)p[1] &lt;&lt; 16) |
+               ((uint32_t)p[2] &lt;&lt; 8)  |  (uint32_t)p[3];
+}
+static void put_be32(uint8_t *p, uint32_t v)
+{
+        p[0] = v &gt;&gt; 24; p[1] = v &gt;&gt; 16; p[2] = v &gt;&gt; 8; p[3] = v;
+}
+static void put_be16(uint8_t *p, uint16_t v)
+{
+        p[0] = v &gt;&gt; 8; p[1] = v;
+}
+
+/* PCR_Extend: PCR[i] = SHA256(PCR[i] || digest)           */
+static TEE_Result pcr_extend(uint32_t idx, const uint8_t *digest)
+{
+        TEE_OperationHandle op = TEE_HANDLE_NULL;
+        uint8_t  out[PCR_LEN];
+        uint32_t outlen = sizeof out;
+        TEE_Result res;
+
+        if (idx &gt;= NUM_PCR)
+                return TEE_ERROR_BAD_PARAMETERS;
+
+        res = TEE_AllocateOperation(&amp;op, TEE_ALG_SHA256,
+                                    TEE_MODE_DIGEST, 0);
+        if (res != TEE_SUCCESS)
+                return res;
+
+        TEE_DigestUpdate(op, g_pcr[idx], PCR_LEN);
+        res = TEE_DigestDoFinal(op, digest, PCR_LEN,
+                                out, &amp;outlen);
+        if (res == TEE_SUCCESS)
+                TEE_MemMove(g_pcr[idx], out, PCR_LEN);
+
+        TEE_FreeOperation(op);
+        return res;
+}
+
+/* The command dispatcher. Every TPM command has this header:
+     uint16 tag | uint32 commandSize | uint32 commandCode
+   and every response has:
+     uint16 tag | uint32 responseSize | uint32 responseCode  */
+
+static uint32_t tpm_dispatch(const uint8_t *cmd, uint32_t cmdlen,
+                             uint8_t *rsp, uint32_t *rsplen)
+{
+        uint32_t cc, size;
+        uint32_t rc = TPM_RC_SUCCESS;
+        uint32_t body = 0;      /* bytes of response payload  */
+
+        if (cmdlen &lt; 10)
+                return TPM_RC_COMMAND_CODE;
+
+        size = be32(cmd + 2);
+        cc   = be32(cmd + 6);
+
+        /* Never trust the caller's length. */
+        if (size != cmdlen)
+                return TPM_RC_COMMAND_CODE;
+
+        switch (cc) {
+        case TPM_CC_Startup:
+                break;                          /* no payload  */
+
+        case TPM_CC_GetRandom: {
+                uint16_t want;
+                if (cmdlen &lt; 12) { rc = TPM_RC_COMMAND_CODE; break; }
+                want = (cmd[10] &lt;&lt; 8) | cmd[11];
+                if (want &gt; 64) want = 64;
+                put_be16(rsp + 10, want);
+                TEE_GenerateRandom(rsp + 12, want);
+                body = 2 + want;
+                break;
+        }
+
+        case TPM_CC_PCR_Extend: {
+                uint32_t idx;
+                if (cmdlen &lt; 10 + 4 + PCR_LEN) {
+                        rc = TPM_RC_COMMAND_CODE; break;
+                }
+                idx = be32(cmd + 10);
+                if (pcr_extend(idx, cmd + 14) != TEE_SUCCESS)
+                        rc = TPM_RC_COMMAND_CODE;
+                break;
+        }
+
+        case TPM_CC_PCR_Read: {
+                uint32_t idx;
+                if (cmdlen &lt; 14) { rc = TPM_RC_COMMAND_CODE; break; }
+                idx = be32(cmd + 10);
+                if (idx &gt;= NUM_PCR) {
+                        rc = TPM_RC_COMMAND_CODE; break;
+                }
+                TEE_MemMove(rsp + 10, g_pcr[idx], PCR_LEN);
+                body = PCR_LEN;
+                break;
+        }
+
+        default:
+                rc = TPM_RC_COMMAND_CODE;
+        }
+
+        put_be16(rsp, TPM_ST_NO_SESSIONS);
+        put_be32(rsp + 2, 10 + body);
+        put_be32(rsp + 6, rc);
+        *rsplen = 10 + body;
+        return rc;
+}
+
+/* Wire it to the single SUBMIT_COMMAND entry point exactly as
+   the real fTPM does, and you have a TPM you can drive from
+   Linux. It will not pass the TCG test suite, but it will
+   extend and read PCRs, which is enough to understand what
+   chapter 23 is doing.                                    */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>TA will not load, out of memory</td><td><code>TA_DATA_SIZE</code> or <code>TZDRAM_SIZE</code> too small
+for a 2 MB heap</td></tr>
+<tr><td>TPM state lost on every reboot</td><td>NV commit not reaching secure storage, or
+<code>tee-supplicant</code> not running when it tried</td></tr>
+<tr><td>PCR values reset without a reboot</td><td>TA unloaded — needs
+<code>TA_FLAG_INSTANCE_KEEP_ALIVE</code></td></tr>
+<tr><td>Every device has the same EK</td><td>Fixed development seed. Correct for QEMU, fatal in a
+product</td></tr>
+<tr><td>NV counters can be rewound</td><td>REE FS without RPMB (<a href="tee-17-time-rollback.html">chapter
+17</a>)</td></tr>
+<tr><td>Sealed data unsealable after a firmware update</td><td>Working as designed — the PCRs changed. This is
+the BitLocker recovery-key experience</td></tr>
+<tr><td>Build fails on wolfSSL</td><td>Submodules not initialised in <code>ms-tpm-20-ref</code></td></tr>
+<tr><td>TPM commands time out</td><td>Response buffer smaller than <code>MAX_RESPONSE_SIZE</code></td></tr>
+<tr><td>Attestation rejected by a relying party</td><td>No EK certificate chaining to a trusted
+manufacturer</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Compare a discrete TPM and an fTPM, and say which threat each addresses that the other does not.</li>
+  <li>Define a PCR and write the extend operation. Explain why it cannot be forged.</li>
+  <li>Explain sealing in terms of PCRs, and say what happens after a firmware update.</li>
+  <li>Explain why the fTPM TA has only one real command, and why that is good design.</li>
+  <li>Name the four things the platform layer must provide and how OP-TEE supplies each.</li>
+  <li>Say why the TPM's clock must come from <code>TEE_GetSystemTime</code>.</li>
+  <li>Explain why the NV store should be in RPMB and what is lost if it is not.</li>
+  <li>Give three ways to produce an Endorsement Seed and say which a product uses.</li>
+  <li>Explain why the fTPM's size is an engineering constraint on a real SoC.</li>
+  <li>Implement <code>PCR_Extend</code> and <code>PCR_Read</code> in a minimal TA and drive them from a
+  client.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

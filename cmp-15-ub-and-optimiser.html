@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Undefined behaviour and the optimiser | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Undefined behaviour and the optimiser</h1>
+<p class="lead">Why a compiler deletes your bounds check, why a bug appears only at <code>-O2</code>, and
+why "it worked before" is not evidence. Undefined behaviour is not a bug in the compiler — it is a licence
+you granted it, and this chapter is about what it does with that licence.</p>
+
+<h2 id="contract">The contract</h2>
+
+<pre class="diagram">   THE C STANDARD says: if a program executes undefined
+   behaviour, the standard imposes NO REQUIREMENTS on what
+   happens.
+
+   THE OPTIMISER READS THAT CONTRAPOSITIVELY:
+
+     "The programmer promised this program has no UB.
+      Therefore I may ASSUME the conditions that would cause
+      UB never occur, and optimise on that assumption."
+
+   That is not aggressive interpretation - it is the only
+   interpretation that makes optimisation possible at all.
+   Every optimisation is "this transformation preserves
+   behaviour for all DEFINED executions".
+
+   THE CONSEQUENCES that surprise people:
+
+     · UB is not "does something unpredictable at that line".
+       It can affect code BEFORE it, because the compiler
+       reasons backwards.
+
+     · UB in a branch that is never taken can still change
+       your program, because the compiler used it to conclude
+       the branch is unreachable.
+
+     · "It works" is not evidence of correctness. It is
+       evidence that this compiler, at this optimisation
+       level, this week, happened to choose an outcome you
+       liked.
+
+   FOUR CATEGORIES, and the difference matters:
+     UNDEFINED         anything may happen
+     UNSPECIFIED       one of several behaviours, no record
+                       (argument evaluation order)
+     IMPLEMENTATION-DEFINED   one of several, DOCUMENTED
+                       (whether char is signed)
+     LOCALE-SPECIFIC</pre>
+
+<h2 id="cases">The ones that bite</h2>
+
+<pre><code>/* --- 1. SIGNED INTEGER OVERFLOW ------------------------- */
+        int f(int x) { return x + 1 &gt; x; }
+   -&gt;   mov w0, #1
+        ret
+/* ALWAYS TRUE. Signed overflow is UB, so the compiler may
+   assume x + 1 &gt; x. For UNSIGNED it must emit a real
+   comparison, because unsigned wrapping is DEFINED.
+
+        for (int i = 0; i &lt;= n; i++)
+/* With int i, the compiler may assume i never wraps, which is
+   what lets it prove the loop terminates and unroll it. With
+   `unsigned i` and n == UINT_MAX, the loop is infinite and
+   the compiler must preserve that.
+
+   THE FLAG: -fwrapv makes signed overflow wrap (defined),
+   at some optimisation cost. -ftrapv traps. The kernel uses
+   -fno-strict-overflow.
+
+/* --- 2. NULL DEREFERENCE IMPLIES NON-NULL --------------- */
+        void f(int *p) {
+                int x = *p;             /* dereference */
+                if (p == NULL)          /* DELETED - if p were
+                        return;            NULL we already had
+                *p = x + 1;                UB               */
+        }
+/* The check is removed. This exact pattern caused
+   CVE-2009-1897 in the Linux kernel: a dereference before a
+   NULL check let the compiler delete the check, and the
+   dereference of a mapped NULL page became exploitable.
+
+/* --- 3. STRICT ALIASING --------------------------------- */
+        float bits_to_float(uint32_t u)
+        {
+                return *(float *)&amp;u;    /* UB */
+        }
+/* Objects of different types may not alias, so the compiler
+   may assume the float load does not see the uint32_t store,
+   and reorder or elide them.
+
+   THE CORRECT WAYS: */
+        memcpy(&amp;f, &amp;u, sizeof f);       /* always correct, and
+                                           compiles to zero
+                                           instructions      */
+        f = __builtin_bit_cast(float, u);   /* C++20 / clang */
+        union { uint32_t u; float f; } c = { .u = u };
+        return c.f;                     /* legal in C, NOT in
+                                           C++              */
+
+/* char, unsigned char and std::byte may alias ANYTHING - that
+   is the exception that makes memcpy work.
+
+   THE KERNEL BUILDS WITH -fno-strict-aliasing because it
+   type-puns deliberately in many places. Application code
+   should NOT rely on that flag.
+
+/* --- 4. OUT-OF-BOUNDS ACCESS ---------------------------- */
+        int a[10];
+        a[10] = 0;              /* UB, and the compiler may
+                                   assume it does not happen */
+/* Which is why a bounds check AFTER the access is deleted,
+   and why `if (i < 10 || i > 10)` can be simplified in
+   surprising ways once the compiler knows an access at a[i]
+   already happened.
+
+/* --- 5. UNINITIALISED VALUES ---------------------------- */
+        int x;
+        if (x) ...              /* UB - and `x` is not merely
+                                   a random number: it may
+                                   behave INCONSISTENTLY,
+                                   because it is "poison" in
+                                   the IR and may be folded
+                                   differently at each use  */
+
+/* --- 6. SHIFT COUNT --------------------------------- */
+        1 &lt;&lt; 32                 /* UB for 32-bit int */
+        x &gt;&gt; -1                 /* UB */
+        1 &lt;&lt; 31                 /* UB in C99 for signed int;
+                                   use 1u &lt;&lt; 31            */
+/* And note the HARDWARE differs: ARM masks the shift count to
+   the register width, x86 masks to 5 or 6 bits. So the same
+   UB gives different answers on different targets.
+
+/* --- 7. INFINITE LOOPS WITHOUT SIDE EFFECTS ------------- */
+        while (1) { }           /* UB in C++; in C, UB only if
+                                   the condition is not a
+                                   constant                 */
+/* The compiler may assume any loop terminates, and delete or
+   fall through it. This has produced genuinely astonishing
+   output when someone wrote an empty spin loop.
+
+/* --- 8. DATA RACES -------------------------------------- */
+        /* two threads, no synchronisation, one writes */
+/* UB. Not "you get one value or the other" - the compiler may
+   split a store into two, invent a store, or cache the value
+   in a register indefinitely. Use _Atomic, or a lock.
+
+/* --- 9. UNSEQUENCED MODIFICATION ------------------------ */
+        i = i++ + 1;            /* UB */
+        f(i++, i++);            /* UB */
+        a[i] = i++;             /* UB */
+/* Not merely "unspecified order" - genuinely undefined.
+
+/* --- 10. FUNCTION POINTER TYPE MISMATCH ----------------- */
+        void (*f)(void) = (void (*)(void))some_int_fn;
+        f();                    /* UB */
+/* And with control-flow integrity enabled, it now TRAPS -
+   which is how a long-latent bug becomes a crash after a
+   toolchain upgrade.                                     */</code></pre>
+
+<div class="danger">
+<b>The pattern behind all of them</b>
+<p>The compiler is not looking for your UB and punishing it. It is doing ordinary reasoning — "this pointer
+was dereferenced, so it is non-null"; "this loop counter is <code>int</code>, so it does not wrap" — and
+propagating the conclusion. The transformation is correct for every program without UB. Yours has UB, so it
+is outside the set the compiler promised anything about.</p>
+</div>
+
+<h2 id="find">Finding it</h2>
+
+<pre><code># --- UBSAN: the single most valuable tool here ---
+    gcc -fsanitize=undefined -fno-sanitize-recover=all -g
+    clang -fsanitize=undefined,integer,nullability -g
+
+# It instruments the program and reports at RUN TIME:
+    prog.c:10:12: runtime error: signed integer overflow:
+    2147483647 + 1 cannot be represented in type 'int'
+
+# WHAT IT CHECKS:
+    signed integer overflow      shift out of range
+    null dereference             misaligned access
+    array bounds (with known sizes)
+    division by zero             invalid enum/bool values
+    float-to-int overflow        unreachable code reached
+    object size violations       vptr misuse (C++)
+    function pointer type mismatch
+
+# COST: roughly 20% slower. Cheap enough to run all your tests
+# under. THE MINIMAL PRODUCTION SUBSET:
+    -fsanitize=undefined -fsanitize-minimal-runtime \
+    -fno-sanitize-recover=all
+# which traps rather than printing, and costs very little.
+
+# --- ASAN: memory errors ---
+    -fsanitize=address -fno-omit-frame-pointer
+# use-after-free, buffer overflow, double free, leaks.
+# ~2x slower, 3x memory. Reports with the allocation and free
+# stacks.
+
+# --- TSAN: data races ---
+    -fsanitize=thread
+# ~10x slower, but it finds races that no amount of testing
+# will.
+
+# --- MSAN: uninitialised reads (clang) ---
+    -fsanitize=memory
+# Requires ALL code including libraries to be instrumented,
+# which is the practical obstacle.
+
+# --- STATIC ANALYSIS ---
+    gcc -fanalyzer             ; GCC 10+, genuinely good
+    clang --analyze
+    clang-tidy
+    cppcheck
+    scan-build make
+
+# --- COMPILER WARNINGS THAT SPECIFICALLY CATCH UB ---
+    -Wall -Wextra
+    -Wstrict-aliasing=2
+    -Warray-bounds=2
+    -Wnull-dereference
+    -Wshift-overflow=2
+    -Wsequence-point
+    -Wuninitialized -Wmaybe-uninitialized
+
+# THE COMBINATION THAT FINDS THE MOST, in practice:
+#   -Wall -Wextra -Werror in CI
+#   + all tests under UBSan and ASan
+#   + a nightly TSan run if threaded
+# That catches the overwhelming majority of what this chapter
+# describes.</code></pre>
+
+<h2 id="defensive">Writing code that has none</h2>
+
+<pre><code>/* --- CHECK BEFORE, NOT AFTER --- */
+        if (p == NULL) return;
+        int x = *p;                     /* right order */
+
+/* --- CHECK OVERFLOW WITHOUT CAUSING IT --- */
+        /* WRONG: */
+        if (a + b &lt; a) overflow();      /* the add is already
+                                           UB               */
+        /* RIGHT: */
+        if (a &gt; INT_MAX - b) overflow();
+        /* OR, best: */
+        int result;
+        if (__builtin_add_overflow(a, b, &amp;result))
+                overflow();
+        /* which compiles to one add plus a branch on the
+           carry flag - no cost at all on ARM             */
+
+/* --- USE UNSIGNED FOR BIT MANIPULATION --- */
+        uint32_t mask = 1u &lt;&lt; 31;       /* defined */
+        int32_t  bad  = 1 &lt;&lt; 31;        /* UB */
+
+/* --- TYPE-PUN WITH memcpy --- */
+        uint32_t u;
+        memcpy(&amp;u, &amp;f, sizeof u);
+        /* every compiler recognises this and emits ZERO
+           instructions for it when the types are
+           register-sized                                  */
+
+/* --- PASS SIZES, ALWAYS --- */
+        void f(int *a, size_t n);       /* not `int a[]` and
+                                           a guess          */
+
+/* --- USE THE SAFE STRING FUNCTIONS --- */
+        strscpy(dst, src, sizeof dst);      /* kernel */
+        snprintf(buf, sizeof buf, ...);
+        /* never strcpy, strcat, sprintf, gets */
+
+/* --- ENABLE THE FLAGS THAT NARROW UB --- */
+        -fwrapv                 signed overflow wraps
+        -fno-strict-aliasing    type punning permitted
+        -fno-delete-null-pointer-checks
+        -ftrivial-auto-var-init=zero     initialise locals
+/* THE KERNEL USES ALL FOUR. They cost some optimisation and
+   remove whole bug classes, which for a codebase of that size
+   and lifetime is clearly the right trade. For your code,
+   decide deliberately rather than by default.
+
+/* --- AND THE STRUCTURAL ONES --- */
+/*   · prefer array indices to pointer arithmetic
+     · keep buffer sizes next to buffers, or use a struct
+     · make invalid states unrepresentable where you can
+     · initialise at declaration
+     · one exit point for resources (C ch. 26 / cmp ch. 06) */</code></pre>
+
+<h2 id="lang">The language design answer</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Language</th><th>Approach to UB</th></tr></thead>
+<tbody>
+<tr><td>C, C++</td><td>Extensive UB, for optimisation freedom and to accommodate every historical machine</td></tr>
+<tr><td>Java, C#</td><td>Almost none: bounds checked, integers wrap, null throws. Pays runtime cost</td></tr>
+<tr><td>Go</td><td>Almost none; bounds checked, but data races are still UB</td></tr>
+<tr><td><strong>Rust</strong></td><td>None in <em>safe</em> code — the compiler proves it away. UB is confined to <code>unsafe</code> blocks, which are auditable and rare (<a href="rs-02-ownership.html">Rust ch. 02</a>)</td></tr>
+<tr><td>Zig</td><td>UB is checked in debug builds, assumed in release — an explicit, per-build choice</td></tr>
+<tr><td>Ada/SPARK</td><td>Checked by default; provably absent with formal verification</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>This is the strongest single argument for Rust in systems programming, and it is worth stating precisely:
+Rust does not eliminate the hardware realities — it moves the burden of proving the absence of UB from the
+programmer's discipline to the compiler's type system, and confines the cases it cannot prove to blocks you
+must write <code>unsafe</code> on. The bugs in this chapter do not become easier to find; they become
+impossible to write outside a marked region.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Likely UB</th></tr></thead>
+<tbody>
+<tr><td>Works at <code>-O0</code>, fails at <code>-O2</code></td><td>Almost certainly UB somewhere</td></tr>
+<tr><td>A NULL check is missing from the assembly</td><td>A dereference before it</td></tr>
+<tr><td>A bounds check disappears</td><td>An out-of-bounds access elsewhere let the compiler conclude the index range</td></tr>
+<tr><td>A loop is deleted or becomes infinite</td><td>Signed overflow, or a loop with no side effects</td></tr>
+<tr><td>A comparison folds to a constant</td><td>Signed overflow assumption</td></tr>
+<tr><td>Type punning gives stale values</td><td>Strict aliasing</td></tr>
+<tr><td>Different results on ARM and x86</td><td>Shift count, or signedness of <code>char</code></td></tr>
+<tr><td>Breaks after a compiler upgrade</td><td>A new optimisation exploited existing UB</td></tr>
+<tr><td>Breaks when LTO is enabled</td><td>The optimiser can finally see the contradiction</td></tr>
+<tr><td>Crashes only under load, in threads</td><td>A data race</td></tr>
+<tr><td>Traps after enabling CFI</td><td>Function pointer type mismatch</td></tr>
+<tr><td>Value differs between two uses</td><td>Uninitialised — it is poison, not a fixed random number</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the contract and explain why the optimiser's reading is the only workable one.</li>
+  <li>Distinguish undefined, unspecified and implementation-defined behaviour.</li>
+  <li>Explain why <code>x + 1 &gt; x</code> folds to true for <code>int</code> and not
+  <code>unsigned</code>.</li>
+  <li>Explain the deleted-null-check pattern and the kernel CVE it caused.</li>
+  <li>Explain strict aliasing and give three correct ways to type-pun.</li>
+  <li>Explain why UB can affect code before it in the source.</li>
+  <li>List ten kinds of UB in C and recognise each in code.</li>
+  <li>Enable UBSan and ASan and run a test suite under them.</li>
+  <li>Rewrite an overflow check so it does not itself overflow.</li>
+  <li>Name four flags that narrow UB and say what each costs.</li>
+  <li>Explain how Rust changes the situation, precisely.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

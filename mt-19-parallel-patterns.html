@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parallel patterns and how to decompose work | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Parallel patterns and how to decompose work</h1>
+<p class="lead">Almost every parallel program is one of six shapes. Recognising which one you have tells you
+where the synchronisation goes, what the scaling limit is, and — usually — that you can avoid sharing
+altogether.</p>
+
+<h2 id="patterns">The six</h2>
+
+<p>Most parallel programs are one of a handful of shapes. Recognising which shape a problem has is more valuable than any individual technique, because the shape determines the synchronisation you will need.</p>
+
+<pre class="diagram">   1. EMBARRASSINGLY PARALLEL / MAP
+        f(x) for every x, independently.
+        NO shared state, NO synchronisation, linear scaling
+        until you hit memory bandwidth.
+        -> image filters, hashing files, per-request work.
+
+   2. REDUCE
+        combine N values into one with an associative op.
+        Tree-shaped: log N depth, and the only sync is at the
+        joins.
+        -> sum, max, count, histogram merge.
+
+   3. MAP-REDUCE (scatter-gather)
+        map, then reduce. The overwhelmingly common shape.
+        -> "count word frequencies", "sum per customer".
+
+   4. PIPELINE
+        stage1 -> stage2 -> stage3, each on its own thread,
+        items flowing through.
+        Throughput = the SLOWEST stage. Latency = the sum.
+        -> decode -> filter -> encode; parse -> plan -> exec.
+
+   5. FORK-JOIN / DIVIDE AND CONQUER
+        split, recurse in parallel, combine. Naturally
+        matches work stealing (chapter 17).
+        -> quicksort, mergesort, tree traversal, FFT.
+
+   6. PRODUCER-CONSUMER
+        decouple rates with a queue. Not really about speed -
+        about smoothing bursts and isolating failure.
+        -> logging, request queues, sensor to processor.
+
+   AND THE ONE THAT IS NOT A PATTERN:
+      "put a mutex around the shared thing and run it on
+      8 threads". That is not a decomposition, it is a hope.</pre>
+
+<h2 id="map">Map, and the mistake in it</h2>
+
+<p>The simplest and most valuable pattern: the same independent operation applied to many items. When a problem fits this, parallelising it is nearly free of synchronisation — which is exactly why it should be the first thing you check for.</p>
+
+<pre><code>/* THE OBVIOUS VERSION - and why it is slow. */
+
+std::atomic&lt;long&gt; total{0};
+
+parallel_for(0, n, [&amp;](int i) {
+        total += expensive(data[i]);     /* EVERY iteration
+                                            writes one atomic  */
+});
+/* All threads hammer one cache line. Often SLOWER than the
+   serial loop (chapter 16).                                 */
+
+/* THE FIX: privatise, then combine. Once. */
+
+struct alignas(64) Partial { long v = 0; };
+std::vector&lt;Partial&gt; partial(nthreads);
+
+parallel_for_chunked(0, n, [&amp;](int lo, int hi, int tid) {
+        long local = 0;                  /* a REGISTER, not
+                                            even memory        */
+        for (int i = lo; i &lt; hi; i++)
+                local += expensive(data[i]);
+        partial[tid].v = local;          /* ONE write, ever    */
+});
+long total = 0;
+for (auto &amp;p : partial) total += p.v;    /* nthreads adds      */
+
+/* The pattern, in one line: ACCUMULATE PRIVATELY, MERGE ONCE.
+   It applies to counters, histograms, string builders, output
+   buffers, allocators, random number generators - anything
+   where the combine is associative.                          */
+
+/* And the libraries already do it: */
+        std::reduce(std::execution::par, v.begin(), v.end(), 0L);
+        v.par_iter().map(expensive).sum::&lt;i64&gt;();      // Rayon
+        #pragma omp parallel for reduction(+:total)    // OpenMP</code></pre>
+
+<div class="key">
+<b>Granularity is the single biggest lever</b>
+<p>Too fine and scheduling overhead dominates: a task that takes 100 ns cannot pay for a 1 µs enqueue. Too
+coarse and the tail dominates: 8 chunks on 8 cores means one slow chunk leaves 7 cores idle. The usual sweet
+spot is <strong>tasks of roughly 10–100 µs</strong>, and <strong>4–8× more chunks than cores</strong> so the
+scheduler can balance. Both numbers are worth measuring rather than trusting.</p>
+</div>
+
+<h2 id="pipeline">Pipelines</h2>
+
+<p>When work must pass through stages in order, the stages themselves can run concurrently on different items. Throughput is then set by the slowest stage, which makes the optimisation target obvious.</p>
+
+<pre><code>/* Three stages, bounded queues between them. */
+
+BoundedQueue&lt;Raw&gt;     q1(64);
+BoundedQueue&lt;Decoded&gt; q2(64);
+
+std::thread reader([&amp;] {
+        Raw r;
+        while (read_next(&amp;r)) q1.push(r);
+        q1.close();                       /* propagate the end  */
+});
+std::thread decoder([&amp;] {
+        Raw r;
+        while (q1.pop(&amp;r)) q2.push(decode(r));
+        q2.close();
+});
+std::thread writer([&amp;] {
+        Decoded d;
+        while (q2.pop(&amp;d)) write_out(d);
+});
+
+/* THE PROPERTIES
+
+   throughput = 1 / (slowest stage time)
+        adding threads to the FAST stages changes nothing.
+        Find the slow stage and parallelise THAT - a pipeline
+        where stage 2 is the bottleneck becomes
+        stage1 -> [stage2 x 4] -> stage3.
+
+   latency = sum of all stages + queueing
+        a pipeline makes throughput better and latency WORSE.
+        If you care about latency, this is the wrong pattern.
+
+   BOUNDED queues are mandatory
+        an unbounded queue between a fast producer and a slow
+        consumer converts backpressure into memory exhaustion,
+        far away from the cause.
+
+   CLOSING must propagate
+        each stage closes its output when its input closes and
+        it has drained. Miss one and shutdown hangs -
+        the commonest pipeline bug.
+
+   ORDER is not preserved once you widen a stage.
+        If output order matters you need sequence numbers and
+        a reorder buffer at the end, which is real work.     */</code></pre>
+
+<h2 id="forkjoin">Fork-join</h2>
+
+<p>Recursive problems split into independent sub-problems that are solved in parallel and combined. The important detail is knowing when to stop splitting, because at some size the overhead exceeds the work.</p>
+
+<pre><code>/* Parallel mergesort, with the two details that matter. */
+
+void psort(int *a, int n, int depth)
+{
+        /* DETAIL 1: a cutoff. Below it, go serial. Without
+           this you create a task per ELEMENT and spend all
+           your time scheduling. */
+        if (n &lt; 4096) { std::sort(a, a + n); return; }
+
+        /* DETAIL 2: bound the depth, or the task count
+           explodes. depth 0 means "no more forking". */
+        int mid = n / 2;
+        if (depth &gt; 0) {
+                auto left = std::async(std::launch::async,
+                                       [&amp;]{ psort(a, mid, depth-1); });
+                psort(a + mid, n - mid, depth - 1);
+                left.get();                    /* join */
+        } else {
+                psort(a, mid, 0);
+                psort(a + mid, n - mid, 0);
+        }
+        std::inplace_merge(a, a + mid, a + n);
+}
+/* call with depth = log2(hardware_concurrency) + 1 */
+
+/* WITH A WORK-STEALING RUNTIME you can skip the depth bound -
+   that is exactly what stealing is for. Rayon: */
+        fn psort(a: &amp;mut [i32]) {
+            if a.len() &lt; 4096 { a.sort(); return; }
+            let mid = a.len() / 2;
+            let (l, r) = a.split_at_mut(mid);
+            rayon::join(|| psort(l), || psort(r));   /* steals  */
+            merge(l, r);
+        }
+/* rayon::join is nearly free when nobody steals - it pushes
+   the right half and runs the left inline. The cutoff is
+   still needed; the depth bound is not.                     */</code></pre>
+
+<h2 id="decompose">Choosing a decomposition</h2>
+
+<p>Before any of the patterns can be applied, the problem must be divided — and how you divide it determines how much synchronisation the result needs. This is where most parallel performance is won or lost.</p>
+
+<pre class="diagram">   THREE WAYS TO CUT A PROBLEM
+
+   BY DATA        each thread gets a slice of the data and
+                  runs the same code.
+                  + scales with data size
+                  + easy to balance
+                  - needs the data to be splittable
+                  -> the default. Try this first.
+
+   BY TASK        each thread runs different code.
+                  + suits heterogeneous work
+                  - scales to the NUMBER OF TASKS, not cores
+                  - balancing is manual and usually wrong
+                  -> pipelines, and GUI-plus-worker.
+
+   BY PIPELINE    each thread is a stage.
+                  + good for streaming, bounded memory
+                  - throughput capped by the slowest stage
+                  - latency increases
+
+   THE QUESTIONS THAT PICK ONE
+
+     Is the work uniform?        yes -> data
+     Is there a natural stream?  yes -> pipeline
+     Is the work heterogeneous?  yes -> task
+     Does order matter?          if yes, avoid widening stages
+     Is state shared?            if yes, can you privatise it?
+                                 (usually yes - do that first)</pre>
+
+<div class="warn">
+<b>Load imbalance beats almost every other inefficiency</b>
+<p>Eight chunks on eight cores where one chunk takes twice as long means seven cores idle for half the run —
+a 43% loss, invisible in any lock profile. Fix it with more, smaller chunks plus dynamic scheduling
+(<code>schedule(dynamic)</code> in OpenMP, work stealing elsewhere) rather than by trying to predict chunk
+costs. Static partitioning is only right when every item genuinely costs the same.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Parallel map slower than serial</td><td>Shared accumulator — privatise and merge</td></tr>
+<tr><td>Speed-up stops at 2–3× on 16 cores</td><td>Load imbalance, or memory bandwidth saturation</td></tr>
+<tr><td>Most time in the scheduler</td><td>Tasks too small; raise the cutoff</td></tr>
+<tr><td>Cores idle at the end of every phase</td><td>Too few chunks; use 4–8× the core count</td></tr>
+<tr><td>Adding threads to a pipeline changes nothing</td><td>You widened a stage that was not the
+bottleneck</td></tr>
+<tr><td>Pipeline consumes all memory</td><td>Unbounded queue absorbing a rate mismatch</td></tr>
+<tr><td>Pipeline hangs at shutdown</td><td>Close not propagated through every stage</td></tr>
+<tr><td>Output order scrambled after optimising</td><td>A widened stage; needs sequence numbers</td></tr>
+<tr><td>Fork-join creates millions of tasks</td><td>No cutoff, or no depth bound without work
+stealing</td></tr>
+<tr><td>Scales on one machine, not on the bigger one</td><td>NUMA — threads on one node, memory on
+another</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the six patterns and give a real workload for each.</li>
+  <li>Explain why a shared atomic accumulator in a parallel map is usually a mistake.</li>
+  <li>State the privatise-and-merge rule and list five things it applies to.</li>
+  <li>Give the two granularity failure modes and the rough numbers that avoid both.</li>
+  <li>State how pipeline throughput and latency are each determined.</li>
+  <li>Explain why bounded queues are mandatory in a pipeline.</li>
+  <li>Explain why close must propagate, and what happens if it does not.</li>
+  <li>Give the two details a fork-join implementation needs, and say which one work stealing
+  removes.</li>
+  <li>Compare data, task and pipeline decomposition and say which to try first.</li>
+  <li>Quantify the cost of one chunk in eight taking twice as long.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

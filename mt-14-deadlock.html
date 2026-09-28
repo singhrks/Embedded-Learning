@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deadlock, livelock and starvation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Deadlock, livelock and starvation</h1>
+<p class="lead">Three ways for a program to stop making progress, distinguishable in about ten seconds if
+you know what to look at. Deadlock is also the one concurrency bug with a complete, mechanical prevention
+strategy — which is why it is inexcusable in new code.</p>
+
+<h2 id="four">The four conditions</h2>
+
+<p>Deadlock requires four conditions simultaneously, which is useful because breaking any single one prevents it. Each break has a different cost, and in practice one of them is the standard answer.</p>
+
+<pre class="diagram">   Coffman's conditions. Deadlock requires ALL FOUR.
+   Break any one and it cannot happen.
+
+   1. MUTUAL EXCLUSION
+        the resource cannot be shared.
+        Break it: use immutable data, or copies, or a
+        lock-free structure. Often impossible.
+
+   2. HOLD AND WAIT
+        a thread holds one resource while requesting another.
+        Break it: take all locks at once (std::scoped_lock),
+        or take none and retry.
+
+   3. NO PREEMPTION
+        a resource cannot be taken away from its holder.
+        Break it: try_lock with a timeout, and back off.
+
+   4. CIRCULAR WAIT
+        a cycle in the "waits for" graph.
+        Break it: a GLOBAL LOCK ORDER.
+        &lt;-- THIS IS THE ONE YOU BREAK. Always.
+
+   Condition 4 is the practical target because it costs
+   nothing at runtime, needs no error path, and can be
+   checked mechanically.</pre>
+
+<pre><code>/* THE CANONICAL DEADLOCK */
+
+void transfer(Account &amp;from, Account &amp;to, int amount)
+{
+        std::lock_guard&lt;std::mutex&gt; g1(from.m);   /* A then B */
+        std::lock_guard&lt;std::mutex&gt; g2(to.m);
+        from.balance -= amount;
+        to.balance   += amount;
+}
+
+/* thread 1: transfer(alice, bob, 100)   locks alice, wants bob
+   thread 2: transfer(bob, alice, 50)    locks bob,  wants alice
+   -> a cycle. Both wait for ever.                            */
+
+
+/* FIX 1: a global order. Any total order will do, as long as
+   everyone uses the same one. Address works and needs no
+   extra state.                                              */
+void transfer(Account &amp;from, Account &amp;to, int amount)
+{
+        Account *a = &amp;from, *b = &amp;to;
+        if (a &gt; b) std::swap(a, b);          /* ORDER BY ADDRESS */
+
+        std::lock_guard&lt;std::mutex&gt; g1(a-&gt;m);
+        std::lock_guard&lt;std::mutex&gt; g2(b-&gt;m);
+        from.balance -= amount;
+        to.balance   += amount;
+}
+/* Careful: transfer(x, x) now locks the same mutex twice.
+   Guard it: if (&amp;from == &amp;to) return; */
+
+
+/* FIX 2: let the library do it. std::scoped_lock takes N
+   mutexes with a deadlock-avoidance algorithm (repeated
+   try_lock with back-off).                                  */
+void transfer(Account &amp;from, Account &amp;to, int amount)
+{
+        std::scoped_lock g(from.m, to.m);    /* C++17, safe in
+                                                any order       */
+        from.balance -= amount;
+        to.balance   += amount;
+}
+/* This is the right default. std::lock() is the C++11 form. */</code></pre>
+
+<div class="key">
+<b>Write the lock order down</b>
+<p>Not in a wiki — in a header, next to the locks, as a numbered list. "Locks are acquired in this order:
+(1) <code>registry.m</code>, (2) <code>account.m</code>, (3) <code>logger.m</code>. Never take a
+lower-numbered lock while holding a higher-numbered one." That comment is checkable in review and by tooling.
+A lock order that exists only in people's heads has already been violated somewhere.</p>
+</div>
+
+<h2 id="hidden">The deadlocks you did not write</h2>
+
+<p>The obvious deadlock — two threads, two locks, opposite order — is easy to spot in review. These are the ones that are not, because the second lock is acquired somewhere you did not write.</p>
+
+<pre><code>/* The cycle is rarely two mutexes in one function. It is
+   almost always a call you did not know took a lock.       */
+
+/* 1. THE CALLBACK. */
+void Subject::notify() {
+        std::lock_guard g(m_);
+        for (auto *o : observers_)
+                o-&gt;on_event();     /* unknown code. It may call
+                                      back into US and try to
+                                      take m_. Or take ITS lock,
+                                      while another thread does
+                                      the reverse.             */
+}
+/* FIX: copy the observer list under the lock, release, then
+   call. Or dispatch onto a queue.                          */
+void Subject::notify() {
+        std::vector&lt;Observer *&gt; copy;
+        { std::lock_guard g(m_); copy = observers_; }
+        for (auto *o : copy) o-&gt;on_event();     /* unlocked    */
+}
+
+/* 2. THE ALLOCATOR. malloc takes locks. Allocating inside
+      your lock creates an order between your lock and the
+      allocator's - and the allocator is taken by everything. */
+
+/* 3. THE LOGGER. Same shape, and worse because logging is
+      added to error paths, which is where lock state is
+      already unusual.                                       */
+
+/* 4. RECURSION THROUGH A LIBRARY. You call into a framework
+      holding your lock; it calls your callback on another
+      path that takes the same lock.                         */
+
+/* 5. FORK. In a multithreaded process, fork() gives the child
+      ONE thread and a copy of every mutex - including ones
+      that were locked by threads that do not exist in the
+      child. The child deadlocks on the first malloc.
+      This is why POSIX says only async-signal-safe functions
+      are legal between fork and exec, and why
+      pthread_atfork exists.                                 */
+
+/* 6. SIGNAL HANDLERS. A handler that takes a lock the
+      interrupted thread already holds deadlocks that thread
+      against itself.                                        */</code></pre>
+
+<h2 id="detect">Telling the three apart</h2>
+
+<p>Deadlock, livelock and simple starvation all present as "the program stopped making progress" and have entirely different causes. Distinguishing them is the first step, and it is straightforward once you know what to look at.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Deadlock</th><th>Livelock</th><th>Starvation</th></tr></thead>
+<tbody>
+<tr><td>CPU usage</td><td><strong>Zero</strong></td><td><strong>100%</strong></td><td>Normal</td></tr>
+<tr><td>Progress</td><td>None, ever</td><td>None, but busy</td><td>Some threads progress, one does
+not</td></tr>
+<tr><td>Threads are</td><td>Blocked in a wait</td><td>Running, retrying</td><td>Runnable but never
+chosen</td></tr>
+<tr><td>Typical cause</td><td>Circular wait</td><td>Mutual back-off, or a CAS loop that always
+loses</td><td>Unfair lock, priority, or a hot producer</td></tr>
+<tr><td>Recovers alone?</td><td>Never</td><td>Sometimes, with randomised back-off</td><td>Sometimes, when load
+drops</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># Deadlock: attach and look. Every thread will be in a wait.
+$ gdb -p $(pidof app)
+(gdb) thread apply all bt
+Thread 3: __lll_lock_wait () ... at accounts.cpp:41
+Thread 2: __lll_lock_wait () ... at accounts.cpp:41
+# Two threads, same line, both waiting. That is your cycle.
+
+$ eu-stack -p $(pidof app)            # lighter than gdb
+$ py-spy dump --pid $(pidof app)      # Python
+$ jstack $(pidof java)                # Java PRINTS the cycle:
+#   "Found one Java-level deadlock"
+
+# Live detection - use it in every debug build:
+$ valgrind --tool=helgrind ./app
+==1234== Thread #2: lock order "0x5a1000 before 0x5a1040" violated
+
+# The kernel's version, and the best of them:
+$ echo 1 > /proc/sys/kernel/lock_stat      # with CONFIG_LOCKDEP
+# lockdep learns the lock order from observed acquisitions and
+# reports a POTENTIAL inversion the first time it sees one -
+# even if the deadlock never actually happens. That is the
+# property you want: it finds the bug on the run where it did
+# NOT deadlock.
+
+# In C++, the same idea, free:
+$ clang++ -Wthread-safety -Wthread-safety-analysis ...
+# with GUARDED_BY / ACQUIRED_BEFORE annotations.</code></pre>
+
+<div class="warn">
+<b>Timeouts are a diagnostic, not a fix</b>
+<p><code>try_lock_for(5s)</code> converts a hang into an error you can log — genuinely useful, and it makes
+production survivable. It does not remove the cycle. Code that retries after a timeout can livelock instead,
+and code that gives up leaves the invariant half-updated. Use timeouts to detect and report; fix the order.</p>
+</div>
+
+<h2 id="livelock">Livelock and starvation</h2>
+
+<p>A system can be completely stuck with every thread busy and none blocked. It is rarer than deadlock, harder to recognise, and usually caused by a well-intentioned retry that everyone performs simultaneously.</p>
+
+<pre><code>/* LIVELOCK: everyone is polite, nobody progresses. */
+
+bool transfer(Account &amp;a, Account &amp;b) {
+        while (true) {
+                std::unique_lock la(a.m);
+                std::unique_lock lb(b.m, std::try_to_lock);
+                if (lb.owns_lock()) { do_it(); return true; }
+                /* release both and retry - no deadlock ... */
+        }   /* ... but two threads can retry in lockstep for
+               ever, each releasing just as the other tries.  */
+}
+/* FIX: randomised exponential back-off, so the two threads
+   desynchronise. This is precisely why Ethernet uses it. */
+                std::this_thread::sleep_for(
+                        std::chrono::microseconds(rand() % (1 &lt;&lt; n)));
+
+/* STARVATION: progress happens, but not for you. */
+
+/* Causes:
+     - a reader-preferring RW lock and continuous readers
+       (chapter 10)
+     - an unfair mutex where a barging thread re-acquires
+       before the queued waiter is scheduled
+     - priority: a SCHED_FIFO thread starving everything below
+     - a CAS loop where one thread always loses to a faster
+       core, or to a core with better cache locality
+
+   Fixes: ticket locks, fair queueing, priority ageing, or
+   accepting it and measuring the p99.9 rather than the mean. */</code></pre>
+
+<h2 id="rules">The rules that prevent all of this</h2>
+
+<ol class="steps">
+  <li><strong>Define a global lock order and document it in the header.</strong> Break circular wait and the
+  other three conditions do not matter.</li>
+  <li><strong>Take multiple locks with <code>scoped_lock</code>,</strong> never by hand.</li>
+  <li><strong>Never call unknown code while holding a lock.</strong> No callbacks, no virtual calls, no
+  allocation in hot paths, no logging.</li>
+  <li><strong>Never hold a lock across I/O or a sleep.</strong></li>
+  <li><strong>Prefer one coarse lock</strong> until a profile forces you to split it. Two locks are more than
+  twice the risk of one.</li>
+  <li><strong>Run lockdep, Helgrind or <code>-Wthread-safety</code> in CI.</strong> All three find inversions
+  on runs that did not hang.</li>
+  <li><strong>Add timeouts in production</strong> so a hang becomes a logged error with a stack, not a
+  mystery.</li>
+</ol>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Hang, zero CPU, two threads on the same lock line</td><td>Classic circular wait</td></tr>
+<tr><td>Hang, 100% CPU</td><td>Livelock, or a CAS loop that never wins</td></tr>
+<tr><td>One request in a thousand takes 30 seconds</td><td>Starvation under an unfair lock</td></tr>
+<tr><td>Deadlock only when logging is enabled</td><td>The logger's lock introduced a new order</td></tr>
+<tr><td>Deadlock only under memory pressure</td><td>An allocation inside a lock, and the allocator took its
+own</td></tr>
+<tr><td>Child process hangs after <code>fork</code></td><td>A mutex copied in a locked state; only the forking
+thread survived</td></tr>
+<tr><td>Hang inside a signal handler</td><td>The handler took a lock the interrupted thread held</td></tr>
+<tr><td>Deadlock appears after adding an observer</td><td>A callback invoked under the lock</td></tr>
+<tr><td>Works for months, deadlocks after a refactor</td><td>Two call paths now acquire in opposite
+orders</td></tr>
+<tr><td>Helgrind reports an inversion that never hangs</td><td>Correct and valuable — it found a latent
+cycle</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the four Coffman conditions and say which one you break in practice, and why that one.</li>
+  <li>Write the classic transfer deadlock and give two distinct fixes.</li>
+  <li>Explain the edge case in ordering by address and how to guard it.</li>
+  <li>Give six ways a lock gets taken that you did not write.</li>
+  <li>Explain why <code>fork</code> in a multithreaded process is dangerous.</li>
+  <li>Distinguish deadlock, livelock and starvation by CPU usage and thread state.</li>
+  <li>Describe how lockdep finds a deadlock on a run that did not deadlock.</li>
+  <li>Explain why a timeout is a diagnostic rather than a fix.</li>
+  <li>Explain why livelock needs randomised back-off specifically.</li>
+  <li>List the seven prevention rules and identify which two you currently violate.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Templates and generic programming | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Templates and generic programming</h1>
+<p class="lead">Write one implementation, get a specialised copy for each type — with no runtime dispatch
+and no cost. Templates are how C++ achieves zero-overhead abstraction, and on embedded they are the
+mechanism for compile-time configuration.</p>
+
+<h2 id="basics">Function and class templates</h2>
+
+<p>A template is not code; it is a recipe the compiler uses to generate code once per set of types you use it with. That single fact explains the compile times, the error messages and the code size.</p>
+
+<pre><code>template&lt;typename T&gt;
+constexpr const T&amp; max(const T&amp; a, const T&amp; b)
+{
+        return a &gt; b ? a : b;
+}
+
+        max(1, 2);              /* T = int, deduced */
+        max(1.0, 2.0);          /* T = double */
+        max&lt;long&gt;(1, 2);        /* T explicit */
+        max(1, 2.0);            /* ERROR - T cannot be both */
+
+/* EACH INSTANTIATION IS A SEPARATE FUNCTION, generated at
+   compile time, and inlined like any other. `max(1,2)`
+   compiles to a single `csel` - identical to the macro,
+   with type checking and no double-evaluation bug.       */
+
+template&lt;typename T, size_t N&gt;
+class RingBuffer {
+        std::array&lt;T, N&gt; data_{};
+        size_t head_ = 0, tail_ = 0;
+
+public:
+        static constexpr size_t capacity = N;
+
+        bool push(const T&amp; v)
+        {
+                size_t next = (head_ + 1) % N;
+                if (next == tail_) return false;    /* full */
+                data_[head_] = v;
+                head_ = next;
+                return true;
+        }
+
+        bool pop(T&amp; out)
+        {
+                if (head_ == tail_) return false;   /* empty */
+                out = data_[tail_];
+                tail_ = (tail_ + 1) % N;
+                return true;
+        }
+
+        size_t size() const { return (head_ - tail_ + N) % N; }
+};
+
+        RingBuffer&lt;uint8_t, 64&gt;   rx;
+        RingBuffer&lt;Message, 16&gt;   queue;
+
+/* N IS A COMPILE-TIME CONSTANT, so:
+     · the storage is a fixed array - NO HEAP
+     · `% N` with N a power of two becomes an AND
+     · the size is known, so bounds are checkable at compile
+       time
+   This is the embedded container pattern: capacity as a
+   template parameter, storage inline.                    */
+
+/* NON-TYPE TEMPLATE PARAMETERS can be integers, enums,
+   pointers, and since C++20 floating point and literal class
+   types:                                                  */
+        template&lt;uint32_t BaseAddr&gt;
+        class Uart {
+                static constexpr auto *regs =
+                        reinterpret_cast&lt;volatile UartRegs *&gt;(
+                                BaseAddr);
+        public:
+                static void put(char c) { regs-&gt;DR = c; }
+        };
+        using Uart0 = Uart&lt;0x09000000&gt;;
+/* The address is a constant folded into every access - no
+   pointer is stored, and no register is used to hold it. */</code></pre>
+
+<h2 id="specialisation">Specialisation</h2>
+
+<p>Sometimes the general recipe is wrong for one particular type. Specialisation lets you replace it, and there are two quite different mechanisms depending on whether it is a full or partial replacement.</p>
+
+<pre><code>/* Provide a different implementation for particular types. */
+
+/* --- FULL SPECIALISATION --- */
+template&lt;typename T&gt;
+struct Serializer {
+        static size_t write(uint8_t *buf, const T&amp; v)
+        {
+                memcpy(buf, &amp;v, sizeof(T));
+                return sizeof(T);
+        }
+};
+
+template&lt;&gt;
+struct Serializer&lt;std::string_view&gt; {
+        static size_t write(uint8_t *buf, std::string_view v)
+        {
+                buf[0] = static_cast&lt;uint8_t&gt;(v.size());
+                memcpy(buf + 1, v.data(), v.size());
+                return v.size() + 1;
+        }
+};
+
+/* --- PARTIAL SPECIALISATION - CLASSES ONLY --- */
+template&lt;typename T&gt;
+struct Serializer&lt;T*&gt; {          /* any pointer */
+        static size_t write(uint8_t *buf, T *p)
+        {
+                return Serializer&lt;T&gt;::write(buf, *p);
+        }
+};
+
+/* FUNCTIONS CANNOT BE PARTIALLY SPECIALISED. Use overloading,
+   or a class template with a static function - which is why
+   the standard library's type traits are all classes.    */
+
+/* --- TAG DISPATCH, the pre-concepts way to select an
+       implementation --- */
+        template&lt;typename It&gt;
+        void advance_impl(It&amp; it, int n,
+                          std::random_access_iterator_tag)
+                { it += n; }
+
+        template&lt;typename It&gt;
+        void advance_impl(It&amp; it, int n,
+                          std::forward_iterator_tag)
+                { while (n--) ++it; }
+
+        template&lt;typename It&gt;
+        void advance(It&amp; it, int n)
+        {
+                advance_impl(it, n,
+                    typename std::iterator_traits&lt;It&gt;::
+                        iterator_category{});
+        }
+/* Still worth recognising - the STL is full of it - but
+   `if constexpr` and concepts have largely replaced it
+   (below).                                                */</code></pre>
+
+<h2 id="ifconstexpr">if constexpr</h2>
+
+<p>Choosing between code paths at compile time used to require elaborate tricks. A compile-time <code>if</code> replaced most of them, and the discarded branch is not even required to compile for the type in question.</p>
+
+<pre><code>/* C++17's most useful template feature: a branch that is
+   DISCARDED at compile time, so the untaken side need not
+   even be valid for that type.                            */
+
+template&lt;typename T&gt;
+size_t serialise(uint8_t *buf, const T&amp; v)
+{
+        if constexpr (std::is_trivially_copyable_v&lt;T&gt;) {
+                memcpy(buf, &amp;v, sizeof(T));
+                return sizeof(T);
+        } else if constexpr (has_serialise_method_v&lt;T&gt;) {
+                return v.serialise(buf);
+        } else {
+                static_assert(always_false_v&lt;T&gt;,
+                              "type is not serialisable");
+        }
+}
+
+/* WITH A PLAIN `if`, every branch must COMPILE for every T,
+   even the ones that never run. With `if constexpr` only the
+   taken branch is instantiated - which is what makes it
+   usable for dispatching on type properties.
+
+/* AND IN EMBEDDED CONFIGURATION CODE: */
+template&lt;bool UseDma&gt;
+class Transfer {
+public:
+        void run(const uint8_t *data, size_t n)
+        {
+                if constexpr (UseDma) {
+                        dma_setup(data, n);
+                        dma_start();
+                } else {
+                        for (size_t i = 0; i &lt; n; i++)
+                                poll_write(data[i]);
+                }
+        }
+};
+/* Transfer&lt;false&gt; contains NO dma code at all - it is not
+   compiled, so it does not exist in the binary. That is how
+   you build a configurable driver with no runtime cost and
+   no #ifdef.                                              */</code></pre>
+
+<div class="key">
+<b><code>if constexpr</code> replaces most <code>#ifdef</code></b>
+<p>An <code>#ifdef</code> hides code from the compiler entirely, so the disabled path is never type-checked
+and rots silently. <code>if constexpr</code> on a <code>constexpr bool</code> is fully parsed and
+type-checked in every configuration, discarded only at instantiation. Same generated code, far better
+maintenance — and it is one of the strongest arguments for C++ over C in configurable firmware.</p>
+</div>
+
+<h2 id="concepts">Concepts</h2>
+
+<p>Templates traditionally fail with pages of errors deep inside the implementation. Concepts state the requirements up front, so a violation is reported at the call with a sentence rather than an essay.</p>
+
+<pre><code>/* C++20. Constrain a template, and get an error message that
+   names the problem rather than a hundred lines of
+   instantiation backtrace.                                */
+
+template&lt;typename T&gt;
+concept Serialisable = requires(const T&amp; t, uint8_t *buf) {
+        { t.serialise(buf) } -&gt; std::convertible_to&lt;size_t&gt;;
+        { T::size } -&gt; std::convertible_to&lt;size_t&gt;;
+};
+
+template&lt;Serialisable T&gt;
+void send(const T&amp; msg) { ... }
+
+        send(42);
+/* ERROR: constraints not satisfied
+     because '42' (of type int) does not satisfy
+     'Serialisable': the required expression
+     't.serialise(buf)' is invalid
+
+   Compare the pre-concepts version, which reported a failure
+   deep inside send()'s body across eight levels of
+   instantiation.
+
+/* THE STANDARD CONCEPTS worth knowing: */
+        std::integral, std::floating_point
+        std::same_as, std::convertible_to, std::derived_from
+        std::copyable, std::movable, std::default_initializable
+        std::invocable, std::predicate
+        std::ranges::range, std::ranges::sized_range
+
+/* THREE WAYS TO WRITE A CONSTRAINT, all equivalent: */
+        template&lt;std::integral T&gt; void f(T);
+        template&lt;typename T&gt; requires std::integral&lt;T&gt; void f(T);
+        void f(std::integral auto x);           /* terse */
+
+/* AND CONCEPTS PARTICIPATE IN OVERLOAD RESOLUTION, with the
+   MORE CONSTRAINED overload preferred: */
+        template&lt;std::integral T&gt;       void g(T);   /* 1 */
+        template&lt;typename T&gt;            void g(T);   /* 2 */
+        g(42);                  /* 1 - more constrained */
+/* Which replaces the enable_if SFINAE machinery entirely, and
+   is the main reason to move to C++20 where the toolchain
+   allows.                                                 */
+
+/* THE PRE-C++20 EQUIVALENT, which you will still meet: */
+        template&lt;typename T,
+                 typename = std::enable_if_t&lt;
+                        std::is_integral_v&lt;T&gt;&gt;&gt;
+        void f(T x);
+/* "Substitution Failure Is Not An Error" - if the enable_if
+   fails to substitute, the candidate is silently removed
+   rather than causing a compile error. Powerful, and the
+   source of C++'s worst error messages.                  */</code></pre>
+
+<h2 id="variadic">Variadic templates</h2>
+
+<p>Templates taking any number of arguments are how type-safe wrappers around variadic C functions are built — giving you the flexibility of <code>printf</code> with actual type checking.</p>
+
+<pre><code>/* Any number of arguments, type-safe, with no varargs. */
+
+template&lt;typename... Args&gt;
+void log(const char *fmt, Args&amp;&amp;... args)
+{
+        format_to(buffer, fmt, std::forward&lt;Args&gt;(args)...);
+}
+
+/* FOLD EXPRESSIONS (C++17) - the readable way to process a
+   pack: */
+        template&lt;typename... Args&gt;
+        auto sum(Args... args) { return (args + ...); }
+                                        /* unary right fold */
+
+        template&lt;typename... Args&gt;
+        bool all_valid(Args... args) { return (args.valid() &amp;&amp; ...); }
+
+        template&lt;typename... Args&gt;
+        void print_all(Args&amp;&amp;... args)
+        {
+                ((std::cout &lt;&lt; args &lt;&lt; ' '), ...);
+                                        /* comma fold */
+        }
+
+        sizeof...(Args)         /* the number of arguments */
+
+/* A PRACTICAL EMBEDDED USE - a compile-time register field
+   builder: */
+        template&lt;typename... Fields&gt;
+        constexpr uint32_t make_reg(Fields... f)
+        {
+                return (f.value | ...);
+        }
+        constexpr auto ctrl = make_reg(Enable{1}, Mode{2},
+                                       Prescale{7});
+/* Computed entirely at compile time; the result is one
+   immediate in the instruction stream.                    */
+
+/* PRE-C++17 RECURSION, which you will still see: */
+        void print() {}                         /* base case */
+        template&lt;typename T, typename... Rest&gt;
+        void print(T first, Rest... rest)
+        {
+                std::cout &lt;&lt; first;
+                print(rest...);                 /* recurse */
+        }
+/* Fold expressions are shorter and compile faster. Use them
+   where available.                                        */</code></pre>
+
+<h2 id="cost">The costs</h2>
+
+<p>Templates are zero-cost at run time and distinctly not free at build time or in binary size, because each instantiation is separate code. That trade matters on a constrained target.</p>
+
+<pre><code>/* Templates are not free in every dimension. */
+
+/* --- CODE BLOAT --- */
+        RingBuffer&lt;uint8_t, 16&gt;
+        RingBuffer&lt;uint8_t, 32&gt;
+        RingBuffer&lt;uint16_t, 16&gt;
+/* THREE COMPLETE COPIES of every member function. On a
+   flash-constrained part this adds up quickly.
+
+   MITIGATIONS:
+     · factor the type-independent parts into a non-template
+       base:                                              */
+        class RingBufferBase {          /* no template */
+        protected:
+                size_t head_, tail_, cap_;
+                bool advance(size_t&amp; idx);   /* shared code */
+        };
+        template&lt;typename T, size_t N&gt;
+        class RingBuffer : RingBufferBase { ... };
+
+     /* · use fewer distinct instantiations - prefer one
+          capacity where you can
+        · -Wl,--icf=all folds byte-identical functions
+          (compilers ch. 12)
+        · MEASURE: nm --size-sort -S, or bloaty            */
+
+/* --- COMPILE TIME --- */
+/* Templates are instantiated in every translation unit that
+   uses them, then deduplicated by the linker. Heavy template
+   use is the main cause of slow C++ builds.
+
+   MITIGATIONS:
+     extern template class RingBuffer&lt;uint8_t, 64&gt;;
+     /* in a header - suppress instantiation here */
+     template class RingBuffer&lt;uint8_t, 64&gt;;
+     /* in ONE .cpp - instantiate it once */
+     · -ftime-trace (clang) + speedscope to see where the time
+       goes
+     · precompiled headers, or C++20 modules if available    */
+
+/* --- ERROR MESSAGES --- */
+/* Without concepts, an error inside a template reports at the
+   point of failure, not the point of misuse - hundreds of
+   lines deep. Use concepts, or static_assert early: */
+        template&lt;typename T&gt;
+        void f(T x) {
+                static_assert(std::is_integral_v&lt;T&gt;,
+                              "f requires an integral type");
+                ...
+        }
+/* One clear message instead of a wall.                    */
+
+/* --- DEBUGGING --- */
+/* Template names in a debugger and in a backtrace are
+   enormous. c++filt and `set print asm-demangle` help;
+   type aliases help more:                                 */
+        using RxBuffer = RingBuffer&lt;uint8_t, 64&gt;;</code></pre>
+
+<h2 id="crtp">CRTP: static polymorphism</h2>
+
+<p>Inheriting from a template parameterised on the derived class gives you polymorphism resolved entirely at compile time — the pattern to reach for when virtual dispatch is too expensive.</p>
+
+<pre><code>/* Polymorphism with no vtable and no indirect call - the
+   embedded alternative to virtual functions (chapter 11). */
+
+template&lt;typename Derived&gt;
+class SensorBase {
+public:
+        int read() {
+                auto raw = self().read_raw();   /* dispatched
+                                                   STATICALLY */
+                return self().convert(raw);
+        }
+
+        void init() {
+                self().configure();
+                self().calibrate();
+        }
+
+private:
+        Derived&amp; self() { return static_cast&lt;Derived&amp;&gt;(*this); }
+};
+
+class Thermistor : public SensorBase&lt;Thermistor&gt; {
+public:
+        uint16_t read_raw()          { return adc_read(CH0); }
+        int      convert(uint16_t r) { return lookup(r); }
+        void     configure()         { adc_init(CH0); }
+        void     calibrate()         { }
+};
+
+        Thermistor t;
+        int temp = t.read();
+
+/* THE GENERATED CODE is fully inlined - read_raw and convert
+   are called directly and usually vanish into the caller.
+   NO vtable pointer in the object, NO indirect call, and the
+   whole chain is optimisable.
+
+/* THE COST: no runtime polymorphism. You cannot have a
+   `std::vector&lt;SensorBase*&gt;` of mixed sensor types, because
+   SensorBase&lt;Thermistor&gt; and SensorBase&lt;Photodiode&gt; are
+   unrelated types.
+
+/* WHEN TO USE WHICH:
+     the set of types is KNOWN AT COMPILE TIME  -&gt; CRTP
+     the set varies at run time, or you need a
+     heterogeneous container                    -&gt; virtual
+     you need both                              -&gt; std::variant
+                                                   (chapter 15)
+*/</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>200-line error inside the standard library</td><td>A constraint violated deep in instantiation — add concepts or a <code>static_assert</code></td></tr>
+<tr><td>"no matching function" with an obvious call</td><td>Deduction failed — often a mismatch like <code>max(1, 2.0)</code></td></tr>
+<tr><td>Binary much larger than expected</td><td>Many instantiations — check with <code>nm --size-sort</code></td></tr>
+<tr><td>Build times growing rapidly</td><td>Template instantiation — try <code>extern template</code>, <code>-ftime-trace</code></td></tr>
+<tr><td>Template code not type-checked in some configs</td><td>You used <code>#ifdef</code> instead of <code>if constexpr</code></td></tr>
+<tr><td>Cannot partially specialise a function</td><td>Only classes can be — use overloading or a class template</td></tr>
+<tr><td>An overload is never selected</td><td>A less-constrained template is winning — constrain it</td></tr>
+<tr><td>SFINAE silently removes what you wanted</td><td>Substitution failure — concepts report it properly</td></tr>
+<tr><td>Debugger shows unreadable type names</td><td>Introduce type aliases</td></tr>
+<tr><td>CRTP object cannot go in a container with siblings</td><td>By design — different base types</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write a function template and a class template with a non-type parameter.</li>
+  <li>Explain why a template capacity parameter suits embedded containers.</li>
+  <li>Distinguish full and partial specialisation, and say what functions cannot do.</li>
+  <li>Explain <code>if constexpr</code> and why it beats <code>#ifdef</code>.</li>
+  <li>Write a concept and show the error message it produces.</li>
+  <li>Explain how concepts affect overload resolution.</li>
+  <li>Use a fold expression to process a parameter pack.</li>
+  <li>Name three costs of templates and a mitigation for each.</li>
+  <li>Implement CRTP and say what it gives up compared with virtual functions.</li>
+  <li>Measure the code size of several instantiations of one template.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

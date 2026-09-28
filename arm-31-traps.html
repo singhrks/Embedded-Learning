@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traps and virtualisation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Traps and virtualisation</h1>
+<p class="lead">A higher exception level can make specific operations at a lower level raise an exception
+instead of executing. That single mechanism — configurable trapping — is the whole basis of virtualisation,
+lazy state management and several security features.</p>
+
+<h2 id="idea">The mechanism</h2>
+
+<div class="key">
+<b>Trap, emulate, resume</b>
+<p>Set a bit in a control register at EL2 or EL3, and a chosen operation at a lower level stops executing and
+becomes a synchronous exception instead. The handler reads <code>ESR</code> to learn exactly what was
+attempted, does something equivalent, advances <code>ELR</code> past the instruction, and returns. The lower
+level never knows.</p>
+<p>This is how a guest can believe it owns hardware it does not have, and how a kernel can defer expensive
+state management until it is actually needed.</p>
+</div>
+
+<h2 id="registers">The trap control registers</h2>
+
+<p>Trapping is how a more-privileged level lets a less-privileged one keep executing an instruction it would
+normally be allowed to run, while quietly redirecting that specific instruction into an exception instead —
+which is the entire mechanism a hypervisor uses to intercept a guest kernel's behaviour without the guest's
+code needing to change at all. Each register below governs one category of thing that can be trapped:
+<code>HCR_EL2</code> is the hypervisor's main lever and covers stage-2 translation, interrupt virtualisation and
+a long list of individually trappable operations; <code>CPTR_EL2</code>/<code>CPACR_EL1</code> narrow that down
+to floating-point and vector state specifically, because emulating or lazily-saving FP context is a common
+optimisation; and <code>HFGRTR_EL2</code>/<code>HFGWTR_EL2</code> exist because early virtualisation hardware
+could only trap whole groups of registers at once, which was wasteful when a hypervisor only cared about one
+register in the group — fine-grained traps let it be precise instead.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>Owner</th><th>Notable bits</th></tr></thead>
+<tbody>
+<tr><td><code>HCR_EL2</code></td><td>Hypervisor</td><td><code>VM</code> enable stage 2 · <code>TGE</code> route all EL0 exceptions to EL2 · <code>IMO/FMO/AMO</code> virtualise IRQ/FIQ/SError · <code>TVM</code> trap virtual-memory register writes · <code>TWI/TWE</code> trap <code>WFI</code>/<code>WFE</code> · <code>TID0-3</code> trap ID register reads · <code>E2H</code> VHE</td></tr>
+<tr><td><code>CPTR_EL2</code> / <code>CPACR_EL1</code></td><td>Hypervisor / kernel</td><td><code>FPEN</code>, <code>ZEN</code>, <code>SMEN</code> — trap FP, SVE and SME access</td></tr>
+<tr><td><code>MDCR_EL2</code> / <code>MDCR_EL3</code></td><td>Hypervisor / monitor</td><td>Trap debug and performance-monitor access</td></tr>
+<tr><td><code>SCR_EL3</code></td><td>Secure monitor</td><td><code>NS</code> security state · <code>IRQ/FIQ/EA</code> routing · <code>SMD</code> disable <code>SMC</code> · <code>HCE</code> enable <code>HVC</code></td></tr>
+<tr><td><code>HFGRTR_EL2</code> / <code>HFGWTR_EL2</code></td><td>Hypervisor</td><td>Fine-grained traps (ARMv8.6): individual registers rather than whole groups</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="sysreg">Trapping a system register</h2>
+
+<p>A hypervisor can arrange for a guest's access to a system register to trap instead of executing, then emulate whatever answer it wishes to give. This is the basic building block of virtualisation.</p>
+
+<pre><code>/* Enable the trap at EL2: */
+        mrs     x0, hcr_el2
+        orr     x0, x0, #(1 &lt;&lt; 26)      /* TVM: trap virtual memory
+                                           control register writes */
+        msr     hcr_el2, x0
+        isb
+
+/* Now a guest at EL1 executing this: */
+        msr     ttbr0_el1, x5
+
+/* ...takes a synchronous exception to EL2 with ESR_EL2.EC = 0x18
+   (trapped MSR/MRS). The ISS encodes exactly which register and
+   which general register were involved:                    */
+
+  ESR_EL2.ISS for EC = 0x18:
+     [24:22] Op0      [20:17] Op2      [16:14] Op1
+     [13:10] CRn      [9:5]   Rt   ← the general register
+     [4:1]   CRm      [0]     Direction: 0 = write (MSR),
+                                         1 = read  (MRS)
+
+/* The handler: */
+static void handle_sysreg_trap(struct vcpu *v)
+{
+        u64 esr = read_sysreg(esr_el2);
+        u32 iss = esr &amp; 0x1FFFFFF;
+
+        int rt        = (iss &gt;&gt; 5) &amp; 0x1F;
+        bool is_read  = iss &amp; 1;
+        u32 reg_id    = iss &amp; ~0x3E;    /* the encoding, minus Rt */
+
+        if (is_read)
+                v-&gt;regs[rt] = emulate_sysreg_read(v, reg_id);
+        else
+                emulate_sysreg_write(v, reg_id, v-&gt;regs[rt]);
+
+        /* ADVANCE past the instruction, or we re-trap forever */
+        write_sysreg(read_sysreg(elr_el2) + 4, elr_el2);
+}
+
+/* That last step is the single most common bug in this area: the
+   guest appears frozen on one instruction, forever. Chapter 28. */</code></pre>
+
+<h2 id="mmio">Trapping MMIO</h2>
+
+<p>Leaving a region deliberately unmapped so that any access faults is how a hypervisor presents hardware that does not physically exist. The fault carries enough information to emulate the access exactly.</p>
+
+<pre class="diagram">Device emulation does not use a trap BIT — it uses an absent
+stage-2 mapping (chapter 16).
+
+   guest writes to what it believes is a UART register
+        │
+   ① stage 1 (guest's own tables): VA → IPA. SUCCEEDS.
+   ② stage 2 (hypervisor's): that IPA is deliberately UNMAPPED
+   ③ stage-2 data abort → EL2
+        │
+   ④ the hypervisor reads:
+        HPFAR_EL2    the faulting IPA → which device register
+        ESR_EL2.ISV  are the details valid?
+             SAS     access size
+             SRT     which guest register
+             WnR     read or write
+        │
+   ⑤ emulate the device, update the model
+   ⑥ ELR_EL2 += 4
+   ⑦ ERET
+
+  ISV is what makes this fast: without it the hypervisor would
+  have to FETCH and DECODE the guest's instruction to work out
+  what it was doing. Some access types (load/store pair, some
+  SIMD forms) do not set ISV, and those take the slow path.
+
+  COST: a full world switch per register access. A guest driver
+  doing ten register writes to send a packet takes ten exits.
+  This is exactly why virtio exists (OS chapter 20).</pre>
+
+<h2 id="lazy">Lazy FP and SVE state</h2>
+
+<p>Saving and restoring the vector register file on every switch is expensive and usually unnecessary. Trapping the first use instead means the cost is only paid by code that actually uses it.</p>
+
+<pre><code>/* FP/SIMD state is large — 32 x 128-bit V registers, or far more
+   with SVE. Saving it on every context switch would dominate the
+   cost, and most threads never touch it.                    */
+
+/* The optimisation:
+     1. on switch, DISABLE FP access for the incoming thread
+     2. if it never uses FP, nothing is saved or restored — free
+     3. if it executes an FP instruction, a TRAP fires        */
+
+        mrs     x0, cpacr_el1
+        bic     x0, x0, #(3 &lt;&lt; 20)      /* FPEN = 0: trap FP     */
+        msr     cpacr_el1, x0
+        isb
+
+/* The trap handler (ESR.EC = 0x07): */
+static void fpsimd_trap(void)
+{
+        save_fpsimd_state(previous_owner);
+        restore_fpsimd_state(current);
+        enable_fpsimd();                /* CPACR_EL1.FPEN = 3    */
+        /* do NOT advance ELR — we want the instruction RETRIED */
+}
+
+/* Note the contrast with the sysreg trap: here we do NOT advance
+   ELR, because we want the original instruction to execute now
+   that FP is enabled. Whether to advance depends entirely on
+   whether you EMULATED the instruction or ENABLED it.      */
+
+/* Which is also why kernel code may not use FP freely: its state
+   is not saved on kernel entry. Code that needs it must bracket
+   it explicitly (C chapter 16):                            */
+        kernel_neon_begin();
+        /* SIMD crypto or checksum */
+        kernel_neon_end();</code></pre>
+
+<h2 id="idle">Trapping WFI and WFE</h2>
+
+<p>A guest executing a wait instruction would idle a physical core that could be running someone else. Trapping it lets the hypervisor schedule something useful instead.</p>
+
+<pre><code>/* A guest executing WFI would halt the PHYSICAL core, which the
+   hypervisor cannot allow — it wants to schedule another vCPU.  */
+
+        HCR_EL2.TWI = 1     /* trap WFI → ESR.EC = 0x01 */
+        HCR_EL2.TWE = 1     /* trap WFE                 */
+
+/* The handler treats it as "this vCPU is idle": */
+static void handle_wfx_trap(struct vcpu *v, bool is_wfe)
+{
+        if (is_wfe)
+                kvm_vcpu_on_spin(v);      /* likely spinning on a
+                                             lock — yield         */
+        else
+                kvm_vcpu_block(v);        /* genuinely idle — block
+                                             until an interrupt    */
+        advance_elr(v);
+}
+
+/* The WFE case is interesting: a guest spinning on a lock held by
+   a DESCHEDULED vCPU wastes its entire timeslice. Trapping WFE
+   lets the hypervisor detect that and yield to the lock holder —
+   the "lock holder preemption" problem, and one of the reasons
+   paravirtualised spinlocks exist.                        */</code></pre>
+
+<h2 id="id">Trapping identification</h2>
+
+<p>A guest asking what hardware it is running on should get the answer the hypervisor wants to give, not the truth — which is what makes migration between different hosts possible.</p>
+
+<pre><code>/* HCR_EL2.TID0-TID3 trap reads of the ID registers, so the
+   hypervisor can present a guest with a DIFFERENT feature set
+   than the hardware actually has.                          */
+
+/* Why this matters:
+     · LIVE MIGRATION. A VM migrating between hosts must see the
+       same features throughout, so the hypervisor advertises the
+       intersection of the cluster's capabilities.
+     · big.LITTLE. Cores in one system genuinely differ. A guest
+       migrating between them would see the feature set change
+       under it, which no OS expects. The hypervisor normalises.
+     · SECURITY. Hiding a feature with a known erratum.
+
+   The cost: every ID register read becomes an exit. Guests read
+   them mostly at boot, so this is acceptable — but a guest that
+   polls one in a loop will be very slow.                  */</code></pre>
+
+<h2 id="finegrained">Fine-grained traps</h2>
+
+<p>Earlier trap controls were coarse, forcing a hypervisor to intercept far more than it needed. Newer cores allow trapping individual registers, which substantially reduces the overhead.</p>
+
+<pre><code>/* Original trap bits are coarse: HCR_EL2.TVM traps ALL
+   virtual-memory register writes, even ones the hypervisor does
+   not care about. Every unnecessary trap is a world switch.
+
+   ARMv8.6 adds FINE-GRAINED TRAPS: individual bits for
+   individual registers.                                     */
+
+        HFGRTR_EL2      fine-grained READ traps
+        HFGWTR_EL2      fine-grained WRITE traps
+        HFGITR_EL2      fine-grained INSTRUCTION traps
+        HDFGRTR_EL2 / HDFGWTR_EL2   debug registers
+
+/* So a hypervisor can trap exactly TTBR0_EL1 writes without
+   trapping TCR_EL1, VBAR_EL1 and the rest. Measurably fewer
+   exits on a memory-management-heavy guest.
+
+   The general principle: every trap is a cost, so the
+   architecture keeps adding ways to trap LESS.            */</code></pre>
+
+<h2 id="nested">Nested virtualisation</h2>
+
+<p>Running a hypervisor inside a virtual machine requires the outer one to emulate the whole trap mechanism for the inner one. It is as intricate as it sounds, and the architecture now assists it directly.</p>
+
+<pre class="diagram">Running a hypervisor INSIDE a guest. ARMv8.3 (NV) and 8.4 (NV2)
+make it practical.
+
+   L0 hypervisor at EL2 (the real one)
+        │
+   L1 hypervisor — believes it is at EL2, actually runs at EL1
+        │
+   L2 guest at EL1
+
+  The problem: L1 executes EL2 instructions and accesses EL2
+  registers, but it is at EL1. Without help, EVERY one of those
+  traps to L0, which must emulate it — including L1's own stage-2
+  table management, which L0 must SHADOW into real stage-2 tables.
+  Enormously slow.
+
+  NV (ARMv8.3): HCR_EL2.NV makes EL2 register accesses from EL1
+  trap cleanly and defines the semantics, so emulation is
+  correct rather than ad hoc.
+
+  NV2 (ARMv8.4): HCR_EL2.NV2 REDIRECTS L1's EL2 register accesses
+  to MEMORY — a VNCR page — instead of trapping. L1 writes what
+  it thinks is VTTBR_EL2 and it lands in a memory structure L0
+  reads later. No exit at all for the common case.
+
+  Used for: nested containers-in-VMs, developing hypervisors
+  inside a VM, and confidential computing stacks.</pre>
+
+<h2 id="tge">TGE and the host</h2>
+
+<p>One control bit changes where a host's own exceptions are routed, which is central to how VHE lets a normal kernel run at EL2.</p>
+
+<pre><code>/* HCR_EL2.TGE — "Trap General Exceptions" — routes ALL EL0
+   exceptions to EL2 instead of EL1.                        */
+
+/* Why: when a HOST kernel runs at EL2 with VHE (chapter 26), its
+   userspace runs at EL0 and its exceptions must reach EL2, not
+   the (nonexistent) EL1. TGE does that.
+
+   TGE also implicitly:
+     · disables stage-2 translation for EL1&0
+     · makes EL1 accesses behave as if no guest is present
+
+   So a VHE host runs with TGE=1 normally, and CLEARS it when
+   entering a guest. That one bit is the boundary between "host
+   context" and "guest context", and toggling it is a large part
+   of what a VM entry does.                                */
+
+/* You can see the transition in KVM's world-switch code:
+   __activate_traps / __deactivate_traps in
+   arch/arm64/kvm/hyp/                                     */</code></pre>
+
+<h2 id="cost">The cost of a trap</h2>
+
+<p>Every trap is an exception entry plus emulation plus a return. Knowing the rough figure explains why paravirtualised interfaces exist for the operations that would otherwise trap constantly.</p>
+
+<pre class="diagram">   guest instruction
+        │  exception entry to EL2          ~20-50 cycles
+        │  save guest state (registers,
+        │    system registers)             ~100-500 cycles
+        │  decode ESR, dispatch            ~20 cycles
+        │  EMULATE                         varies
+        │  restore guest state             ~100-500 cycles
+        │  ERET                            ~20 cycles
+        ▼
+   ~500-2000 cycles per exit, and more without VHE
+
+  Which is why the whole design direction is TRAP LESS:
+     stage-2 translation      instead of shadow page tables
+     GIC list registers       instead of trapping every EOI
+     virtio                   instead of emulating a real NIC
+     device passthrough       instead of any emulation at all
+     fine-grained traps       instead of coarse ones
+     NV2 memory redirection   instead of nested traps
+
+  MEASURING exits is the first step in any VM performance work:
+     perf stat -e kvm:kvm_exit -a sleep 10
+     perf record -e kvm:kvm_exit -a &amp;&amp; perf report
+        → group by exit reason. MMIO dominating means you should
+          be using virtio or passthrough.</pre>
+
+<h2 id="debug">Debugging traps</h2>
+
+<p>When a guest behaves unexpectedly, the question is usually which trap fired and what the hypervisor did with it. These are the ways to find out.</p>
+
+<pre><code># which exits, and how many?
+perf stat -e 'kvm:*' -a sleep 10
+perf record -e kvm:kvm_exit -a &amp;&amp; perf report --sort=dso,symbol
+
+# KVM's own statistics
+ls /sys/kernel/debug/kvm/*/
+cat /sys/kernel/debug/kvm/*/vcpu0/*
+#   mmio_exits, wfi_exits, wfe_exits, hvc_exits, sys64_exits...
+
+# trace them
+echo 1 &gt; /sys/kernel/debug/tracing/events/kvm/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+#   kvm_exit: ESR_EC: 0x24 (DABT_LOW) ... ipa 0x9000000
+
+# from inside a guest, confirm what it thinks it has
+cat /proc/cpuinfo | grep Features
+#   compare with the host's — differences mean ID traps are
+#   normalising the feature set
+
+# in a hypervisor you are writing: log every unhandled EC once
+        pr_warn_once("unhandled trap EC=0x%02x ISS=0x%07x\n", ec, iss);</code></pre>
+
+<div class="tip">
+<b>The two questions for any trap handler</b>
+<p><strong>Did I emulate the instruction, or did I enable something so it can run?</strong> If you emulated it,
+advance <code>ELR</code>. If you enabled something, do <em>not</em> — the instruction must be retried.</p>
+<p><strong>Is this trap on a hot path?</strong> If a workload takes millions of a particular exit, the answer
+is architectural: use a mechanism that does not trap at all. Emulating faster is rarely the right fix.</p>
+</div>
+
+<h2 id="deeper">Where this goes next</h2>
+
+<p>Traps are the mechanism; a hypervisor is what you build out of them. The
+<a href="virt-01-what-is-a-hypervisor.html">virtualisation track</a> picks up here —
+<a href="virt-04-hcr-traps.html">HCR_EL2 bit by bit</a>, <a href="virt-05-stage2.html">stage-2
+translation</a>, the <a href="virt-10-vgic.html">vGIC</a>, <a href="virt-14-virtio-transport.html">virtio</a>
+and <a href="virt-17-kvm-internals.html">KVM's implementation of all of it</a>, ending with a working
+hypervisor in two hundred lines.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest frozen on one instruction</td><td><code>ELR</code> not advanced after emulation</td></tr>
+<tr><td>FP instruction faults repeatedly</td><td><code>ELR</code> advanced when it should have been retried</td></tr>
+<tr><td>Guest I/O extremely slow</td><td>MMIO emulation — one exit per register access</td></tr>
+<tr><td>Guest hangs on a system register write</td><td>Trap configured but not handled</td></tr>
+<tr><td>Guest sees different CPU features than the host</td><td>ID register traps normalising for migration</td></tr>
+<tr><td>Guest spinlocks perform terribly</td><td>Lock holder preemption; needs WFE trapping and yield</td></tr>
+<tr><td>Nested VM is unusably slow</td><td>No NV2 — every L1 EL2 access traps to L0</td></tr>
+<tr><td>Kernel oops after using SIMD in a driver</td><td>FP state not saved; needs <code>kernel_neon_begin()</code></td></tr>
+<tr><td>Undefined instruction on <code>HVC</code></td><td><code>HCR_EL2.HCD</code> set, or EL2 not implemented</td></tr>
+<tr><td>Exits dominated by one reason</td><td>Use a non-trapping mechanism for that operation</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain the trap-emulate-resume cycle and which register configures it.</li>
+  <li>Decode the ISS of a trapped <code>MSR</code> and say what a handler does with it.</li>
+  <li>Explain why MMIO emulation uses an unmapped stage-2 page rather than a trap bit.</li>
+  <li>Say what <code>ISV</code> saves the hypervisor from doing.</li>
+  <li>Explain lazy FP switching and why its handler does <em>not</em> advance <code>ELR</code>.</li>
+  <li>Give two reasons a hypervisor traps ID register reads.</li>
+  <li>Explain what fine-grained traps improve.</li>
+  <li>Explain what NV2 changes about nested virtualisation.</li>
+  <li>Explain what <code>HCR_EL2.TGE</code> does and when a VHE host sets it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

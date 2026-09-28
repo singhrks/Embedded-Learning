@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrency and shared state in a design | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Concurrency and shared state in a design</h1>
+<p class="lead">Every variable touched by two contexts is a design decision, and in a design round you should
+be able to point at each one and say who writes it, who reads it, and what protects it. Most concurrency bugs
+are not subtle races — they are shared state nobody wrote down.</p>
+
+<h2 id="contexts">Name the contexts first</h2>
+
+<pre class="diagram">   "Two threads" is not enough detail. On an embedded
+   system the contexts have different capabilities, and
+   the right mechanism depends on which pair you have.
+
+   TASK &lt;-&gt; TASK        both can block. Mutexes, queues,
+                        semaphores all available.
+
+   ISR -&gt; TASK          the ISR CANNOT block. Only
+                        ISR-safe, non-blocking primitives.
+                        The common case.
+
+   ISR &lt;-&gt; ISR          different priorities can preempt
+                        each other. Same priority cannot.
+                        Only interrupt masking or atomics.
+
+   CPU &lt;-&gt; DMA          DMA is not a thread and obeys no
+                        lock. Ownership must be by
+                        protocol, plus barriers and cache
+                        maintenance.
+
+   CORE &lt;-&gt; CORE        real parallelism. Now you need
+                        actual atomics and barriers, not
+                        just interrupt masking - disabling
+                        interrupts on one core does NOT
+                        stop the other.
+
+   THE LAST ONE CATCHES PEOPLE. A critical section
+   implemented as "disable interrupts" is correct on a
+   single core and useless on a dual-core part. If the
+   design has two cores, every such critical section is a
+   bug.</pre>
+
+<h2 id="table">Write the sharing table</h2>
+
+<pre><code>FOR EVERY PIECE OF SHARED STATE, three columns. Producing
+this table in a design round is worth more than describing
+any individual mechanism.
+
+  state              writer      reader     protection
+  ------------------ ----------- ---------- ---------------
+  rx_ring[]          UART ISR    comms task SPSC, no lock
+  rx_head            UART ISR    comms task published after
+                                            data; single
+                                            writer
+  rx_tail            comms task  UART ISR   single writer
+  adc_sample         ADC ISR     ctrl task  volatile u32,
+                                            atomic on ARM
+  setpoint           comms task  ctrl task  double buffer
+                                            + atomic index
+  motor_state        ctrl task   all        mutex, PI on
+  error_counters     several     diag task  atomic add
+  config             comms task  all        RCU-style: swap
+                                            a pointer
+  dma_buffer[]       DMA         proc task  ownership flag
+                                            + cache maint
+
+THE PATTERNS, from cheapest to most expensive:
+
+  1. DON'T SHARE. Pass ownership through a queue. The
+     data belongs to exactly one context at a time and
+     there is nothing to protect. This is the right answer
+     far more often than people assume.
+
+  2. SINGLE WRITER, ALIGNED WORD. On ARM a naturally
+     aligned 32-bit load or store is atomic, so one writer
+     and any number of readers needs only volatile.
+
+  3. SPSC RING BUFFER. One producer, one consumer, power-
+     of-two size, publish the index AFTER the data. No
+     lock at all.
+
+  4. DOUBLE BUFFER + ATOMIC INDEX SWAP. Writer fills the
+     inactive buffer, then atomically swaps which is
+     active. Readers always see a consistent snapshot.
+
+  5. ATOMIC READ-MODIFY-WRITE. Counters, flags, simple
+     state machines.
+
+  6. INTERRUPT MASKING. Short critical sections, and the
+     only option when an ISR is involved. Single core only.
+
+  7. MUTEX WITH PRIORITY INHERITANCE. Task-to-task
+     exclusion over anything non-trivial.
+
+REACH DOWN THE LIST, NOT UP. A design that uses a mutex
+for something a queue would have solved has added a
+blocking point and an inversion risk for nothing.</code></pre>
+
+<div class="key">
+<b>The strongest answer to "how do you handle shared state?"</b>
+<p>"I try not to have any." Passing ownership through a queue — the producer fills a buffer, hands it over, and
+never touches it again — eliminates the class of bug rather than managing it. Every lock you do not have is a
+deadlock you cannot have, a priority inversion you cannot suffer, and a critical section that cannot delay an
+interrupt. Reaching for a mutex should be the fallback, not the default, and saying so demonstrates that you
+understand what locks actually cost.</p>
+</div>
+
+<h2 id="failures">The failure modes, and how to design them out</h2>
+
+<pre class="diagram">   RACE CONDITION
+     Two contexts touch the same state without ordering.
+     DESIGN OUT: the sharing table. If every row has a
+     protection column, you have at least considered each.
+
+   DEADLOCK
+     Two contexts each hold what the other wants.
+     DESIGN OUT: a global LOCK ORDER, documented, and never
+     taken out of order. Two locks is where this starts;
+     three is where it becomes likely.
+
+   PRIORITY INVERSION
+     A high-priority task blocked behind a low one, with a
+     medium one preventing progress. Unbounded.
+     DESIGN OUT: mutexes (not semaphores) with inheritance
+     enabled; short critical sections; and no lock shared
+     between a real-time task and a best-effort one.
+
+   LOST WAKEUP
+     A signal arrives between the check and the wait.
+     DESIGN OUT: use the kernel primitive rather than
+     rolling your own; on bare metal, the disable-then-WFI
+     pattern (WFI wakes on a pending interrupt even when
+     PRIMASK masks it).
+
+   TORN READ
+     A 64-bit value read as two 32-bit halves while it
+     changes.
+     DESIGN OUT: keep shared values word-sized, or use a
+     seqlock, or a critical section.
+
+   ABA / STALE POINTER
+     A pointer swapped and freed while another context
+     still holds it.
+     DESIGN OUT: never free while a reader might hold it -
+     use a pool with generation counts, or defer
+     reclamation.
+
+   THE ONE THAT ACTUALLY BITES MOST OFTEN in embedded
+   systems is not any of these - it is an ISR touching a
+   structure that a task is halfway through updating,
+   because nobody wrote down that the structure was
+   shared.</pre>
+
+<div class="qbank">
+<div class="qbank-head"><h3 id="q">Questions</h3><span class="qbank-count"></span></div>
+
+<details class="qa">
+<summary>An ISR and a task share a data structure. Walk me through your options.<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>First: the ISR cannot block, so mutexes are off the table entirely — there is no owner to record and
+nothing to switch to.</p>
+<p>Then, cheapest first. <strong>If it is a single aligned word with one writer</strong>, a
+<code>volatile</code> read/write is atomic on ARM and needs nothing else. <strong>If it is a stream</strong>,
+use a single-producer/single-consumer ring buffer: the ISR writes data then publishes the head index; the task
+reads the tail. No lock, and correct because each index has exactly one writer. <strong>If it is a structure
+that must be updated as a unit</strong>, either double-buffer it (the ISR fills the inactive one and swaps an
+index atomically, so the task always sees a consistent snapshot) or have the task disable interrupts briefly
+around its access — acceptable for a few instructions, and the only option that works both ways.
+<strong>If the RTOS provides a queue</strong>, use it: <code>xQueueSendFromISR</code> copies the data, handles
+the wake, and removes the problem.</p>
+<p>And the ISR must signal the task that there is work — with the yield-from-ISR call, or the woken task waits
+until the next tick for no reason.</p>
+<div class="qa-listen"><b>Listening for</b>Ruling out mutexes immediately with the reason, and reaching for a
+queue rather than inventing a lock.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Why is a single-producer, single-consumer ring buffer safe without a lock?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Three properties together. <strong>Each index has exactly one writer</strong> — the producer owns head, the
+consumer owns tail — so neither is ever the subject of a lost update. <strong>Both indices are single aligned
+words</strong>, so reads and writes are atomic on ARM. <strong>The producer publishes the head index
+<em>after</em> writing the data</strong>, so a consumer that sees a new head is guaranteed the corresponding
+byte is already stored.</p>
+<p>The third point is the one with a caveat: it relies on the writes not being reordered. On Cortex-M's
+largely in-order model that holds; on a weakly-ordered multicore system you need a release barrier before
+publishing the index and an acquire barrier after reading it — which is exactly what C11's
+<code>atomic_store_explicit(..., memory_order_release)</code> expresses.</p>
+<p>Also: use a power-of-two size so the wrap is a mask rather than a modulo, and treat "full" as
+<code>next == tail</code>, which wastes one slot but avoids needing a separate count that both sides would
+write.</p>
+<div class="qa-listen"><b>Listening for</b>All three properties, and the ordering caveat for multicore.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you prevent deadlock in a design with several locks?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Define a global lock ordering and never violate it. Number the locks, document the order, and require that
+any code holding lock N may only acquire locks numbered above N. This makes a cycle impossible by
+construction, which is stronger than testing for it.</p>
+<p>Supporting practices: hold as few locks at once as possible — ideally one; never call out of a subsystem
+while holding its lock, because you cannot know what the callee will take; use timeouts on acquisition so a
+deadlock becomes a detectable, reportable error rather than a silent hang; and prefer designs that do not need
+multiple locks at all — passing ownership through a queue avoids the problem entirely.</p>
+<p>For verification: Linux's <code>lockdep</code> (<code>CONFIG_PROVE_LOCKING</code>) proves the ordering at
+runtime and reports violations even when no deadlock actually occurred, which catches the bug before it
+manifests. It is worth enabling for driver work.</p>
+<div class="qa-listen"><b>Listening for</b>Lock ordering as a design rule rather than a testing problem, and
+"never call out while holding a lock".</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>A design has two cores. What changes about your critical sections?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Disabling interrupts stops preemption on <em>your</em> core and does nothing to the other one, so every
+critical section implemented that way becomes a bug. You now need real atomics — load-exclusive/store-exclusive
+or LSE instructions — and real barriers, because the two cores' views of memory can genuinely differ.</p>
+<p>You also need to think about which memory is shared and how it is mapped: shared data must be in a region
+marked as inner-shareable so the coherency protocol covers it, and if one core has a cache the other does not
+snoop, you need explicit maintenance.</p>
+<p>The other change is architectural. Two cores are often used asymmetrically — a Cortex-A running Linux and a
+Cortex-M in the same package, for instance — in which case the right pattern is usually not shared locks at
+all but a message-passing interface over a mailbox and a shared ring buffer, with ownership passed explicitly.
+That avoids needing a coherency story for arbitrary data structures and confines the hard part to one
+well-tested channel.</p>
+<div class="qa-listen"><b>Listening for</b>The interrupt-disabling failure specifically, and message passing
+as the preferred architecture rather than shared-memory locking.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How does a task safely read a value that a DMA controller is writing?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>DMA is not a thread and obeys no lock, so the protection has to be a <em>protocol</em>: at any moment, the
+buffer belongs either to the DMA or to the CPU, and ownership transfers only at defined points.</p>
+<p>The standard shape is double buffering: DMA fills buffer A while the task processes buffer B; at the
+transfer-complete interrupt they swap. The task never touches the buffer DMA owns. For a circular receive, the
+half-transfer and transfer-complete interrupts define the same boundary.</p>
+<p>Two mechanisms on top of the protocol. <strong>Barriers</strong>: the completion flag must not become
+visible before the data writes, so a <code>DMB</code> sits between them; and <code>volatile</code> is required
+so the compiler actually re-reads the flag. <strong>Cache maintenance</strong> on parts with a D-cache: clean
+before a memory-to-peripheral transfer so the DMA sees your data, invalidate after a peripheral-to-memory
+transfer so the CPU does not read stale lines — with buffers aligned and padded to the cache line size, or the
+invalidate will discard a neighbouring variable's cached value.</p>
+<p>And the buffer must be in DMA-reachable memory and never on the stack.</p>
+<div class="qa-listen"><b>Listening for</b>"Ownership protocol, not a lock" as the framing, then barriers and
+cache maintenance as the mechanisms.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Where would you use a double buffer rather than a lock?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>Whenever a reader needs a <em>consistent snapshot</em> of a multi-field structure and must not block —
+which describes most real-time readers. The writer fills the inactive buffer at its leisure, then atomically
+swaps an index; the reader reads whichever index is currently active and always sees a complete, coherent set
+of values.</p>
+<p>Concrete cases: a control loop reading a setpoint structure updated by a comms task; a display reading a
+frame of sensor values; a task reading calibration data that is occasionally recomputed.</p>
+<p>What it buys over a mutex: the reader never blocks, so a high-priority task cannot be delayed by a
+low-priority writer — the priority inversion is designed out rather than mitigated. The cost is double the
+memory and the fact that the reader may get slightly stale data, which for a control loop is almost always
+preferable to being late.</p>
+<p>The detail that matters: the index swap must be genuinely atomic, and the reader must latch the index once
+at the start of its read rather than re-reading it, or it can read across a swap.</p>
+<div class="qa-listen"><b>Listening for</b>"The reader never blocks" as the motivation, and latching the
+index once.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>What is a lost wakeup and how do you avoid it?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>A signal that arrives between the moment you test a condition and the moment you go to sleep, so the sleep
+never ends. The classic bare-metal form:</p>
+<pre><code>while (!work_pending) {
+    __WFI();      /* interrupt fires HERE: sets the flag,
+                     returns - then we sleep anyway */
+}</code></pre>
+<p>The symptom is a device that hangs roughly once a day and never reproduces on the bench.</p>
+<p>The fix on Cortex-M relies on an architectural guarantee: <code>WFI</code> wakes on a <em>pending</em>
+interrupt even when <code>PRIMASK</code> masks it. So you disable interrupts, test the condition, and
+<code>WFI</code> inside the masked region — the interrupt cannot run to set the flag, and if it is already
+pending the <code>WFI</code> returns immediately.</p>
+<p>With an RTOS you avoid rolling your own: a semaphore, queue or task notification handles the check-and-sleep
+atomically inside the kernel, which is exactly why those primitives exist.</p>
+<div class="qa-listen"><b>Listening for</b>The specific disable-test-WFI pattern and why the architectural
+guarantee makes it correct.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>Two tasks both need the SPI bus for different devices. How do you arrange that?<span class="qa-lvl m">Mid</span></summary>
+<div class="qa-body">
+<p>A bus mutex held across the whole transaction — from asserting chip select to deasserting it — because the
+bus configuration (mode, clock rate) and the chip select are shared state that must not change mid-transfer.
+Each device carries its own configuration, and the transaction function reconfigures the controller, drives CS,
+transfers, waits for the shift register to empty, releases CS, and gives the mutex back.</p>
+<p>The mutex must have priority inheritance and a timeout — never wait forever on a bus, because a wedged
+device then blocks a task permanently.</p>
+<p>The alternative that scales better: a single bus-owner task with a request queue. Other tasks post a
+transaction descriptor and wait for completion; only the owner touches the hardware. That serialises access by
+construction, makes DMA easy to use, and removes the mutex entirely — which is exactly what Linux's SPI
+subsystem does with its message queue and per-device <code>spi_device</code> structs.</p>
+<p>The failure without either: two tasks interleave, the mode changes mid-transaction, two chip selects go low
+at once, and you get corruption that appears only when both devices are used concurrently — that is, only in
+the integrated system and never in a unit test.</p>
+<div class="qa-listen"><b>Listening for</b>Holding the lock across the whole transaction including CS, and the
+bus-owner-task alternative.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>How do you test concurrency in an embedded system?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>Deliberately, because ordinary testing exercises one interleaving out of millions and the bug lives in a
+rare one.</p>
+<p><strong>Make races more likely:</strong> run at higher event rates than the product will see; add
+randomised delays at context-switch points; run on a faster or slower clock to change the timing;
+deliberately fire interrupts during critical sections.</p>
+<p><strong>Use tooling that reasons rather than samples:</strong> ThreadSanitizer on a host build (if the code
+is portable enough to run there — which is a good reason to write it that way); <code>lockdep</code> in kernel
+code, which proves lock ordering rather than testing it; static analysers that check for missing locks.</p>
+<p><strong>Instrument for evidence:</strong> record a trace of task switches, ISR entries and lock
+acquisitions — SystemView or Tracealyzer — so that when something does go wrong you can see the interleaving
+rather than guessing. This is also how you <em>see</em> priority inversion rather than inferring it.</p>
+<p><strong>And design so there is less to test:</strong> the sharing table, ownership passing, single-writer
+patterns. The most reliable way to pass a concurrency test is to have less concurrency.</p>
+<div class="qa-listen"><b>Listening for</b>Amplification and tracing as concrete techniques, and the closing
+point that design beats testing here.</div>
+</div>
+</details>
+
+<details class="qa">
+<summary>A field unit hangs once every few weeks with no crash log. Where do you look?<span class="qa-lvl s">Senior</span></summary>
+<div class="qa-body">
+<p>The absence of a crash log is itself information: the CPU is probably still executing, so this is a hang
+rather than a fault. That points at a deadlock, a lost wakeup, or a task blocked forever on something that
+never arrives.</p>
+<p>What I would want in place beforehand — and would add if not: a watchdog fed only from the place that proves
+real progress (a watchdog fed by a timer would keep a deadlocked system alive indefinitely); a record of which
+task was running and which were blocked, written to <code>.noinit</code> before the watchdog reset; the reset
+cause read at boot and reported; and per-task counters so a stalled task is visible as one whose counter
+stopped.</p>
+<p>Given those, the watchdog reset dumps the task states and the answer is usually immediate: a task blocked on
+a queue that no longer receives, or two tasks each holding what the other wants.</p>
+<p>The systematic causes to check in the code: any <code>portMAX_DELAY</code> without a recovery path — a lost
+signal then blocks a task permanently; any acquisition without a timeout; and any lock taken in two different
+orders anywhere.</p>
+<div class="qa-listen"><b>Listening for</b>Inferring "hang not fault" from the missing log, and the watchdog
+petting rule as the thing that makes the diagnosis possible.</div>
+</div>
+</details>
+
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Corruption only when two features are used together</td><td>Shared state nobody wrote down</td></tr>
+<tr><td>Hangs once every few weeks</td><td>Deadlock or lost wakeup; needs a progress-based watchdog</td></tr>
+<tr><td>High-priority task delayed unpredictably</td><td>Priority inversion — semaphore used for exclusion</td></tr>
+<tr><td>Critical sections stop working on a dual-core part</td><td>Interrupt masking does not affect the other
+core</td></tr>
+<tr><td>Reader sees half-updated structure</td><td>No snapshot mechanism — double buffer it</td></tr>
+<tr><td>64-bit counter occasionally absurd</td><td>Torn read across two 32-bit halves</td></tr>
+<tr><td>Woken task responds a tick late</td><td>Missing yield-from-ISR after a <code>FromISR</code> call</td></tr>
+<tr><td>DMA data occasionally stale on Cortex-M7</td><td>Missing cache invalidate, or unaligned buffer</td></tr>
+<tr><td>Bus corruption with two devices</td><td>Lock not held across the whole transaction</td></tr>
+<tr><td>Task blocked forever</td><td><code>portMAX_DELAY</code> with no recovery path</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five context pairs and the constraint each imposes.</li>
+  <li>Explain why interrupt masking is not a critical section on a dual-core part.</li>
+  <li>Give the three columns of a sharing table.</li>
+  <li>List the seven protection patterns from cheapest to most expensive.</li>
+  <li>Give the three properties that make an SPSC ring buffer lock-free, and the multicore caveat.</li>
+  <li>State the rule that makes deadlock impossible by construction.</li>
+  <li>Explain why a double buffer is preferable to a lock for a real-time reader.</li>
+  <li>Describe a lost wakeup and the disable-test-WFI fix.</li>
+  <li>Say why DMA needs an ownership protocol rather than a lock.</li>
+  <li>Give two techniques for making concurrency bugs appear in testing.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/qa.js"></script>
+</body>
+</html>

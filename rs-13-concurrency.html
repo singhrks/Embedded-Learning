@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fearless concurrency: Send, Sync, threads and channels | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Fearless concurrency: <code>Send</code>, <code>Sync</code>, threads and channels</h1>
+<p class="lead">Rust's data-race guarantee comes from two marker traits and the borrow checker. That is the
+whole mechanism — and it means a program that compiles cannot have a data race, which is a guarantee no
+other systems language offers.</p>
+
+<h2 id="markers">Send and Sync</h2>
+
+<p>Two traits carry the entire thread-safety story, and they are inferred rather than written. Understanding what each one means turns "fearless concurrency" from a slogan into a mechanism.</p>
+
+<pre class="diagram">   Send    it is safe to MOVE this type to another thread
+   Sync    it is safe to SHARE &amp;T with another thread
+           (equivalently: &amp;T is Send)
+
+   BOTH ARE AUTO TRAITS: the compiler implements them
+   automatically for any type whose components all implement
+   them. You almost never write them.
+
+   WHAT IS NOT Send:
+     Rc&lt;T&gt;           - a non-atomic refcount
+     *const T, *mut T - raw pointers, conservatively
+     MutexGuard      - some platforms require unlock on the
+                       locking thread
+
+   WHAT IS NOT Sync:
+     Cell&lt;T&gt;, RefCell&lt;T&gt;  - unsynchronised interior
+                            mutability
+     Rc&lt;T&gt;
+     raw pointers
+
+   WHAT IS BOTH: almost everything else. i32, String,
+   Vec&lt;T&gt; (if T is), Arc&lt;T&gt; (if T is Send+Sync), Mutex&lt;T&gt;
+   (if T is Send), atomics.
+
+   AND THE COMBINATION THAT MATTERS:
+        Mutex&lt;T&gt;   is Sync if T: Send
+   because the mutex provides the synchronisation, so sharing
+   a reference to it is safe as long as the contents can move
+   between threads.
+
+   THE ENFORCEMENT IS AUTOMATIC:
+
+        let rc = Rc::new(5);
+        thread::spawn(move || { println!("{rc}"); });
+        // error: `Rc&lt;i32&gt;` cannot be sent between threads
+        //        safely
+        //        required because it appears within the type
+        //        of the closure
+
+   You did not annotate anything. The compiler worked out
+   that the closure captures an Rc, that Rc is not Send, and
+   that spawn requires Send. THAT is the whole data-race
+   guarantee.</pre>
+
+<h2 id="threads">Threads</h2>
+
+<p>Spawning a thread is ordinary, and the compiler's insistence about what may cross into it is where the data-race guarantee actually lives.</p>
+
+<pre><code>    use std::thread;
+
+    let h = thread::spawn(|| {
+        expensive_work()
+    });
+    let result = h.join().unwrap();     // Result - Err if it
+                                        // panicked
+
+/* THE SIGNATURE explains the constraints: */
+    pub fn spawn&lt;F, T&gt;(f: F) -> JoinHandle&lt;T&gt;
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+
+/*   Send      the closure moves to another thread
+     'static   the thread may outlive this scope, so the
+               closure must not borrow anything local
+               (chapter 04)
+
+/* WHICH IS WHY `move` IS USUALLY REQUIRED: */
+    let data = vec![1, 2, 3];
+    thread::spawn(move || println!("{data:?}"));   // data
+                                                   // MOVED in
+
+/* SCOPED THREADS lift the 'static requirement, because the
+   scope guarantees they are joined before it ends: */
+    let data = vec![1, 2, 3];
+    thread::scope(|s| {
+        s.spawn(|| println!("{data:?}"));   // BORROWS - no
+                                            // move, no clone
+        s.spawn(|| println!("{}", data.len()));
+    });                                     // both joined
+                                            // here
+    println!("{data:?}");                   // still usable
+
+/* Two shared borrows in two threads - allowed, because
+   neither mutates. The borrow checker's rule extends across
+   threads with no extra machinery.                       */</code></pre>
+
+<h2 id="sharing">Sharing data</h2>
+
+<p>The standard combination for shared mutable state, and why the type system makes the lock impossible to forget — which is the difference from every C API you have used.</p>
+
+<pre><code>    use std::sync::{Arc, Mutex, RwLock};
+
+/* --- Arc&lt;Mutex&lt;T&gt;&gt;: the standard shape --- */
+    let counter = Arc::new(Mutex::new(0));
+
+    let mut handles = vec![];
+    for _ in 0..10 {
+        let c = Arc::clone(&amp;counter);
+        handles.push(thread::spawn(move || {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+        }));                    // the GUARD drops here,
+                                // unlocking
+    }
+    for h in handles { h.join().unwrap(); }
+    println!("{}", *counter.lock().unwrap());   // 10
+
+/* THE GUARD IS THE POINT: `lock()` returns a
+   MutexGuard&lt;T&gt; which Derefs to T and unlocks on Drop
+   (chapter 10). YOU CANNOT ACCESS THE DATA WITHOUT HOLDING
+   THE LOCK - the API makes it impossible, rather than
+   documenting it.
+
+   Compare C++ (C++ chapter 13), where std::mutex and the
+   data it protects are separate objects and nothing connects
+   them. Rust's Mutex&lt;T&gt; CONTAINS the data.
+
+/* POISONING: if a thread panics while holding the lock, the
+   mutex is poisoned and later lock() calls return Err -
+   because the data may be in a half-updated state.       */
+    match m.lock() {
+        Ok(g) => use(g),
+        Err(poisoned) => {
+            let g = poisoned.into_inner();  // use it anyway
+            recover(g);
+        }
+    }
+
+/* RwLock, for read-heavy data: */
+    let cfg = Arc::new(RwLock::new(Config::default()));
+    { let r = cfg.read().unwrap(); use(&amp;r); }   // many
+    { let mut w = cfg.write().unwrap(); w.rate = 48000; }
+                                                // one
+
+/* ATOMICS, for single values (C++ chapter 13 covers the
+   memory model, which is the SAME model): */
+    use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    COUNT.fetch_add(1, Ordering::Relaxed);
+
+    READY.store(true, Ordering::Release);
+    if READY.load(Ordering::Acquire) { /* sees prior writes */ }
+
+    let ok = FLAG.compare_exchange(false, true,
+                                   Ordering::AcqRel,
+                                   Ordering::Acquire).is_ok();
+
+/* THE ORDERINGS AND THEIR ARM INSTRUCTIONS are identical to
+   C++'s (C++ chapter 13, ARM chapter 21): Relaxed is a plain
+   access, Acquire is ldar, Release is stlr, SeqCst adds a
+   barrier. Use SeqCst unless you have measured a reason.  */</code></pre>
+
+<div class="key">
+<b>Why "fearless" is not marketing</b>
+<p>In C or C++, a data race is undefined behaviour you discover through corruption months later, and
+ThreadSanitizer finds only races your tests happen to execute. In Rust, the same mistake is a compile error
+with a message naming the type that is not <code>Send</code>. The class of bug does not become easier to
+debug — it becomes impossible to write outside <code>unsafe</code>.</p>
+</div>
+
+<h2 id="channels">Channels</h2>
+
+<p>Message passing as the alternative to shared state, and the ownership transfer that makes it cheap.</p>
+
+<pre><code>    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();     // unbounded, multi-
+                                        // producer,
+                                        // single-consumer
+
+    for i in 0..3 {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            tx.send(format!("from {i}")).unwrap();
+        });
+    }
+    drop(tx);                   // drop the ORIGINAL, or rx
+                                // never sees a disconnect
+
+    for msg in rx {             // iterates until every sender
+        println!("{msg}");      // is dropped
+    }
+
+    let (tx, rx) = mpsc::sync_channel(4);   // BOUNDED - send
+                                            // blocks when
+                                            // full
+
+    rx.recv()                   // blocks; Err when all
+                                // senders drop
+    rx.try_recv()               // non-blocking
+    rx.recv_timeout(dur)
+
+/* CHANNELS TRANSFER OWNERSHIP. `send(v)` moves v; the
+   receiver owns it afterwards. No sharing, therefore no
+   locking, therefore no race - which is why "share memory by
+   communicating" works so cleanly here.
+
+/* AND THE BETTER CRATE: */
+    use crossbeam_channel as chan;
+    let (tx, rx) = chan::bounded(16);
+    chan::select! {                     // wait on several
+        recv(rx1) -> msg => handle(msg),
+        recv(rx2) -> msg => handle(msg),
+        default(Duration::from_millis(10)) => timeout(),
+    }
+/* crossbeam adds multi-CONSUMER, select, and better
+   performance. It is what most production code uses.    */</code></pre>
+
+<h2 id="embedded">Concurrency without an OS</h2>
+
+<p>Without an OS there are no threads, and the concurrency is between an interrupt and main. The problem is real and the tools are different.</p>
+
+<pre><code>/* On bare metal there are no threads - there are interrupts,
+   and possibly several cores. Send and Sync still apply, and
+   the ecosystem uses them.                               */
+
+/* --- 1. ATOMICS, for flags and counters --- */
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static TICKS: AtomicU32 = AtomicU32::new(0);
+
+    #[interrupt]
+    fn SysTick() { TICKS.fetch_add(1, Ordering::Relaxed); }
+
+    fn now() -> u32 { TICKS.load(Ordering::Relaxed) }
+
+/* NOTE: not every target has atomics. Cortex-M0 lacks
+   LDREX/STREX, so `portable-atomic` provides them via
+   critical sections:                                     */
+    use portable_atomic::AtomicU64;     // works everywhere
+
+/* --- 2. CRITICAL SECTIONS, for compound state --- */
+    use critical_section::Mutex;
+    use core::cell::RefCell;
+
+    static SHARED: Mutex&lt;RefCell&lt;State&gt;&gt; =
+        Mutex::new(RefCell::new(State::new()));
+
+    #[interrupt]
+    fn TIM2() {
+        critical_section::with(|cs| {
+            SHARED.borrow(cs).borrow_mut().tick();
+        });
+    }
+/* `critical_section::Mutex` is not a blocking lock - it
+   requires a token proving interrupts are disabled
+   (chapter 10). Zero cost, and sound by construction.
+
+/* --- 3. A LOCK-FREE SPSC QUEUE, ISR to main --- */
+    use heapless::spsc::{Queue, Producer, Consumer};
+
+    static mut Q: Queue&lt;Event, 16&gt; = Queue::new();
+
+    // in init, once:
+    let (mut prod, mut cons) = unsafe { Q.split() };
+    // `prod` goes to the ISR, `cons` to the main loop -
+    // and the TYPES enforce that only one end does each
+
+    #[interrupt]
+    fn EXTI0() {
+        PRODUCER.enqueue(Event::Button).ok();   // never
+                                                // blocks
+    }
+    fn main_loop() {
+        while let Some(ev) = CONSUMER.dequeue() { handle(ev); }
+    }
+/* Single-producer single-consumer needs no lock at all - the
+   same design as the C++ ring in C++ chapter 13, with the
+   producer and consumer halves as distinct TYPES so the
+   invariant cannot be violated.
+
+/* --- 4. RTIC: priorities and resources, checked at compile
+       time --- */
+    #[app(device = pac, peripherals = true)]
+    mod app {
+        #[shared] struct Shared { counter: u32 }
+        #[local]  struct Local  { led: Led }
+
+        #[task(binds = TIM2, shared = [counter], priority = 2)]
+        fn timer(mut cx: timer::Context) {
+            cx.shared.counter.lock(|c| *c += 1);
+        }
+
+        #[idle(shared = [counter])]
+        fn idle(mut cx: idle::Context) -> ! {
+            loop {
+                let n = cx.shared.counter.lock(|c| *c);
+                ...
+            }
+        }
+    }
+/* RTIC applies the STACK RESOURCE POLICY: it computes each
+   resource's priority ceiling at compile time and raises
+   BASEPRI only as far as needed - so a resource shared only
+   between equal-priority tasks needs NO critical section at
+   all. Deadlock is impossible by construction, and the
+   analysis is done by the macro, not at run time
+   (chapter 20).                                          */</code></pre>
+
+<h2 id="unsafe-impl">Implementing Send and Sync</h2>
+
+<p>Occasionally you must assert thread-safety the compiler cannot infer. This is the correct way to do it and the obligation you take on by doing so.</p>
+
+<pre><code>/* Occasionally you must assert it yourself - almost always
+   because a raw pointer made the type conservatively
+   non-Send.                                              */
+
+    pub struct Uart { base: *mut u32 }
+
+    // SAFETY: `base` points to a memory-mapped peripheral.
+    // The Uart is created once via a token that guarantees
+    // exclusive ownership, so moving it between contexts
+    // cannot create aliasing.
+    unsafe impl Send for Uart {}
+
+    // NOT Sync: two &amp;Uart in two contexts could interleave
+    // register writes. Callers must wrap it in a Mutex.
+
+/* THE DISCIPLINE: `unsafe impl Send` and `unsafe impl Sync`
+   are promises the compiler cannot check (chapter 14).
+   Write the SAFETY comment, and state which of the two you
+   are NOT implementing and why - that second half is what
+   readers need.
+
+/* AND THE OPPOSITE - explicitly opting OUT: */
+    use core::marker::PhantomData;
+    pub struct NotSync {
+        data: u32,
+        _marker: PhantomData&lt;*const ()&gt;,    // raw pointer:
+                                            // not Send, not
+                                            // Sync
+    }
+/* PhantomData with a chosen type is how you control auto
+   traits without any runtime cost. `PhantomData&lt;&amp;'a T&gt;`
+   also expresses a lifetime relationship for a type that
+   holds no reference - which is what type-state patterns
+   need (chapter 02).                                     */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Error</th><th>Meaning and fix</th></tr></thead>
+<tbody>
+<tr><td>"<code>Rc&lt;T&gt;</code> cannot be sent between threads safely"</td><td>Use <code>Arc</code></td></tr>
+<tr><td>"<code>RefCell&lt;T&gt;</code> cannot be shared between threads"</td><td>Use <code>Mutex</code> or <code>RwLock</code></td></tr>
+<tr><td>"<code>*mut T</code> cannot be sent"</td><td>Wrap it and <code>unsafe impl Send</code>, with a justification</td></tr>
+<tr><td>"closure may outlive the current function"</td><td>Add <code>move</code>, or use a scoped thread</td></tr>
+<tr><td>"borrowed data escapes outside of function"</td><td>The <code>'static</code> bound — own the data or scope the thread</td></tr>
+<tr><td><code>lock()</code> returns <code>Err</code></td><td>Poisoned — a previous holder panicked</td></tr>
+<tr><td>Deadlock</td><td>Rust does <strong>not</strong> prevent this — establish a lock order</td></tr>
+<tr><td>Receiver never terminates</td><td>A sender clone was not dropped</td></tr>
+<tr><td><code>fetch_add</code> unavailable on Cortex-M0</td><td>No LDREX — use <code>portable-atomic</code></td></tr>
+<tr><td>Corruption between an ISR and main</td><td>No critical section, or the wrong atomic ordering</td></tr>
+<tr><td>RTIC reports a priority error</td><td>The analysis found a real ceiling violation at compile time</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define <code>Send</code> and <code>Sync</code> and say which common types lack each.</li>
+  <li>Explain how the compiler derives them and why you rarely write them.</li>
+  <li>Explain why <code>thread::spawn</code> requires <code>Send + 'static</code>.</li>
+  <li>Use scoped threads to borrow local data, and say why it is sound.</li>
+  <li>Explain why <code>Mutex&lt;T&gt;</code> containing the data beats a separate mutex.</li>
+  <li>Explain lock poisoning and how to recover.</li>
+  <li>Use a channel and explain why ownership transfer removes the need for locking.</li>
+  <li>Give four concurrency mechanisms for bare metal and when each fits.</li>
+  <li>Explain what RTIC computes at compile time and what it eliminates.</li>
+  <li>Write a justified <code>unsafe impl Send</code> and say what you deliberately did not
+  implement.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

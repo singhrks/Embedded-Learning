@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>virtio device families and vhost | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>virtio device families and vhost</h1>
+<p class="lead">One queue mechanism, thirty device types, and three places the device implementation can
+live: in the VMM process, in the host kernel, or in a separate process entirely. Which you choose decides
+your throughput, your latency and your blast radius when the device model has a bug.</p>
+
+<h2 id="families">The device families</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>ID</th><th>Device</th><th>Queues</th><th>What it is for</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>virtio-net</code></td><td>RX/TX pair per channel, plus a control queue</td><td>Networking.
+The most optimised of the lot; supports multiqueue, checksum and TSO offload</td></tr>
+<tr><td>2</td><td><code>virtio-blk</code></td><td>1 or more</td><td>Block storage. Simplest useful device —
+a good first one to implement</td></tr>
+<tr><td>3</td><td><code>virtio-console</code></td><td>2 per port</td><td>Serial ports and the hvc
+console</td></tr>
+<tr><td>4</td><td><code>virtio-rng</code></td><td>1</td><td>Entropy. Small, and matters more than it looks: a
+guest with no entropy blocks at boot</td></tr>
+<tr><td>5</td><td><code>virtio-balloon</code></td><td>2–3</td><td>Return guest pages to the host under
+pressure</td></tr>
+<tr><td>9</td><td><code>virtio-9p</code></td><td>1</td><td>File sharing, largely superseded by
+virtiofs</td></tr>
+<tr><td>16</td><td><code>virtio-gpu</code></td><td>2</td><td>Display and 3D, with venus/virgl for GPU
+passthrough of API calls</td></tr>
+<tr><td>18</td><td><code>virtio-input</code></td><td>2</td><td>Keyboard, mouse, touch — evdev over a
+queue</td></tr>
+<tr><td>19</td><td><code>virtio-vsock</code></td><td>3</td><td>Host↔guest sockets with no network stack. The
+right answer for an agent inside a VM</td></tr>
+<tr><td>22</td><td><code>virtio-snd</code></td><td>4</td><td>Audio</td></tr>
+<tr><td>23</td><td><code>virtio-fs</code></td><td>2+</td><td>FUSE protocol over a queue, with DAX so the guest
+can map host page cache directly</td></tr>
+<tr><td>25</td><td><code>virtio-iommu</code></td><td>1</td><td>A paravirtual IOMMU — lets a guest manage DMA
+mappings for its own passed-through devices</td></tr>
+<tr><td>27</td><td><code>virtio-mem</code></td><td>1</td><td>Memory hotplug at sub-DIMM granularity;
+supersedes ballooning for most uses</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>Which ones matter on an embedded target</b>
+<p><code>virtio-blk</code>, <code>virtio-net</code>, <code>virtio-console</code> and <code>virtio-rng</code>
+give you a fully functional Linux guest on QEMU's <code>virt</code> machine with four command-line options.
+Everything else is specialisation. Start there, and see the recipes in
+<a href="qemu-15-recipes.html">QEMU chapter 15</a>.</p>
+</div>
+
+<h2 id="where">Three places a device can live</h2>
+
+<p>The same device specification can be implemented in three different places, and the choice determines the performance and the failure modes far more than the device type does.</p>
+
+<pre class="diagram">   1. IN THE VMM (userspace, e.g. QEMU)
+
+      guest  --notify-->  KVM  --exit-->  QEMU thread
+                                            |
+                                          host syscall
+      Latency:  ~15-30 us per batch
+      Pros:     easy to write, debug and sandbox; full access
+                to files, sockets, image formats (qcow2)
+      Cons:     two context switches per batch
+
+   2. IN THE HOST KERNEL (vhost)
+
+      guest  --notify(ioeventfd)-->  KVM  --wake--> vhost-net
+                                                    kernel thread
+                                                       |
+                                                    net stack
+      Latency:  close to host-native
+      Pros:     no userspace round trip; the kernel already has
+                the socket/block layer right there
+      Cons:     device model is kernel code - a bug is a host
+                kernel bug. Only exists for net, blk (vhost-blk,
+                out of tree), scsi, vsock.
+
+      QEMU still does SETUP: feature negotiation, queue
+      addresses, and it hands vhost the memory map and the
+      eventfds. Only the DATA PATH moves.
+
+   3. IN ANOTHER PROCESS (vhost-user / vhost-vdpa)
+
+      guest  --notify-->  KVM  --> a separate daemon
+                                   (DPDK, SPDK, virtiofsd,
+                                    a rust-vmm device)
+      Latency:  can be the best of all - a polling DPDK thread
+                never sleeps, so there is no wake-up at all
+      Pros:     device crash does not take down the VMM or the
+                host kernel; can be written in Rust; can be
+                updated independently
+      Cons:     the daemon must map ALL of guest memory, so it
+                is inside the trust boundary for confidentiality
+
+      The daemon learns the guest memory layout over a UNIX
+      socket (the vhost-user protocol) and then accesses the
+      rings directly.</pre>
+
+<h2 id="net">virtio-net in detail</h2>
+
+<p>The networking device is the one with the most features and the most tuning knobs, and the interesting ones are all about avoiding copies and notifications.</p>
+
+<pre><code>/* Feature bits worth knowing, because they decide performance
+   far more than the ring implementation does.              */
+
+  VIRTIO_NET_F_CSUM            device handles checksums; the
+                               guest can send unchecksummed
+                               packets. Saves a pass over data.
+  VIRTIO_NET_F_GUEST_CSUM      the guest will accept them.
+  VIRTIO_NET_F_HOST_TSO4/6     device will segment; the guest
+                               may send 64 KB "packets".
+                               THE big win - one descriptor
+                               chain instead of forty.
+  VIRTIO_NET_F_GUEST_TSO4/6    guest accepts big receives (GRO).
+  VIRTIO_NET_F_MRG_RXBUF       merge several receive buffers
+                               into one packet - needed for
+                               large receives without wasting
+                               memory on small ones.
+  VIRTIO_NET_F_MQ              multiqueue: one RX/TX pair per
+                               vCPU, so no cross-CPU contention.
+  VIRTIO_NET_F_CTRL_VQ         a control queue for MAC filters,
+                               VLANs, offload changes.
+  VIRTIO_NET_F_MTU             device tells the guest the MTU.
+
+/* The header prepended to every packet: */
+
+struct virtio_net_hdr_v1 {
+        __u8  flags;            /* NEEDS_CSUM, DATA_VALID       */
+        __u8  gso_type;         /* NONE, TCPV4, UDP, TCPV6      */
+        __le16 hdr_len;
+        __le16 gso_size;        /* MSS for segmentation         */
+        __le16 csum_start;      /* where the checksum field is  */
+        __le16 csum_offset;
+        __le16 num_buffers;     /* MRG_RXBUF: how many buffers
+                                   this packet occupies         */
+};
+
+/* Descriptor chain for one transmitted packet:
+
+     desc[0]  the header above          (device reads)
+     desc[1]  the packet data           (device reads)
+     ...      more fragments if scattered
+
+   For a receive:
+
+     desc[0]  a buffer the DEVICE WRITES, big enough for header
+              plus data. With MRG_RXBUF, several such buffers
+              may be consumed for one large packet, and
+              num_buffers says how many.                     */</code></pre>
+
+<pre><code># Turn the knobs and watch what happens.
+
+# Multiqueue, 4 pairs, with vhost:
+$ qemu-system-aarch64 -M virt -accel kvm \
+   -netdev tap,id=n0,vhost=on,queues=4 \
+   -device virtio-net-pci,netdev=n0,mq=on,vectors=10
+
+# vectors = 2*queues + 2 (one per queue direction, plus config
+# and control). Too few and the guest silently falls back to
+# fewer queues.
+
+# In the guest, confirm:
+$ ethtool -l eth0
+Channels: Combined: 4
+
+# Which offloads did the guest actually get?
+$ ethtool -k eth0 | grep -E 'tx-checksum|tso|gro|gso'
+tx-checksumming: on
+tcp-segmentation-offload: on
+generic-receive-offload: on
+
+# Turning TSO off is the single fastest way to prove it matters:
+$ ethtool -K eth0 tso off
+$ iperf3 -c host      # expect a large drop</code></pre>
+
+<h2 id="blk">virtio-blk, the one to implement first</h2>
+
+<p>Block is the device to implement first: a small command set, an obvious data path, and a specification short enough to read in one sitting.</p>
+
+<pre><code>/* Three descriptors per request. That is the whole protocol. */
+
+struct virtio_blk_outhdr {
+        __le32 type;       /* IN=0 read, OUT=1 write,
+                              FLUSH=4, GET_ID=8, DISCARD=11,
+                              WRITE_ZEROES=13                */
+        __le32 reserved;
+        __le64 sector;     /* in 512-byte units, ALWAYS,
+                              regardless of the logical block
+                              size the device advertises     */
+};
+
+  desc[0]  -&gt; struct virtio_blk_outhdr   (device reads)
+  desc[1]  -&gt; the data buffer            (read: device writes
+                                          write: device reads)
+  desc[2]  -&gt; a single status byte       (device writes)
+                 VIRTIO_BLK_S_OK      0
+                 VIRTIO_BLK_S_IOERR   1
+                 VIRTIO_BLK_S_UNSUPP  2
+
+/* A device model's whole hot path: */
+
+static void blk_handle_request(struct blkdev *d, struct chain *c)
+{
+        struct virtio_blk_outhdr *h = c-&gt;desc[0].addr;
+        void   *buf  = c-&gt;desc[1].addr;
+        size_t  len  = c-&gt;desc[1].len;
+        uint8_t *st  = c-&gt;desc[2].addr;
+        off_t   off  = (off_t)le64toh(h-&gt;sector) * 512;
+
+        switch (le32toh(h-&gt;type)) {
+        case VIRTIO_BLK_T_IN:
+                *st = (pread(d-&gt;fd, buf, len, off) == (ssize_t)len)
+                    ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+                break;
+        case VIRTIO_BLK_T_OUT:
+                *st = (pwrite(d-&gt;fd, buf, len, off) == (ssize_t)len)
+                    ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+                break;
+        case VIRTIO_BLK_T_FLUSH:
+                *st = fdatasync(d-&gt;fd) == 0
+                    ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+                break;
+        default:
+                *st = VIRTIO_BLK_S_UNSUPP;
+        }
+        vq_complete(c, len);
+}
+
+/* THE FLUSH IS NOT OPTIONAL. A device model that ignores
+   VIRTIO_BLK_T_FLUSH will pass every functional test and lose
+   the guest's filesystem on the first host power cut, because
+   the guest believed its journal was durable. If you take one
+   thing from this chapter, take that.                       */</code></pre>
+
+<div class="danger">
+<b>Cache modes are a durability contract</b>
+<p>QEMU's <code>cache=</code> option decides who may lie about durability.
+<code>cache=writeback</code> (the default) lets the host page cache absorb writes and relies on the guest
+issuing flushes — correct, and fast, <em>if</em> your flush path works. <code>cache=unsafe</code> discards
+flushes entirely: excellent for a throwaway build VM, catastrophic for anything you care about.
+<code>cache=none</code> uses O_DIRECT. Choose deliberately, and never leave <code>unsafe</code> in a script
+someone else might reuse.</p>
+</div>
+
+<h2 id="vsock">virtio-vsock: the one people forget</h2>
+
+<p>A host-to-guest socket that needs no network configuration solves a problem most people work around badly, and it is under-used.</p>
+
+<pre><code>/* Host-guest communication without a network. No IP, no
+   firewall, no DHCP, no risk of the guest routing somewhere.
+   Addresses are (CID, port).                               */
+
+  CID 0  hypervisor
+  CID 1  local (loopback)
+  CID 2  the HOST, always
+  CID 3+ guests, assigned by the VMM
+
+# QEMU:
+$ qemu-system-aarch64 ... -device vhost-vsock-pci,guest-cid=42
+
+# Guest, a server:
+$ socat VSOCK-LISTEN:1234,fork -
+# Host, a client:
+$ socat - VSOCK-CONNECT:42:1234
+
+/* In C, it is just sockets: */
+    int s = socket(AF_VSOCK, SOCK_STREAM, 0);
+    struct sockaddr_vm a = {
+            .svm_family = AF_VSOCK,
+            .svm_cid    = VMADDR_CID_HOST,   /* 2              */
+            .svm_port   = 1234,
+    };
+    connect(s, (struct sockaddr *)&amp;a, sizeof a);
+
+/* Use it for: guest agents, log shipping, test harnesses,
+   debugging a guest with no network configured, and anything
+   where giving the guest a network interface would be a
+   security decision you do not want to make.               */</code></pre>
+
+<h2 id="fs">virtiofs and DAX</h2>
+
+<p>Sharing a filesystem rather than a block device changes the semantics considerably, and the memory-mapping path is what makes it fast.</p>
+
+<pre><code># Sharing a host directory with a guest, properly.
+
+# Host: run the daemon (a vhost-user device in its own process)
+$ /usr/libexec/virtiofsd --socket-path=/tmp/vfs.sock \
+      -o source=/srv/shared -o cache=auto
+
+# QEMU: connect to it, and give it shared memory
+$ qemu-system-aarch64 -M virt,memory-backend=mem \
+   -object memory-backend-file,id=mem,size=4G,\
+mem-path=/dev/shm,share=on \
+   -chardev socket,id=vfs,path=/tmp/vfs.sock \
+   -device vhost-user-fs-pci,chardev=vfs,tag=myfs
+
+# Guest:
+$ mount -t virtiofs myfs /mnt
+
+/* Why "share=on" and a file-backed memory object are
+   mandatory: virtiofsd is a SEPARATE PROCESS. It must be able
+   to map guest memory to read and write the queues. Anonymous
+   private memory cannot be shared, so the VM will start and
+   the mount will hang.
+
+   DAX goes further: with a DAX window, the guest maps host
+   PAGE CACHE PAGES directly into its own address space. A
+   read() becomes a memory access with no copy and no exit at
+   all. That is why virtiofs beats 9p by an order of magnitude
+   on metadata-heavy workloads like a source tree.          */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Guest filesystem corrupt after a host crash</td><td>Device model ignores
+<code>VIRTIO_BLK_T_FLUSH</code>, or <code>cache=unsafe</code></td></tr>
+<tr><td>Network throughput a fraction of the host's</td><td>TSO/checksum offload not negotiated — every packet
+is a separate chain</td></tr>
+<tr><td>Multiqueue configured but only one queue active</td><td>Too few MSI-X vectors, or the guest never sent
+the control-queue command to enable the pairs</td></tr>
+<tr><td>vhost-user device never starts, VM hangs at boot</td><td>Guest memory not shared
+(<code>share=on</code> and a file-backed memory object missing)</td></tr>
+<tr><td>Guest blocks for a minute early in boot</td><td>No <code>virtio-rng</code>; the entropy pool is
+empty</td></tr>
+<tr><td>Large receives dropped or truncated</td><td><code>MRG_RXBUF</code> negotiated but
+<code>num_buffers</code> not honoured</td></tr>
+<tr><td>Guest sees the wrong disk size after resizing</td><td>Config-space change not signalled with a
+configuration-change interrupt</td></tr>
+<tr><td>vsock connection refused from the host</td><td>Wrong CID — the guest must connect to CID 2, not to its
+own</td></tr>
+<tr><td>virtiofs mount hangs</td><td>Daemon not running, socket path mismatch, or DAX window requested without
+shared memory</td></tr>
+<tr><td>Everything is slow only with <code>-accel tcg</code></td><td>Not a virtio problem — emulation is the
+bottleneck (<a href="qemu-02-tcg.html">QEMU chapter 2</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name six virtio device types and what each replaces.</li>
+  <li>Compare the three places a device implementation can live, with a latency figure for each.</li>
+  <li>Explain what vhost moves into the kernel and what QEMU still does.</li>
+  <li>Explain why vhost-user requires shared guest memory.</li>
+  <li>List four virtio-net feature bits and say what each saves.</li>
+  <li>Describe the three-descriptor structure of a virtio-blk request.</li>
+  <li>Explain why ignoring <code>FLUSH</code> is a data-loss bug and not a performance choice.</li>
+  <li>Give the vsock CID for the host and describe one good use for vsock.</li>
+  <li>Explain what DAX gives virtiofs over 9p.</li>
+  <li>Diagnose "multiqueue configured but only one queue is busy".</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File systems | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>File systems</h1>
+<p class="lead">A filesystem turns a flat array of blocks into named, persistent, hierarchical objects — and
+must survive power loss halfway through any operation. That durability requirement is what makes filesystem
+design hard, and what every design below is really answering.</p>
+
+<h2 id="abstraction">What a filesystem provides</h2>
+
+<p>Dozens of filesystems answer to the same four system calls, which requires a layer in the middle translating generic operations into whatever each one actually does. That layer is why a program never needs to know what it is reading from.</p>
+
+<pre class="diagram">   application:   open("/home/user/data.txt")
+                          │
+   ┌──────────────────────▼───────────────────────────┐
+   │  VFS — the uniform layer                          │
+   │  file, inode, dentry, superblock                  │
+   └──────────────────────┬───────────────────────────┘
+        ┌─────────────────┼──────────────────┬─────────────┐
+        ▼                 ▼                  ▼             ▼
+     ext4              btrfs              NFS            procfs
+        │                 │                  │        (no storage
+        ▼                 ▼                  ▼         at all)
+   ┌────────────────────────────────┐   network
+   │  block layer (chapter 15)      │
+   └────────────┬───────────────────┘
+                ▼
+             device
+
+The VFS is why `cat` works on a disk file, a network mount, a pipe
+and /proc/cpuinfo without knowing the difference.</pre>
+
+<h2 id="vfs">The four VFS objects</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Object</th><th>Represents</th><th>Lifetime</th></tr></thead>
+<tbody>
+<tr><td><code>struct super_block</code></td><td>A mounted filesystem</td><td>From mount to unmount</td></tr>
+<tr><td><code>struct inode</code></td><td>A file's <em>metadata</em>: size, permissions, timestamps, block pointers. <strong>Not the name.</strong></td><td>Cached; one per file</td></tr>
+<tr><td><code>struct dentry</code></td><td>One path component and its inode — the name-to-inode binding</td><td>Cached aggressively (the dcache)</td></tr>
+<tr><td><code>struct file</code></td><td>An <em>open</em> file: the current offset, mode, and the <code>f_op</code> table</td><td>Per <code>open()</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Names live in directories, not in files</b>
+<p>An inode has no name. A <strong>directory</strong> is a file whose contents map names to inode numbers.
+This single design decision explains hard links (several names, one inode), why <code>rename()</code> within
+a filesystem is instantaneous (it edits directory entries only), why deleting a file with an open descriptor
+does not free the space (the inode's link count reached zero but its <em>open</em> count did not), and why you
+cannot hard-link across filesystems (inode numbers are only meaningful within one).</p>
+</div>
+
+<pre><code>ls -li                  # the leading number is the INODE number
+stat file.txt           # inode, links, size, blocks, timestamps
+                        # note: Links: 2 means two names for this inode
+
+ln  file.txt hard       # another NAME for the same inode
+ln -s file.txt soft     # a small file whose CONTENTS are a path
+
+df -i                   # inode usage — a filesystem can run out of
+                        # inodes while blocks remain free, which is a
+                        # confusing "No space left on device" with
+                        # df showing plenty of space
+
+# a deleted-but-open file still consumes space:
+lsof +L1                # files with link count 0 that are still open
+ls -l /proc/PID/fd/     # shows "(deleted)"</code></pre>
+
+<h2 id="layout">On-disk layout</h2>
+
+<p>Every filesystem has to solve the same structural problem: where to record what a file is, where its data lives, and which blocks are free. The designs differ in the details and share this skeleton.</p>
+
+<pre class="diagram">A classic UNIX-style filesystem (ext4 simplified)
+
+  +-----------+-------------+-------------+---------------------+
+  | superblock| inode bitmap| inode table |     data blocks     |
+  |           | block bitmap|             |                     |
+  +-----------+-------------+-------------+---------------------+
+
+  superblock   size, block size, free counts, mount state, UUID.
+               Replicated, because losing it loses everything.
+  bitmaps      which inodes and blocks are free
+  inode table  fixed-size records, indexed by inode number
+  data blocks  file contents and directory contents
+
+  ext4 divides all of this into BLOCK GROUPS so metadata sits near
+  the data it describes, reducing seeks on rotational media.
+
+How an inode finds its data:
+
+  small file    12 direct block pointers            → up to 48 KB
+  larger        1 single-indirect (a block of ptrs) → +4 MB
+                1 double-indirect                    → +4 GB
+                1 triple-indirect                    → +4 TB
+
+  ext4 replaces most of this with EXTENTS: (start, length) pairs.
+  One extent can describe 128 MB, so a large contiguous file needs
+  a handful of records instead of millions of pointers.</pre>
+
+<h2 id="consistency">Crash consistency: the real problem</h2>
+
+<p>This is the genuinely hard problem in filesystem design: a machine can lose power between any two writes, and the filesystem must still be interpretable afterwards. Each approach below is a different answer to that.</p>
+
+<pre class="diagram">Appending a block to a file requires THREE updates:
+
+   1. mark the block used in the block bitmap
+   2. add the block pointer to the inode
+   3. update the inode's size
+
+Power fails between any two:
+
+   after 1 only  → a block is leaked. Wasteful, not dangerous.
+   after 2 only  → the inode points at a block marked FREE.
+                   It will be handed to another file. Two files now
+                   share a block: SILENT CORRUPTION.
+   after 3 only  → size claims data that was never written; the
+                   file contains whatever was previously in that
+                   block — possibly another user's data. A
+                   security bug, not just a correctness one.
+
+There is no ordering of three independent writes that is safe,
+because the disk may reorder them and may not complete any of them.
+Every solution below adds a mechanism to make a MULTI-BLOCK update
+appear ATOMIC.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>Mechanism</th><th>Cost</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td><strong>fsck</strong></td><td>Repair inconsistencies after the fact by scanning everything</td><td>Hours on a large filesystem; may lose data</td><td>ext2, FAT</td></tr>
+<tr><td><strong>Journalling</strong></td><td>Write intent to a log first; replay it after a crash</td><td>Metadata written twice</td><td>ext3/4, XFS, NTFS</td></tr>
+<tr><td><strong>Copy-on-write</strong></td><td>Never overwrite; write new blocks and atomically switch the root pointer</td><td>Fragmentation; more space</td><td>btrfs, ZFS, APFS</td></tr>
+<tr><td><strong>Log-structured</strong></td><td>The whole filesystem is an append-only log</td><td>Needs garbage collection</td><td>F2FS, NILFS, and every SSD's FTL internally</td></tr>
+<tr><td><strong>Soft updates</strong></td><td>Carefully order writes so any prefix is consistent</td><td>Extremely intricate to implement</td><td>FFS on BSD</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Journalling modes in ext4 — the trade-off made explicit */
+
+data=journal      /* both data AND metadata to the journal first.
+                     Safest, and roughly halves write throughput.  */
+data=ordered      /* DEFAULT. Metadata journalled; data blocks are
+                     forced to disk BEFORE the metadata that refers
+                     to them commits. Prevents the "size claims
+                     unwritten data" case above.                   */
+data=writeback    /* metadata journalled, data unordered. Fastest;
+                     after a crash a file can contain stale blocks
+                     — including another file's old contents.      */
+
+mount -o data=ordered,barrier=1 /dev/sda1 /mnt
+/* barrier=1 (the default) issues cache flushes so the DEVICE does
+   not reorder the journal commit ahead of the data. Turning it off
+   is fast and unsafe, and is a very common cause of "journalling
+   did not protect me".                                          */</code></pre>
+
+<h2 id="durability">fsync and what "written" means</h2>
+
+<p>A successful write does not mean the data is safe. What actually guarantees durability — and what each level of flushing does and does not promise — is the distinction that separates a database that survives a power cut from one that does not.</p>
+
+<pre><code>write(fd, buf, n);      /* returns as soon as the data is in the
+                           PAGE CACHE. Nothing has reached disk. */
+
+fsync(fd);              /* force this file's data AND metadata out,
+                           and flush the device's write cache      */
+fdatasync(fd);          /* data plus only the metadata needed to
+                           read it back — skips timestamp updates,
+                           so it is measurably faster              */
+sync();                 /* everything, everywhere. Returns before
+                           completion on some systems.             */
+
+/* The durable-rename idiom — the standard way to update a file
+   atomically. Every step matters.                              */
+fd = open("file.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+write(fd, data, len);
+fsync(fd);                          /* 1. contents are durable    */
+close(fd);
+rename("file.tmp", "file");         /* 2. atomic swap of the name */
+dirfd = open(".", O_RDONLY);
+fsync(dirfd);                       /* 3. the RENAME is durable   */
+close(dirfd);
+
+/* Skipping step 3 is the classic bug: the rename is a directory
+   metadata change, and until the directory is synced a crash can
+   leave you with neither the old file nor the new one.        */</code></pre>
+
+<div class="danger">
+<b>Every layer has a cache that can lie</b>
+<p>Application buffer &rarr; libc <code>stdio</code> buffer &rarr; kernel page cache &rarr; device write cache
+&rarr; platters or flash. <code>fflush()</code> only empties the second. <code>fsync()</code> pushes through
+the third and asks the fourth to flush — but consumer drives have been known to acknowledge a flush without
+performing one, and a virtualisation layer or a RAID controller with a non-battery-backed cache can do the
+same. If durability genuinely matters, test it: write, cut power, verify.</p>
+</div>
+
+<h2 id="types">Filesystems worth knowing</h2>
+
+<p>A handful of filesystems account for nearly everything you will encounter, and each was designed around a particular assumption about the storage beneath it. Knowing which tells you where each is appropriate.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Filesystem</th><th>Design</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><strong>ext4</strong></td><td>Journalled, extents, block groups</td><td>The safe Linux default</td></tr>
+<tr><td><strong>XFS</strong></td><td>Journalled, B+trees, allocation groups, excellent parallelism</td><td>Large files, many threads, big storage</td></tr>
+<tr><td><strong>btrfs</strong></td><td>COW, snapshots, checksums, integrated RAID, compression</td><td>Snapshots and data integrity</td></tr>
+<tr><td><strong>ZFS</strong></td><td>COW, checksums everywhere, pooled storage, self-healing</td><td>Data you cannot lose; licence keeps it out of the kernel</td></tr>
+<tr><td><strong>F2FS</strong></td><td>Log-structured, flash-aware</td><td>Phones, embedded eMMC/SD</td></tr>
+<tr><td><strong>UBIFS / JFFS2</strong></td><td>Operate on <em>raw NAND</em>, doing their own wear levelling</td><td>Embedded devices with bare flash and no FTL</td></tr>
+<tr><td><strong>SquashFS</strong></td><td>Read-only, compressed</td><td>Firmware images, live systems, container layers</td></tr>
+<tr><td><strong>tmpfs</strong></td><td>Page cache with no backing store</td><td><code>/tmp</code>, <code>/run</code>, <code>/dev/shm</code></td></tr>
+<tr><td><strong>overlayfs</strong></td><td>Union: read-only lower + writable upper, COW per file</td><td>Containers, live images</td></tr>
+<tr><td><strong>FAT / exFAT</strong></td><td>No journal, no permissions, universally supported</td><td>Interchange only — never for anything that matters</td></tr>
+<tr><td><strong>procfs / sysfs / debugfs</strong></td><td>No storage; files are generated on read</td><td>Kernel interfaces (<a href="os-16-io-subsystem.html">ch. 16</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="flash">Flash storage changes the rules</h2>
+
+<p>Flash cannot be overwritten in place and wears out with use, which invalidates most assumptions built into traditional filesystems. Either the filesystem or the device must compensate, and which one it is matters enormously.</p>
+
+<pre class="diagram">NAND flash cannot overwrite. It can only:
+   · READ a page          (4-16 KB)
+   · PROGRAM a page       (once, after erase)
+   · ERASE a BLOCK        (128 KB - 4 MB) — and blocks wear out
+                            after ~1,000-100,000 erase cycles
+
+So a "write 4 KB at offset X" becomes:
+   read the whole block → erase it → reprogram it with the change
+   = WRITE AMPLIFICATION, and it consumes erase cycles.
+
+TWO PLACES this is solved:
+
+  MANAGED FLASH (SSD, eMMC, SD, UFS)
+      an on-device Flash Translation Layer does log-structured
+      writes, wear levelling, garbage collection and bad-block
+      management, and presents a normal block device.
+      → use ext4, XFS, F2FS. Issue TRIM/discard so the FTL knows
+        which blocks are free:  mount -o discard, or fstrim weekly.
+
+  RAW NAND (embedded, no FTL)
+      the FILESYSTEM must do all of that itself.
+      → UBI + UBIFS, or JFFS2. Using ext4 on raw NAND will destroy
+        the flash and lose data.
+
+Either way: the number of WRITES matters more than their size, and
+excessive logging or a chatty database can wear out an embedded
+device's flash in months.</pre>
+
+<h2 id="perf">Performance</h2>
+
+<p>Filesystem performance is dominated by a few effects rather than by raw throughput, and knowing which ones lets you fix a slow workload rather than replacing hardware that was never the bottleneck.</p>
+
+<pre><code># the dentry cache is why repeated path lookups are free
+cat /proc/sys/fs/dentry-state
+slabtop | grep -E 'dentry|inode'
+
+# and why a `find /` inflates memory — it populates the dcache
+echo 2 &gt; /proc/sys/vm/drop_caches    # drop dentries and inodes
+
+# readahead
+blockdev --getra /dev/sda
+posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+# many small files are dominated by metadata, not data
+#   1 file  of 1 GB   : ~1 open, sequential reads
+#   1M files of 1 KB  : ~1M opens, 1M inode reads, 1M dentry lookups
+# This is why extracting a source tarball is slower than copying a
+# disk image of the same size, and why build systems are IOPS-bound.
+
+# measure
+iostat -x 1
+fio --name=test --rw=randread --bs=4k --numjobs=4 --size=1G
+strace -c -e trace=openat,read,write,fsync ./program</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"No space left" but <code>df</code> shows free space</td><td>Inodes exhausted — check <code>df -i</code></td></tr>
+<tr><td>Deleting files does not free space</td><td>A process still holds the file open; <code>lsof +L1</code></td></tr>
+<tr><td>Data lost after power cut despite journalling</td><td>Device write cache not flushed, or barriers disabled</td></tr>
+<tr><td>File exists but is full of zeros after a crash</td><td><code>data=writeback</code>, or missing <code>fsync</code> before rename</td></tr>
+<tr><td>Config file lost entirely after a crash</td><td>Renamed without syncing the directory</td></tr>
+<tr><td>Extracting many small files is far slower than one big one</td><td>Metadata operations dominate; IOPS-bound</td></tr>
+<tr><td>Embedded device's flash fails after months</td><td>Write amplification and no wear levelling; wrong filesystem for raw NAND</td></tr>
+<tr><td>SSD slows down over time</td><td>TRIM not issued; the FTL cannot garbage collect</td></tr>
+<tr><td>Hard link across filesystems fails</td><td>Inode numbers are per-filesystem</td></tr>
+<tr><td>Memory usage grows during a large <code>find</code></td><td>Dentry and inode cache — reclaimable</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four VFS objects and what each represents.</li>
+  <li>Explain why names live in directories and give three consequences.</li>
+  <li>Describe the three-write append problem and why no ordering is safe.</li>
+  <li>Compare journalling and copy-on-write as crash-consistency strategies.</li>
+  <li>Explain the three ext4 journalling modes and their trade-offs.</li>
+  <li>Write the durable-rename idiom and say what each step protects.</li>
+  <li>Explain write amplification and the two places it can be handled.</li>
+  <li>Say why ext4 on raw NAND is a mistake, and what to use instead.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

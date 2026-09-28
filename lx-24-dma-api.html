@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The DMA API | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The DMA API</h1>
+<p class="lead">Giving a device direct access to memory, correctly. Three address spaces, two allocation
+styles, cache coherency, and the SMMU underneath it all — this is where the isolation track's theory becomes
+code you write.</p>
+
+<h2 id="addresses">Three kinds of address</h2>
+
+<p>This is the idea the whole chapter rests on, and getting it wrong is the source of the most damaging bugs in driver work. The address your CPU uses, the address the memory chip uses, and the address the <em>device</em> must use to reach that same memory are three different things, and they are not interchangeable.</p>
+
+<pre class="diagram">   VIRTUAL ADDRESS      what the CPU uses. void *.
+        |               Only meaningful to the kernel.
+        |
+   PHYSICAL ADDRESS     what is on the memory bus.
+        |               phys_addr_t.
+        |
+   DMA ADDRESS          what the DEVICE must be programmed
+                        with. dma_addr_t.
+
+  THEY ARE NOT THE SAME NUMBER, and assuming they are is the
+  defining DMA bug.
+
+  The DMA address differs from the physical address when:
+     · an SMMU/IOMMU is translating (isolation ch. 03-05) -
+       then the DMA address is an IOVA, an entirely made-up
+       number that exists only in the SMMU's page tables
+     · a bus applies an offset (dma-ranges in the DT)
+     · bounce buffering (SWIOTLB) is in play because the
+       device cannot address the memory you allocated
+     · the device sits behind a bridge that remaps
+
+  SO: NEVER program a device with virt_to_phys(). Always with
+  the dma_addr_t the DMA API gave you. The API is what knows
+  about the SMMU, the offsets and the bounce buffers - and it
+  is what SETS UP the SMMU mapping, so a hand-computed
+  physical address is not merely wrong, it is unmapped and
+  will fault (isolation ch. 06).</pre>
+
+<h2 id="mask">Step one: declare what the device can address</h2>
+
+<p>Many devices cannot address all of memory — an older peripheral may only manage 32 bits of address on a machine with 8 GB of RAM. You must tell the kernel what your device can reach, before any allocation, so it can hand you memory the device can actually use.</p>
+
+<pre><code>/* Before any allocation or mapping, in probe: */
+
+        ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
+        if (ret) {
+                dev_err(dev, "no suitable DMA mask\n");
+                return ret;
+        }
+
+/* WHAT THIS DECLARES: "this device's address register is 40
+   bits wide". The kernel then:
+     · allocates only from memory the device can reach
+     · sets up bounce buffers if you later map something above
+       that limit
+     · configures the SMMU's IOVA range accordingly
+
+   GET IT WRONG - claim 64 bits on a device with a 32-bit
+   address register - and the top bits are silently dropped by
+   the hardware. The DMA lands somewhere else in memory. This
+   is one of the nastiest bugs in the field: it works on a
+   board with 2 GB of RAM and corrupts memory on the 8 GB
+   variant, because only then do allocations land above 4 GB.
+
+   THE DEFAULT is 32 bits. If your device really is 32-bit,
+   you can omit the call - but state it explicitly anyway, so
+   the next reader knows it was considered.                 */</code></pre>
+
+<h2 id="coherent">Coherent (consistent) mappings</h2>
+
+<p>The simplest kind of DMA buffer: allocated once, long-lived, and set up so that CPU and device always see the same contents without any explicit synchronisation. It is the right choice for descriptor rings and control structures.</p>
+
+<pre><code>/* For memory the CPU and device both touch REPEATEDLY, for
+   the lifetime of the driver: descriptor rings, command
+   queues, status blocks.                                    */
+
+        void *cpu_addr;
+        dma_addr_t dma_handle;
+
+        cpu_addr = dma_alloc_coherent(dev, size, &amp;dma_handle,
+                                      GFP_KERNEL);
+        if (!cpu_addr)
+                return -ENOMEM;
+
+        /* program the device with dma_handle */
+        writel(lower_32_bits(dma_handle), base + REG_DESC_LO);
+        writel(upper_32_bits(dma_handle), base + REG_DESC_HI);
+
+        /* the CPU uses cpu_addr normally - NO cache
+           maintenance needed, ever                          */
+        ring[0].addr = ...;
+        ring[0].len  = ...;
+
+        ...
+        dma_free_coherent(dev, size, cpu_addr, dma_handle);
+
+/* WHAT "COHERENT" MEANS: the CPU and device see the same
+   data without explicit cache maintenance. How that is
+   achieved depends on the hardware:
+
+     · on a system with hardware coherency (dma-coherent in
+       the DT, ARM ch. 19), it is ordinary cached memory and
+       the interconnect keeps it consistent
+     · without it, the kernel maps the memory NON-CACHED
+
+   THAT SECOND CASE IS THE COST. Non-cached CPU access is
+   slow - every read goes to DRAM. So use coherent mappings
+   for SMALL, control-plane structures, and streaming mappings
+   for BULK data.
+
+/* AND EVEN COHERENT MEMORY NEEDS ORDERING BARRIERS
+   (chapter 26) - coherency is about caches, not about the
+   order in which writes become visible: */
+
+        ring[idx].flags = DESC_OWN;
+        dma_wmb();                      /* descriptor visible
+                                           BEFORE the doorbell */
+        writel(idx, base + REG_DOORBELL);
+
+/* A POOL, for many small identical buffers - avoids wasting a
+   page each: */
+        pool = dma_pool_create("mydev", dev, 64, /* size  */
+                                             64, /* align */
+                                             0); /* boundary */
+        p = dma_pool_alloc(pool, GFP_KERNEL, &amp;dma);
+        dma_pool_free(pool, p, dma);
+        dma_pool_destroy(pool);</code></pre>
+
+<h2 id="streaming">Streaming mappings</h2>
+
+<p>For data that already exists — a buffer handed to you by a filesystem or a network stack — you cannot choose how it was allocated. Instead you map it for the device temporarily, and the cache maintenance becomes something you must get exactly right.</p>
+
+<pre><code>/* For buffers used for ONE transfer, that the CPU already
+   owns: a network packet, a block of user data, a frame.   */
+
+        dma_addr_t dma;
+
+        dma = dma_map_single(dev, buf, len, DMA_TO_DEVICE);
+        if (dma_mapping_error(dev, dma))     /* CHECK IT */
+                return -ENOMEM;
+
+        /* the buffer now belongs to the DEVICE. The CPU MUST
+           NOT touch it until it is unmapped.               */
+        writel(lower_32_bits(dma), base + REG_ADDR);
+        writel(len, base + REG_LEN);
+        writel(GO, base + REG_CTRL);
+
+        wait_for_completion(&amp;d-&gt;done);
+
+        dma_unmap_single(dev, dma, len, DMA_TO_DEVICE);
+        /* now the CPU owns it again */
+
+/* THE DIRECTIONS, and they are not decorative: */
+        DMA_TO_DEVICE       CPU wrote it, device reads it
+        DMA_FROM_DEVICE     device writes it, CPU reads it
+        DMA_BIDIRECTIONAL   both. More cache maintenance.
+        DMA_NONE            debugging only
+
+/* WHAT map/unmap ACTUALLY DO on a non-coherent system:
+     map,   TO_DEVICE:    CLEAN the cache - push the CPU's
+                          writes out to memory so the device
+                          sees them
+     unmap, FROM_DEVICE:  INVALIDATE the cache - discard stale
+                          lines so the CPU reads what the
+                          device wrote
+   plus, always: set up (or tear down) the SMMU mapping for
+   this buffer, allocating an IOVA.
+
+   THE OWNERSHIP RULE follows directly: touching the buffer
+   while the device owns it either loses your write (it gets
+   invalidated) or reads stale data. It is not a convention;
+   it is what the cache maintenance implies.               */
+
+/* TOUCHING IT MID-TRANSFER, when you genuinely must: */
+        dma_sync_single_for_cpu(dev, dma, len, DMA_FROM_DEVICE);
+        inspect(buf);                   /* CPU owns it now */
+        dma_sync_single_for_device(dev, dma, len, DMA_FROM_DEVICE);
+        /* device owns it again */</code></pre>
+
+<div class="danger">
+<b>What you must never DMA to</b>
+<ul>
+<li><strong>Stack memory.</strong> On a <code>VMAP_STACK</code> kernel the stack is vmalloc'd, so it is not
+physically contiguous and <code>virt_to_phys</code> is meaningless. Even without that, it may share a cache
+line with other stack data, which cache maintenance would corrupt.</li>
+<li><strong><code>vmalloc</code> memory.</strong> Physically scattered (<a href="lx-05-allocators.html">chapter
+06</a>).</li>
+<li><strong>Module static data.</strong> May be in the module's vmalloc area.</li>
+<li><strong>Anything you did not map.</strong> With an SMMU present, an unmapped address is not "the wrong
+data" — it is a fault.</li>
+</ul>
+<p>Allocate with <code>kmalloc</code> and map it, or use <code>dma_alloc_coherent</code>. Every other route
+is a bug that hides until the machine configuration changes.</p>
+</div>
+
+<h2 id="sg">Scatter-gather</h2>
+
+<p>Large transfers are rarely one contiguous chunk of physical memory. Scatter-gather is how you hand a device a list of separate fragments and have it treat them as one transfer, which is what makes large I/O possible without huge contiguous allocations.</p>
+
+<pre><code>/* Large buffers are rarely physically contiguous. Rather than
+   forcing a contiguous allocation, describe the pieces.    */
+
+        struct sg_table sgt;
+        struct scatterlist *sg;
+        int i, nents;
+
+        /* build the list - or get one from a caller */
+        sg_alloc_table(&amp;sgt, nr_pages, GFP_KERNEL);
+        for_each_sgtable_sg(&amp;sgt, sg, i)
+                sg_set_page(sg, pages[i], PAGE_SIZE, 0);
+
+        /* map it ALL at once */
+        nents = dma_map_sgtable(dev, &amp;sgt, DMA_FROM_DEVICE, 0);
+        if (nents)
+                return nents;
+
+        /* CRITICAL: iterate the MAPPED list, not the original.
+           The IOMMU may have COALESCED several physical
+           segments into one contiguous IOVA range, so the
+           mapped list can be SHORTER.                       */
+        for_each_sgtable_dma_sg(&amp;sgt, sg, i) {
+                program_descriptor(d, i,
+                                   sg_dma_address(sg),
+                                   sg_dma_len(sg));
+        }
+
+        ... transfer ...
+
+        dma_unmap_sgtable(dev, &amp;sgt, DMA_FROM_DEVICE, 0);
+        sg_free_table(&amp;sgt);
+
+/* THE COALESCING POINT IS THE COMMON BUG: code that iterates
+   with for_each_sg() using the ORIGINAL nents, and reads
+   sg->length instead of sg_dma_len(sg), programs the wrong
+   descriptors. It works without an SMMU (where no coalescing
+   happens) and breaks the moment one is enabled - which is
+   exactly when someone turns on isolation.               */</code></pre>
+
+<h2 id="engine">Using a DMA engine</h2>
+
+<p>Many SoCs have a general-purpose DMA controller that moves data on your behalf, rather than each peripheral having its own. The kernel presents these through one common API, so a driver can request a channel and describe a transfer without knowing which controller the board has.</p>
+
+<pre><code>/* Many SoC peripherals do not master the bus themselves; a
+   shared DMA controller moves data for them. The dmaengine
+   API drives it.                                            */
+
+#include &lt;linux/dmaengine.h&gt;
+
+/* device tree: */
+        dmas = &lt;&amp;dmac 12&gt;, &lt;&amp;dmac 13&gt;;
+        dma-names = "tx", "rx";
+
+/* probe: */
+        d-&gt;rxchan = dma_request_chan(dev, "rx");
+        if (IS_ERR(d-&gt;rxchan))
+                return dev_err_probe(dev, PTR_ERR(d-&gt;rxchan),
+                                     "no rx channel\n");
+
+        struct dma_slave_config cfg = {
+                .direction    = DMA_DEV_TO_MEM,
+                .src_addr     = d-&gt;phys_base + REG_FIFO,
+                .src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+                .src_maxburst = 8,
+        };
+        dmaengine_slave_config(d-&gt;rxchan, &amp;cfg);
+
+/* one transfer: */
+        struct dma_async_tx_descriptor *desc;
+        dma_cookie_t cookie;
+
+        desc = dmaengine_prep_slave_sg(d-&gt;rxchan, sgt.sgl,
+                                       sgt.nents,
+                                       DMA_DEV_TO_MEM,
+                                       DMA_PREP_INTERRUPT |
+                                       DMA_CTRL_ACK);
+        if (!desc)
+                return -EINVAL;
+
+        desc-&gt;callback       = mydev_dma_done;
+        desc-&gt;callback_param = d;
+
+        cookie = dmaengine_submit(desc);
+        if (dma_submit_error(cookie))
+                return -EIO;
+
+        dma_async_issue_pending(d-&gt;rxchan);   /* GO */
+
+        ... the callback fires ...
+
+        dmaengine_terminate_sync(d-&gt;rxchan);  /* in remove -
+                                                 _sync waits  */
+        dma_release_channel(d-&gt;rxchan);
+
+/* CYCLIC transfers, for continuous capture - audio, ADCs:  */
+        desc = dmaengine_prep_dma_cyclic(chan, dma_addr,
+                                         buf_len, period_len,
+                                         DMA_DEV_TO_MEM,
+                                         DMA_PREP_INTERRUPT);
+/* the callback fires once per PERIOD and the transfer never
+   ends, which is how you build a ring without gaps.       */</code></pre>
+
+<h2 id="smmu">The SMMU, from the driver's side</h2>
+
+<p>On modern hardware the addresses a device issues are themselves translated, by a separate MMU sitting in front of the device. Most of the time this is invisible to you — and understanding that it is there explains several otherwise baffling failure modes.</p>
+
+<pre><code>/* Everything the isolation track described (chapters 03-07)
+   happens inside the DMA API. From the driver you see it in
+   three places:                                             */
+
+/* 1. THE DEVICE TREE declares the relationship: */
+        my_device: dma-thing@1c000000 {
+                compatible = "vendor,dma-thing";
+                reg = &lt;0x0 0x1c000000 0x0 0x1000&gt;;
+                iommus = &lt;&amp;smmu 0x42&gt;;    /* StreamID 0x42 */
+                dma-coherent;             /* hardware coherency */
+        };
+
+/* 2. dma_map_* SETS UP THE TRANSLATION and returns an IOVA,
+      not a physical address. dma_unmap_* tears it down and
+      invalidates the SMMU TLB.
+
+      This is why a "clever" driver that caches a dma_addr_t
+      and reuses it after unmapping gets an SMMU fault: the
+      mapping is gone.
+
+/* 3. FAULTS APPEAR IN dmesg with the StreamID: */
+      arm-smmu-v3 : event 0x10 received:
+      arm-smmu-v3 : 0x0000004200000010
+      arm-smmu-v3 : 0x0000000000000000
+        -&gt; C_BAD_STREAMID, or F_TRANSLATION at an IOVA
+
+      Read them with isolation chapter 06. The usual causes,
+      from a driver author's point of view:
+        · programmed the device with a physical address
+        · used a dma_addr_t after unmapping
+        · the device is issuing a longer transfer than you
+          mapped
+        · wrong StreamID in the DT, so the SMMU has no
+          context for this device at all
+
+/* AND THE DEBUGGING SWITCH worth knowing: */
+        iommu.passthrough=1        # kernel cmdline: bypass
+                                   # translation entirely
+   If the problem disappears with passthrough, it is a mapping
+   problem, not a hardware one. Never ship with it.        */</code></pre>
+
+<h2 id="debug">Debugging DMA</h2>
+
+<p>DMA bugs corrupt memory belonging to something else entirely, so the crash almost never points at the driver responsible. These tools exist to catch the mistake at the moment it happens rather than leaving you to work backwards from unrelated damage.</p>
+
+<pre><code># THE DMA DEBUG INFRASTRUCTURE - turn it on while developing:
+    CONFIG_DMA_API_DEBUG=y
+
+# It tracks every mapping and reports:
+#   · unmapping with the wrong size or direction
+#   · freeing memory that is still mapped
+#   · CPU access to a buffer the device owns
+#   · mapping the same buffer twice
+#   · a dma_addr_t used after unmap
+#   · DMA to a stack or vmalloc address
+#
+# The report names both the map and the misuse site. This
+# option finds more real DMA bugs than any amount of testing.
+
+    DMA-API: device driver tries to free DMA memory it has
+             not allocated [device address=0x00000000abcd0000]
+    DMA-API: device driver maps memory from stack
+
+# See the mappings:
+    cat /sys/kernel/debug/dma-api/dump
+    cat /sys/kernel/debug/dma-api/error_count
+
+# Force bounce buffering, to test that path:
+    swiotlb=force                 # kernel cmdline
+
+# Is the SMMU actually translating for this device?
+    ls /sys/kernel/iommu_groups/*/devices/
+    dmesg | grep -i smmu</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>DMA writes land in unrelated memory</td><td>Programmed with a physical or virtual address instead of the <code>dma_addr_t</code></td></tr>
+<tr><td>SMMU translation fault at a plausible address</td><td>Same cause — the physical address is not a valid IOVA</td></tr>
+<tr><td>Works on 2 GB board, corrupts on 8 GB</td><td>DMA mask too wide for the hardware; top address bits dropped</td></tr>
+<tr><td>Device reads stale data</td><td>Missing <code>dma_wmb()</code>, or the CPU wrote after mapping</td></tr>
+<tr><td>CPU reads stale data</td><td>Read before <code>dma_unmap</code> or <code>dma_sync_for_cpu</code></td></tr>
+<tr><td>Random corruption near a buffer</td><td>DMA to a stack buffer sharing a cache line</td></tr>
+<tr><td>Works without an SMMU, faults with one</td><td>Iterating the unmapped scatterlist, or using <code>sg-&gt;length</code> instead of <code>sg_dma_len</code></td></tr>
+<tr><td>Fault after a successful transfer</td><td><code>dma_addr_t</code> reused after unmapping</td></tr>
+<tr><td>Only the first N bytes transfer</td><td>Device programmed with a length longer than the mapping, truncated at the fault</td></tr>
+<tr><td>Everything works with <code>iommu.passthrough=1</code></td><td>Confirms a mapping bug, not a hardware one</td></tr>
+<tr><td><code>dma_alloc_coherent</code> fails for a large size</td><td>Fragmentation — use CMA (<a href="lx-05-allocators.html">ch. 06</a>)</td></tr>
+<tr><td>CPU access to a coherent buffer is very slow</td><td>Non-coherent system: it is mapped uncached. Use streaming for bulk data</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three address spaces and four reasons a DMA address differs from a physical one.</li>
+  <li>Set a DMA mask and explain the failure a too-wide mask causes.</li>
+  <li>Choose between coherent and streaming mappings, with the reason.</li>
+  <li>Explain what <code>dma_map_single</code> does on a non-coherent system, per direction.</li>
+  <li>State the ownership rule and why it follows from cache maintenance.</li>
+  <li>List four kinds of memory you must never DMA to.</li>
+  <li>Map a scatterlist and explain why you must iterate the mapped list.</li>
+  <li>Drive a transfer through the dmaengine API, including teardown.</li>
+  <li>Explain what the DMA API does with the SMMU, and read a fault.</li>
+  <li>Enable <code>DMA_API_DEBUG</code> and name five things it catches.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

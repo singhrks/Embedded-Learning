@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media frameworks and acceleration APIs | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Media frameworks and acceleration APIs</h1>
+<p class="lead">Between your application and the hardware sits a stack of abstractions whose job is to hide
+the differences between vendors — and whose main failure mode is to hide the fact that it silently stopped
+using the hardware at all.</p>
+
+<h2 id="layers">The stack</h2>
+
+<pre class="diagram">   YOUR APPLICATION
+        |
+   +----------------------------------------------------+
+   |  PIPELINE FRAMEWORK                                 |
+   |    GStreamer, ffmpeg/libav, MediaFoundation,        |
+   |    AVFoundation, ExoPlayer                          |
+   |    - demux, decode, filter, render, sync            |
+   +----------------------------------------------------+
+        |
+   +----------------------------------------------------+
+   |  ACCELERATION API                                   |
+   |    VA-API, V4L2 M2M, NVDEC, MediaCodec,             |
+   |    VideoToolbox, DXVA2 / D3D11VA                    |
+   +----------------------------------------------------+
+        |
+   +----------------------------------------------------+
+   |  KERNEL DRIVER                                      |
+   |    V4L2, DRM/KMS, vendor VPU driver                 |
+   +----------------------------------------------------+
+        |
+      HARDWARE
+
+   EACH LAYER CAN FALL BACK. That is the design goal - a
+   pipeline that always works - and the operational problem,
+   because "always works" and "works efficiently" are
+   different properties and only one of them is reported.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Framework</th><th>Where</th><th>Character</th></tr></thead>
+<tbody>
+<tr><td><strong>ffmpeg / libav*</strong></td><td>Everywhere</td><td>The universal toolkit. A library and a
+CLI; every other framework uses it or reimplements it</td></tr>
+<tr><td><strong>GStreamer</strong></td><td>Linux, embedded</td><td>A graph of elements negotiating caps.
+Powerful, and the negotiation is where the difficulty lives</td></tr>
+<tr><td><strong>MediaCodec / ExoPlayer</strong></td><td>Android</td><td>The only sanctioned path. ExoPlayer
+handles the container and adaptive streaming above it</td></tr>
+<tr><td><strong>AVFoundation / VideoToolbox</strong></td><td>Apple</td><td>Clean, well documented, hardware
+paths that work by default</td></tr>
+<tr><td><strong>Media Foundation</strong></td><td>Windows</td><td>Transform-based; wraps DXVA and vendor
+encoders</td></tr>
+<tr><td><strong>libcamera</strong></td><td>Linux</td><td>Replaces ad-hoc V4L2 camera code — handles the media
+graph, 3A and per-sensor tuning</td></tr>
+<tr><td><strong>Chromium / WebCodecs</strong></td><td>Browsers</td><td>WebCodecs exposes raw encode and decode
+to JavaScript, hardware-backed where available</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="gstreamer">GStreamer, and the negotiation problem</h2>
+
+<pre><code># A pipeline is a graph of elements. The pieces negotiate
+# CAPS - format, resolution, framerate, and crucially the
+# memory type.
+
+$ gst-launch-1.0 filesrc location=in.mp4 ! qtdemux ! h264parse \
+    ! avdec_h264 ! videoconvert ! autovideosink
+#   ^ software decode, and a videoconvert that will quietly
+#     do an NV12 -> RGB pass on the CPU
+
+# The hardware version, with everything staying in GPU memory:
+$ gst-launch-1.0 filesrc location=in.mp4 ! qtdemux ! h264parse \
+    ! vaapih264dec ! "video/x-raw(memory:VASurface)" \
+    ! vaapipostproc ! vaapisink
+#              ^^^^^^^^^^^^^^^^^^^ the caps filter that FORCES
+#              the frames to stay in VA surfaces. Without it
+#              GStreamer may insert a download to system
+#              memory and you lose the whole benefit.
+
+# V4L2 on embedded:
+$ gst-launch-1.0 v4l2src device=/dev/video0 \
+    ! "video/x-raw,format=NV12,width=1920,height=1080" \
+    ! v4l2h264enc ! h264parse ! matroskamux ! filesink location=out.mkv
+
+# THE DIAGNOSTIC THAT MATTERS - see what was actually
+# negotiated, element by element:
+$ GST_DEBUG=GST_CAPS:5 gst-launch-1.0 ... 2>&amp;1 | grep -i 'caps:'
+
+# Or dump the graph and look at it:
+$ GST_DEBUG_DUMP_DOT_DIR=/tmp gst-launch-1.0 ...
+$ dot -Tpng /tmp/*PLAYING*.dot -o pipeline.png
+# Every element and the caps on every link. If you see
+# videoconvert or a "system memory" caps where you expected
+# a hardware memory type, you found your problem.
+
+# "not-negotiated" is GStreamer's most common error and it
+# always means: no common format between two adjacent
+# elements. Read the caps on both sides and look for the
+# missing overlap - usually a pixel format or a modifier
+# (chapter 4).</code></pre>
+
+<div class="key">
+<b>Hardware memory types are the whole point</b>
+<p>Every acceleration API has a notion of "a frame that lives in hardware memory" —
+<code>memory:VASurface</code>, <code>memory:DMABuf</code>, <code>memory:GLMemory</code>,
+<code>AVHWFramesContext</code>. Keeping frames in that domain from decoder to display is what zero-copy
+<em>is</em> (<a href="vid-16-hardware-codecs.html">chapter 16</a>). The moment a frame is downloaded to system
+memory the benefit is gone, and every framework will do that download automatically and silently to make an
+otherwise-impossible link work.</p>
+</div>
+
+<h2 id="ffmpeg">ffmpeg's hardware model</h2>
+
+<pre><code>/* Two contexts, and understanding the split is most of it. */
+
+  AVHWDeviceContext   the device: a VA display, a CUDA
+                      context, a DRM fd
+  AVHWFramesContext   a POOL of frames living on that device,
+                      with a fixed format and size
+
+/* Decoding into hardware frames: */
+
+  AVBufferRef *hw_device = NULL;
+  av_hwdevice_ctx_create(&amp;hw_device, AV_HWDEVICE_TYPE_VAAPI,
+                         "/dev/dri/renderD128", NULL, 0);
+
+  codec_ctx-&gt;hw_device_ctx = av_buffer_ref(hw_device);
+  codec_ctx-&gt;get_format    = get_hw_format;   /* see below */
+
+/* THE CALLBACK IS MANDATORY. libavcodec asks which pixel
+   format you want from a list; if you do not pick the
+   hardware one, it silently gives you software frames and
+   everything still works, slowly. */
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                        const enum AVPixelFormat *fmts)
+{
+        for (const enum AVPixelFormat *p = fmts;
+             *p != AV_PIX_FMT_NONE; p++)
+                if (*p == AV_PIX_FMT_VAAPI)
+                        return *p;
+        fprintf(stderr, "no hardware format offered\n");
+        return AV_PIX_FMT_NONE;      /* fail LOUDLY rather
+                                        than fall back */
+}
+
+/* After decode, frame->format is AV_PIX_FMT_VAAPI and
+   frame->data[3] is the VASurfaceID. The pixels are NOT in
+   frame->data[0] - reading them requires an explicit
+   transfer, which is exactly the copy you are trying to
+   avoid: */
+
+  av_hwframe_transfer_data(sw_frame, hw_frame, 0);   /* SLOW  */
+
+/* Or export as DMABUF and hand it to DRM/KMS or the GPU
+   (chapter 18): */
+  av_hwframe_map(drm_frame, hw_frame, AV_HWFRAME_MAP_DIRECT);
+
+/* THE CLI equivalents: */
+$ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+    -hwaccel_output_format vaapi \
+    -i in.mp4 -c:v h264_vaapi -b:v 5M out.mp4
+#          ^^^^^^^^^^^^^^^^^^^^^^^^^ WITHOUT this the frames
+#          are downloaded to system memory after decode and
+#          uploaded again before encode - two full copies per
+#          frame, and it still "works".</code></pre>
+
+<h2 id="android">Android and the browser</h2>
+
+<pre><code>// MediaCodec - Android's only sanctioned codec API.
+// The same queue model as V4L2 underneath (chapter 17).
+
+MediaCodec codec = MediaCodec.createDecoderByType("video/avc");
+MediaFormat fmt = MediaFormat.createVideoFormat("video/avc", 1920, 1080);
+fmt.setByteBuffer("csd-0", spsBuffer);      // SPS
+fmt.setByteBuffer("csd-1", ppsBuffer);      // PPS
+
+// THE ZERO-COPY DECISION IS THIS ONE LINE:
+codec.configure(fmt, surface, null, 0);
+//                   ^^^^^^^
+//   a Surface  -> frames go straight to the compositor,
+//                 never touch the CPU. Fast path.
+//   null       -> frames come back as ByteBuffers you must
+//                 read, convert and upload. Slow path.
+// Passing null "to inspect the frames" is how a video app
+// becomes a battery problem.
+
+codec.start();
+for (;;) {
+    int in = codec.dequeueInputBuffer(10000);
+    if (in >= 0) { /* fill and queueInputBuffer */ }
+
+    MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+    int out = codec.dequeueOutputBuffer(info, 10000);
+    if (out >= 0)
+        codec.releaseOutputBuffer(out, true);  // true = render
+                                               // it to the
+                                               // Surface
+}
+
+// Check what the fast path is doing:
+//   adb shell dumpsys SurfaceFlinger
+//   look at the composition column: DEVICE = a hardware
+//   plane, CLIENT = GPU composited (chapter 18)</code></pre>
+
+<pre><code>// WebCodecs - raw codec access in the browser, hardware-backed
+// where the platform allows.
+
+const decoder = new VideoDecoder({
+  output: (frame) => {
+    // A VideoFrame. It may live in GPU memory - draw it
+    // straight to a canvas or a WebGL texture and it never
+    // touches JS memory.
+    ctx.drawImage(frame, 0, 0);
+    frame.close();          // MANDATORY. VideoFrames hold
+                            // hardware buffers and the pool is
+                            // small; forgetting close() stalls
+                            // the decoder within a few frames.
+  },
+  error: (e) => console.error(e),
+});
+
+// Ask before you commit - support varies by browser and
+// platform, and hardwareAcceleration is a HINT:
+const support = await VideoDecoder.isConfigSupported({
+  codec: 'avc1.640028',            // High profile, level 4.0
+  hardwareAcceleration: 'prefer-hardware',
+});
+
+decoder.configure({ codec: 'avc1.640028', codedWidth: 1920,
+                    codedHeight: 1080 });
+decoder.decode(new EncodedVideoChunk({
+  type: 'key', timestamp: 0, data: chunkBytes }));</code></pre>
+
+<div class="warn">
+<b>Every framework will lie to you by succeeding</b>
+<p>Ask for hardware decode into a texture. If the modifier does not match, or the format is unsupported, or
+the surface is the wrong type, the framework inserts a download, a colour conversion and an upload, and
+returns success. Frame rate on a desktop may be unaffected. The only reliable check is to measure the video
+engine's utilisation and the memory bandwidth — <code>intel_gpu_top</code>, <code>nvidia-smi dmon</code>,
+<code>dumpsys SurfaceFlinger</code>, or <code>/sys/kernel/debug/dri/0/state</code> — not whether the picture
+appears.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>CPU at 100% despite requesting hardware decode</td><td><code>get_format</code> callback missing, or
+the fallback was taken</td></tr>
+<tr><td>Two full-frame copies per frame in the profile</td><td><code>-hwaccel_output_format</code> not
+set</td></tr>
+<tr><td>GStreamer: "not-negotiated"</td><td>No common caps between adjacent elements — dump the graph</td></tr>
+<tr><td>GStreamer works but is slow</td><td>A <code>videoconvert</code> or a download inserted during
+negotiation</td></tr>
+<tr><td>Android app drains battery playing video</td><td><code>configure()</code> called with
+<code>null</code> instead of a Surface</td></tr>
+<tr><td>MediaCodec stalls after a few frames</td><td>Output buffers not released</td></tr>
+<tr><td>WebCodecs decoder stalls</td><td><code>frame.close()</code> not called</td></tr>
+<tr><td>Works on one machine, falls back on another</td><td>Different driver, format or modifier support</td></tr>
+<tr><td>Frames arrive but pixels are empty</td><td>Hardware frame read as if it were software —
+<code>data[0]</code> is not the picture</td></tr>
+<tr><td>Encoder output is much larger than expected</td><td>Hardware encoder, shallow search
+(<a href="vid-16-hardware-codecs.html">chapter 16</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the four layers between an application and video hardware.</li>
+  <li>Explain why every layer falling back gracefully is an operational problem.</li>
+  <li>Say what a hardware memory type is and name three examples.</li>
+  <li>Explain GStreamer caps negotiation and what "not-negotiated" means.</li>
+  <li>Distinguish <code>AVHWDeviceContext</code> from <code>AVHWFramesContext</code>.</li>
+  <li>Explain why ffmpeg's <code>get_format</code> callback is mandatory and what happens without it.</li>
+  <li>Say what <code>-hwaccel_output_format</code> prevents.</li>
+  <li>Identify the one line in a MediaCodec setup that decides the fast path.</li>
+  <li>Explain why <code>VideoFrame.close()</code> is mandatory in WebCodecs.</li>
+  <li>Give three ways to verify hardware acceleration is genuinely in use.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

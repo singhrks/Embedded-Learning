@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security internals: tokens, ACLs and integrity levels | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Security internals: tokens, ACLs and integrity levels</h1>
+<p class="lead">Three earlier chapters promised this one: <a href="win-29-process-internals.html">chapter
+28</a>'s Protected Process Light discussion, <a href="win-32-object-namespace.html">chapter 31</a>'s
+access-check-at-open-time mechanism, and <a href="win-34-alpc.html">chapter 33</a>'s impersonation walkthrough
+all deferred the actual token and ACL machinery to here. This chapter is that machinery: what a token actually
+contains, how a DACL is evaluated, and what integrity levels add on top of the DACL model.</p>
+
+<h2 id="token">The access token: identity plus everything it can do</h2>
+
+<p>Every access decision in Windows compares two things: what the caller has, and what the object requires. The token is the first half — the complete description of an identity and everything it is permitted to do.</p>
+
+<pre class="diagram">   EVERY PROCESS AND THREAD HAS AN ACCESS TOKEN attached -
+   the object the Security Reference Monitor consults every
+   time an access check happens. A token carries:
+
+     USER SID              who this is - a Security
+                           Identifier, not a name (names can
+                           change; the SID is the durable
+                           identity)
+     GROUP SIDs            every group this identity belongs
+                           to - Administrators, Users, and
+                           many built-in groups Windows
+                           itself uses internally
+     PRIVILEGES            a separate list from group
+                           membership - specific abilities
+                           like SeDebugPrivilege or
+                           SeShutdownPrivilege, each
+                           individually enabled or disabled
+                           (see below)
+     INTEGRITY LEVEL       Low / Medium / High / System -
+                           a SECOND, ORTHOGONAL axis on top of
+                           the DACL model (see below)
+     DEFAULT DACL          the ACL new objects THIS token
+                           creates will get if the creator
+                           does not specify one explicitly
+
+   TWO KINDS OF TOKEN:
+     PRIMARY TOKEN          the one a process itself runs as -
+                            set at process creation, rarely
+                            changed afterward
+     IMPERSONATION TOKEN    a token a THREAD temporarily
+                            adopts to act as someone else for
+                            one operation - exactly the
+                            mechanism chapter 33's ALPC
+                            impersonation walkthrough used,
+                            now named properly</pre>
+
+<div class="key">
+<b>Privileges are not the same axis as access rights</b>
+<p>An access right (like <code>FILE_WRITE_DATA</code>) is granted per-object, via that object's own DACL — it
+answers "can this identity touch this specific thing." A privilege (like <code>SeDebugPrivilege</code>, which
+lets a process open any other process for debugging regardless of that process's own DACL, or
+<code>SeShutdownPrivilege</code>) is granted to an identity globally, via the token, and answers a completely
+different question: "can this identity perform this class of system-wide operation at all." A process can hold
+a privilege and still fail an access check on a specific object if its DACL denies it, and — more relevant to
+malware analysis — a process failing every ordinary DACL check can still cause enormous damage if it holds a
+powerful privilege like <code>SeDebugPrivilege</code>, since that privilege exists precisely to bypass
+per-object DACL checks for debugging purposes.</p>
+</div>
+
+<h2 id="dacl">DACLs and ACEs: how the check is actually evaluated</h2>
+
+<p>The other half is the list attached to the object. It is evaluated in order, and that ordering is not cosmetic — a correctly written list and a badly ordered one containing the identical entries behave completely differently.</p>
+
+<pre class="diagram">   A DACL IS AN ORDERED LIST of Access Control Entries
+   (ACEs), and the ORDER MATTERS - the Security Reference
+   Monitor walks the list top to bottom and STOPS at the
+   first ACE that resolves the request, it does not
+   necessarily examine every entry.
+
+     ACE TYPE           MEANING
+     ACCESS_DENIED_ACE  if this SID matches and covers the
+                        requested access, DENY immediately -
+                        this is why a well-formed DACL puts
+                        DENY entries BEFORE ALLOW entries: a
+                        deny buried after a matching allow
+                        would never be reached
+     ACCESS_ALLOWED_ACE grant the matching, requested subset
+                        of access
+     SYSTEM_AUDIT_ACE   not an access decision at all - causes
+                        an audit log entry to be generated,
+                        independent of whether access was
+                        granted or denied
+
+   A DACL WITH ZERO ACEs is not "deny everything" the way an
+   empty allowlist intuitively suggests - it means NO ACCESS
+   IS EXPLICITLY GRANTED, which in practice denies everyone,
+   but a NULL DACL (no DACL at all, a distinct state from an
+   empty one) means NO PROTECTION - everyone gets everything,
+   a genuinely dangerous and rare configuration.</pre>
+
+<pre><code>PS&gt; Get-Acl C:\ProgramData\MyApp | Format-List
+PS&gt; icacls C:\ProgramData\MyApp
+# icacls output ordering reflects the actual ACE evaluation
+# order in the DACL - reading deny entries before allow
+# entries in the printed list is not a display convention,
+# it is showing you the real evaluation order described
+# above.
+
+/* From kernel mode, the equivalent access-check machinery a
+   driver occasionally needs directly (most drivers rely on
+   the I/O manager's own automatic check against the device
+   object's DACL and never call this themselves): */
+SeAccessCheck(securityDescriptor, subjectContext,
+              subjectContextLocked, desiredAccess,
+              previouslyGrantedAccess, &amp;privileges,
+              genericMapping, accessMode,
+              &amp;grantedAccess, &amp;accessStatus);
+</code></pre>
+
+<h2 id="integrity">Integrity levels: a second axis, orthogonal to the DACL</h2>
+
+<p>On top of the whole permission system sits a second, much simpler ranking that can only ever restrict access further. It is what makes sandboxing a browser meaningful even when the sandboxed code runs as your own user account.</p>
+
+<pre class="diagram">   MANDATORY INTEGRITY CONTROL adds a SIMPLE, ONE-DIMENSIONAL
+   ranking ON TOP of the full DACL model above, and the two
+   are evaluated as SEPARATE, BOTH-MUST-PASS checks:
+
+     SYSTEM     kernel and a small set of system services
+     HIGH       an elevated (UAC-elevated) administrator
+                process
+     MEDIUM     the default for an ordinary logged-on user's
+                processes, even an administrator's, until
+                elevated
+     LOW        a deliberately sandboxed process - the
+                classic example is a browser's rendering
+                process, or Protected Mode Internet Explorer
+                historically
+
+   THE CORE RULE: a process CANNOT WRITE to (or, with a few
+   specific exceptions, even open with write access) an
+   object whose integrity level is HIGHER than its own -
+   "no write up" - REGARDLESS of what the object's DACL would
+   otherwise allow. A Low-integrity process holding a token
+   whose DACL would ordinarily grant it write access to a
+   Medium-integrity file is STILL denied, because integrity
+   level is checked independently and can only make access
+   MORE restrictive than the DACL, never less.
+
+   THIS IS WHY SANDBOXING A BROWSER RENDERER AS LOW INTEGRITY
+   IS MEANINGFUL EVEN WHEN THE USER'S OWN ACCOUNT HAS FULL
+   RIGHTS EVERYWHERE: integrity level is a security boundary
+   the DACL alone cannot express, because the DACL describes
+   what an IDENTITY can do, while integrity level describes
+   how much a given RUNNING PROCESS - compromised or not - is
+   trusted to touch, independent of who is running it.</pre>
+
+<h2 id="uac">UAC elevation: two tokens for one logged-on administrator</h2>
+
+<p>This explains something every Windows user has experienced without knowing the mechanism: being an administrator does not mean your programs run with administrative rights. The account has two tokens, and which one a process gets is decided when it starts.</p>
+
+<pre class="diagram">   AN ADMINISTRATOR ACCOUNT UNDER UAC ACTUALLY GETS TWO
+   TOKENS AT LOGON, not one:
+
+     THE FILTERED TOKEN     Medium integrity, administrative
+                            group SIDs present but marked
+                            DENY-ONLY or as-needed-disabled -
+                            this is what EVERY ordinary
+                            process the user starts runs
+                            with by default
+     THE FULL (ELEVATED)    High integrity, full
+     TOKEN                  administrative rights active -
+                            used ONLY when a process is
+                            explicitly elevated ("Run as
+                            administrator"), which is exactly
+                            the consent prompt UAC shows
+
+   THIS IS WHY BEING "AN ADMINISTRATOR" DOES NOT MEAN EVERY
+   PROCESS YOU RUN HAS ADMINISTRATIVE RIGHTS: by default you
+   are running with the FILTERED token, at Medium integrity,
+   and only a process you explicitly elevate switches to the
+   full token at High integrity - the same account, two very
+   different tokens depending on which one a given process
+   was started with.</pre>
+
+<h2 id="ppl-tieback">Tying back: PPL and impersonation, now fully explained</h2>
+
+<p><a href="win-29-process-internals.html">Chapter 28</a> stated that Protected Process Light is a user-mode-
+only boundary that does not protect against kernel-mode code — now that mechanism can be stated precisely: PPL
+adds a signer-level check the object manager enforces on top of the normal token and DACL model, refusing even
+a process running with a fully elevated, High-integrity administrator token the ability to open a PPL process
+for the access rights that would let it read or write that process's memory, specifically because DACLs and
+integrity levels alone were not sufficient to stop a compromised-but-administrative process from tampering with
+security-sensitive processes like LSASS. And <a href="win-34-alpc.html">chapter 33</a>'s impersonation
+walkthrough was this same primary/impersonation token split in action: a server thread temporarily swaps its
+own primary token's effect for an impersonation token built from the calling client's identity, so every
+<code>SeAccessCheck</code> the server triggers during that one request is evaluated against the client's SIDs,
+privileges, and integrity level — not the server's own, generally more powerful, ones.</p>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A process fails an access check despite holding a relevant privilege</td><td>Privileges and DACL access
+rights are separate axes — check whether the object's DACL actually grants the right, and whether the
+privilege itself is enabled in the token, not just present</td></tr>
+<tr><td>A deny ACE appears to have no effect</td><td>It is ordered after a matching allow ACE — DACL evaluation
+stops at the first match, so deny entries must come first</td></tr>
+<tr><td>An object with zero ACEs denies everyone</td><td>Expected — an empty DACL grants nothing; do not
+confuse it with a NULL DACL, which grants everyone everything</td></tr>
+<tr><td>An elevated administrator process still cannot write to a file its DACL allows</td><td>Check the
+object's integrity level — "no write up" can deny access the DACL alone would permit</td></tr>
+<tr><td>A logged-on administrator's ordinary programs run without admin rights</td><td>Expected — by default
+they run with the filtered, Medium-integrity token; only explicitly elevated processes get the full token</td></tr>
+<tr><td>An elevated admin process still cannot open a PPL-protected process</td><td>Expected — PPL enforces a
+signer-level check that DACLs and integrity levels do not override</td></tr>
+<tr><td>An impersonating server's operation is denied even though the server itself has full rights</td><td>
+Expected — the operation is checked against the impersonated client's token, not the server's own</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List what an access token contains, and explain why the user identity is a SID rather than a name.</li>
+  <li>Explain the difference between a primary token and an impersonation token.</li>
+  <li>Explain why privileges and DACL access rights are evaluated as separate mechanisms.</li>
+  <li>Explain DACL evaluation order and why deny ACEs must precede allow ACEs to be effective.</li>
+  <li>Explain the difference between an empty DACL and a NULL DACL.</li>
+  <li>State the "no write up" rule and explain why it is meaningful even for a fully-privileged account.</li>
+  <li>Explain the two-token model UAC uses for administrator accounts.</li>
+  <li>Using this chapter, explain precisely why PPL resists even an elevated administrator, and how ALPC
+  impersonation evaluates access against the client rather than the server.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Advanced SIMD and floating point | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Advanced SIMD and floating point</h1>
+<p class="lead"><a href="arm-04-register-file.html">Chapter 4</a> showed that a second, wider register file
+exists alongside the integer one and left it there. This chapter is what it is for: how one instruction
+operates on many values at once, what the floating-point control registers actually change, why the whole
+register file has to be enabled before it can be used at all, and what it costs a kernel on every context
+switch.</p>
+
+<h2 id="lanes">One register, many values</h2>
+
+<p>The idea behind Advanced SIMD — universally called NEON — is that a 128-bit register need not hold one
+128-bit number. It can hold sixteen bytes, or eight 16-bit values, or four 32-bit values, and a single
+instruction operates on all of them simultaneously and independently.</p>
+
+<pre class="diagram">   THE SAME 128 BITS, INTERPRETED FOUR WAYS:
+
+   V0.16B   ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐  16 x  8-bit
+            └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘
+   V0.8H    ┌───┬───┬───┬───┬───┬───┬───┬───┐   8 x 16-bit
+            └───┴───┴───┴───┴───┴───┴───┴───┘
+   V0.4S    ┌───────┬───────┬───────┬───────┐   4 x 32-bit
+            └───────┴───────┴───────┴───────┘
+   V0.2D    ┌───────────────┬───────────────┐   2 x 64-bit
+            └───────────────┴───────────────┘
+
+   THE SUFFIX IS PART OF THE INSTRUCTION, not a property of
+   the register. The SAME register V0 is addressed as .16B in
+   one instruction and .4S in the next, and the hardware does
+   not track which you "meant" - the bits are simply
+   reinterpreted.
+
+     ADD  V2.4S, V0.4S, V1.4S
+
+   performs FOUR independent 32-bit additions. Lane 0 of V0
+   plus lane 0 of V1 goes to lane 0 of V2, and so on. There
+   is NO carry between lanes - that independence is the whole
+   point, and it is what lets the hardware do all four at
+   once.
+
+   THE NARROWER NAMES from chapter 4 - Q, D, S, H, B - are
+   the SCALAR view of the same registers, used when you want
+   one value rather than a vector. Qn is the full 128 bits;
+   Dn is the low 64; Sn the low 32; Hn the low 16.</pre>
+
+<div class="key">
+<b>Writing a narrow register zeroes the rest — always</b>
+<p>This mirrors the integer rule from <a href="arm-04-register-file.html">chapter 4</a>, where writing
+<code>W0</code> zeroes the top half of <code>X0</code>. Writing <code>S0</code> or <code>D0</code> zeroes
+every bit above it in <code>V0</code>. It is not a merge. Code that assumes the upper lanes survived a scalar
+operation is reading zeros, and this is one of the most common mistakes when hand-writing NEON — particularly
+when mixing scalar floating-point with vector code in the same routine.</p>
+</div>
+
+<h2 id="ops">The operation classes worth recognising</h2>
+
+<p>The instruction set is large, but it is not arbitrary — nearly everything falls into a handful of shapes,
+and recognising the shape tells you what an unfamiliar mnemonic does without looking it up.</p>
+
+<pre><code>/* --- ELEMENTWISE: lane N op lane N -> lane N ------------- */
+        ADD   V2.4S, V0.4S, V1.4S
+        FMUL  V2.4S, V0.4S, V1.4S      /* F prefix = float  */
+        FMLA  V2.4S, V0.4S, V1.4S      /* multiply-ACCUMULATE
+                                          into the destination -
+                                          the workhorse of any
+                                          dot product or filter */
+
+/* --- WIDENING and NARROWING: the lane count changes ------ */
+        UADDL V2.8H, V0.8B, V1.8B      /* 8x8-bit -> 8x16-bit,
+                                          so the sum cannot
+                                          overflow             */
+        XTN   V2.8B, V0.8H             /* back down, truncating */
+        SQXTN V2.8B, V0.8H             /* back down, SATURATING */
+
+/* --- SATURATING: clamp instead of wrap ------------------- */
+        SQADD V2.8B, V0.8B, V1.8B
+/* Q = saturating. 250 + 10 gives 255, not 4. This is the
+   behaviour audio and image code wants, and getting it for
+   free is a large part of why SIMD suits those domains. */
+
+/* --- REDUCTION: many lanes -> one value ------------------ */
+        ADDV  S0, V1.4S                /* sum of all lanes     */
+        UMAXV B0, V1.16B               /* largest lane         */
+/* Reductions are comparatively EXPENSIVE and they break the
+   independence that makes SIMD fast. Do them once at the end
+   of a loop, never inside it. */
+
+/* --- PERMUTE: move data between lanes -------------------- */
+        ZIP1  V2.4S, V0.4S, V1.4S      /* interleave           */
+        TBL   V2.16B, {V0.16B}, V1.16B /* arbitrary shuffle -
+                                          a 16-entry lookup    */
+
+/* --- STRUCTURED LOAD/STORE: de-interleave in the load ---- */
+        LD2   {V0.16B, V1.16B}, [x0]
+/* Loads 32 bytes and SPLITS them: even-numbered bytes into
+   V0, odd into V1. For interleaved data - stereo audio,
+   RGB pixels - this de-interleaves for free, which is often
+   worth more than the arithmetic instructions. LD3 and LD4
+   do the same for three- and four-way interleaving. */</code></pre>
+
+<h2 id="fpcr">Floating point: the control and status registers</h2>
+
+<p>Scalar floating point uses the same register file, and its behaviour is governed by two registers that most
+programmers never touch and that change results when they are touched. They matter to a kernel because they
+are part of a thread's context.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register / field</th><th>Controls</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><code>FPCR.RMode</code></td><td>Rounding mode — nearest-even, toward zero, up, down</td><td>Changing it
+changes results; a library that sets it and does not restore it corrupts every later calculation in that
+thread</td></tr>
+<tr><td><code>FPCR.FZ</code></td><td>Flush-to-zero: treat denormals as zero</td><td>Substantially faster on
+some implementations, and not IEEE-conformant — a deliberate accuracy trade, not a free win</td></tr>
+<tr><td><code>FPCR</code> exception enables</td><td>Whether invalid, divide-by-zero, overflow and inexact
+<em>trap</em></td><td>Untrapped by default: you get a default result and a sticky flag rather than an
+exception</td></tr>
+<tr><td><code>FPSR</code> cumulative flags</td><td>Sticky record that an exception condition occurred</td><td>
+They accumulate and are never cleared by hardware — you must clear them before a check means anything</td></tr>
+<tr><td><code>FPSR.QC</code></td><td>Sticky flag that a saturating instruction actually saturated</td><td>The
+only way to detect that a SIMD result was clamped rather than exact</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>These registers are per-thread state, and that has two consequences</b>
+<p>First, a kernel must save and restore them on a context switch along with the vector registers — omitting
+them means one thread's rounding mode silently leaks into another's arithmetic. Second, because the flags are
+<em>sticky</em> and never self-clear, testing <code>FPSR</code> to find out whether <em>your</em> calculation
+overflowed requires clearing it first; otherwise you are reading the accumulated history of everything that
+ran on that thread beforehand.</p>
+</div>
+
+<h2 id="enabling">The register file must be switched on first</h2>
+
+<p>This is the detail that turns a working user-space program into a kernel that crashes at boot, and it has
+no equivalent on the integer side: access to the whole SIMD and floating-point register file is trappable, and
+on reset it is trapped.</p>
+
+<pre><code>/* CPACR_EL1.FPEN controls whether EL0 and EL1 may execute
+   any FP or SIMD instruction at all.
+
+     00  trapped at both EL0 and EL1
+     01  trapped at EL0 only
+     10  trapped at both          (reserved-ish; see the ARM)
+     11  not trapped
+
+   AFTER RESET IT IS TRAPPING. An FP instruction executed
+   before this is configured takes an exception with
+
+        ESR_ELx.EC = 0b000111   (access to SVE/SIMD/FP
+                                 trapped)
+
+   which is chapter 29's syndrome decoding, and it is a
+   classic early-boot failure: the C compiler emitted a
+   floating-point or SIMD instruction into code you did not
+   think used floating point at all - a struct copy compiled
+   into vector loads, say - and the kernel dies before the
+   console is up.                                            */
+
+        MRS     x0, CPACR_EL1
+        ORR     x0, x0, #(3 << 20)      /* FPEN = 0b11 */
+        MSR     CPACR_EL1, x0
+        ISB                             /* chapter 21: the
+                                           change is not in
+                                           effect until this
+                                           retires            */
+
+/* THE SAME CONTROL EXISTS AT HIGHER LEVELS:
+     CPTR_EL2.TFP    traps FP/SIMD from EL1 and EL0 to EL2
+     CPTR_EL3.TFP    traps it to EL3
+   A hypervisor uses this deliberately - see below.
+
+   AND THIS IS WHY KERNELS FORBID FP IN KERNEL CODE:
+   it is not superstition. Kernel code runs with the user
+   thread's FP state loaded, so using FP would corrupt it
+   unless the kernel saves and restores around every use.
+   Linux therefore builds with -mgeneral-regs-only, which
+   makes the compiler refuse to emit FP or SIMD at all, and
+   provides explicit kernel_neon_begin()/end() for the rare
+   code - crypto, RAID checksums - that genuinely wants it. */</code></pre>
+
+<h2 id="lazy">Lazy context switching, and why the trap is deliberate</h2>
+
+<p>The trap described above is not only a safety check for unconfigured systems. Kernels keep it armed
+deliberately, as the mechanism behind an optimisation that makes the large register file affordable.</p>
+
+<pre class="diagram">   THE VECTOR REGISTER FILE IS 32 x 128 BITS = 512 BYTES,
+   plus FPCR and FPSR. Saving and restoring that on EVERY
+   context switch would be a significant cost - and most
+   threads never touch it.
+
+   SO KERNELS DO IT LAZILY:
+
+     1. On context switch, do NOT restore the new thread's
+        FP state. Instead, TRAP FP access (CPACR_EL1.FPEN)
+        and record that the registers currently belong to
+        some other thread.
+
+     2. If the new thread never uses FP - the common case -
+        nothing is ever saved or restored. Cost: zero.
+
+     3. The moment it DOES execute an FP instruction, the
+        trap fires. The handler:
+             - saves the register file to whichever thread
+               owns it right now
+             - loads this thread's saved state
+             - clears the trap
+             - RETURNS TO RE-EXECUTE the faulting instruction
+
+   THE COST MOVED, IT DID NOT VANISH: a thread that uses FP
+   pays one trap the first time it does so after each switch.
+   For a thread that uses FP constantly this is pure loss,
+   which is why some kernels track usage and switch to eager
+   saving for such threads.
+
+   THIS IS ALSO A SECURITY BOUNDARY. If step 3 restores the
+   registers but a path exists that clears the trap WITHOUT
+   restoring, a thread reads another thread's vector
+   registers - which may hold key material from a crypto
+   routine. That exact class of bug has been found in real
+   kernels more than once.</pre>
+
+<h2 id="using">Getting SIMD into your code</h2>
+
+<p>There are four ways to reach these instructions, and they trade control against portability and effort in
+a way that makes the choice reasonably clear-cut in practice.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>Control</th><th>When it is the right answer</th></tr></thead>
+<tbody>
+<tr><td><strong>Auto-vectorisation</strong> — let the compiler do it</td><td>None</td><td>Always try first.
+Costs nothing, and modern compilers vectorise simple loops well</td></tr>
+<tr><td><strong>Intrinsics</strong> — <code>vaddq_u32()</code> and friends</td><td>High; the compiler still
+allocates registers and schedules</td><td>The usual answer when auto-vectorisation fails. Portable across
+compilers, and debuggable</td></tr>
+<tr><td><strong>Inline assembly</strong></td><td>Total</td><td>Rarely. You take over register allocation and
+scheduling, and usually lose to the compiler</td></tr>
+<tr><td><strong>A library</strong> — Ne10, or your BLAS</td><td>None</td><td>For standard operations, someone
+has already tuned this per microarchitecture</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* CHECK WHETHER THE COMPILER ALREADY DID IT before writing
+   anything by hand - this is the step people skip:        */
+
+$ gcc -O3 -march=armv8-a -fopt-info-vec-optimized -c loop.c
+loop.c:7:3: optimized: loop vectorized using 16 byte vectors
+
+/* AND WHEN IT REFUSES, IT USUALLY TELLS YOU WHY: */
+$ gcc -O3 -fopt-info-vec-missed -c loop.c
+loop.c:7:3: missed: couldn't vectorize loop
+loop.c:8:12: missed: possible alias between data refs
+
+/* "possible alias" is the commonest reason, and it is
+   fixable: the compiler cannot prove the input and output
+   arrays do not overlap, so it must assume they might.
+   `restrict` (C chapter 04) is the promise that they do
+   not:                                                     */
+
+void scale(float * restrict out,
+           const float * restrict in, size_t n)
+{
+        for (size_t i = 0; i &lt; n; i++)
+                out[i] = in[i] * 2.0f;
+}
+/* Now it vectorises. One keyword, four times the throughput,
+   and no intrinsics written.                                */
+
+/* INTRINSICS, when you do need them: */
+#include &lt;arm_neon.h&gt;
+
+void scale_neon(float *out, const float *in, size_t n)
+{
+        float32x4_t two = vdupq_n_f32(2.0f);
+
+        for (size_t i = 0; i + 4 &lt;= n; i += 4) {
+                float32x4_t v = vld1q_f32(in + i);
+                vst1q_f32(out + i, vmulq_f32(v, two));
+        }
+        /* AND THE TAIL. n is rarely a multiple of 4, and
+           forgetting this is the single most common NEON
+           bug - it silently leaves the last few elements
+           unprocessed.                                     */
+        for (size_t i = n &amp; ~(size_t)3; i &lt; n; i++)
+                out[i] = in[i] * 2.0f;
+}</code></pre>
+
+<div class="note">
+<b>Where SVE differs, in one paragraph</b>
+<p>Advanced SIMD has a fixed 128-bit width baked into every instruction, which means code must be rewritten to
+exploit wider hardware. The Scalable Vector Extension removes that: the same binary runs on implementations
+with different vector lengths, because the length is read at run time and loops are controlled by predicate
+registers rather than by a trip count you computed. That also removes the tail problem above entirely. SVE
+uses its own register file (Z0–Z31, with the NEON V registers aliased into their low 128 bits) and its own
+enable bit alongside <code>FPEN</code> — so everything in this chapter about trapping, lazy switching and
+context size applies to it too, with a larger and <em>implementation-dependent</em> amount of state to save.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Kernel crashes very early, <code>EC = 0b000111</code></td><td>An FP or SIMD instruction executed
+before <code>CPACR_EL1.FPEN</code> was configured</td></tr>
+<tr><td>A kernel that uses no floating point still emits FP instructions</td><td>The compiler vectorised a
+struct copy or memset — build with <code>-mgeneral-regs-only</code></td></tr>
+<tr><td>Upper lanes of a vector register are unexpectedly zero</td><td>A scalar write to <code>Sn</code> or
+<code>Dn</code> zeroed the rest of <code>Vn</code></td></tr>
+<tr><td>The last few elements of an array are not processed</td><td>The scalar tail after a vectorised loop was
+omitted</td></tr>
+<tr><td>Results differ between two machines running the same binary</td><td>Flush-to-zero or a rounding mode
+was changed and not restored</td></tr>
+<tr><td>A saturating routine silently produces clamped values</td><td>Working as designed — check
+<code>FPSR.QC</code> if you need to know it happened</td></tr>
+<tr><td>Checking <code>FPSR</code> reports an exception you did not cause</td><td>The flags are sticky; clear
+them before the operation you want to test</td></tr>
+<tr><td>A loop will not auto-vectorise</td><td>Usually possible aliasing — add <code>restrict</code>, and read
+<code>-fopt-info-vec-missed</code></td></tr>
+<tr><td>One thread observes another's vector register contents</td><td>A lazy-FP switching bug — a serious
+security issue, not a correctness curiosity</td></tr>
+<tr><td>A thread using FP heavily is slower than expected</td><td>Paying a lazy-switch trap after every context
+switch</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>V0.4S</code> means and why the suffix belongs to the instruction, not the register.</li>
+  <li>Explain what happens to the upper bits of <code>V0</code> when you write <code>S0</code>.</li>
+  <li>Name five classes of SIMD operation and give an example of each.</li>
+  <li>Explain what a structured load (<code>LD2</code>) does and why it matters for interleaved data.</li>
+  <li>Name the two floating-point control registers and two things each governs.</li>
+  <li>Explain why <code>FPSR</code> flags must be cleared before they can be tested meaningfully.</li>
+  <li>Explain what <code>CPACR_EL1.FPEN</code> does and the boot failure it causes when forgotten.</li>
+  <li>Explain why kernels forbid floating point in kernel code, and what they use instead.</li>
+  <li>Describe lazy FP context switching, its benefit, and the security bug it can introduce.</li>
+  <li>Given a loop that will not vectorise, name the most likely reason and the fix.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

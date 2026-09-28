@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scheduling in Linux | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Scheduling in Linux</h1>
+<p class="lead">Five scheduling classes, one runqueue per CPU, and a set of latency properties that decide
+whether your embedded system meets its deadlines. This chapter is about what a driver author needs: which
+class to ask for, what preemption model you are running under, and where latency actually comes from.</p>
+
+<h2 id="classes">The classes, in priority order</h2>
+
+<p>Linux does not have one scheduler; it has several, tried strictly in order. A task belongs to exactly one class, and any runnable task in a higher class runs before <em>any</em> task in a lower one — which is what makes real-time behaviour possible at all.</p>
+
+<pre class="diagram">A task is picked from the HIGHEST non-empty class. Lower
+classes only run when every higher one is idle.
+
+  1. STOP          the stop-machine task. Not for you.
+  2. DEADLINE      SCHED_DEADLINE - EDF with admission control
+  3. REAL-TIME     SCHED_FIFO, SCHED_RR - fixed priority 1..99
+  4. FAIR          SCHED_OTHER, SCHED_BATCH - CFS/EEVDF.
+                   Where 99.9% of everything lives.
+  5. IDLE          SCHED_IDLE - only when nothing else wants
+                   the CPU
+
+  CONSEQUENCE, and it is the one that bites: a runaway
+  SCHED_FIFO task at priority 50 that never blocks will starve
+  EVERY normal task on that CPU, forever. Including your shell.
+  Including kernel threads that other things wait on.
+
+  Linux ships a safety valve for exactly this:
+     /proc/sys/kernel/sched_rt_runtime_us  = 950000
+     /proc/sys/kernel/sched_rt_period_us   = 1000000
+  RT tasks get at most 950 ms of every second, leaving 50 ms
+  for everything else. Turn it off (-1) only on a system you
+  have fully analysed.</pre>
+
+<h2 id="fair">The fair class</h2>
+
+<p>This is the class essentially everything runs in by default. Rather than fixed time slices, it tracks how much CPU each task has already received and always runs whoever is furthest behind — which is why "priority" here behaves less like a rank and more like a weighting.</p>
+
+<pre><code>/* CFS (and EEVDF, which replaced it in 6.6) does not use
+   priorities directly. It tracks how much VIRTUAL RUNTIME each
+   task has consumed and runs the one that is furthest behind.
+
+   NICE VALUES (-20 .. +19) scale the rate at which vruntime
+   accumulates. Each step of 1 is about 1.25x, so:
+
+        nice -20  ~ 88x the CPU share of nice +19
+        nice   0  the default
+        nice +19  minimal share
+
+   NICE IS A RATIO, NOT A GUARANTEE. Two nice-0 tasks get 50%
+   each; a nice-0 and a nice-5 get roughly 75/25. With one
+   runnable task, nice is irrelevant - it gets everything.  */
+
+/* THE KNOBS you will actually touch: */
+
+  /sys/kernel/debug/sched/base_slice_ns
+        the target time a task runs before being preempted.
+        Smaller = lower latency, more context switches.
+
+  /proc/sys/kernel/sched_child_runs_first
+  /proc/sys/kernel/sched_autogroup_enabled
+        desktop-oriented; usually off in embedded
+
+/* AND THE ONE THAT MATTERS ON MOBILE SoCs: */
+
+  SCHED_UTIL / schedutil governor + EAS (Energy Aware
+  Scheduling). On a big.LITTLE system the scheduler uses a
+  per-CPU energy model to decide WHERE to place a task, not
+  just when. A task placed on a little core that then needs
+  performance costs a migration plus a frequency ramp - which
+  is why "the benchmark is slow for the first 200 ms" is a
+  scheduling story, not a code story. (ARM ch. 33)         */</code></pre>
+
+<h2 id="rt">Real-time classes</h2>
+
+<p>When a task genuinely must run within a bounded time — servicing an audio buffer, driving a motor — fairness is the wrong goal. These classes drop it entirely: a real-time task runs until it yields, and everything else waits.</p>
+
+<pre><code>#include &lt;sched.h&gt;      /* userspace */
+
+        struct sched_param p = { .sched_priority = 50 };
+        sched_setscheduler(0, SCHED_FIFO, &amp;p);
+
+/* SCHED_FIFO   runs until it blocks, yields, or is preempted
+                by a HIGHER priority RT task. No time slice.
+   SCHED_RR     same, but round-robins with equal-priority
+                peers after a quantum
+                (/proc/sys/kernel/sched_rr_timeslice_ms)
+
+   Priorities 1 (lowest) to 99 (highest).
+
+   IN THE KERNEL, for a thread you created: */
+        sched_set_fifo(task);           /* a sane default RT */
+        sched_set_fifo_low(task);       /* priority 1 */
+        sched_set_normal(task, nice);
+
+/* WHEN AN RT THREAD IS RIGHT:
+     · a control loop with a hard period
+     · servicing a hardware FIFO that overruns
+     · audio, motor control, safety interlocks
+
+   THE RULES for writing one:
+     · it MUST block regularly. An RT task that spins is a
+       system hang.
+     · preallocate everything. No allocation in the loop.
+     · mlockall() in userspace, so no page faults.
+     · never take a lock also held by a non-RT task without
+       priority inheritance (rt_mutex) - that is priority
+       inversion, and it is how Mars Pathfinder famously
+       failed.
+     · pin it: sched_setaffinity, and isolate the CPU with
+       isolcpus= or cpusets, so nothing else competes.     */
+
+/* SCHED_DEADLINE - the honest one, when you can characterise
+   the work: */
+        struct sched_attr a = {
+                .sched_policy   = SCHED_DEADLINE,
+                .sched_runtime  =  1 * 1000 * 1000,  /* 1 ms  */
+                .sched_deadline =  5 * 1000 * 1000,  /* 5 ms  */
+                .sched_period   = 10 * 1000 * 1000,  /* 10 ms */
+        };
+        sched_setattr(0, &amp;a, 0);
+/* The kernel ADMITS it only if the system can still meet every
+   existing deadline - it does the utilisation arithmetic for
+   you and returns -EBUSY if not. That admission control is
+   what makes it a real guarantee rather than a hope.       */</code></pre>
+
+<h2 id="preempt">Preemption models</h2>
+
+<p>This is a single build-time choice about how aggressively the kernel is willing to interrupt its own code
+to run something more urgent, and it is the single biggest lever over worst-case latency available to anyone
+building an embedded system — trading average throughput for how quickly the system can react to the
+highest-priority thing waiting.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Model</th><th>Kernel code is</th><th>Typical worst-case latency</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>PREEMPT_NONE</code></td><td>Never preempted</td><td>Tens of ms</td><td>Throughput servers</td></tr>
+<tr><td><code>PREEMPT_VOLUNTARY</code></td><td>Preempted at explicit points</td><td>Several ms</td><td>Desktops</td></tr>
+<tr><td><code>PREEMPT</code></td><td>Preemptible except in critical sections</td><td>Hundreds of µs</td><td><strong>Most embedded</strong></td></tr>
+<tr><td><code>PREEMPT_RT</code></td><td>Nearly fully preemptible</td><td>Tens of µs</td><td>Hard real-time</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* PREEMPT_RT, merged into mainline over 6.12, changes the
+   rules your driver must obey:
+
+     · spinlocks become SLEEPING locks (rt_mutex based). Code
+       under a spin_lock() can be preempted.
+     · interrupt handlers run in THREADS by default, so they
+       can be prioritised and preempted.
+     · raw_spinlock_t is the only truly non-preemptible lock,
+       reserved for the scheduler and low-level arch code.
+     · local_irq_disable() sections must be tiny.
+
+   WHAT THIS MEANS FOR YOUR DRIVER:
+     · a long spin_lock section that was merely rude on a
+       normal kernel becomes a LATENCY BUG on RT
+     · you must not assume spin_lock disables preemption
+     · GFP_ATOMIC under a spinlock is now questionable, since
+       the lock can sleep
+     · code that must be atomic uses raw_spinlock_t - and
+       every use of that needs justification
+
+   TEST YOUR DRIVER ON PREEMPT_RT even if you do not ship it.
+   It surfaces latency and locking assumptions that are
+   invisible otherwise.                                     */</code></pre>
+
+<h2 id="latency">Where latency actually comes from</h2>
+
+<p>"The system is not responsive enough" is rarely a scheduler problem, even though the scheduler gets blamed. Latency accumulates from several independent sources, and fixing the wrong one wastes a great deal of time — so it is worth knowing what they are before reaching for priorities.</p>
+
+<pre class="diagram">An interrupt fires. How long until your RT thread runs?
+
+   1. INTERRUPTS DISABLED somewhere        &lt;-- usually the
+      the GIC cannot even deliver              biggest source
+   2. hardware IRQ latency, GIC to CPU
+   3. the top half runs
+   4. it wakes your thread
+   5. PREEMPTION DISABLED somewhere        &lt;-- second biggest
+      the scheduler cannot switch
+   6. the scheduler picks your thread
+   7. context switch, cache and TLB cold
+   8. your code runs
+
+  THE TWO DOMINANT TERMS are (1) and (5) - some other piece of
+  code holding interrupts or preemption off. And they are
+  caused by things you would not guess:
+
+     · a long spinlock section in an unrelated driver
+     · a printk to a slow serial console (milliseconds! and it
+       happens with interrupts disabled)
+     · TLB shootdowns and cache maintenance over a large range
+     · a slow MMIO read in an interrupt handler
+     · SMMU invalidation waiting for a sync completion
+     · firmware: an SMC that takes a long time (isolation
+       ch. 11), or SMI-equivalent secure work
+     · CPU frequency changes and idle-state exit latency
+
+  MEASURE, DO NOT GUESS:
+
+     cyclictest -p 80 -t1 -n -i 200 -l 100000 -m
+        the standard tool. Reports min/avg/MAX wakeup latency.
+        The MAX is the only number that matters.
+
+     ftrace's latency tracers name the culprit:
+        echo preemptirqsoff > /sys/kernel/tracing/current_tracer
+        echo 0 > /sys/kernel/tracing/tracing_max_latency
+        ... run the load ...
+        cat /sys/kernel/tracing/trace
+     -> a full backtrace of the LONGEST section that had
+        interrupts or preemption disabled. This tells you
+        exactly which function to fix.</pre>
+
+<div class="key">
+<b>The one thing to remember about latency</b>
+<p>Your worst-case latency is not determined by your code. It is determined by the <em>worst</em> critical
+section anywhere in the kernel that runs on the same CPU — including drivers you did not write and did not
+enable deliberately. That is why real-time embedded systems isolate CPUs, strip the config down to what is
+needed, and measure with <code>cyclictest</code> under realistic load rather than reasoning about it.</p>
+</div>
+
+<h2 id="affinity">Placing work on CPUs</h2>
+
+<p>By default the scheduler decides which CPU runs what. For latency-critical work you can override that and pin tasks or interrupts to specific cores — a powerful tool that also makes things worse just as easily as better.</p>
+
+<pre><code># ISOLATE a CPU from the general scheduler:
+    isolcpus=3 nohz_full=3 rcu_nocbs=3        # kernel cmdline
+
+# isolcpus    no task is placed there unless explicitly affined
+# nohz_full   no scheduler tick on that CPU when one task runs
+# rcu_nocbs   RCU callbacks are offloaded elsewhere
+# Together: CPU 3 becomes nearly quiet, and an RT thread pinned
+# there sees dramatically better worst-case latency.
+
+# Then pin your thread:
+    taskset -c 3 ./my_control_loop
+    # or in code: sched_setaffinity()
+
+# IRQ affinity - route the device's interrupt to the same CPU
+# (or deliberately away from it):
+    cat /proc/interrupts
+    echo 8 > /proc/irq/42/smp_affinity        # CPU 3 = bit 3
+    # and stop irqbalance from undoing it:
+    systemctl stop irqbalance
+
+# In the kernel, for a threaded IRQ or kthread:
+    irq_set_affinity_hint(irq, cpumask_of(3));
+    kthread_bind(task, 3);
+
+# WHY PIN AT ALL: migration costs a cold cache and a cold TLB
+# (CA ch. 14), and on big.LITTLE it may cost a move to a
+# slower core. For a periodic control loop the variance
+# matters more than the average.</code></pre>
+
+<h2 id="observe">Observing the scheduler</h2>
+
+<p>None of the above needs to be guessed at. The scheduler exposes what it is doing in detail, and being able to see which task ran, when, and why it stopped is what separates measuring a latency problem from speculating about it.</p>
+
+<pre><code># Per-task statistics:
+    cat /proc/PID/sched
+      se.sum_exec_runtime          : total CPU time
+      se.statistics.wait_max       : LONGEST time waiting to
+                                     run  &lt;-- latency, per task
+      nr_switches, nr_voluntary_switches
+      nr_involuntary_switches      : preempted this often
+
+# System-wide:
+    cat /proc/schedstat
+    cat /sys/kernel/debug/sched/debug     # runqueue contents
+
+# Tracing - the real tool:
+    trace-cmd record -e sched_switch -e sched_wakeup \
+                     -e irq_handler_entry -e irq_handler_exit
+    trace-cmd report
+    # or kernelshark for the graphical view
+
+# perf, for where time goes:
+    perf sched record -- sleep 10
+    perf sched latency --sort max
+      # per-task: average and MAXIMUM scheduling delay
+    perf sched timehist
+
+# The single most useful one-liner for "why is my thread late":
+    perf sched latency --sort max | head -20</code></pre>
+
+<h2 id="driver">What this means for a driver</h2>
+
+<p>Most of this chapter is context rather than something you call. This section is the part that changes what you actually write: a driver does not schedule anything itself, but almost everything it does adds to, or subtracts from, the latency the whole system experiences.</p>
+
+<pre><code>/* You will rarely set a scheduling policy from a driver. What
+   you WILL do is avoid making everyone else's latency worse: */
+
+   · KEEP INTERRUPT HANDLERS SHORT. Acknowledge, grab the data,
+     wake something, return. Everything else goes to a threaded
+     handler or a workqueue (chapter 15).
+
+   · KEEP SPINLOCK SECTIONS SHORT. Microseconds. Never do MMIO
+     reads, memory allocation, or loops of unknown length under
+     one.
+
+   · NEVER busy-wait for hardware without a bound:
+        /* WRONG */
+        while (readl(base + STATUS) &amp; BUSY)
+                ;
+        /* RIGHT */
+        ret = readl_poll_timeout(base + STATUS, val,
+                                 !(val &amp; BUSY),
+                                 10,        /* poll every 10us */
+                                 1000);     /* give up at 1ms  */
+        if (ret)
+                return -ETIMEDOUT;
+     /* and the _atomic variant if you cannot sleep:
+        readl_poll_timeout_atomic()                          */
+
+   · PREFER threaded IRQs, so the work is schedulable:
+        devm_request_threaded_irq(dev, irq,
+                                  my_hardirq,   /* quick */
+                                  my_thread_fn, /* the work */
+                                  IRQF_ONESHOT, name, d);
+
+   · DO NOT printk in hot paths. A serial console printk can
+     take MILLISECONDS with interrupts disabled. Use trace
+     events or dev_dbg (compiled out unless enabled).      */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>System freezes, only the RT task runs</td><td>A <code>SCHED_FIFO</code> task that never blocks — RT throttling saves you, if enabled</td></tr>
+<tr><td>Latency spikes under load</td><td>Some other critical section — find it with the <code>preemptirqsoff</code> tracer</td></tr>
+<tr><td>Occasional multi-millisecond stall</td><td>A <code>printk</code> to a serial console, or a long TLB/cache maintenance</td></tr>
+<tr><td>Latency fine on the bench, bad in the field</td><td>Real load exercises paths your test did not — <code>cyclictest</code> under load</td></tr>
+<tr><td>An RT thread misses deadlines despite high priority</td><td>Priority inversion on a lock; or blocked on a non-RT kthread</td></tr>
+<tr><td>Throughput drops when you raise priority</td><td>Preemption thrashing — more context switches, colder caches</td></tr>
+<tr><td>First iterations slow, then fine</td><td>Frequency ramp and cache warming; big.LITTLE placement</td></tr>
+<tr><td><code>sched_setscheduler</code> returns <code>-EPERM</code></td><td>Needs <code>CAP_SYS_NICE</code> or an <code>RLIMIT_RTPRIO</code> allowance</td></tr>
+<tr><td><code>SCHED_DEADLINE</code> returns <code>-EBUSY</code></td><td>Admission control refused — the system cannot meet it</td></tr>
+<tr><td>Driver works on <code>PREEMPT</code>, breaks on <code>PREEMPT_RT</code></td><td>Assumed <code>spin_lock</code> disables preemption</td></tr>
+<tr><td>Interrupts land on the wrong CPU again</td><td><code>irqbalance</code> is running</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five scheduling classes in priority order.</li>
+  <li>Explain what RT throttling protects against.</li>
+  <li>Explain what a nice value actually controls, and when it does nothing.</li>
+  <li>Distinguish <code>SCHED_FIFO</code>, <code>SCHED_RR</code> and <code>SCHED_DEADLINE</code>.</li>
+  <li>List five rules for writing an RT thread.</li>
+  <li>Name the four preemption models and what <code>PREEMPT_RT</code> changes for drivers.</li>
+  <li>List the components of interrupt-to-thread latency and the two that dominate.</li>
+  <li>Use <code>cyclictest</code> and the <code>preemptirqsoff</code> tracer to find a latency source.</li>
+  <li>Isolate a CPU and pin both a thread and an IRQ to it.</li>
+  <li>List five things a driver should do to avoid harming system latency.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

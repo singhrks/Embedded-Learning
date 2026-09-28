@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual memory, paging and page replacement | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Virtual memory, paging and page replacement</h1>
+<p class="lead"><a href="ca-16-virtual-memory.html">CA chapter 16</a> covered the hardware mechanism. This
+chapter is the software policy: which pages live in RAM, which are evicted, and how the OS makes a page fault
+into a feature rather than an error.</p>
+
+<h2 id="demand">Demand paging</h2>
+
+<div class="key">
+<b>The idea</b>
+<p>Do not load anything until it is touched. Mark pages invalid, and let the hardware tell you — via a page
+fault — exactly which page a program actually needs. Programs typically use a small fraction of what they map,
+so this converts a large up-front cost into a series of small on-demand ones.</p>
+</div>
+
+<pre class="diagram">Executing a 200 MB binary
+
+  WITHOUT demand paging: read 200 MB from disk, then start.
+                         Slow to start, and most of it is never used.
+
+  WITH demand paging:    map the file, start immediately.
+                         Fault in ~2 MB of actually-executed code.
+
+  This is also why:
+    · a huge malloc() returns instantly — nothing is allocated yet
+    · a program's RSS is far smaller than its VSZ
+    · the first run of a program is slower than the second
+      (the second finds the pages in the page cache)</pre>
+
+<h2 id="fault">The page fault handler</h2>
+
+<p>A page fault is not an error; it is the normal mechanism by which memory becomes present. What matters is which of several very different situations just occurred, because only one is a bug.</p>
+
+<pre class="diagram">   instruction touches an address
+        │
+        ▼
+   MMU walks the page tables → entry INVALID → PAGE FAULT
+        │
+        ▼
+   kernel handler receives:  faulting address (FAR_EL1)
+                             cause (ESR_EL1): read/write/exec
+                             the faulting instruction (ELR_EL1)
+        │
+        ▼
+   Is the address inside a valid mapping (a VMA)?
+        │
+        ├── NO ────────────────────► SIGSEGV / bug check
+        │                            "invalid permissions" or
+        │                            an unmapped address
+        │
+        └── YES: what kind of fault?
+              │
+              ├── not present, backed by a FILE
+              │      → read the page from the page cache, or from
+              │        disk if not cached                  MAJOR fault
+              │
+              ├── not present, ANONYMOUS, never touched
+              │      → give it the shared zero page (read) or
+              │        allocate a zeroed frame (write)     MINOR fault
+              │
+              ├── not present, in SWAP
+              │      → read it back from swap              MAJOR fault
+              │
+              ├── present but READ-ONLY, and this is a write
+              │      → COPY-ON-WRITE: duplicate the page   MINOR fault
+              │
+              ├── present, ACCESS FLAG clear
+              │      → set the flag, retry                 MINOR fault
+              │
+              └── stack region, address just below SP
+                     → grow the stack                      MINOR fault
+        │
+        ▼
+   install the PTE, invalidate the stale TLB entry
+        │
+        ▼
+   RETURN — and the SAME instruction re-executes, now succeeding</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Minor fault</th><th>Major fault</th></tr></thead>
+<tbody>
+<tr><td>Disk I/O</td><td>None</td><td><strong>Yes</strong></td></tr>
+<tr><td>Cost</td><td>~1–5 µs</td><td>~100 µs (SSD) to ~10 ms (disk)</td></tr>
+<tr><td>Causes</td><td>First touch, COW, access-flag, page already in cache</td><td>Reading from a file or from swap</td></tr>
+<tr><td>Acceptable in real time?</td><td>Marginal</td><td><strong>Never</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># count them
+/usr/bin/time -v ./program | grep -i faults
+#   Major (requiring I/O) page faults: 12
+#   Minor (reclaiming a frame) page faults: 45231
+
+ps -o min_flt,maj_flt,cmd -p PID
+perf stat -e page-faults,major-faults ./program
+sar -B 1                      # system-wide fault and paging rates</code></pre>
+
+<h2 id="vma">How the kernel knows what should be there</h2>
+
+<p>The kernel does not track a process's memory page by page. It tracks regions with common properties, which is what makes a sparse multi-gigabyte address space cheap to describe.</p>
+
+<pre><code>/* The page tables say what IS mapped. A separate structure says
+   what SHOULD be mappable — that is what the fault handler
+   consults.                                                   */
+
+struct vm_area_struct {          /* one per contiguous mapping */
+        unsigned long vm_start, vm_end;
+        unsigned long vm_flags;          /* READ|WRITE|EXEC|SHARED */
+        struct file  *vm_file;           /* backing file, or NULL
+                                            for anonymous          */
+        unsigned long vm_pgoff;          /* offset within the file */
+        const struct vm_operations_struct *vm_ops;   /* ->fault()  */
+};
+/* Kept in a maple tree (formerly a red-black tree) per mm_struct,
+   so "which VMA contains this address?" is O(log n).          */
+
+/* Windows: the same idea, called a Virtual Address Descriptor. */</code></pre>
+
+<pre><code>cat /proc/self/maps
+# 5584f2a00000-5584f2a02000 r-xp 00000000 fe:01 1234  /usr/bin/cat
+# 5584f2c01000-5584f2c02000 rw-p 00001000 fe:01 1234  /usr/bin/cat
+# 5584f4b1e000-5584f4b3f000 rw-p 00000000 00:00 0     [heap]
+# 7ffd8a3c0000-7ffd8a3e1000 rw-p 00000000 00:00 0     [stack]
+#      ^start        ^end   ^perms ^offset ^dev ^inode ^backing
+#                    p = private (COW),  s = shared
+
+cat /proc/self/smaps          # per-VMA: Rss, Pss, Shared/Private,
+                              # Dirty/Clean, THP usage, swap</code></pre>
+
+<h2 id="replacement">Page replacement policy</h2>
+
+<p>When memory is full, which page is evicted? The theoretically optimal choice — the page used furthest in
+the future — requires knowing the future, so every real policy approximates it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Policy</th><th>Rule</th><th>Problem</th></tr></thead>
+<tbody>
+<tr><td><strong>OPT / Belady</strong></td><td>Evict the page used furthest in the future</td><td>Unimplementable; used only as a benchmark</td></tr>
+<tr><td><strong>FIFO</strong></td><td>Evict the oldest</td><td>Ignores usage. Suffers <em>Belady's anomaly</em>: more frames can mean <em>more</em> faults.</td></tr>
+<tr><td><strong>LRU</strong></td><td>Evict the least recently used</td><td>Good, but exact LRU needs a timestamp on every access — far too expensive in hardware</td></tr>
+<tr><td><strong>Clock / second chance</strong></td><td>Circular scan; if the access bit is set, clear it and move on</td><td>Cheap LRU approximation. The classic implementation.</td></tr>
+<tr><td><strong>Two-list (Linux)</strong></td><td>Active and inactive LRU lists; promotion on second reference</td><td>Resists scan pollution</td></tr>
+<tr><td><strong>LFU / ARC / MGLRU</strong></td><td>Track frequency as well as recency</td><td>More state; better under mixed workloads</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">Linux's two-list approach, and the problem it solves
+
+   ACTIVE list      pages referenced more than once — the working set
+       ▲   │
+       │   │ aging pushes down when the active list grows too large
+       │   ▼
+   INACTIVE list    candidates for eviction
+           │
+           ▼ evicted (clean: dropped; dirty: written back first)
+
+  A page enters the INACTIVE list on first touch. It is promoted to
+  ACTIVE only on a SECOND reference.
+
+  Why: a large sequential scan — `cat bigfile`, a backup — touches
+  millions of pages exactly once. With plain LRU those pages would
+  evict your entire working set. With two lists they never reach
+  the active list, and the working set survives. This is called
+  scan resistance, and it is why `grep -r /` does not destroy your
+  machine's performance for the next ten minutes.
+
+  MGLRU (Multi-Gen LRU, Linux 6.1+) generalises this to several
+  generations, with much lower overhead at scale.</pre>
+
+<h2 id="thrashing">Thrashing and the working set</h2>
+
+<p>When the working set exceeds physical memory, a system spends its time moving pages rather than computing. The transition is sharp rather than gradual, which is why it feels like a cliff.</p>
+
+<pre class="diagram">   throughput
+       ▲
+       │        ╭──────────╮
+       │      ╭─╯          ╰─╮
+       │    ╭─╯               ╰──╮
+       │  ╭─╯                     ╰────────  ← THRASHING
+       │╭─╯                            ╰───────────
+       └──────────────────────────────────────────► degree of
+                                                     multiprogramming
+
+  Beyond a point, adding processes means no process's working set
+  fits. Every process faults, the disk saturates, and CPU
+  utilisation COLLAPSES while the system appears maximally busy.
+
+  The classic failure signature:
+     · load average very high
+     · CPU mostly in iowait
+     · si/so columns in vmstat non-zero and large
+     · everything, including your shell, responds in seconds
+
+  WORKING SET: the set of pages a process has touched in the last
+  T units of time. If the sum of all working sets exceeds RAM,
+  thrashing is inevitable regardless of policy.
+
+  Responses: reduce concurrency, add memory, use cgroup limits so
+  one process cannot drag the system down, or enable PSI-based
+  pressure handling.</pre>
+
+<pre><code># detect it
+vmstat 1
+#  r  b   swpd   free  buff  cache   si   so    bi    bo  cs us sy id wa
+#              ^^^^                  ^^   ^^                          ^^
+#   si/so = swap in/out per second. Sustained non-zero = thrashing.
+#   wa    = iowait. High wa with low us/sy means waiting on disk.
+
+# PSI — the modern, direct measure of pressure (Linux 4.20+)
+cat /proc/pressure/memory
+# some avg10=45.23 avg60=30.12 avg300=12.45
+#      ^ % of time at least one task was stalled on memory
+# This is far more actionable than free/available, and cgroup-aware.</code></pre>
+
+<h2 id="swap">Swap</h2>
+
+<p>Swap is widely misunderstood as "extra slow memory". Its actual role is subtler, and the common advice to disable it is usually counterproductive on a modern kernel.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>What is swapped?</td><td>Only <strong>anonymous</strong> pages. File-backed pages are simply dropped and re-read from the file.</td></tr>
+<tr><td>Is swap bad?</td><td>No. Swapping <em>out</em> idle pages to make room for cache is good. Swapping <em>in</em> continuously is thrashing.</td></tr>
+<tr><td>Should I disable it?</td><td>Usually not — without swap the kernel cannot evict idle anonymous memory at all, so it evicts <em>file</em> pages instead, hurting more. Do disable it for hard real-time and for latency-critical databases with their own caching.</td></tr>
+<tr><td><code>vm.swappiness</code></td><td>0–200; the bias toward reclaiming anonymous versus file pages. Default 60. Lower means prefer dropping cache.</td></tr>
+<tr><td>zram / zswap</td><td>Compressed swap in RAM. Excellent on memory-constrained devices — CPU is cheaper than I/O.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>swapon --show
+cat /proc/PID/status | grep VmSwap        # how much THIS process has swapped
+smem -s swap -r                            # per-process swap usage
+
+# real-time and latency-critical work: pin everything resident
+mlockall(MCL_CURRENT | MCL_FUTURE);
+# ...and check RLIMIT_MEMLOCK allows it. Without this, a single
+# major fault can blow a millisecond deadline.</code></pre>
+
+<h2 id="hugepages">Huge pages</h2>
+
+<p>Using larger pages reduces the number of translation entries needed, which matters because that resource is small and precious. The gains are real and so are the allocation difficulties.</p>
+
+<pre><code>/* TLB reach (CA chapter 16): 1024 entries x 4 KB = 4 MB.
+   With 2 MB pages the same TLB covers 2 GB.                  */
+
+/* Transparent Huge Pages — automatic, no code change */
+cat /sys/kernel/mm/transparent_hugepage/enabled
+#   [always] madvise never
+madvise(p, len, MADV_HUGEPAGE);      /* opt in, per region */
+
+/* Explicit huge pages — reserved, guaranteed, never swapped */
+echo 1024 &gt; /proc/sys/vm/nr_hugepages
+mmap(NULL, len, PROT_READ|PROT_WRITE,
+     MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);</code></pre>
+
+<div class="warn">
+<b>THP is not free</b>
+<p>Allocating a 2 MB huge page requires 2 MB of <em>contiguous</em> physical memory. Under fragmentation the
+kernel may enter synchronous compaction to find it, stalling the faulting process for milliseconds. Databases
+(MongoDB, Redis, Oracle) routinely recommend <code>transparent_hugepage=madvise</code> or
+<code>never</code> for exactly this reason — the latency variance is worse than the TLB benefit. Explicit
+<code>hugetlbfs</code> pages, reserved at boot, avoid the problem entirely.</p>
+</div>
+
+<h2 id="prefault">Controlling paging from user space</h2>
+
+<p>Taking page faults at unpredictable moments is unacceptable for real-time work. Faulting everything in up front, and locking it, is how such programs avoid it.</p>
+
+<pre><code>madvise(p, len, MADV_WILLNEED);   /* prefetch: fault it in now */
+madvise(p, len, MADV_DONTNEED);   /* discard: anonymous pages are
+                                     freed and re-fault as ZERO   */
+madvise(p, len, MADV_SEQUENTIAL); /* aggressive readahead         */
+madvise(p, len, MADV_RANDOM);     /* disable readahead            */
+madvise(p, len, MADV_FREE);       /* may be reclaimed lazily —
+                                     faster than DONTNEED         */
+madvise(p, len, MADV_HUGEPAGE);
+madvise(p, len, MADV_COLD);       /* deprioritise, do not free    */
+
+posix_fadvise(fd, off, len, POSIX_FADV_DONTNEED);   /* drop from cache */
+posix_fadvise(fd, off, len, POSIX_FADV_WILLNEED);
+
+mlock(p, len);                    /* pin: never evicted           */
+mlockall(MCL_CURRENT | MCL_FUTURE);
+mmap(..., MAP_POPULATE, ...);     /* prefault the whole mapping   */</code></pre>
+
+<h2 id="userfaultfd">Handling faults in user space</h2>
+
+<p>Page faults can be handled by a user-space program rather than the kernel, which is what makes live migration and certain garbage collectors possible.</p>
+
+<pre><code>/* userfaultfd lets a user process handle its own page faults.
+   The mechanism behind live VM migration, distributed shared
+   memory, and CRIU checkpoint/restore.                        */
+
+int uffd = syscall(SYS_userfaultfd, O_CLOEXEC);
+/* register a region; a helper thread reads fault events from uffd
+   and supplies pages with UFFDIO_COPY. The faulting thread blocks
+   until the page arrives — post-copy migration in a nutshell. */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>First run slow, second run fast</td><td>Major faults on the first; page cache hits on the second</td></tr>
+<tr><td><code>malloc</code> of 10 GB succeeds instantly, crashes later</td><td>Lazy allocation plus overcommit; memory arrives on first touch</td></tr>
+<tr><td>RSS far below VSZ</td><td>Normal — most mapped pages are never touched</td></tr>
+<tr><td>System unresponsive, CPU mostly iowait</td><td>Thrashing; check <code>vmstat</code> si/so and PSI</td></tr>
+<tr><td>Millisecond latency spike in a tight loop</td><td>Major fault; use <code>mlockall</code></td></tr>
+<tr><td>Backup job destroys database performance</td><td>Scan pollution — mitigated by two-list LRU, and by <code>POSIX_FADV_DONTNEED</code></td></tr>
+<tr><td>Random multi-millisecond stalls on a busy server</td><td>THP compaction; set <code>transparent_hugepage=madvise</code></td></tr>
+<tr><td>Disabling swap made things worse</td><td>The kernel now evicts file cache instead of idle anonymous pages</td></tr>
+<tr><td>Memory freed but RSS unchanged</td><td><code>MADV_FREE</code> defers reclamation, or the allocator kept it</td></tr>
+<tr><td>Real-time task misses a deadline hourly</td><td>An unlocked page faulted; <code>mlockall(MCL_FUTURE)</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain demand paging and three observable consequences of it.</li>
+  <li>Walk the page fault handler's decision tree and name six distinct fault causes.</li>
+  <li>Distinguish minor from major faults by cost and cause.</li>
+  <li>Explain what a VMA is and why the page tables alone are insufficient.</li>
+  <li>Explain Belady's anomaly and which policy suffers it.</li>
+  <li>Explain Linux's two-list LRU and the specific problem it solves.</li>
+  <li>Describe thrashing, its signature in <code>vmstat</code>, and three responses.</li>
+  <li>Explain why disabling swap can make memory pressure worse.</li>
+  <li>Give two reasons THP can hurt latency, and the mitigation.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

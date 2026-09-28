@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the Pi as a hardware lab bench | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the Pi as a hardware lab bench</h1>
+<p class="lead">Turn a spare Pi into the instrument that tests everything else on your desk: a logic analyser,
+a bus master, a programmable stimulus generator and a power cycler, driven over the network and scriptable
+from CI. This is the Pi used as a development <em>tool</em> rather than a development target.</p>
+
+<h2 id="why">The idea</h2>
+
+<pre class="diagram">   Most embedded debugging needs a second machine that can
+   watch and poke the first one. Commercial instruments do
+   this well and cost hundreds. A spare Pi does most of it
+   for the price of jumper wires.
+
+   +---------------------+          +--------------------+
+   |   PI LAB BENCH      |          |   TARGET           |
+   |                     |          |   (an MCU board,   |
+   |  logic capture   &lt;--+----------+--  another Pi, a   |
+   |  I2C/SPI master  ---+----------+--&gt; sensor, a HAT)  |
+   |  UART console    &lt;--+----------+--                  |
+   |  GPIO stimulus   ---+----------+--&gt;                 |
+   |  power control   ---+----------+--&gt; (via a relay    |
+   |                     |          |     or MOSFET)     |
+   |  HTTP / SSH API     |          +--------------------+
+   +----------+----------+
+              |
+        your laptop, or CI
+
+   WHAT THIS BUYS YOU:
+     - a regression test that involves REAL HARDWARE, run
+       from CI on every commit
+     - remote access to a board on a bench you are not
+       sitting at
+     - the ability to power-cycle a target you have just
+       bricked (mcu chapter 04's recovery problem)
+     - protocol capture without buying an analyser
+
+   WHAT IT DOES NOT REPLACE:
+     - an oscilloscope. A Pi sees digital levels, not edges,
+       ringing or voltage (bus chapter 20). For signal
+       integrity you still need a scope.
+     - a proper analyser's sample depth and rate.</pre>
+
+<h2 id="capture">Part 1: logic capture</h2>
+
+<pre><code># sigrok supports the Pi's GPIO as a capture source, and
+# PulseView (bus chapter 20) decodes the result.
+
+$ sudo apt install sigrok-cli libsigrok-dev
+
+# The Pi as a capture device, sampling GPIO:
+$ sigrok-cli --driver=fx2lafw --samples 1000000 ...
+# (an external $10 FX2 analyser plugged into the Pi is
+#  usually better than the GPIO route: higher rate, buffered
+#  in hardware, and it does not compete with Linux for
+#  timing)
+
+# --- THE HONEST DESIGN DECISION ---
+# Sampling GPIO from a Linux userspace loop gives you a few
+# MHz at best and drops samples when the scheduler
+# intervenes (chapter 13). For a 100 kHz I2C bus that is
+# adequate; for a 20 MHz SPI bus it is not.
+#
+# THREE WAYS TO DO BETTER, in increasing order of effort:
+#   1. plug a cheap FX2-based analyser into the Pi's USB and
+#      let sigrok drive it. The Pi becomes the network-
+#      attached host, which is the useful part anyway.
+#   2. on a Pi 5, use RP1's PIO (chapter 14) to sample at a
+#      fixed rate into a buffer with no CPU involvement.
+#   3. use the kernel's edge timestamps via libgpiod for
+#      event capture rather than continuous sampling -
+#      excellent for slow signals, useless for a bus.
+
+# EVENT CAPTURE with hardware timestamps, which needs no
+# extra hardware at all (chapter 11):
+$ gpiomon -c gpiochip4 -e both --format="%e %s.%n" 17 23 24
+# Each edge is timestamped by the kernel at interrupt time,
+# so jitter in YOUR process does not corrupt the record.
+# Good to roughly tens of microseconds, which covers
+# buttons, interrupts, handshakes and slow protocols.
+
+# Decode a captured stream offline:
+$ sigrok-cli -i capture.sr -P i2c:scl=D1:sda=D0
+$ sigrok-cli -i capture.sr -P uart:rx=D2:baudrate=115200
+$ sigrok-cli -i capture.sr -P spi:clk=D3:mosi=D4:cs=D5
+</code></pre>
+
+<h2 id="master">Part 2: the Pi as a bus master and stimulus</h2>
+
+<pre><code>#!/usr/bin/env python3
+"""bench.py - the instrument, as a small library."""
+import time, subprocess
+import gpiod
+from gpiod.line import Direction, Value, Edge, Bias
+from smbus2 import SMBus, i2c_msg
+import spidev, serial
+
+CHIP = "/dev/gpiochip4"          # resolve properly in real
+                                 # code (chapter 02)
+
+class Bench:
+    def __init__(self):
+        self.i2c = SMBus(1)
+        self.spi = spidev.SpiDev(); self.spi.open(0, 0)
+        self.spi.max_speed_hz = 1_000_000     # start slow
+        self.uart = serial.Serial("/dev/serial0", 115200,
+                                  timeout=1.0)
+
+    # ---- power control: the single most useful feature ----
+    def power(self, on: bool):
+        """Drive a MOSFET or relay feeding the target's rail."""
+        with gpiod.request_lines(CHIP, consumer="bench-power",
+                config={26: gpiod.LineSettings(
+                            direction=Direction.OUTPUT)}) as r:
+            r.set_value(26, Value.ACTIVE if on else Value.INACTIVE)
+            time.sleep(0.05)
+
+    def power_cycle(self, off_time=0.5):
+        self.power(False); time.sleep(off_time); self.power(True)
+
+    # ---- stimulus ----
+    def pulse(self, line: int, width_s: float):
+        with gpiod.request_lines(CHIP, consumer="bench-pulse",
+                config={line: gpiod.LineSettings(
+                            direction=Direction.OUTPUT)}) as r:
+            r.set_value(line, Value.ACTIVE)
+            time.sleep(width_s)
+            r.set_value(line, Value.INACTIVE)
+
+    # ---- measurement ----
+    def measure_pulse(self, line: int, timeout=5.0):
+        """Return the width of the next pulse, in seconds,
+        using KERNEL timestamps rather than Python's clock."""
+        cfg = {line: gpiod.LineSettings(
+                    direction=Direction.INPUT,
+                    edge_detection=Edge.BOTH,
+                    bias=Bias.PULL_DOWN)}
+        with gpiod.request_lines(CHIP, consumer="bench-meas",
+                                 config=cfg) as r:
+            t_rise = None
+            deadline = time.monotonic() + timeout
+            while time.monotonic() &lt; deadline:
+                if not r.wait_edge_events(timeout=0.5):
+                    continue
+                for ev in r.read_edge_events():
+                    if ev.event_type == Edge.RISING:
+                        t_rise = ev.timestamp_ns
+                    elif t_rise is not None:
+                        return (ev.timestamp_ns - t_rise) / 1e9
+        raise TimeoutError("no pulse")
+
+    # ---- bus access ----
+    def i2c_probe(self, addr: int) -&gt; bool:
+        try:
+            self.i2c.i2c_rdwr(i2c_msg.write(addr, []))
+            return True
+        except OSError:
+            return False
+
+    def i2c_read(self, addr, reg, n=1):
+        w = i2c_msg.write(addr, [reg])
+        r = i2c_msg.read(addr, n)
+        self.i2c.i2c_rdwr(w, r)          # repeated start
+        return list(r)                    # (bus chapter 06)
+
+    def spi_xfer(self, data):
+        return self.spi.xfer2(list(data))
+
+    def uart_expect(self, pattern: bytes, timeout=10.0):
+        """Wait for a string on the target's console."""
+        buf, deadline = b"", time.monotonic() + timeout
+        while time.monotonic() &lt; deadline:
+            buf += self.uart.read(256)
+            if pattern in buf:
+                return buf
+        raise TimeoutError(f"never saw {pattern!r}; got {buf!r}")
+</code></pre>
+
+<h2 id="tests">Part 3: hardware tests in CI</h2>
+
+<pre><code>#!/usr/bin/env python3
+"""test_target.py - run against real hardware, from CI."""
+import pytest
+from bench import Bench
+
+@pytest.fixture(scope="module")
+def bench():
+    b = Bench()
+    b.power_cycle()          # every run starts from a known
+    b.uart_expect(b"boot ok") # state - the single most
+    yield b                   # important property of a
+    b.power(False)            # hardware test
+
+def test_i2c_device_present(bench):
+    assert bench.i2c_probe(0x76), "sensor did not ACK"
+
+def test_chip_id(bench):
+    assert bench.i2c_read(0x76, 0xD0, 1)[0] == 0x60
+
+def test_watchdog_resets_a_hung_target(bench):
+    """Prove the target's watchdog works (chapter 19) -
+    a test that is IMPOSSIBLE without real hardware."""
+    bench.uart.write(b"hang\n")          # command it to hang
+    bench.uart_expect(b"boot ok", timeout=30)  # it must come back
+
+def test_pulse_timing(bench):
+    """The target should emit a 10 ms pulse on request."""
+    bench.uart.write(b"pulse\n")
+    width = bench.measure_pulse(17)
+    assert 0.009 &lt; width &lt; 0.011, f"got {width*1000:.2f} ms"
+
+def test_recovers_from_brownout(bench):
+    """Cut power mid-write and confirm the filesystem
+    survives - chapter 19's design requirement, tested."""
+    bench.uart.write(b"write-loop\n")
+    time.sleep(1.0)
+    bench.power_cycle(off_time=0.2)
+    bench.uart_expect(b"boot ok", timeout=60)
+    bench.uart.write(b"fsck-status\n")
+    assert b"clean" in bench.uart_expect(b"fsck", timeout=10)
+</code></pre>
+
+<pre><code># Run it from anywhere:
+$ ssh pi-bench 'cd bench &amp;&amp; python3 -m pytest -v'
+
+# Or expose it over HTTP so CI does not need SSH keys:
+# bench_api.py
+from flask import Flask, jsonify
+app = Flask(__name__); b = Bench()
+
+@app.post("/power/cycle")
+def cycle(): b.power_cycle(); return jsonify(ok=True)
+
+@app.get("/i2c/&lt;int:addr&gt;/&lt;int:reg&gt;")
+def read(addr, reg): return jsonify(value=b.i2c_read(addr, reg)[0])
+
+# systemd unit (chapter 07) so it starts on boot, and a
+# udev/group setup so it does not run as root (chapter 12).
+
+# IN CI:
+#   - name the bench Pi in your runner config
+#   - each job power-cycles the target first
+#   - flash the firmware under test over UART/SWD
+#   - run the hardware tests
+#   - collect the captured logs as artefacts
+</code></pre>
+
+<div class="key">
+<b>Why this is worth building</b>
+<p>Every other test you write runs in an environment you control. These run against the actual electrical
+system, and they catch the class of bug that no unit test can: a watchdog that was never wired up, a
+brown-out that corrupts the filesystem, a sensor that NACKs one time in a thousand, timing that drifts when
+the board is warm. The tests above take a weekend to build and then run on every commit forever. Teams that
+have a hardware-in-the-loop rig ship noticeably fewer field failures, and this is the cheapest possible
+version of one.</p>
+</div>
+
+<h2 id="power">Part 4: the power-control detail</h2>
+
+<pre class="diagram">   Power cycling is the feature you will use most, and the
+   one people wire wrongly.
+
+   DO NOT drive a target's supply from a GPIO pin. A Pi pin
+   sources ~16 mA; a target board wants hundreds.
+
+   USE A SWITCH:
+
+     Pi GPIO --[1k]--+---- gate
+                     |
+                  [N-MOSFET]  logic-level, e.g. AO3400
+                     |
+     target GND -----+---- source ---- GND
+
+   LOW-SIDE SWITCHING (above) is simplest: the MOSFET
+   interrupts the target's ground return. It works, and note
+   the target's ground is then NOT at your ground when
+   switched off - which matters if you also have UART and
+   I2C lines connected. Those lines can back-power the
+   target through its protection diodes, so it never fully
+   powers down.
+
+   THE FIX: switch the HIGH side (a P-MOSFET or a load
+   switch IC in the positive rail), or use a relay, or add
+   series resistors in every signal line so back-powering
+   cannot supply meaningful current.
+
+   "The target does not fully power off when I cut the rail"
+   is a real and confusing bench problem, and the cause is
+   always another connected wire supplying it.
+
+   A USB-CONTROLLED RELAY BOARD or a smart plug avoids all
+   of this for a few pounds more, and is what most people
+   end up using.</pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<ul>
+  <li><strong>Add SWD flashing.</strong> With OpenOCD on the bench Pi (chapter 17), flash a Cortex-M target
+  over its SWD pins — now CI can build firmware from the <a href="track.html?t=mcu">MCU track</a>, flash it,
+  and test it, with no human involved.</li>
+  <li><strong>Test the MCU track's RTOS.</strong> Run <a href="mcu-24-project-rtos.html">mcu chapter 24</a>'s
+  scheduler on a target and use <code>measure_pulse</code> to verify context-switch timing from outside the
+  system being measured.</li>
+  <li><strong>Reproduce the priority-inversion experiment</strong> from that chapter, with the bench recording
+  worst-case blocking time over an hour rather than reading it off a debugger.</li>
+  <li><strong>Add a current measurement</strong> with an INA219 over I2C, and turn
+  <a href="mcu-13-low-power.html">mcu chapter 13</a>'s sleep-current budget into an automated test that fails
+  if the target draws more than 10 µA asleep.</li>
+  <li><strong>Capture and decode</strong> a full I2C transaction from the <a href="rpi-21-project-driver.html">
+  chapter 21</a> driver, and compare the wire traffic against what your driver believes it sent.</li>
+  <li><strong>Make it multi-target</strong>: several boards on one bench Pi, selected by a parameter, so one
+  rig serves a whole team.</li>
+</ul>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Target does not power off when the rail is cut</td><td>Back-powered through a UART or I2C line —
+switch the high side</td></tr>
+<tr><td>GPIO cannot drive the target's supply</td><td>Pin sources ~16 mA; use a MOSFET or relay</td></tr>
+<tr><td>Captured samples drop under load</td><td>Userspace sampling — use an FX2 analyser or PIO</td></tr>
+<tr><td>Measured pulse widths jitter badly</td><td>Timing read in Python; use kernel edge timestamps</td></tr>
+<tr><td>Tests pass alone, fail in sequence</td><td>No power cycle between tests — start from a known
+state</td></tr>
+<tr><td>UART capture misses the boot banner</td><td>Serial opened after the target started; open
+first</td></tr>
+<tr><td>Intermittent I2C failures on the bench</td><td>Long jumper wires and capacitance (bus chapter
+07)</td></tr>
+<tr><td>Bench API works locally, fails from CI</td><td>Running as root locally but not in the service —
+check groups</td></tr>
+<tr><td>Everything works until the bench Pi reboots</td><td>Service not enabled; GPIO left in an undefined
+state</td></tr>
+<tr><td>Cannot distinguish a real failure from a flaky rig</td><td>Log the bench's own health alongside every
+result</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State what a Pi lab bench can and cannot replace.</li>
+  <li>Explain why userspace GPIO sampling is inadequate for a fast bus, and give two better options.</li>
+  <li>Say why kernel edge timestamps beat reading the clock in your test script.</li>
+  <li>Explain why every hardware test should begin with a power cycle.</li>
+  <li>Name two failure classes that only a hardware-in-the-loop test can catch.</li>
+  <li>Explain why a GPIO must not drive a target's supply directly.</li>
+  <li>Describe the back-powering problem and two ways to avoid it.</li>
+  <li>Say why the bench service should not run as root.</li>
+  <li>Give a test that proves a watchdog works, and explain why it needs real hardware.</li>
+  <li>Explain why the bench's own health should be recorded with every result.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

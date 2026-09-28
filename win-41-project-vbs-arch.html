@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: the Windows four-layer stack — VBS, VTL1 and the seams | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: the Windows four-layer stack — VBS, VTL1 and the seams</h1>
+<p class="lead">The same design as the OP-TEE project, built with Windows' own isolation instead of TrustZone:
+an application asks for a signature, a KMDF driver decides whether it may, a VBS enclave in VTL1 performs it
+with a key that never leaves, and the secure kernel seals that key to the platform. The shape is identical.
+One of the seams is not, and that difference is the most useful thing in this project.</p>
+
+<h2 id="vtl">VTL0, VTL1, and what actually enforces the boundary</h2>
+
+<p>TrustZone splits the machine with a bit in the bus fabric. Windows splits it with the hypervisor, which is a
+completely different mechanism reaching the same result — and the difference shows up the moment you try to
+cross it.</p>
+
+<pre class="diagram">   VIRTUAL TRUST LEVELS. Both levels have a full ring 0 and
+   ring 3. The hypervisor decides which physical pages each
+   level may see, using second-level address translation.
+
+   ┌──────────────── VTL 0 ────────┐ ┌───── VTL 1 ────────┐
+   │  ring 3                       │ │  ring 3            │
+   │    your applications          │ │    TRUSTLETS and   │
+   │    services, everything       │ │    VBS ENCLAVES    │
+   │                               │ │    (LSAIso, and    │
+   │                               │ │     our enclave)   │
+   ├───────────────────────────────┤ ├────────────────────┤
+   │  ring 0                       │ │  ring 0            │
+   │    ntoskrnl.exe               │ │    securekernel.exe│
+   │    EVERY third-party driver   │ │    (Microsoft only)│
+   └───────────────────────────────┘ └────────────────────┘
+         ▲                                    ▲
+         └────────── HYPERVISOR ──────────────┘
+            enforces the split; neither kernel
+            can override it
+
+   THE PROPERTY: VTL1 can read VTL0's memory. VTL0 CANNOT
+   read VTL1's. That asymmetry is the whole design, and it
+   is the same asymmetry the secure world has in TrustZone.
+
+   THE CONSEQUENCE YOU CARE ABOUT: ntoskrnl.exe is in VTL0.
+   A kernel driver - yours, and a rootkit's - is on the
+   UNTRUSTED side of this line. That is a strange thought
+   the first time, and it is the point.</pre>
+
+<div class="key">
+<b>Windows' secure world is not open the way OP-TEE's is</b>
+<p>In OP-TEE you can write code for every layer, including the trusted OS itself. In Windows, VTL1 ring 0 —
+<code>securekernel.exe</code> — is Microsoft's, and so are the classic trustlets (<code>LSAIso.exe</code>,
+which is Credential Guard). What <em>is</em> open to you is VTL1 ring 3, as a <strong>VBS enclave</strong>: a
+DLL loaded into an isolated region of your own process that the rest of the system, kernel included, cannot
+read. That is the layer this project builds, and it is genuinely the Windows equivalent of a trusted
+application.</p>
+</div>
+
+<h2 id="stack">The four layers</h2>
+
+<p>Read it as the same sequence of trust reductions as the OP-TEE stack, because it is — right up until the
+third arrow, which works differently for a reason worth understanding.</p>
+
+<pre class="diagram">   LAYER 1   winsign.exe                          VTL0
+             an ordinary application             ring 3
+                  │  DeviceIoControl(IOCTL_WINSIGN_SIGN)
+                  │  ── SEAM A: the IOCTL contract ──
+                  ▼
+   LAYER 2   winsign.sys                          VTL0
+             a KMDF driver                       ring 0
+             · decides WHO may sign, from the
+               caller's token
+             · bounds and copies the request
+                  │
+                  │  ?? it cannot call the enclave ??
+                  │  ── SEAM B: the inverted call ──
+                  ▼
+             winsignhost.exe                      VTL0
+             a service that HOSTS the enclave     ring 3
+             · no security role whatsoever
+                  │  CallEnclave(...)
+                  │  ── SEAM C: the VTL transition ──
+                  ▼
+   LAYER 3   winsign_enclave.dll                  VTL1
+             a VBS enclave                       ring 3
+             · holds the private key
+             · re-validates everything
+                  │  EnclaveSealData / EnclaveUnsealData
+                  │  ── SEAM D: the secure-kernel call ──
+                  ▼
+   LAYER 4   securekernel.exe + TPM               VTL1
+             seals the key to this platform      ring 0
+
+   THREE TRUST BOUNDARIES (A, C, D) AND ONE HOP THAT IS NOT
+   ONE (B). Keeping those apart in your head is the single
+   most important thing on this page.</pre>
+
+<h2 id="inverted">Why the kernel driver cannot call the enclave</h2>
+
+<p>This is the structural difference from OP-TEE, and it is not something you can engineer around — so it is
+better to understand it than to fight it.</p>
+
+<pre class="diagram">   IN OP-TEE:
+     SMC is a CPU instruction available at EL1. A Linux
+     driver issues it directly. Kernel to secure world is
+     ONE HOP.
+
+   IN WINDOWS:
+     A VBS enclave is entered by CallEnclave, which is a
+     VTL0 USER-MODE operation against an enclave that a
+     USER-MODE process created in its own address space.
+     There is no kernel-mode equivalent exposed to drivers.
+
+     So: kernel to enclave needs a user-mode process in
+     between. Always.
+
+   WHICH MEANS THE DRIVER MUST GET WORK *OUT* TO USER MODE.
+   The standard Windows pattern for that is the INVERTED
+   CALL MODEL:
+
+     the host service issues an IOCTL and the driver does
+     not complete it - it holds the IRP pending in a queue.
+     When work arrives, the driver completes that pending
+     IRP with the work as its output. The service does the
+     work, posts the result back with a second IOCTL, and
+     immediately issues another pending IOCTL to wait again.
+
+     A "call" from kernel to user mode, built entirely out
+     of the user-mode side asking first.
+
+   YOU HAVE SEEN THIS SHAPE BEFORE. It is the same trick as
+   a blocking read() that a driver completes later, which is
+   why it is worth recognising rather than memorising.</pre>
+
+<div class="danger">
+<b>The host service is plumbing, not security — and mistaking it for security is the classic error</b>
+<p>It is tempting to put a check in <code>winsignhost.exe</code>, because it is convenient and it is where the
+data is. But the host is an ordinary VTL0 user-mode process: an attacker with SYSTEM can debug it, patch it, or
+replace it entirely. Everything it does can be forged. The <em>only</em> two places a decision means anything
+are layer 2, which has the original caller's token and runs where an attacker needs kernel access to interfere,
+and layer 3, which the attacker cannot reach at all. Anything you enforce in between is decoration.</p>
+</div>
+
+<h2 id="seams">The seams, and the contract at each</h2>
+
+<p>Same exercise as the OP-TEE project, and for the same reason: writing down what each boundary guarantees is
+what makes the validation code in the next three chapters look necessary rather than paranoid.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Seam</th><th>Mechanism</th><th>Trust boundary?</th><th>What the lower side must assume</th></tr></thead>
+<tbody>
+<tr><td><strong>A</strong> app → driver</td><td><code>DeviceIoControl</code>, buffered I/O</td><td><strong>Yes
+</strong></td><td>Lengths are attacker-chosen; with METHOD_NEITHER the pointers would be too</td></tr>
+<tr><td><strong>B</strong> driver ↔ host</td><td>Inverted call, pended IRP</td><td><strong>No</strong></td><td>
+Nothing. The host is as untrusted as the app — it just happens to be convenient</td></tr>
+<tr><td><strong>C</strong> host → enclave</td><td><code>CallEnclave</code>, VTL0 → VTL1</td><td><strong>Yes —
+the important one</strong></td><td>The parameter points into VTL0 memory that VTL0 can change while you read
+it</td></tr>
+<tr><td><strong>D</strong> enclave → secure kernel</td><td><code>EnclaveSealData</code> and
+friends</td><td><strong>Yes</strong></td><td>Both sides are VTL1; the policy argument decides what can later
+unseal the blob</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>Seam C has the same hazard as OP-TEE's shared memory, with a sharper edge</b>
+<p>An enclave can read all of VTL0's address space, which sounds like a convenience and is actually the trap:
+the parameter you were handed lives in memory the untrusted side can rewrite <em>after</em> you have validated
+it. Reading a length, checking it, and then reading the buffer gives the attacker a window between the two. The
+rule is identical to the one in <a href="tee-20-ta-security.html">OP-TEE chapter 20</a> — copy into enclave
+memory first, then validate the copy, then use only the copy — and chapter 42 does exactly that, in the one
+place it matters.</p>
+</div>
+
+<h2 id="threat">What this design defends against</h2>
+
+<p>Stating this before any code exists keeps the rest of the project honest, and it is the section a reviewer
+will ask for first.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Attacker</th><th>Outcome</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Unprivileged user</td><td><strong>Blocked</strong></td><td>Device interface ACL, plus the driver's
+token check</td></tr>
+<tr><td>Administrator / SYSTEM</td><td><strong>Can request signatures; cannot extract the key</strong></td><td>
+The key exists only in VTL1 pages the hypervisor does not map into VTL0</td></tr>
+<tr><td>A malicious or compromised kernel driver</td><td><strong>Same</strong></td><td><code>ntoskrnl.exe</code>
+is in VTL0. This is precisely what VBS was built for</td></tr>
+<tr><td>Someone who patches <code>winsignhost.exe</code></td><td><strong>Can request signatures; nothing
+more</strong></td><td>The host was never trusted — see the box above</td></tr>
+<tr><td>Someone who copies the sealed blob to another machine</td><td><strong>Blocked</strong></td><td>Sealing
+is rooted in the platform; chapter 43</td></tr>
+<tr><td>Someone who replaces the enclave DLL</td><td><strong>Blocked</strong></td><td>Enclave images are
+signature-checked at load, and the sealing policy binds the blob to the image identity</td></tr>
+<tr><td>An attacker who disables VBS in firmware and reboots</td><td><strong>Not blocked by this
+design</strong></td><td>Needs Secure Boot plus a policy that refuses to run without VBS</td></tr>
+<tr><td>A bug in your own enclave code</td><td><strong>Not blocked</strong></td><td>Which is why layer 3 is
+deliberately tiny</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="vs">Against the OP-TEE version of the same project</h2>
+
+<p>Having built the same thing twice on two platforms, the comparison is worth more than either project alone —
+it separates what is essential to the design from what is an accident of the platform.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Concern</th><th>OP-TEE / TrustZone</th><th>Windows / VBS</th></tr></thead>
+<tbody>
+<tr><td>What enforces isolation</td><td>The NS bit, in hardware outside the CPU</td><td>The hypervisor, via
+second-level address translation</td></tr>
+<tr><td>Where the untrusted kernel sits</td><td>Normal world EL1</td><td>VTL0 ring 0 — equally
+untrusted</td></tr>
+<tr><td>Kernel can enter the secure side</td><td><strong>Yes</strong>, via SMC</td><td><strong>No</strong> —
+hence the host service</td></tr>
+<tr><td>Your trusted code runs at</td><td>S-EL0, as a TA</td><td>VTL1 ring 3, as an enclave</td></tr>
+<tr><td>Can you write the secure OS</td><td>Yes — OP-TEE is yours to modify</td><td>No —
+<code>securekernel.exe</code> is Microsoft's</td></tr>
+<tr><td>Persisting a key</td><td>Secure storage, HUK-derived</td><td><code>EnclaveSealData</code>, TPM- and
+identity-rooted</td></tr>
+<tr><td>Proving it to a third party</td><td>Vendor-specific attestation</td><td>
+<code>EnclaveGetAttestationReport</code></td></tr>
+<tr><td>Deployment friction</td><td>Rebuild and reflash firmware</td><td>Ship a signed DLL</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="files">The files you will create</h2>
+
+<p>Four components and, awkwardly, three different signing and build stories. Laying the tree out this way lets
+each piece be built and tested on its own.</p>
+
+<pre><code>winsign/
+├── inc/
+│   └── winsign_ioctl.h        SEAM A - app, driver and host
+│                              THE PERMANENT CONTRACT (ch. 41)
+├── app/
+│   └── winsign.cpp            LAYER 1 - the application
+├── sys/
+│   ├── winsign.c              LAYER 2 - the KMDF driver
+│   ├── winsign.inf
+│   └── winsign.vcxproj
+├── host/
+│   └── winsignhost.cpp        the enclave host - NOT a layer,
+│                              the inverted-call service (ch. 42)
+├── enclave/
+│   ├── winsign_enclave.c      LAYER 3 - the VBS enclave
+│   ├── winsign_enclave.def
+│   └── enclave_api.h          SEAM C - host and enclave
+└── tools/
+    └── verify.ps1             independent verification (ch. 43)
+
+/* AGAIN, TWO SHARED HEADERS, ONE PER TRUST BOUNDARY. The
+   application must not see the enclave's interface, and the
+   enclave must not see the driver's. Each header is included
+   by exactly the components on either side of its seam.   */</code></pre>
+
+<h2 id="order">The order to build it in</h2>
+
+<p>Four moving parts on a machine where a mistake in one of them bugchecks the box. This order keeps a working
+system in front of you at every step, and leaves the driver — the only piece that can take the machine down —
+until after the hard part is proved.</p>
+
+<pre class="diagram">   0. CHECK VBS IS ACTUALLY ON. msinfo32, or the one-liner
+      in chapter 42. Everything below fails confusingly if
+      it is not, and the failure does not say so.
+
+   1. THE ENCLAVE, called directly by a throwaway host of
+      twenty lines. No driver, no service, no IOCTL. This
+      is the part most likely to fight you - signing, the
+      supported-DLL set, the entry point - so do it while
+      nothing else can be blamed.              (chapter 42)
+
+   2. SEALING, so the key survives a restart. Still no
+      driver.                                  (chapter 43)
+
+   3. THE DRIVER, with a test IOCTL that returns a constant.
+      Proves seam A, the INF, the interface ACL and your
+      test-signing setup - separately from any of the
+      logic.                                   (chapter 41)
+
+   4. THE INVERTED CALL, joining 1-3 together. Proves
+      seam B.                                  (chapter 41)
+
+   5. THE ATTACK TESTS. Only now is there anything to
+      attack.                                  (chapter 43)
+
+   NOTE THIS IS THE OPPOSITE ORDER TO THE OP-TEE PROJECT,
+   where the secure side was easy and the transport was not.
+   Here the transport is routine Windows driver work and the
+   enclave is where the surprises live.</pre>
+
+<div class="note">
+<b>You need a machine you can afford to break</b>
+<p>Test-signed drivers, a VBS-capable machine and an enclave that must be loaded into a live process is not a
+combination to develop on your daily driver. A VM with nested virtualisation enabled and a checkpoint taken
+before each install is the right setup — see <a href="win-22-windbg.html">chapter 23</a> for attaching a kernel
+debugger to it, which you will want by step 3.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Which seam</th></tr></thead>
+<tbody>
+<tr><td><code>CreateEnclave</code> fails with <code>ERROR_NOT_SUPPORTED</code></td><td>None — VBS is off, or
+the machine cannot do it</td></tr>
+<tr><td><code>CreateFile</code> on the device fails with access denied</td><td>A — the interface ACL, which is
+a deliberate policy decision</td></tr>
+<tr><td><code>DeviceIoControl</code> returns <code>ERROR_INSUFFICIENT_BUFFER</code></td><td>A — the output
+buffer size the app declared</td></tr>
+<tr><td>The app hangs forever on a signing request</td><td>B — the host is not running, so nothing ever
+completes the pended IRP</td></tr>
+<tr><td><code>LoadEnclaveImage</code> fails</td><td>C — the DLL's signature, or a dependency outside the
+supported set</td></tr>
+<tr><td>The enclave faults the moment it touches the parameter</td><td>C — a pointer into VTL0 treated as
+though it were enclave memory</td></tr>
+<tr><td><code>EnclaveUnsealData</code> fails after a rebuild</td><td>D — expected, if the sealing policy binds
+to exact code</td></tr>
+<tr><td>Everything works until you reboot</td><td>D — the key was never sealed, only held in memory</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw VTL0 and VTL1 with both rings, and say where each of the four components lives.</li>
+  <li>State which direction VTL memory access works, and why that asymmetry is the whole design.</li>
+  <li>Explain why <code>ntoskrnl.exe</code> being in VTL0 is the point rather than a limitation.</li>
+  <li>Explain why a kernel driver cannot call an enclave, and what the inverted call model does about it.</li>
+  <li>Name the three trust boundaries and the one hop that is not one.</li>
+  <li>Say what an attacker who fully controls <code>winsignhost.exe</code> can and cannot do.</li>
+  <li>Explain the hazard at seam C and the rule that answers it.</li>
+  <li>Give three differences between this and the OP-TEE project, and one thing that is identical.</li>
+  <li>Say what you would build first here, and why it is the opposite of the OP-TEE order.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

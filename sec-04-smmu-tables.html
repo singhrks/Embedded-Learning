@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMMU: stream tables and context descriptors | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SMMU: stream tables and context descriptors</h1>
+<p class="lead">SMMUv3 is entirely table-driven: software builds structures in memory and tells the hardware
+where they are. There is no per-device register bank to program. This chapter walks the lookup chain from a
+StreamID to a page table.</p>
+
+<h2 id="chain">The lookup chain</h2>
+
+<p>Translating a device transaction walks a chain of structures, each selecting the next. Holding the whole chain in your head is what makes an SMMU fault log readable rather than opaque.</p>
+
+<pre class="diagram">   transaction: StreamID, SubstreamID, address, R/W, NS
+        |
+        v
+   +--------------------------------------------------+
+   | STREAM TABLE            base: SMMU_STRTAB_BASE    |
+   |   indexed by StreamID                             |
+   |   entry: STE, 64 bytes (8 x 64-bit words)         |
+   +------------------------+-------------------------+
+                            |
+                            v
+   +--------------------------------------------------+
+   | STREAM TABLE ENTRY (STE)                          |
+   |   V             is this stream configured?        |
+   |   Config[2:0]   bypass / abort / S1 / S2 / both   |
+   |   S1ContextPtr  -> the CD table for this device   |
+   |   S1Fmt, S1CDMax  linear or 2-level CD table      |
+   |   S2TTB         stage-2 table root                |
+   |   S2TCR-like fields, S2VMID                       |
+   |   SHCFG, MTCFG, ALLOCCFG   attribute overrides    |
+   |   STRW          which translation regime          |
+   |   EATS          Address Translation Services       |
+   +------------------------+-------------------------+
+                            |
+                            v
+   +--------------------------------------------------+
+   | CONTEXT DESCRIPTOR (CD), 64 bytes                 |
+   |   indexed by SubstreamID                          |
+   |   V, A (ASID)                                     |
+   |   TTB0, TTB1        stage-1 table roots           |
+   |   T0SZ, T1SZ, TG0, TG1, IPS, EPD0/1               |
+   |   MAIR                                            |
+   |   ASET, nSCFG, AA64                               |
+   |   -- exactly the CPU's TCR_EL1 + MAIR_EL1 +       |
+   |      TTBR0/1_EL1, packed into memory              |
+   +------------------------+-------------------------+
+                            |
+                            v
+   translation tables — IDENTICAL descriptor format to the CPU's
+                        (ARM chapter 14)
+
+  That last point is the important one: the SMMU deliberately
+  reuses the CPU's translation architecture, which is what makes
+  SVA possible (chapter 05).</pre>
+
+<h2 id="ste">The Stream Table Entry</h2>
+
+<p>The per-device configuration record: what kind of translation applies, where its tables are, and what happens on a fault. Nearly every SMMU misconfiguration is a wrong field in this structure.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th><code>Config[2:0]</code></th><th>Behaviour</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>0b000</code></td><td><strong>Abort</strong> — every transaction from this stream is terminated</td><td>Unconfigured devices. <strong>The correct default.</strong></td></tr>
+<tr><td><code>0b100</code></td><td><strong>Bypass</strong> — no translation, no checks</td><td>Debug only (<a href="sec-02-dma-problem.html">ch. 02</a>)</td></tr>
+<tr><td><code>0b101</code></td><td>Stage 1 only</td><td>A bare-metal OS isolating its devices</td></tr>
+<tr><td><code>0b110</code></td><td>Stage 2 only</td><td>Device passthrough to a VM with no guest IOMMU</td></tr>
+<tr><td><code>0b111</code></td><td>Both stages</td><td>Nested: guest IOMMU plus hypervisor confinement</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Building an STE for stage-1-only translation. Field names
+   follow the SMMUv3 spec; the shape is what matters.       */
+
+struct ste {
+        uint64_t w[8];          /* 64 bytes */
+};
+
+static void ste_make_s1(struct ste *e, uint64_t cd_table_pa,
+                        unsigned ssid_bits)
+{
+        memset(e, 0, sizeof *e);
+
+        /* word 0: valid, config, CD table pointer and format */
+        e-&gt;w[0] = STE_VALID
+                | FIELD_PREP(STE_CONFIG, 0b101)         /* S1 only  */
+                | FIELD_PREP(STE_S1FMT, ssid_bits ? 1 : 0)
+                | (cd_table_pa &amp; STE_S1CTXPTR_MASK)
+                | FIELD_PREP(STE_S1CDMAX, ssid_bits);
+
+        /* word 1: fault behaviour and attribute handling */
+        e-&gt;w[1] = FIELD_PREP(STE_S1DSS, 0b01)   /* SSID 0 for no-SSID
+                                                   transactions      */
+                | FIELD_PREP(STE_S1CIR, 0b01)   /* cacheable CD fetch */
+                | FIELD_PREP(STE_S1COR, 0b01)
+                | FIELD_PREP(STE_S1CSH, 0b11)   /* inner shareable    */
+                | FIELD_PREP(STE_STRW, 0b00)    /* EL1&amp;0 regime       */
+                | STE_S1STALLD;                  /* terminate rather
+                                                    than stall        */
+
+        /* the ZEROED and populated entry must be visible to the
+           SMMU before it is marked valid — the SMMU is a separate
+           observer reading memory directly (ARM chapter 13)     */
+        __asm__ volatile("dsb ishst" ::: "memory");
+}
+
+/* And a stage-2 STE, for passthrough to a VM: */
+static void ste_make_s2(struct ste *e, uint64_t s2_pgd_pa,
+                        unsigned vmid)
+{
+        memset(e, 0, sizeof *e);
+        e-&gt;w[0] = STE_VALID | FIELD_PREP(STE_CONFIG, 0b110);
+        e-&gt;w[2] = FIELD_PREP(STE_S2VMID, vmid)
+                | FIELD_PREP(STE_S2T0SZ, 64 - ipa_bits)
+                | FIELD_PREP(STE_S2SL0, start_level)
+                | FIELD_PREP(STE_S2TG, granule)
+                | STE_S2AA64 | STE_S2R;         /* record faults */
+        e-&gt;w[3] = s2_pgd_pa &amp; STE_S2TTB_MASK;
+        __asm__ volatile("dsb ishst" ::: "memory");
+}</code></pre>
+
+<div class="warn">
+<b>STE and CD memory has attribute requirements</b>
+<p>The SMMU fetches these structures itself, as a separate bus master. The memory holding them must be
+accessible to it and must have <em>consistent</em> attributes: if the CPU writes them as cacheable Inner
+Shareable while the SMMU is configured to fetch them non-cacheable, the SMMU reads stale data. That is a
+mismatched-attributes bug (<a href="arm-19-shareability.html">ARM 19</a>) with a particularly confusing
+symptom — a table that looks correct in a memory dump but does not work.</p>
+<p>The <code>S1CIR</code>/<code>S1COR</code>/<code>S1CSH</code> fields in the STE, and
+<code>SMMU_CR1</code>'s equivalents for the stream table itself, must match how software writes them.</p>
+</div>
+
+<h2 id="twolevel">Two-level stream tables</h2>
+
+<p>When the identifier space is large, the stream table is split across two levels so that only the entries actually used consume memory — the same technique page tables use, for the same reason.</p>
+
+<pre class="diagram">A flat table needs 2^SIDSIZE entries of 64 bytes:
+
+   16-bit StreamID -> 65536 * 64 =  4 MB
+   20-bit          -> 1M    * 64 = 64 MB
+
+Wasteful when a dozen devices exist. So:
+
+   SMMU_STRTAB_BASE_CFG.FMT = 1        two-level
+
+   StreamID[hi]  -> L1 descriptor (8 bytes)
+                       V, SPAN, L2 table address
+   StreamID[lo]  -> index into that L2 table of STEs
+
+   +-------------+
+   | L1 desc 0   |--> [ STE ][ STE ][ STE ] ... (SPAN entries)
+   | L1 desc 1   |    invalid — no L2 table allocated
+   | L1 desc 2   |--> [ STE ][ STE ] ...
+   +-------------+
+
+  Only the spans actually used are allocated. Exactly the
+  sparseness argument of multi-level page tables (ARM ch. 13).
+
+  SPAN encodes log2(entries + 1), so a span of 0 means the L1
+  descriptor is invalid — a common off-by-one when building
+  these by hand.</pre>
+
+<h2 id="cd">The Context Descriptor</h2>
+
+<p>Where the stream table entry describes the device, the context descriptor describes one address space belonging to it — which is what allows several processes to share a device safely.</p>
+
+<pre><code>/* The CD is the SMMU's version of a CPU translation context.
+   Compare field by field with ARM chapter 12:              */
+
+   CD field        CPU equivalent
+   --------        --------------
+   TTB0, TTB1      TTBR0_EL1, TTBR1_EL1
+   T0SZ, T1SZ      TCR_EL1.T0SZ / T1SZ
+   TG0, TG1        TCR_EL1.TG0 / TG1
+   IPS             TCR_EL1.IPS
+   IRGN, ORGN, SH  TCR_EL1 walk cacheability and shareability
+   EPD0, EPD1      TCR_EL1.EPD0 / EPD1  (disable a TTBR)
+   MAIR            MAIR_EL1
+   ASID (A)        TTBR0_EL1[63:48]
+   AA64            execution state
+   nSCFG, ASET     SMMU-specific: NS handling, ASID scope
+
+/* Which is the whole point: the SMMU can be pointed at the
+   SAME translation tables a process is using, with the SAME
+   ASID, and the device then dereferences exactly the pointers
+   the application uses. That is SVA (chapter 05).         */
+
+static void cd_make(struct cd *c, uint64_t ttbr0, unsigned asid)
+{
+        memset(c, 0, sizeof *c);
+        c-&gt;w[0] = CD_VALID | CD_AA64
+                | FIELD_PREP(CD_T0SZ, 64 - va_bits)
+                | FIELD_PREP(CD_TG0, granule_code)
+                | FIELD_PREP(CD_IRGN0, 0b01)    /* WB cacheable walks */
+                | FIELD_PREP(CD_ORGN0, 0b01)
+                | FIELD_PREP(CD_SH0, 0b11)      /* inner shareable    */
+                | CD_EPD1                        /* no TTBR1 for a
+                                                    device context    */
+                | FIELD_PREP(CD_ASID, asid);
+        c-&gt;w[1] = ttbr0 &amp; CD_TTB0_MASK;
+        c-&gt;w[3] = mair_value;
+        __asm__ volatile("dsb ishst" ::: "memory");
+}</code></pre>
+
+<h2 id="cdtable">CD tables</h2>
+
+<p>A device with several clients needs several context descriptors, indexed by the substream identifier. This is the structure that makes that indexing work.</p>
+
+<pre class="diagram">Like stream tables, CD tables can be linear or two-level,
+depending on how many SubstreamIDs a device uses:
+
+   LINEAR    STE.S1Fmt = 0
+             one contiguous array of 2^S1CDMax entries
+             fine for a handful of contexts
+
+   TWO-LEVEL STE.S1Fmt = 1 or 2
+             for a device with thousands of contexts — a GPU
+             serving every process on the system
+
+  And the degenerate case: a device with NO SubstreamIDs uses a
+  single CD, with STE.S1CDMax = 0. The CD pointer then points
+  directly at one 64-byte descriptor rather than a table.
+
+  STE.S1DSS controls what happens to a transaction that arrives
+  WITHOUT a SubstreamID on a device that has them:
+       0b00  terminate
+       0b01  use SubstreamID 0
+       0b10  bypass stage 1
+
+  Getting S1DSS wrong gives a device whose SubstreamID-tagged
+  traffic works while its untagged traffic aborts — a confusing
+  partial failure.</pre>
+
+<h2 id="registers">The few registers that exist</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Register</th><th>Holds</th></tr></thead>
+<tbody>
+<tr><td><code>SMMU_IDR0-5</code></td><td>Read-only capability: StreamID width, supported granules, stage support, ATS, PRI, coherency of table walks</td></tr>
+<tr><td><code>SMMU_CR0</code></td><td>Global enable: <code>SMMUEN</code>, <code>EVENTQEN</code>, <code>CMDQEN</code>, <code>PRIQEN</code></td></tr>
+<tr><td><code>SMMU_CR1</code></td><td>Table and queue memory attributes — must match how software writes them</td></tr>
+<tr><td><code>SMMU_CR2</code></td><td>Private TLB behaviour, <code>RECINVSID</code> (record invalid-StreamID events)</td></tr>
+<tr><td><code>SMMU_STRTAB_BASE</code></td><td>Physical address of the stream table</td></tr>
+<tr><td><code>SMMU_STRTAB_BASE_CFG</code></td><td>Format (linear or 2-level), <code>LOG2SIZE</code>, <code>SPLIT</code></td></tr>
+<tr><td><code>SMMU_CMDQ_BASE/PROD/CONS</code></td><td>The command queue</td></tr>
+<tr><td><code>SMMU_EVENTQ_BASE/PROD/CONS</code></td><td>The event queue</td></tr>
+<tr><td><code>SMMU_PRIQ_*</code></td><td>The page-request queue</td></tr>
+<tr><td><code>SMMU_GERROR/GERRORN</code></td><td>Global errors — a malformed command, a queue overflow</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>That is nearly the whole MMIO interface. Everything else — every device's configuration — lives in memory
+structures. This is a deliberate contrast with SMMUv2, which had a bank of registers per "context bank" and
+therefore a hard limit on how many contexts could exist.</p>
+
+<h2 id="init">Bringing an SMMU up</h2>
+
+<p>Bringing an SMMU up is an ordered sequence, and the ordering is not negotiable: structures must exist and be visible to the hardware before the unit is enabled to use them.</p>
+
+<pre><code>/* The order matters, and several steps are easy to omit. */
+
+/* 1. read capabilities BEFORE assuming anything */
+        idr0 = readl(base + SMMU_IDR0);
+        idr1 = readl(base + SMMU_IDR1);
+        sid_bits   = FIELD_GET(IDR1_SIDSIZE, idr1);
+        ssid_bits  = FIELD_GET(IDR1_SSIDSIZE, idr1);
+        has_s1     = idr0 &amp; IDR0_S1P;
+        has_s2     = idr0 &amp; IDR0_S2P;
+        coherent   = idr0 &amp; IDR0_COHACC;    /* are table walks
+                                               coherent with the CPU? */
+
+/* 2. DISABLE the SMMU while configuring */
+        writel(0, base + SMMU_CR0);
+        wait_for_ack(SMMU_CR0ACK, 0);
+
+/* 3. allocate and ZERO the stream table. Every STE must be
+      valid-bit-clear or explicitly set to ABORT — never left as
+      whatever memory happened to contain.                    */
+        strtab = alloc_zeroed(strtab_size);
+        for (i = 0; i &lt; nr_entries; i++)
+                ste_make_abort(&amp;strtab[i]);
+
+/* 4. allocate the command, event and PRI queues */
+
+/* 5. program the bases and attributes */
+        writeq(strtab_pa | fmt, base + SMMU_STRTAB_BASE);
+        writel(cfg,               base + SMMU_STRTAB_BASE_CFG);
+        writel(queue_attrs,       base + SMMU_CR1);
+
+/* 6. invalidate EVERYTHING cached from a previous boot stage */
+        cmdq_issue(CMD_CFGI_ALL);
+        cmdq_issue(CMD_TLBI_NSNH_ALL);
+        cmdq_issue(CMD_SYNC);
+
+/* 7. enable the queues, THEN the SMMU */
+        writel(CR0_CMDQEN | CR0_EVTQEN, base + SMMU_CR0);
+        wait_for_ack(...);
+        writel(CR0_CMDQEN | CR0_EVTQEN | CR0_SMMUEN, base + SMMU_CR0);
+        wait_for_ack(...);
+
+/* Step 3 is the security-critical one: if unconfigured entries
+   are left with the valid bit SET from stale memory, unknown
+   devices get whatever translation that garbage describes. Zero
+   the table, and configure the default as ABORT.          */</code></pre>
+
+<h2 id="secure">Secure and non-secure interfaces</h2>
+
+<p>An SMMU has its own secure and non-secure programming interfaces, so that secure-world configuration cannot be altered from the normal world. That separation is what makes the SMMU trustworthy as a security boundary.</p>
+
+<pre class="diagram">SMMUv3 has TWO complete programming interfaces, at different
+address offsets:
+
+   +0x0000   Non-secure  SMMU_*
+   +0x8000   Secure      SMMU_S_*        (present if IDR1.SECURE_IMPL)
+
+  Each has its OWN stream table, command queue, event queue and
+  enable bit. They are independent.
+
+  WHY: a device operating in the secure world must be configured
+  by secure firmware. If the Non-secure OS could program that
+  device's translations, it could redirect a secure DMA engine's
+  transfers into normal-world memory — a complete bypass of
+  TrustZone.
+
+  And the STE carries security attributes too: STE.NSCFG and
+  CD.NSCFG determine whether the resulting transaction is issued
+  as Secure or Non-secure, exactly as the descriptor NS bit does
+  for the CPU (ARM chapter 14).
+
+  So the SMMU is not merely an isolation device for the normal
+  world — it is part of the TrustZone enforcement boundary
+  (chapters 08-10).</pre>
+
+<h2 id="linux">What Linux does</h2>
+
+<p>In practice Linux programs all of this for you through the IOMMU layer, and knowing where the kernel's abstractions meet the hardware structures is what lets you debug across the boundary.</p>
+
+<pre><code>/* drivers/iommu/arm/arm-smmu-v3/ — worth reading, and about
+   6000 lines. The structures map directly onto the above:  */
+
+struct arm_smmu_device {
+        void __iomem            *base;
+        struct arm_smmu_strtab_cfg strtab_cfg;   /* stream table   */
+        struct arm_smmu_cmdq     cmdq;
+        struct arm_smmu_evtq     evtq;
+        struct arm_smmu_priq     priq;
+        u32                      features;       /* from IDR0-5    */
+};
+
+struct arm_smmu_domain {                 /* one per address space  */
+        struct arm_smmu_device  *smmu;
+        enum arm_smmu_domain_stage stage;         /* S1 or S2      */
+        struct io_pgtable_ops   *pgtbl_ops;       /* the page tables */
+        struct arm_smmu_ctx_desc cd;              /* the CD         */
+};
+
+/* And the generic IOMMU layer above it: */
+        iommu_domain_alloc()      create an address space
+        iommu_attach_device()     point a StreamID at it
+        iommu_map(domain, iova, paddr, size, prot)
+        iommu_unmap(domain, iova, size)
+
+/* The io-pgtable library builds the actual tables, and is SHARED
+   with the CPU's page table code — because the format is
+   identical.                                                */</code></pre>
+
+<h2 id="debug">Inspecting the tables</h2>
+
+<p>The SMMU exposes its own configuration and state, which is how you confirm the kernel programmed what you expected rather than inferring it from behaviour.</p>
+
+<pre><code># the SMMU's own view
+dmesg | grep -i smmu
+#   arm-smmu-v3 2b400000.iommu: ias 48-bit, oas 48-bit (features 0x00013fbf)
+#   arm-smmu-v3 2b400000.iommu: allocated 65536 entry cmdq
+#   arm-smmu-v3 2b400000.iommu: 2-level strtab only covers 0..0xffff
+
+# domains and groups
+ls /sys/kernel/iommu_groups/*/devices/
+cat /sys/kernel/iommu_groups/*/type          # DMA, DMA-FQ, identity
+
+# mappings, live
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+#   map:   IOVA=0x... paddr=0x... size=0x1000
+#   unmap: IOVA=0x... size=0x1000
+
+# from a JTAG debugger, walk the tables by hand:
+#   1. read SMMU_STRTAB_BASE
+#   2. index by StreamID (allowing for the two-level format)
+#   3. read the STE's 8 words; check V and Config
+#   4. follow S1ContextPtr to the CD
+#   5. follow the CD's TTB0 into the page tables, which you can
+#      then walk exactly as in ARM chapter 13
+
+# Doing this once by hand makes every later SMMU problem
+# tractable.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>C_BAD_STE</code> events</td><td>Malformed STE, or the STE memory has attributes the SMMU cannot read coherently</td></tr>
+<tr><td><code>C_BAD_CD</code></td><td>Bad TCR-equivalent fields, or a misaligned CD table</td></tr>
+<tr><td>Tables look right in a dump but do not work</td><td>Mismatched memory attributes between CPU writes and SMMU fetches</td></tr>
+<tr><td>Unknown devices get working translations</td><td>Stream table not zeroed; stale valid entries</td></tr>
+<tr><td>SubstreamID traffic works, untagged traffic aborts</td><td><code>STE.S1DSS</code> misconfigured</td></tr>
+<tr><td>Stream table allocation fails at boot</td><td>Flat format with a large StreamID space; use two-level</td></tr>
+<tr><td>Secure device redirected by the normal-world OS</td><td>Secure interface not used for secure streams</td></tr>
+<tr><td>Changes to an STE have no effect</td><td>Missing <code>CMD_CFGI_STE</code> and <code>CMD_SYNC</code> (<a href="sec-05-smmu-stages.html">ch. 05</a>)</td></tr>
+<tr><td>SMMU enable never acknowledges</td><td>Queues not enabled first, or a base address the SMMU cannot reach</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the lookup chain from StreamID to a page table entry.</li>
+  <li>Give the five STE <code>Config</code> values and when each is correct.</li>
+  <li>Explain why the default for an unconfigured stream must be abort, not bypass.</li>
+  <li>Map five CD fields onto their CPU system-register equivalents.</li>
+  <li>Explain why the CD's similarity to the CPU's context is the point.</li>
+  <li>Explain when a two-level stream table or CD table is needed.</li>
+  <li>Explain why STE and CD memory attributes must match how software writes them.</li>
+  <li>Say why the SMMU has separate secure and non-secure programming interfaces.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

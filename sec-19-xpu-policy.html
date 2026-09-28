@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access control: designing a policy | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Access control: designing a policy</h1>
+<p class="lead">Knowing how to program an XPU is the easy half. The hard half is deciding what the policy
+should <em>be</em> — and doing it as engineering rather than as a guess, on a chip with sixty bus masters
+and a memory map nobody has ever written down in one place.</p>
+
+<h2 id="method">The method</h2>
+
+<p>Writing an access-control policy is a design exercise before it is a programming one, and doing it ad hoc produces a policy that is both permissive and unmaintainable. This is a method that scales.</p>
+
+<pre class="diagram">   1. ENUMERATE every bus master. All of them.
+   2. ENUMERATE every protected resource.
+   3. Build the ACCESS MATRIX: who needs what, and why.
+   4. Group masters into DOMAINS to fit the hardware's limits.
+   5. Lay out the MEMORY MAP to match the region granularity.
+   6. Express the policy as DATA, in one place.
+   7. GENERATE the firmware tables and the device tree from it.
+   8. TEST the negative cases.
+   9. REVIEW, with people who did not write it.
+
+  Steps 1 and 2 take a week and feel like clerical work. They
+  are the whole job. Every failure of a real policy traces back
+  to a master nobody listed or a resource nobody classified.</pre>
+
+<h2 id="masters">Step 1: enumerate the masters</h2>
+
+<p>Step one is knowing every master on the SoC that can issue transactions. That list is longer than most teams expect and is where the surprises live.</p>
+
+<pre><code>/* "Every block that can issue a bus transaction." Far more
+   than people expect. On a mid-range application SoC:      */
+
+   CPU cluster(s)          often several, with different IDs
+                           per core or per cluster
+   GPU                     usually several masters: shader,
+                           command processor, ...
+   display controller      one per pipe
+   camera ISP              plus its own DMA
+   video encoder/decoder
+   audio DSP               and its DMA
+   sensor hub / always-on MCU
+   modem subsystem         its DSP, its DMA, its own CPU
+   Wi-Fi / Bluetooth       often bus masters over PCIe or a
+                           dedicated port
+   PCIe root complex       and EVERY endpoint behind it
+   USB host and device
+   SDIO / eMMC / UFS controllers
+   Ethernet MAC
+   generic DMA engines     several, with many channels
+   crypto engine
+   power-management controller / SCP
+   CoreSight / debug access port     &lt;-- a master, and the
+                                         one people forget
+   trace funnel writing to memory (ETR)
+   a "system cache" or interconnect maintenance block
+
+/* FOR EACH ONE, record:
+
+     what is its master ID, or ID range?
+     is the ID fixed, or programmable by that master?
+     is it behind an SMMU? which one? which StreamIDs?
+     is it behind an XPU? which one?
+     what security state does it issue in? fixed or dynamic?
+     who controls its firmware, and how is that firmware
+       verified?
+     when is it released from reset, relative to the XPU
+       configuration?
+
+/* SOURCES: the SoC TRM's master ID table, the interconnect
+   configuration, the SMMU StreamID mapping, the DT, and -
+   this one matters - ASKING THE SoC INTEGRATION TEAM. The
+   documentation is routinely incomplete. Blocks get added
+   late.
+
+/* AND THEN VERIFY EMPIRICALLY: program a deny-all XPU, run the
+   system, and collect the faults. Every master that faults is
+   one you now know about. Masters that never appear are either
+   idle or not covered - and telling those two apart is the
+   point of the exercise.                                    */</code></pre>
+
+<div class="danger">
+<b>The master you did not list is your vulnerability</b>
+<p>A debug block that can write DRAM. A power-management microcontroller running unsigned vendor firmware
+with full bus access. A PCIe endpoint that arrives with the user's plug-in card. An audio DSP whose
+firmware is loaded from the normal-world filesystem. Each of these has been the path around an otherwise
+sound TrustZone design on shipping hardware. The policy is defined by its <em>completeness</em>, not by how
+carefully you wrote the entries you thought of.</p>
+</div>
+
+<h2 id="resources">Step 2: enumerate the resources</h2>
+
+<p>Step two is the other axis: every resource worth protecting, at the granularity the hardware can actually express.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Class</th><th>Examples</th><th>Typical rule</th></tr></thead>
+<tbody>
+<tr><td><strong>Secure code and data</strong></td><td>BL31, trusted OS, secure heap, secure stacks</td><td>Secure domain only. Locked.</td></tr>
+<tr><td><strong>Key material</strong></td><td>Fuse controller, key slots, RNG, crypto engine</td><td>Secure domain, minimum permissions. Often no write at runtime at all.</td></tr>
+<tr><td><strong>Subsystem private memory</strong></td><td>Modem heap, DSP firmware and scratch</td><td>That subsystem only. Not even the AP.</td></tr>
+<tr><td><strong>Shared buffers</strong></td><td>AP↔modem IPC, mailboxes, ring buffers</td><td>Exactly the two parties. The <em>only</em> intended overlaps.</td></tr>
+<tr><td><strong>Normal-world DRAM</strong></td><td>The kernel and everything it manages</td><td>AP domain plus the media masters that need it.</td></tr>
+<tr><td><strong>Protected media</strong></td><td>DRM decode buffers, framebuffer during trusted UI</td><td>Secure or a "protected" domain; write-only for some masters.</td></tr>
+<tr><td><strong>System control</strong></td><td>Clocks, resets, power, PLLs, thermal</td><td>Whoever owns power management. Usually secure or AP, not both.</td></tr>
+<tr><td><strong>The access-control blocks themselves</strong></td><td>XPU, SMMU secure interface, TZASC config</td><td>Secure domain only, then locked.</td></tr>
+<tr><td><strong>Debug</strong></td><td>CoreSight, ETR buffers, the DAP</td><td>Gated by the lifecycle state (<a href="sec-10-hw-enforcement.html">ch. 10</a>).</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="matrix">Step 3: the access matrix</h2>
+
+<p>With both lists, the policy is a grid — and filling it in explicitly is what surfaces the permissions nobody could justify but everybody assumed were needed.</p>
+
+<pre><code># One row per resource, one column per domain, and a REASON
+# for every non-empty cell. The reason column is what makes
+# this a review artifact rather than a table.
+
+resource            secure  ap    modem media sensor debug  reason
+--------------------------------------------------------------------
+bl31_dram            rw      -     -     -     -      -     EL3 only
+optee_dram           rw      -     -     -     -      -     TEE only
+optee_shm            rw      rw    -     -     -      -     TEE ABI (ch.12)
+ns_dram              rw      rw    -     rw    -      -     kernel + media
+modem_dram           rw      -     rw    -     -      -     modem private
+ap_modem_shm         rw      rw    rw    -     -      -     IPC ring
+sensor_sram          rw      r     -     -     rw     -     AP reads results
+framebuffer          rw      rw    -     rw    -      -     display path
+protected_video      rw      -     -     w     -      -     write-only: the
+                                                            codec fills it,
+                                                            nothing reads it
+                                                            back to the AP
+fuse_ctrl            r       -     -     -     -      -     provisioning only
+crypto_engine        rw      -     -     -     -      -     secure keys
+rng                  rw      rw    -     -     -      -     both need entropy
+clock_ctrl           rw      rw    -     -     -      -     Linux CCF drives it
+xpu_config           rw      -     -     -     -      -     self-protection
+coresight            rw      -     -     -     -      rw    lifecycle gated
+
+# READ THE EMPTY CELLS. They are the security properties:
+#   modem cannot see the framebuffer
+#   media cannot see modem memory
+#   nothing but secure code reads the fuses
+#   the AP cannot read protected video back
+#
+# Each empty cell should survive the question "what breaks if
+# we fill this in?" - and if the answer is "nothing", it is a
+# property worth keeping.</code></pre>
+
+<div class="key">
+<b>Three principles, applied concretely</b>
+<ul>
+<li><strong>Least privilege.</strong> Start from all-deny and add only what a demonstrated failure requires.
+Never start from all-allow and subtract.</li>
+<li><strong>Directionality.</strong> Read and write are separate questions. A display controller reads; it
+never writes. A video encoder writes a protected buffer; nothing reads it back. Half the value of a good
+matrix is in the cells that say <code>r</code> or <code>w</code> rather than <code>rw</code>.</li>
+<li><strong>Justify every allow.</strong> A cell without a reason is a cell nobody can safely remove later,
+which means it will still be there in five years' worth of derived products.</li>
+</ul>
+</div>
+
+<h2 id="map">Step 5: laying out memory to fit</h2>
+
+<p>Turning the matrix into hardware configuration is mechanical once the matrix exists, which is precisely why the matrix is worth producing first.</p>
+
+<pre class="diagram">The XPU has 16 regions and a 1 MB granule. Your matrix has 24
+distinct resource classes. Something has to give - and the
+right thing to give is the ADDRESS MAP, decided early.
+
+  BAD LAYOUT - interleaved, needs a region per buffer:
+
+     0x8000_0000  kernel
+     0x8010_0000  modem shared
+     0x8020_0000  kernel
+     0x8030_0000  sensor
+     0x8040_0000  kernel
+     ...                      -&gt; 20 regions, 4 KB apart,
+                                 impossible to express
+
+  GOOD LAYOUT - grouped by DOMAIN, aligned to the granule:
+
+     0x8000_0000  +----------------------+
+                  | AP DRAM              |  1 region
+                  | 768 MB               |
+     0xB000_0000  +----------------------+
+                  | AP/modem shared 4 MB |  1 region
+     0xB040_0000  +----------------------+
+                  | AP/sensor shared 1 MB|  1 region
+     0xB050_0000  +----------------------+
+                  | (gap - denied)       |
+     0xC000_0000  +----------------------+
+                  | modem private 128 MB |  1 region
+     0xC800_0000  +----------------------+
+                  | protected media 64 MB|  1 region
+     0xCC00_0000  +----------------------+
+                  | secure world 32 MB   |  1 region
+     0xCE00_0000  +----------------------+
+
+  Six regions instead of twenty. And note the GAPS: address
+  space that matches no region and is therefore denied to
+  everyone. Gaps are free - use them as guard bands between
+  domains, so an off-by-a-little DMA lands in a fault rather
+  than in the neighbour's memory.
+
+  THE RULE: group by WHO MAY TOUCH IT, not by what it is for.
+  All AP memory contiguous, all modem memory contiguous, each
+  sharing window its own aligned block.
+
+  This decision is made at SoC memory-map definition time,
+  which is roughly 18 months before anyone writes the XPU
+  driver. Bring the security requirements to that meeting or
+  you will spend the project working around its output.</pre>
+
+<h2 id="single">Steps 6 and 7: one source of truth</h2>
+
+<p>A policy with a single overly-permissive entry can undo the rest of it. These are the patterns that quietly do that.</p>
+
+<pre><code># The same policy must appear in at least four places:
+#   the firmware's XPU tables
+#   the firmware's TZASC/TZC configuration
+#   the device tree's reserved-memory nodes
+#   the SMMU stream table setup
+# and often a fifth: the modem or DSP's own linker script.
+#
+# Hand-maintaining four copies guarantees they will drift. So
+# write the policy ONCE, as data, and generate.
+
+# platform_policy.yaml
+domains:
+  secure:  { masters: [cpu_s, crypto] }
+  ap:      { masters: [cpu_ns, dma0, dma1, usb, ufs] }
+  modem:   { masters: [mdsp, mdma] }
+  media:   { masters: [gpu, display, venc, vdec] }
+  sensor:  { masters: [shub] }
+
+regions:
+  - name: ns_dram
+    base: 0x80000000
+    size: 0x30000000
+    access: { ap: rw, media: rw, secure: rw }
+    dt_node: false                 # the kernel owns it
+  - name: ap_modem_shm
+    base: 0xB0000000
+    size: 0x00400000
+    access: { ap: rw, modem: rw, secure: rw }
+    dt_node: { name: modem_shm, no_map: false }
+  - name: modem_priv
+    base: 0xC0000000
+    size: 0x08000000
+    access: { modem: rw, secure: rw }
+    dt_node: { name: modem_mem, no_map: true }
+  - name: secure_dram
+    base: 0xCE000000
+    size: 0x02000000
+    access: { secure: rw }
+    dt_node: { name: secure_mem, no_map: true }
+    lock: true
+
+# Then one generator emits:
+#   xpu_policy.c        the firmware table
+#   tzc_regions.c       the TZASC configuration
+#   reserved-memory.dtsi  the DT nodes
+#   policy_test.c       the negative-test list
+#   policy.md           a human-readable matrix for review
+#
+# Now a change is made in ONE place, and the four artifacts
+# cannot disagree. This is the single highest-value thing in
+# this chapter, and it is a two-hundred-line Python script.</code></pre>
+
+<h2 id="test">Step 8: test the negatives</h2>
+
+<p>A policy is only real if denials actually happen. Testing that requires deliberately attempting forbidden accesses, which is a step most projects skip.</p>
+
+<pre><code>/* Positive tests - "the driver works" - happen anyway. They
+   tell you nothing about the policy, because a policy of
+   "allow everything" passes all of them.
+
+   NEGATIVE tests are the only ones that measure isolation. */
+
+struct denial_test {
+        const char *name;
+        uint32_t    master;
+        uint64_t    addr;
+        bool        write;
+};
+
+static const struct denial_test must_fail[] = {
+  { "AP reads secure DRAM",        M_CPU_NS, SECURE_DRAM,   false },
+  { "AP writes secure DRAM",       M_CPU_NS, SECURE_DRAM,   true  },
+  { "AP reads modem private",      M_CPU_NS, MODEM_PRIV,    false },
+  { "modem reads AP DRAM",         M_MODEM,  NS_DRAM,       false },
+  { "modem reads framebuffer",     M_MODEM,  FRAMEBUFFER,   false },
+  { "media writes secure DRAM",    M_GPU,    SECURE_DRAM,   true  },
+  { "AP reads protected video",    M_CPU_NS, PROT_VIDEO,    false },
+  { "AP writes fuse controller",   M_CPU_NS, FUSE_CTRL,     true  },
+  { "AP writes XPU config",        M_CPU_NS, XPU_BASE,      true  },
+  { "sensor reads AP DRAM",        M_SHUB,   NS_DRAM,       false },
+  { "display writes DRAM",         M_DISPLAY,NS_DRAM,       true  },
+  { "unlisted addr, any master",   M_CPU_NS, UNMAPPED_GAP,  false },
+};
+
+/* HOW to issue a transaction as a non-CPU master: program that
+   master's own DMA to do a small transfer, and check for the
+   error. Most subsystems have a test or loopback mode; if not,
+   the smallest real operation will do. This is genuine work to
+   build, and it is the part that separates a policy you HAVE
+   from a policy you KNOW.                                   */
+
+/* RUN THESE:
+     · in CI, on real silicon, every night
+     · on the FINAL lifecycle state, not a dev part
+     · after every firmware change
+     · after every DT change
+     · and specifically after any "temporary" bring-up widening
+
+   A denial test that starts passing when it should fail is the
+   highest-priority bug in the build. Wire it to fail the
+   pipeline.                                                */</code></pre>
+
+<h2 id="review">Step 9: review</h2>
+
+<div class="note">
+<b>What a reviewer should be able to ask</b>
+<ul>
+<li>"Show me the master list, and how you know it is complete."</li>
+<li>"Which masters are not behind any SMMU or XPU, and why is that acceptable?"</li>
+<li>"Point at the reason for this <code>rw</code>. What breaks if it becomes <code>r</code>?"</li>
+<li>"Which regions are unlocked at runtime, who can change them, and what stops the normal world asking?"</li>
+<li>"Where is the window between reset and enforcement, and which masters run inside it?"</li>
+<li>"Show me the negative test for this empty cell, and the CI run where it passed."</li>
+<li>"Which of these four artifacts is generated, and which is hand-written?"</li>
+</ul>
+<p>If any of those questions has no answer, that is the finding — not a comment on the code.</p>
+</div>
+
+<h2 id="evolve">Living with a policy</h2>
+
+<p>Policies must survive new firmware, new peripherals and new chip revisions, so how they are expressed and reviewed matters as much as what they contain.</p>
+
+<pre><code>/* Policies rot. Specifically:
+
+   · BRING-UP WIDENING. Someone opens a region to make a new
+     block work at 2 a.m., intending to narrow it later.
+     -&gt; require every widening to carry an expiry and a ticket;
+        fail the build after the date.
+
+   · DERIVED PRODUCTS. A cheaper variant drops the modem, and
+     nobody removes its domain - leaving an allow for a master
+     that no longer exists, or worse, whose ID has been reused
+     by a different block.
+     -&gt; regenerate from the policy file per product; never copy
+        the generated C.
+
+   · NEW MASTERS mid-project. A block is added; the policy is
+     not updated; it works because the default was never
+     tightened.
+     -&gt; that is why the default is DENY. A new master that
+        nobody told you about fails loudly on day one.
+
+   · DEBUG BUILDS diverging. The dev configuration is permissive
+     and the production one is not, so the negative tests only
+     ever run against the permissive one.
+     -&gt; run the denial suite against the PRODUCTION policy on
+        production silicon.                                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A new subsystem faults on everything</td><td>Its master ID is not in any region — correct behaviour of a deny-by-default policy</td></tr>
+<tr><td>Policy needs more regions than the hardware has</td><td>Memory map not grouped by domain; regroup, do not compromise the policy</td></tr>
+<tr><td>Buffers fail only at certain sizes or addresses</td><td>Crossing a region boundary; alignment does not match the granule</td></tr>
+<tr><td>Firmware and DT disagree after a change</td><td>Hand-maintained copies — generate them</td></tr>
+<tr><td>Isolation works on the dev board, not on production</td><td>Different policy build, or lifecycle state differences</td></tr>
+<tr><td>An allow nobody can explain</td><td>Bring-up widening that was never removed</td></tr>
+<tr><td>A master reaches memory the matrix forbids</td><td>Master ID shared or remapped — the matrix is describing something the hardware cannot distinguish</td></tr>
+<tr><td>Negative tests all pass, but so does everything</td><td>The XPU was never enabled — verify <code>XPU_CTRL</code></td></tr>
+<tr><td>Corruption during early boot only</td><td>A master released from reset before enforcement began</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>List the nine steps and say which two are usually skipped.</li>
+  <li>Enumerate the bus masters of a device you have worked on — all of them.</li>
+  <li>Explain why an unlisted master defeats the policy regardless of its quality.</li>
+  <li>Build an access matrix with a reason in every cell, and read its empty cells aloud as security
+  properties.</li>
+  <li>Explain why read and write must be separate decisions, with an example of each.</li>
+  <li>Redesign an interleaved memory map so it fits sixteen regions.</li>
+  <li>Explain why gaps between domains are worth keeping.</li>
+  <li>Name the four artifacts that must agree, and how to make them agree by construction.</li>
+  <li>Write ten negative tests for a system you know, and say how you would issue each one.</li>
+  <li>List four ways a policy rots and the control that stops each.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

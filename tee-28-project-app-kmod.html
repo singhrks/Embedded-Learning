@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: layers 1 and 2 — the application and the kernel driver | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: layers 1 and 2 — the application and the kernel driver</h1>
+<p class="lead">The normal-world half of the stack: a shared header that is a permanent promise, an
+unprivileged application, and a Linux driver that owns the TEE session and is the only thing in the system
+permitted to talk to the trusted application. Every line of both, plus the build.</p>
+
+<h2 id="uapi">Seam A: the header that can never change</h2>
+
+<p>Start here, because this is the part you can never take back. Once a program in the field includes this
+header, its layout and its numbers are fixed forever — which is <a href="lx-02-kernel-vs-user.html">the Linux
+track's</a> ABI rule applied to your own interface.</p>
+
+<pre><code>/* uapi/secsign_uapi.h  —  SEAM A
+ *
+ * Shared by the application (layer 1) and the driver
+ * (layer 2). PERMANENT: additions only, at the end, never
+ * a change to anything already here.
+ */
+#ifndef _UAPI_SECSIGN_H
+#define _UAPI_SECSIGN_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/ioctl.h&gt;
+
+#define SECSIGN_MAX_DATA   (1u &lt;&lt; 20)   /* 1 MiB  */
+#define SECSIGN_SIG_LEN    64           /* P-256 r||s */
+#define SECSIGN_PUBKEY_LEN 64           /* P-256 x||y */
+
+struct secsign_sign {
+        __u64 data;          /* IN  - user pointer to the message */
+        __u32 data_len;      /* IN  - bytes, &lt;= SECSIGN_MAX_DATA  */
+        __u32 _pad;          /* MUST be zero - reserved so the
+                                struct can grow without changing
+                                its size (chapter 21 of the Linux
+                                track)                            */
+        __u8  sig[SECSIGN_SIG_LEN];   /* OUT */
+};
+
+struct secsign_pubkey {
+        __u8  key[SECSIGN_PUBKEY_LEN]; /* OUT */
+};
+
+#define SECSIGN_IOC_MAGIC  'S'
+#define SECSIGN_IOC_SIGN   _IOWR(SECSIGN_IOC_MAGIC, 1, struct secsign_sign)
+#define SECSIGN_IOC_PUBKEY _IOR (SECSIGN_IOC_MAGIC, 2, struct secsign_pubkey)
+
+#endif /* _UAPI_SECSIGN_H */</code></pre>
+
+<div class="key">
+<b>Three decisions in that header worth naming</b>
+<p><code>__u64 data</code> rather than a pointer, so the structure has the same layout for 32-bit and 64-bit
+callers and no compatibility handler is ever needed. An explicit <code>_pad</code> that must be zero, so a
+later version can use those bytes for a flag while old binaries — which leave it zero — keep working. And
+fixed-size output arrays rather than a second pointer, so the signature comes back in the same copy that
+carried the request, removing a whole second round of pointer validation.</p>
+</div>
+
+<h2 id="cli">Layer 1: the application</h2>
+
+<p>Deliberately ordinary. It has no special privileges, knows nothing about the TEE, and would work unchanged
+if the signing were done by a completely different mechanism — which is what a good seam looks like from
+above.</p>
+
+<pre><code>/* cli/main.c  —  LAYER 1 */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/stat.h&gt;
+
+#include "secsign_uapi.h"
+
+#define DEV "/dev/secsign"
+
+static int do_pubkey(int fd)
+{
+        struct secsign_pubkey pk;
+
+        memset(&amp;pk, 0, sizeof(pk));
+        if (ioctl(fd, SECSIGN_IOC_PUBKEY, &amp;pk) &lt; 0) {
+                perror("SECSIGN_IOC_PUBKEY");
+                return 1;
+        }
+
+        for (unsigned i = 0; i &lt; SECSIGN_PUBKEY_LEN; i++)
+                printf("%02x", pk.key[i]);
+        putchar('\n');
+        return 0;
+}
+
+static int do_sign(int fd, const char *path)
+{
+        struct secsign_sign req;
+        struct stat st;
+        unsigned char *buf = NULL;
+        char *outpath = NULL;
+        int in = -1, out = -1, ret = 1;
+        ssize_t n;
+
+        in = open(path, O_RDONLY);
+        if (in &lt; 0) { perror(path); goto done; }
+
+        if (fstat(in, &amp;st) &lt; 0) { perror("fstat"); goto done; }
+
+        if (st.st_size &lt;= 0 || (size_t)st.st_size &gt; SECSIGN_MAX_DATA) {
+                fprintf(stderr, "%s: must be 1..%u bytes\n",
+                        path, SECSIGN_MAX_DATA);
+                goto done;
+        }
+
+        buf = malloc((size_t)st.st_size);
+        if (!buf) { perror("malloc"); goto done; }
+
+        /* read() can return short - loop. (C track, chapter 16) */
+        for (size_t got = 0; got &lt; (size_t)st.st_size; got += (size_t)n) {
+                n = read(in, buf + got, (size_t)st.st_size - got);
+                if (n &lt; 0) { perror("read"); goto done; }
+                if (n == 0) { fprintf(stderr, "short read\n"); goto done; }
+        }
+
+        memset(&amp;req, 0, sizeof(req));      /* zeroes _pad too */
+        req.data     = (__u64)(uintptr_t)buf;
+        req.data_len = (__u32)st.st_size;
+
+        if (ioctl(fd, SECSIGN_IOC_SIGN, &amp;req) &lt; 0) {
+                perror("SECSIGN_IOC_SIGN");
+                goto done;
+        }
+
+        if (asprintf(&amp;outpath, "%s.sig", path) &lt; 0) {
+                outpath = NULL; goto done;
+        }
+        out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out &lt; 0) { perror(outpath); goto done; }
+
+        if (write(out, req.sig, SECSIGN_SIG_LEN) != SECSIGN_SIG_LEN) {
+                perror("write"); goto done;
+        }
+
+        printf("wrote %s (%d bytes)\n", outpath, SECSIGN_SIG_LEN);
+        ret = 0;
+
+done:
+        if (out &gt;= 0) close(out);
+        if (in  &gt;= 0) close(in);
+        free(outpath);
+        free(buf);
+        return ret;
+}
+
+int main(int argc, char **argv)
+{
+        int fd, ret;
+
+        if (argc &lt; 2) {
+                fprintf(stderr,
+                        "usage: %s sign &lt;file&gt;\n"
+                        "       %s pubkey\n", argv[0], argv[0]);
+                return 2;
+        }
+
+        fd = open(DEV, O_RDWR);
+        if (fd &lt; 0) {
+                fprintf(stderr, "%s: %s\n", DEV, strerror(errno));
+                return 1;
+        }
+
+        if (!strcmp(argv[1], "pubkey"))
+                ret = do_pubkey(fd);
+        else if (!strcmp(argv[1], "sign") &amp;&amp; argc == 3)
+                ret = do_sign(fd, argv[2]);
+        else { fprintf(stderr, "unknown command\n"); ret = 2; }
+
+        close(fd);
+        return ret;
+}</code></pre>
+
+<h2 id="taheader">Seam B: the header shared with the trusted application</h2>
+
+<p>The second contract, between layers 2 and 3. It is separate from the UAPI on purpose — the application has
+no business knowing the TA's UUID or command numbering, and keeping them apart means the TA interface can be
+revised without touching anything user space depends on.</p>
+
+<pre><code>/* ta/include/secsign_ta.h  —  SEAM B
+ * Included by the kernel driver AND by the TA.
+ */
+#ifndef SECSIGN_TA_H
+#define SECSIGN_TA_H
+
+/* Generate your own with uuidgen; this one is an example. */
+#define SECSIGN_TA_UUID \
+        { 0x7a1b3c4d, 0x5e6f, 0x4718, \
+          { 0x9a, 0x2b, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18 } }
+
+#define SECSIGN_CMD_SIGN    0
+#define SECSIGN_CMD_PUBKEY  1
+
+#define SECSIGN_TA_SIG_LEN     64
+#define SECSIGN_TA_PUBKEY_LEN  64
+#define SECSIGN_TA_MAX_DATA    (1u &lt;&lt; 20)
+
+#endif /* SECSIGN_TA_H */</code></pre>
+
+<h2 id="kmod">Layer 2: the Linux kernel driver</h2>
+
+<p>The driver does three jobs: expose a device node, enforce policy, and own exactly one TEE session that it
+serialises every caller through. It is the first place the request is validated and the last place it exists
+in a form the normal world fully controls.</p>
+
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+/* kmod/secsign_drv.c  —  LAYER 2
+ *
+ * A misc device that forwards signing requests to a trusted
+ * application over the in-kernel TEE client interface.
+ */
+#include &lt;linux/module.h&gt;
+#include &lt;linux/miscdevice.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/tee_drv.h&gt;
+#include &lt;linux/uuid.h&gt;
+
+#include "secsign_uapi.h"
+#include "../ta/include/secsign_ta.h"
+
+struct secsign_dev {
+        struct tee_context *ctx;
+        u32                 session;
+        struct mutex        lock;   /* serialises the single
+                                       session across callers */
+        struct miscdevice   misc;
+};
+
+static struct secsign_dev *sdev;
+
+/* ---- session management -------------------------------- */
+
+static int secsign_match(struct tee_ioctl_version_data *ver,
+                         const void *data)
+{
+        /* Only OP-TEE, and only the kernel-side ABI. */
+        return ver-&gt;impl_id == TEE_IMPL_ID_OPTEE &amp;&amp;
+               ver-&gt;gen_caps &amp; TEE_GEN_CAP_GP;
+}
+
+static int secsign_open_session(struct secsign_dev *d)
+{
+        struct tee_ioctl_open_session_arg arg = { };
+        const uuid_t uuid = UUID_INIT(0x7a1b3c4d, 0x5e6f, 0x4718,
+                                      0x9a, 0x2b, 0xc3, 0xd4,
+                                      0xe5, 0xf6, 0x07, 0x18);
+        int ret;
+
+        d-&gt;ctx = tee_client_open_context(NULL, secsign_match,
+                                         NULL, NULL);
+        if (IS_ERR(d-&gt;ctx))
+                return PTR_ERR(d-&gt;ctx);
+
+        export_uuid(arg.uuid, &amp;uuid);
+        arg.clnt_login = TEE_IOCTL_LOGIN_REE_KERNEL;
+        arg.num_params = 0;
+
+        ret = tee_client_open_session(d-&gt;ctx, &amp;arg, NULL);
+        if (ret &lt; 0 || arg.ret) {
+                tee_client_close_context(d-&gt;ctx);
+                d-&gt;ctx = NULL;
+                return ret ? ret : -EINVAL;
+        }
+
+        d-&gt;session = arg.session;
+        return 0;
+}
+
+/* TEE_IOCTL_LOGIN_REE_KERNEL is what lets the TA tell a
+   request from the KERNEL apart from one from an arbitrary
+   user process (chapter 11). The TA can, and in this project
+   does, refuse anything else.                              */
+
+/* ---- the one real operation ---------------------------- */
+
+static int secsign_do_sign(struct secsign_dev *d,
+                           const void *data, u32 len,
+                           u8 *sig_out)
+{
+        struct tee_ioctl_invoke_arg arg = { };
+        struct tee_param param[2] = { };
+        struct tee_shm *shm_in, *shm_out;
+        void *in_va, *out_va;
+        int ret;
+
+        /* Shared memory is NORMAL-world memory the secure
+           world can see. Allocate, fill, invoke, free.     */
+        shm_in = tee_shm_alloc_kernel_buf(d-&gt;ctx, len);
+        if (IS_ERR(shm_in))
+                return PTR_ERR(shm_in);
+
+        shm_out = tee_shm_alloc_kernel_buf(d-&gt;ctx,
+                                           SECSIGN_TA_SIG_LEN);
+        if (IS_ERR(shm_out)) {
+                ret = PTR_ERR(shm_out);
+                goto out_in;
+        }
+
+        in_va = tee_shm_get_va(shm_in, 0);
+        if (IS_ERR(in_va)) { ret = PTR_ERR(in_va); goto out_both; }
+        memcpy(in_va, data, len);
+
+        arg.func       = SECSIGN_CMD_SIGN;
+        arg.session    = d-&gt;session;
+        arg.num_params = 2;
+
+        param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT;
+        param[0].u.memref.shm      = shm_in;
+        param[0].u.memref.size     = len;
+        param[0].u.memref.shm_offs = 0;
+
+        param[1].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+        param[1].u.memref.shm      = shm_out;
+        param[1].u.memref.size     = SECSIGN_TA_SIG_LEN;
+        param[1].u.memref.shm_offs = 0;
+
+        ret = tee_client_invoke_func(d-&gt;ctx, &amp;arg, param);
+        if (ret &lt; 0)
+                goto out_both;
+        if (arg.ret) {
+                /* arg.ret_origin says WHICH LAYER failed -
+                   far more useful than the code (ch. 08). */
+                pr_err("secsign: TA failed 0x%x origin %u\n",
+                       arg.ret, arg.ret_origin);
+                ret = -EIO;
+                goto out_both;
+        }
+        if (param[1].u.memref.size != SECSIGN_TA_SIG_LEN) {
+                ret = -EPROTO;      /* TA returned a bad length */
+                goto out_both;
+        }
+
+        out_va = tee_shm_get_va(shm_out, 0);
+        if (IS_ERR(out_va)) { ret = PTR_ERR(out_va); goto out_both; }
+        memcpy(sig_out, out_va, SECSIGN_TA_SIG_LEN);
+        ret = 0;
+
+out_both:
+        tee_shm_free(shm_out);
+out_in:
+        tee_shm_free(shm_in);
+        return ret;
+}
+
+/* ---- ioctl --------------------------------------------- */
+
+static long secsign_ioctl(struct file *f, unsigned int cmd,
+                          unsigned long uarg)
+{
+        void __user *uptr = (void __user *)uarg;
+        long ret;
+
+        switch (cmd) {
+        case SECSIGN_IOC_SIGN: {
+                struct secsign_sign req;
+                void *kbuf;
+
+                if (copy_from_user(&amp;req, uptr, sizeof(req)))
+                        return -EFAULT;
+
+                /* VALIDATE EVERYTHING. req came from user
+                   space and every field is attacker-chosen. */
+                if (req._pad)                       /* reserved */
+                        return -EINVAL;
+                if (req.data_len == 0 ||
+                    req.data_len &gt; SECSIGN_MAX_DATA)
+                        return -EINVAL;
+
+                kbuf = kvmalloc(req.data_len, GFP_KERNEL);
+                if (!kbuf)
+                        return -ENOMEM;
+
+                /* COPY, then use. The user buffer can change
+                   after this point and it no longer matters. */
+                if (copy_from_user(kbuf,
+                                   (void __user *)(uintptr_t)req.data,
+                                   req.data_len)) {
+                        ret = -EFAULT;
+                        goto sign_out;
+                }
+
+                mutex_lock(&amp;sdev-&gt;lock);
+                ret = secsign_do_sign(sdev, kbuf, req.data_len,
+                                      req.sig);
+                mutex_unlock(&amp;sdev-&gt;lock);
+                if (ret)
+                        goto sign_out;
+
+                /* Copy the whole struct back: the signature
+                   rides home in the same object.            */
+                if (copy_to_user(uptr, &amp;req, sizeof(req)))
+                        ret = -EFAULT;
+
+sign_out:
+                kvfree(kbuf);
+                return ret;
+        }
+
+        case SECSIGN_IOC_PUBKEY: {
+                struct secsign_pubkey pk;
+                struct tee_ioctl_invoke_arg arg = { };
+                struct tee_param param[1] = { };
+                struct tee_shm *shm;
+                void *va;
+
+                memset(&amp;pk, 0, sizeof(pk));
+
+                shm = tee_shm_alloc_kernel_buf(sdev-&gt;ctx,
+                                SECSIGN_TA_PUBKEY_LEN);
+                if (IS_ERR(shm))
+                        return PTR_ERR(shm);
+
+                arg.func       = SECSIGN_CMD_PUBKEY;
+                arg.session    = sdev-&gt;session;
+                arg.num_params = 1;
+
+                param[0].attr =
+                        TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+                param[0].u.memref.shm      = shm;
+                param[0].u.memref.size     = SECSIGN_TA_PUBKEY_LEN;
+                param[0].u.memref.shm_offs = 0;
+
+                mutex_lock(&amp;sdev-&gt;lock);
+                ret = tee_client_invoke_func(sdev-&gt;ctx, &amp;arg, param);
+                mutex_unlock(&amp;sdev-&gt;lock);
+
+                if (ret &lt; 0 || arg.ret) {
+                        tee_shm_free(shm);
+                        return ret ? ret : -EIO;
+                }
+
+                va = tee_shm_get_va(shm, 0);
+                if (!IS_ERR(va))
+                        memcpy(pk.key, va, SECSIGN_TA_PUBKEY_LEN);
+                tee_shm_free(shm);
+
+                if (IS_ERR(va))
+                        return PTR_ERR(va);
+
+                return copy_to_user(uptr, &amp;pk, sizeof(pk))
+                        ? -EFAULT : 0;
+        }
+
+        default:
+                return -ENOTTY;   /* the correct errno for an
+                                     unknown ioctl (ch. 23 of
+                                     the Linux track)        */
+        }
+}
+
+static const struct file_operations secsign_fops = {
+        .owner          = THIS_MODULE,
+        .unlocked_ioctl = secsign_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,  /* the struct is
+                                                layout-identical,
+                                                so this is enough */
+        .llseek         = no_llseek,
+};
+
+/* ---- module init/exit ---------------------------------- */
+
+static int __init secsign_init(void)
+{
+        int ret;
+
+        sdev = kzalloc(sizeof(*sdev), GFP_KERNEL);
+        if (!sdev)
+                return -ENOMEM;
+
+        mutex_init(&amp;sdev-&gt;lock);
+
+        ret = secsign_open_session(sdev);
+        if (ret) {
+                pr_err("secsign: no TEE session (%d)\n", ret);
+                goto err_free;
+        }
+
+        sdev-&gt;misc.minor = MISC_DYNAMIC_MINOR;
+        sdev-&gt;misc.name  = "secsign";
+        sdev-&gt;misc.fops  = &amp;secsign_fops;
+        sdev-&gt;misc.mode  = 0600;      /* POLICY: root only.
+                                         Loosen deliberately,
+                                         with a udev rule.  */
+
+        ret = misc_register(&amp;sdev-&gt;misc);
+        if (ret)
+                goto err_session;
+
+        pr_info("secsign: ready\n");
+        return 0;
+
+err_session:
+        tee_client_close_session(sdev-&gt;ctx, sdev-&gt;session);
+        tee_client_close_context(sdev-&gt;ctx);
+err_free:
+        kfree(sdev);
+        sdev = NULL;
+        return ret;
+}
+
+static void __exit secsign_exit(void)
+{
+        misc_deregister(&amp;sdev-&gt;misc);
+        tee_client_close_session(sdev-&gt;ctx, sdev-&gt;session);
+        tee_client_close_context(sdev-&gt;ctx);
+        kfree(sdev);
+        sdev = NULL;
+}
+
+module_init(secsign_init);
+module_exit(secsign_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("TEE-backed signing service");</code></pre>
+
+<div class="warn">
+<b>Opening the session at module init is a deliberate simplification</b>
+<p>It makes the driver fail loudly and early if the TA is missing, which is exactly what you want while
+developing. It is the wrong choice for production: the TEE driver may not have probed yet when your module
+loads, so a real driver either defers (returning <code>-EPROBE_DEFER</code> from a platform driver probe,
+<a href="lx-17-device-model.html">Linux chapter 19</a>) or opens the session lazily on first use and retries.
+Opening it lazily also means a TA crash can be recovered from by reopening, rather than requiring a module
+reload.</p>
+</div>
+
+<h2 id="build">Building and loading</h2>
+
+<p>Two build systems, because the module is built against the running kernel's headers and the CLI is not. The
+only thing they share is the UAPI header, which is why it sits outside both trees.</p>
+
+<pre><code># kmod/Makefile
+obj-m += secsign.o
+secsign-objs := secsign_drv.o
+ccflags-y += -I$(src)/../uapi
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# Cross-compiling for the arm64 target you will actually run:
+#   make -C $(KDIR) M=$(PWD) ARCH=arm64 \
+#        CROSS_COMPILE=aarch64-linux-gnu- modules
+
+# cli/Makefile
+CFLAGS  += -O2 -Wall -Wextra -I../uapi -D_GNU_SOURCE
+secsign-cli: main.c
+	$(CC) $(CFLAGS) -o $@ $&lt;</code></pre>
+
+<pre><code># On the target, in the order that tells you where a failure is:
+
+# 1. Is there a TEE at all? (chapter 04)
+$ ls /dev/tee*
+/dev/tee0  /dev/teepriv0
+
+# 2. Is tee-supplicant running? Storage will fail without it.
+$ pgrep tee-supplicant || echo "NOT RUNNING"
+
+# 3. Load the driver. This is where a missing or unsigned TA
+#    shows up, loudly.
+$ sudo insmod secsign.ko
+$ dmesg | tail -3
+secsign: ready
+
+# If instead you see:
+#   secsign: no TEE session (-22)
+# the TA was not found or failed to load - go back to
+# chapter 28 and check the UUID and the signature.
+
+$ ls -l /dev/secsign
+crw------- 1 root root 10, 123 ... /dev/secsign
+
+# 4. Exercise it.
+$ echo -n "hello world" &gt; /tmp/msg
+$ sudo ./secsign-cli sign /tmp/msg
+wrote /tmp/msg.sig (64 bytes)
+$ sudo ./secsign-cli pubkey
+04a1b2c3...</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>insmod</code> fails, "no TEE session"</td><td>The TA is missing, unsigned, or its UUID does not
+match the one in the driver</td></tr>
+<tr><td><code>ioctl</code> returns <code>-ENOTTY</code></td><td>Wrong command number — usually a header
+mismatch between the app and the driver</td></tr>
+<tr><td><code>ioctl</code> returns <code>-EFAULT</code></td><td>A user pointer used directly rather than via
+<code>copy_from_user</code></td></tr>
+<tr><td><code>ioctl</code> returns <code>-EINVAL</code> on a valid file</td><td><code>_pad</code> not zeroed —
+the application skipped the <code>memset</code></td></tr>
+<tr><td>Works for root, <code>EACCES</code> otherwise</td><td>The <code>0600</code> mode; change it
+deliberately rather than by reflex</td></tr>
+<tr><td>Concurrent callers serialise and feel slow</td><td>Expected — one session, one mutex. Scaling that is
+a design change, not a tuning one</td></tr>
+<tr><td>32-bit application, garbage results</td><td>Would happen if the struct used a pointer instead of
+<code>__u64</code> — which is why it does not</td></tr>
+<tr><td><code>-EPROTO</code> from the driver</td><td>The TA returned a signature of the wrong length; trust the
+check, not the TA</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why the request struct uses <code>__u64</code> rather than a pointer.</li>
+  <li>Explain what the reserved <code>_pad</code> field buys, and why it must be rejected when non-zero.</li>
+  <li>Explain why the driver copies the user buffer before doing anything with it.</li>
+  <li>Explain what <code>TEE_IOCTL_LOGIN_REE_KERNEL</code> lets the TA do.</li>
+  <li>Explain why there is one session and a mutex rather than a session per caller.</li>
+  <li>Say why opening the session at module init is wrong for production and what to do instead.</li>
+  <li>Explain why the driver checks the returned signature length even though the TA is trusted code.</li>
+  <li>Name the correct errno for an unrecognised ioctl command.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

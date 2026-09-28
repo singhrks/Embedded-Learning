@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>User buffers: buffered, direct and neither | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>User buffers: buffered, direct and neither</h1>
+<p class="lead">Three ways the I/O manager can hand you a user's buffer, with completely different
+performance, safety and access rules. Choosing correctly is a design decision made once per interface — and
+choosing <code>METHOD_NEITHER</code> by accident is how drivers get CVEs.</p>
+
+<h2 id="three">The three methods</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>METHOD_BUFFERED</th><th>METHOD_IN/OUT_DIRECT</th><th>METHOD_NEITHER</th></tr></thead>
+<tbody>
+<tr><td>What you get</td><td>A kernel copy</td><td>An MDL</td><td>The raw user pointer</td></tr>
+<tr><td>Field</td><td><code>Irp-&gt;AssociatedIrp.SystemBuffer</code></td><td><code>Irp-&gt;MdlAddress</code></td><td><code>Irp-&gt;UserBuffer</code></td></tr>
+<tr><td>Copy cost</td><td>Two copies</td><td><strong>Zero</strong></td><td>Zero</td></tr>
+<tr><td>Safe at any IRQL</td><td><strong>Yes</strong></td><td>Yes, once mapped</td><td><strong>No</strong></td></tr>
+<tr><td>Valid in any process</td><td><strong>Yes</strong></td><td>Yes</td><td><strong>No</strong></td></tr>
+<tr><td>Probing done for you</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td></tr>
+<tr><td>Good for</td><td>Small transfers, control</td><td>Large transfers, DMA</td><td>Almost nothing</td></tr>
+<tr><td>Typical size</td><td>&lt; 4 KB</td><td>&gt; 4 KB</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The decision, in one line</b>
+<p>Use <strong>METHOD_BUFFERED</strong> for control operations and small data. Use
+<strong>METHOD_OUT_DIRECT</strong> / <strong>METHOD_IN_DIRECT</strong> for bulk data and anything you will
+DMA. Use <strong>METHOD_NEITHER</strong> only when you have a specific, defensible reason — and then write
+the probing code with the care of someone who knows it is the most commonly botched thing in Windows
+drivers.</p>
+</div>
+
+<h2 id="buffered">METHOD_BUFFERED</h2>
+
+<p>The safest of the three methods, and the right default for small transfers. The I/O manager copies the data for you, so your driver never touches a user address at all — which removes an entire category of bug at the cost of one copy.</p>
+
+<pre class="diagram">   WRITE:
+     user buffer --copy--&gt; SystemBuffer (non-paged pool)
+                              |
+                              v
+                          your driver reads it
+
+   READ:
+     your driver writes SystemBuffer
+                              |
+     user buffer &lt;--copy-- SystemBuffer
+     (the I/O manager copies back AT COMPLETION)
+
+  ONE buffer serves BOTH directions in an IOCTL. It is sized
+  max(InputBufferLength, OutputBufferLength), so:
+
+     · your input is available when you start
+     · you overwrite it with output
+     · the I/O manager copies OutputBufferLength bytes back
+
+  READ YOUR INPUT BEFORE WRITING YOUR OUTPUT. Writing output
+  first destroys the input you have not read yet - a bug that
+  works whenever input and output happen not to overlap, and
+  fails when they do.
+
+  THE SAFETY: the I/O manager probed the user buffer, copied
+  it in kernel space in the CALLER'S context at PASSIVE_LEVEL,
+  and the copy is in non-paged pool. So SystemBuffer is safe
+  to touch at any IRQL, in any thread, at any time - which is
+  exactly what you need for asynchronous completion from a
+  DPC.
+
+  THE COST: two copies. For a 4-byte control value that is
+  irrelevant. For a 4 MB frame it is not.</pre>
+
+<pre><code>NTSTATUS
+MyDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+        PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+        ULONG inLen  = sp-&gt;Parameters.DeviceIoControl.
+                           InputBufferLength;
+        ULONG outLen = sp-&gt;Parameters.DeviceIoControl.
+                           OutputBufferLength;
+        PVOID buffer = Irp-&gt;AssociatedIrp.SystemBuffer;
+        NTSTATUS status;
+        ULONG_PTR info = 0;
+
+        switch (sp-&gt;Parameters.DeviceIoControl.IoControlCode) {
+        case IOCTL_MY_SET_CONFIG: {
+                MY_CONFIG cfg;
+
+                if (inLen &lt; sizeof(MY_CONFIG)) {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                        break;
+                }
+                /* SystemBuffer is a kernel copy already, but
+                   copy again into a local if you will write
+                   output into the same buffer               */
+                RtlCopyMemory(&amp;cfg, buffer, sizeof(cfg));
+
+                status = MyValidateAndApply(&amp;cfg);
+                break;
+        }
+
+        case IOCTL_MY_GET_STATS: {
+                MY_STATS stats;
+
+                if (outLen &lt; sizeof(MY_STATS)) {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                        Irp-&gt;IoStatus.Information = sizeof(MY_STATS);
+                        break;          /* tell them the size */
+                }
+                MyGatherStats(&amp;stats);
+                RtlCopyMemory(buffer, &amp;stats, sizeof(stats));
+                info = sizeof(stats);
+                status = STATUS_SUCCESS;
+                break;
+        }
+
+        default:
+                status = STATUS_INVALID_DEVICE_REQUEST;
+                break;
+        }
+
+        Irp-&gt;IoStatus.Status = status;
+        Irp-&gt;IoStatus.Information = info;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+}</code></pre>
+
+<h2 id="direct">METHOD_DIRECT</h2>
+
+<p>For large transfers, copying is the dominant cost. Direct I/O avoids it: the I/O manager locks the user's pages in memory and hands you a description of them, so the data is never duplicated.</p>
+
+<pre class="diagram">   The I/O manager:
+     1. probes the user buffer
+     2. builds an MDL describing its physical pages
+     3. LOCKS those pages in memory
+     4. hands you Irp-&gt;MdlAddress
+
+   NO COPY happens. You either:
+     · map the MDL to a kernel virtual address and touch it,
+       or
+     · hand the MDL straight to a DMA engine (chapter 19)
+
+   METHOD_IN_DIRECT   the buffer is INPUT to the driver
+                      (despite "IN" - the user WRITES it, the
+                      driver READS it)
+   METHOD_OUT_DIRECT  the buffer is OUTPUT from the driver
+
+   THE NAMING IS GENUINELY CONFUSING. Remember it from the
+   USER's point of view: OUT_DIRECT means data comes OUT of
+   the driver to the user, so the driver writes it. That is
+   the common case for a read.
+
+   AND FOR IOCTLs: only the OUTPUT buffer is described by the
+   MDL. The INPUT buffer of a DIRECT ioctl is still buffered,
+   in SystemBuffer. So a DIRECT ioctl gives you BOTH:
+
+        input  -&gt; Irp-&gt;AssociatedIrp.SystemBuffer
+        output -&gt; Irp-&gt;MdlAddress
+
+   That asymmetry catches everyone once.</pre>
+
+<pre><code>        PVOID kva;
+        ULONG length;
+
+        if (Irp-&gt;MdlAddress == NULL) {
+                status = STATUS_INVALID_PARAMETER;
+                goto complete;
+        }
+
+        length = MmGetMdlByteCount(Irp-&gt;MdlAddress);
+
+        /* map it to a kernel address valid in ANY context */
+        kva = MmGetSystemAddressForMdlSafe(Irp-&gt;MdlAddress,
+                        NormalPagePriority | MdlMappingNoExecute);
+        if (kva == NULL) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto complete;
+        }
+
+        RtlCopyMemory(kva, source, min(length, sourceLength));
+        info = min(length, sourceLength);
+        status = STATUS_SUCCESS;
+
+/* NOTES:
+     · MmGetSystemAddressForMdlSafe can FAIL under memory
+       pressure - check it. The non-Safe variant bugchecks
+       instead, which is why it is never the right call.
+     · MdlMappingNoExecute is required on modern Windows;
+       omitting it fails the mapping outright.
+     · the I/O manager unlocks and frees the MDL at
+       completion. Do NOT unlock it yourself.
+     · for DMA you do not map at all - you pass the MDL to the
+       DMA adapter (chapter 19). That is the real payoff:
+       user pages go straight to the hardware with no copy and
+       no kernel mapping.                                   */</code></pre>
+
+<h2 id="neither">METHOD_NEITHER</h2>
+
+<p>The third method hands you the raw user-mode addresses and gets out of the way. It is the fastest and by a wide margin the most dangerous, and it is where a large share of real driver vulnerabilities live.</p>
+
+<pre><code>/* You get the RAW USER POINTERS:
+        input  -&gt; sp-&gt;Parameters.DeviceIoControl.Type3InputBuffer
+        output -&gt; Irp-&gt;UserBuffer
+
+   NOTHING has been probed, nothing copied, nothing locked.
+   These addresses are valid ONLY:
+        · in the calling process's context
+        · at IRQL &lt;= APC_LEVEL
+        · until the user changes the memory, which another
+          thread can do at any instant                      */
+
+/* THE ONLY CORRECT WAY TO USE IT: */
+
+        PVOID userIn  = sp-&gt;Parameters.DeviceIoControl.
+                            Type3InputBuffer;
+        PVOID userOut = Irp-&gt;UserBuffer;
+        MY_CONFIG local;
+
+        if (inLen &lt; sizeof(MY_CONFIG))
+                return STATUS_BUFFER_TOO_SMALL;
+
+        __try {
+                if (Irp-&gt;RequestorMode != KernelMode) {
+                        ProbeForRead(userIn, inLen,
+                                     __alignof(MY_CONFIG));
+                        ProbeForWrite(userOut, outLen,
+                                      __alignof(ULONG));
+                }
+
+                /* COPY IN. Never validate in place. */
+                RtlCopyMemory(&amp;local, userIn, sizeof(local));
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return GetExceptionCode();
+        }
+
+        /* validate the COPY, use only the COPY */
+        if (local.Rate == 0 || local.Rate &gt; MAX_RATE)
+                return STATUS_INVALID_PARAMETER;
+
+        status = MyApply(&amp;local);
+
+        __try {
+                RtlCopyMemory(userOut, &amp;result, sizeof(result));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return GetExceptionCode();
+        }</code></pre>
+
+<div class="danger">
+<b>Why METHOD_NEITHER produces CVEs</b>
+<ul>
+<li><strong>No <code>__try</code>.</strong> A bad pointer becomes a bugcheck — a denial of service any user
+can trigger.</li>
+<li><strong>Probed, then used the original pointer.</strong> Another thread rewrites the buffer between the
+probe and the use. Classic TOCTOU (the same argument as <a href="sec-09-two-worlds.html">isolation chapter
+09</a>).</li>
+<li><strong>Validated in place.</strong> Same problem: the value you checked is not the value you use.</li>
+<li><strong>Forgot <code>RequestorMode</code>.</strong> Probing is skipped for kernel callers — but if you
+never check, a user-mode caller's kernel-looking address is used unprobed.</li>
+<li><strong>Touched the pointer from a DPC or another thread.</strong> The address means nothing outside the
+caller's process context.</li>
+<li><strong>Trusted a length field inside the user buffer</strong> to bound a copy.</li>
+</ul>
+<p>Every one of these has shipped in real drivers. If you cannot state why <code>METHOD_BUFFERED</code>
+or <code>METHOD_DIRECT</code> is unacceptable for your case, do not use
+<code>METHOD_NEITHER</code>.</p>
+</div>
+
+<h2 id="setting">Choosing it, per interface</h2>
+
+<p>The method is not a property of your driver — it is encoded in each individual IOCTL code, which means one driver can use different methods for different operations, choosing the right trade-off per request.</p>
+
+<pre><code>/* FOR READ/WRITE: the DEVICE OBJECT's flags decide, and it
+   applies to every read and write on that device.        */
+
+        /* WDM: */
+        deviceObject-&gt;Flags |= DO_BUFFERED_IO;
+        /* or */
+        deviceObject-&gt;Flags |= DO_DIRECT_IO;
+        /* neither flag set = METHOD_NEITHER */
+
+        /* WDF: */
+        WdfDeviceInitSetIoType(DeviceInit,
+                               WdfDeviceIoBuffered);
+        WdfDeviceInitSetIoType(DeviceInit,
+                               WdfDeviceIoDirect);
+        /* and per-queue, in newer versions: */
+        WdfDeviceInitSetIoTypeEx(DeviceInit, &amp;ioTypeConfig);
+
+/* FOR IOCTLs: encoded in the CONTROL CODE itself
+   (chapter 17), so it is per-operation: */
+
+        #define IOCTL_MY_SET_CONFIG \
+            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, \
+                     METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+        #define IOCTL_MY_READ_BULK \
+            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, \
+                     METHOD_OUT_DIRECT, FILE_READ_ACCESS)
+
+/* SO A SINGLE DRIVER can use BUFFERED for its control IOCTLs
+   and DIRECT for its bulk transfer IOCTL, which is exactly
+   the right design: cheap safety where the data is small,
+   zero copy where it is large.                            */
+
+/* AND IN A FILTER DRIVER: inherit the method from the device
+   below you, or reads and writes arrive in a form your lower
+   driver does not expect:                                 */
+        fdo-&gt;Flags |= lowerDevice-&gt;Flags &amp;
+                      (DO_BUFFERED_IO | DO_DIRECT_IO);</code></pre>
+
+<h2 id="wdf">In WDF, it is simpler</h2>
+
+<p>KMDF removes most of the above. You ask for the buffer and the framework gives you a validated pointer and length regardless of which method the IOCTL used — which is one of the strongest practical arguments for the framework.</p>
+
+<pre><code>/* WDF hides the method behind one API. You ask for a buffer
+   and the framework gives you a safe kernel pointer,
+   whichever transfer method was used.                     */
+
+VOID
+MyEvtIoDeviceControl(_In_ WDFQUEUE Queue,
+                     _In_ WDFREQUEST Request,
+                     _In_ size_t OutputBufferLength,
+                     _In_ size_t InputBufferLength,
+                     _In_ ULONG IoControlCode)
+{
+        PVOID inBuf, outBuf;
+        size_t inLen, outLen;
+        NTSTATUS status;
+
+        status = WdfRequestRetrieveInputBuffer(Request,
+                        sizeof(MY_CONFIG),   /* MINIMUM size -
+                                                checked FOR you */
+                        &amp;inBuf, &amp;inLen);
+        if (!NT_SUCCESS(status)) {
+                WdfRequestComplete(Request, status);
+                return;
+        }
+
+        status = WdfRequestRetrieveOutputBuffer(Request,
+                        sizeof(MY_STATS), &amp;outBuf, &amp;outLen);
+        ...
+
+        WdfRequestCompleteWithInformation(Request, status,
+                                          bytesWritten);
+}
+
+/* WdfRequestRetrieve*Buffer:
+     · works for BUFFERED and DIRECT identically
+     · CHECKS THE MINIMUM LENGTH and returns
+       STATUS_BUFFER_TOO_SMALL if it is short - so the most
+       common validation is done for you
+     · for DIRECT, maps the MDL and handles the failure
+     · refuses outright for METHOD_NEITHER unless you opted
+       in
+
+   AND for DMA, ask for the MDL instead:               */
+        status = WdfRequestRetrieveOutputWdmMdl(Request, &amp;mdl);
+
+/* THIS IS THE ARGUMENT FOR WDF in miniature: the same code
+   handles both transfer methods, the length check is not
+   optional-and-forgotten, and METHOD_NEITHER is opt-in rather
+   than the default you fall into.                        */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Buffer is NULL</td><td>Wrong field for the method — <code>SystemBuffer</code> vs <code>MdlAddress</code> vs <code>UserBuffer</code></td></tr>
+<tr><td>Input data is garbage after writing output</td><td>METHOD_BUFFERED shares one buffer — read input first</td></tr>
+<tr><td>Bugcheck touching the buffer in a DPC</td><td>METHOD_NEITHER pointer used outside the caller's context</td></tr>
+<tr><td>Bugcheck on a bad user pointer</td><td>No <code>__try</code>/<code>__except</code></td></tr>
+<tr><td>Validation passes, bad data used</td><td>Validated in place instead of copying in</td></tr>
+<tr><td>Works for small buffers, fails for large</td><td>DIRECT MDL not mapped, or length taken from the wrong place</td></tr>
+<tr><td><code>MmGetSystemAddressForMdlSafe</code> returns NULL</td><td>Memory pressure — handle it, do not use the unsafe variant</td></tr>
+<tr><td>DIRECT ioctl input buffer is NULL</td><td>Input is still in <code>SystemBuffer</code>, not the MDL</td></tr>
+<tr><td>Filter driver corrupts data</td><td>Buffering flags not inherited from the lower device</td></tr>
+<tr><td>Output not returned to the user</td><td><code>IoStatus.Information</code> not set</td></tr>
+<tr><td>Security review flags the driver</td><td>METHOD_NEITHER without justification</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the three methods, the field each uses, and their trade-offs.</li>
+  <li>Explain why METHOD_BUFFERED is safe at any IRQL and in any process.</li>
+  <li>Explain the shared input/output buffer and the ordering rule it implies.</li>
+  <li>Explain what METHOD_DIRECT gives you and why the input buffer of a DIRECT ioctl is still
+  buffered.</li>
+  <li>Say why <code>MmGetSystemAddressForMdlSafe</code> is the only correct choice.</li>
+  <li>Write the complete safe pattern for METHOD_NEITHER.</li>
+  <li>List six ways METHOD_NEITHER is got wrong.</li>
+  <li>Set the method for read/write and per-IOCTL, in both WDM and WDF.</li>
+  <li>Explain what <code>WdfRequestRetrieveInputBuffer</code> does for you.</li>
+  <li>Choose the right method for four different interfaces and justify each.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

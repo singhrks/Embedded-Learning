@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIMT: how a GPU really executes | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SIMT: how a GPU really executes</h1>
+<p class="lead">You write code for one thread. The hardware runs thirty-two of them from a single
+instruction pointer. That gap between the programming model and the execution model is where GPU performance
+lives, and pretending it is not there is why most first kernels are slow.</p>
+
+<h2 id="simt">SIMD wearing a disguise</h2>
+
+<pre class="diagram">   SIMD - what the hardware does
+     one instruction, one register file of N lanes, N results.
+     The programmer sees vectors and writes vector code.
+
+        vaddps  ymm0, ymm1, ymm2      ; 8 floats at once
+
+   SIMT - what the GPU shows you
+     one instruction, N THREADS each with their own registers
+     and their own view of memory. The programmer writes
+     SCALAR code for one thread.
+
+        c[i] = a[i] + b[i];           // "one thread"
+
+   UNDERNEATH THEY ARE THE SAME MACHINE. The GPU groups your
+   threads into WARPS of 32 and issues one instruction for the
+   whole warp, every cycle.
+
+     warp = 32 threads
+            ONE program counter
+            32 sets of registers
+            a 32-bit ACTIVE MASK saying which lanes are live
+
+   WHAT SIMT ADDS OVER SIMD
+
+     1. per-lane addressing. Each thread computes its own
+        address, so gather and scatter are free at the
+        programming level (though not at the memory level -
+        chapter 4).
+     2. per-lane control flow, via the mask. You may write an
+        `if` and it will behave correctly - at a cost
+        (chapter 3).
+
+   WHAT IT DOES NOT CHANGE
+
+     the 32 threads still share ONE program counter. They are
+     not independent. Anything that makes them want to be in
+     different places costs you.</pre>
+
+<div class="key">
+<b>The warp is the unit of everything</b>
+<p>Scheduling, instruction issue, memory coalescing, divergence and most synchronisation all operate on
+warps, not threads. "How many threads" is almost never the useful question; "how many warps, and are their
+lanes doing the same thing on adjacent data" is. A block of 100 threads occupies four warps and wastes 28
+lanes of the fourth — which is why block sizes are always multiples of 32.</p>
+</div>
+
+<h2 id="sm">Inside an SM</h2>
+
+<pre class="diagram">   One Streaming Multiprocessor, roughly (NVIDIA Ampere-ish):
+
+   +-----------------------------------------------------------+
+   |  INSTRUCTION CACHE                                        |
+   +-----------------------------------------------------------+
+   |  WARP SCHEDULERS  x4                                      |
+   |    each holds up to 16 resident warps and picks ONE       |
+   |    ready warp per cycle to issue                          |
+   +-----------------------------------------------------------+
+   |  REGISTER FILE   65,536 x 32-bit  =  256 KB               |
+   |    partitioned among resident warps. THIS is the budget   |
+   |    that decides how many fit (chapter 5).                 |
+   +-----------------------------------------------------------+
+   |  EXECUTION UNITS                                          |
+   |    32x INT32/FP32 lanes    (the main array)               |
+   |    16x FP64                (few, on consumer parts)       |
+   |     4x SFU     sin, cos, rsqrt - slow, low throughput     |
+   |     4x LD/ST   address generation                         |
+   |     4x TENSOR  matrix-multiply-accumulate                 |
+   +-----------------------------------------------------------+
+   |  128 KB, split between L1 CACHE and SHARED MEMORY         |
+   |    the split is configurable per kernel                   |
+   +-----------------------------------------------------------+
+
+   THE KEY OBSERVATION: there are 32 FP32 lanes and up to 64
+   RESIDENT WARPS. The hardware can only execute a few warps
+   per cycle, but it KEEPS dozens ready. When one stalls on
+   memory, the scheduler issues from another - in the same
+   cycle, at no cost, because every warp's registers are
+   already live in the file.
+
+   That is latency hiding, and it is why occupancy matters.</pre>
+
+<h2 id="issue">One cycle in the life of a scheduler</h2>
+
+<pre><code>/* A warp scheduler holds N resident warps. Every cycle it
+   picks one that is READY and issues its next instruction. */
+
+  cycle 1:  warp 3  -> LDG   R4, [R2]     ; global load, ~500
+                                            cycles. warp 3 is
+                                            now STALLED.
+  cycle 2:  warp 7  -> FMA   R1, R2, R3   ; ready, issue it
+  cycle 3:  warp 12 -> LDG   R8, [R6]     ; stalls too
+  cycle 4:  warp 7  -> FMA   R5, R1, R4   ; still ready
+  cycle 5:  warp 19 -> IADD  R0, R0, 1
+  ...
+  cycle 500: warp 3's load returns -> warp 3 is READY again
+
+/* WITH ENOUGH WARPS the ALUs never idle, and the 500-cycle
+   memory latency is completely invisible.
+
+   WITH TOO FEW WARPS - say 4 resident - all four issue a load
+   and then everyone waits. The SM sits idle for hundreds of
+   cycles with nothing to do.
+
+   THE ARITHMETIC:
+     to hide 500 cycles of latency with an SM that issues 4
+     instructions per cycle, you need roughly
+         500 x 4 / (instructions between loads)
+     warps in flight. For memory-heavy code that is dozens.
+
+   THIS IS WHY "more parallelism" is the answer to almost
+   every GPU performance question, and why a kernel with
+   perfect arithmetic and no occupancy is slow.            */</code></pre>
+
+<h2 id="indep">Independent thread scheduling</h2>
+
+<pre><code>/* PRE-VOLTA (before 2017): one PC per warp. Threads within a
+   warp could NOT make independent progress. This was legal:  */
+
+        /* the "warp-synchronous" idiom - once ubiquitous */
+        shared[tid] = value;
+        /* no __syncthreads() needed if tid < 32, because the
+           warp is in lockstep by construction */
+        if (tid &lt; 16) shared[tid] += shared[tid + 16];
+
+/* VOLTA AND LATER: each thread has its own PC and call stack.
+   Threads in a warp may diverge and RECONVERGE independently,
+   and the hardware may interleave them.
+
+   That broke every warp-synchronous program in existence,
+   silently and intermittently.
+
+   THE FIX: state your assumption explicitly. */
+
+        __syncwarp();                    /* barrier the warp    */
+        val = __shfl_down_sync(0xffffffff, val, 16);
+        /*                     ^^^^^^^^^^ the mask of lanes you
+                               are synchronising with. The _sync
+                               suffix is mandatory now; the old
+                               unsuffixed __shfl is removed.   */
+
+/* WHY THE CHANGE WAS WORTH IT: it makes this correct, which
+   it was not before: */
+
+        while (!atomicCAS(&amp;lock, 0, 1)) ;   /* lane 0 wins ...  */
+        /* critical section */
+        atomicExch(&amp;lock, 0);
+/* Pre-Volta, the winning lane could not proceed to release
+   the lock while the losing lanes spun - the whole warp
+   deadlocked. Per-thread PCs fixed a genuine footgun.       */</code></pre>
+
+<div class="warn">
+<b>Never assume implicit lockstep</b>
+<p>If your code relies on threads in a warp being at the same instruction, it is wrong on modern hardware —
+even though it will usually appear to work. Every intra-warp operation now takes an explicit mask:
+<code>__shfl_sync</code>, <code>__ballot_sync</code>, <code>__any_sync</code>, <code>__syncwarp</code>. In
+HLSL and Vulkan the equivalents are the wave intrinsics (<code>WaveActiveSum</code>,
+<code>WaveReadLaneFirst</code>), which were designed after this lesson and require no mask.</p>
+</div>
+
+<h2 id="intrinsics">Warp-level operations</h2>
+
+<pre><code>/* Because a warp shares an instruction stream, the hardware
+   can offer cross-lane operations that cost almost nothing -
+   no shared memory, no barrier, just wires in the register
+   file. They are the single best optimisation available. */
+
+/* CUDA */
+  __shfl_sync(mask, var, srcLane)      /* read another lane   */
+  __shfl_down_sync(mask, var, delta)   /* shift within warp   */
+  __shfl_xor_sync(mask, var, lanemask) /* butterfly exchange  */
+  __ballot_sync(mask, pred)            /* 32-bit vote bitmap  */
+  __all_sync / __any_sync(mask, pred)  /* reductions on bools */
+  __activemask()                       /* who is live now     */
+  __reduce_add_sync(mask, val)         /* Ampere+: one insn   */
+
+/* HLSL / DX12 wave intrinsics (SM 6.0+) */
+  WaveActiveSum(v)      WaveActiveMax(v)
+  WaveActiveBallot(p)   WaveActiveAllTrue(p)
+  WaveGetLaneIndex()    WaveReadLaneFirst(v)
+  WavePrefixSum(v)
+
+/* A WARP REDUCTION - 5 instructions, no memory, no barrier: */
+__device__ float warp_sum(float v)
+{
+        for (int off = 16; off &gt; 0; off /= 2)
+                v += __shfl_down_sync(0xffffffff, v, off);
+        return v;      /* lane 0 holds the total              */
+}
+
+/* Compare with the shared-memory version: allocate shared
+   memory (which costs occupancy), write, __syncthreads(),
+   tree-reduce with more barriers, read back. The warp version
+   is several times faster and uses no shared memory at all.
+
+   THE PATTERN FOR A FULL BLOCK REDUCTION:
+     1. warp_sum within each warp        (no barrier)
+     2. lane 0 of each warp writes to shared    (32 floats max)
+     3. __syncthreads()                          (one barrier)
+     4. the first warp reduces those 32 values with warp_sum
+   Two barriers total, whatever the block size.             */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Kernel uses 3% of peak FLOPs</td><td>Too few resident warps to hide memory latency</td></tr>
+<tr><td>Block size 100 performs like block size 128</td><td>Warps are 32 wide; the remainder wastes
+lanes</td></tr>
+<tr><td>Code works on Pascal, fails intermittently on Volta+</td><td>Warp-synchronous programming without
+explicit sync</td></tr>
+<tr><td><code>__shfl</code> does not compile</td><td>The unsuffixed forms were removed; use
+<code>_sync</code></td></tr>
+<tr><td>Deadlock in an intra-warp spinlock on old hardware</td><td>Single PC per warp — the winner could not
+proceed</td></tr>
+<tr><td>Reduction is slower than expected</td><td>Using shared memory where warp shuffles would do</td></tr>
+<tr><td>Occupancy is low despite small blocks</td><td>Register pressure — the file is the limit
+(<a href="gpu-05-occupancy.html">chapter 5</a>)</td></tr>
+<tr><td>Adding one variable halved performance</td><td>It pushed register count over a threshold, evicting
+warps</td></tr>
+<tr><td>Wave intrinsics return odd results on AMD</td><td>Wavefront is 32 or 64 depending on the part; do not
+hardcode 32</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Distinguish SIMD from SIMT and say what SIMT adds.</li>
+  <li>State what a warp shares and what each thread in it owns privately.</li>
+  <li>Explain why block sizes should be multiples of 32.</li>
+  <li>Draw an SM and name the resource that limits how many warps are resident.</li>
+  <li>Walk through several cycles of warp scheduling and explain how latency is hidden.</li>
+  <li>Estimate how many warps are needed to hide a 500-cycle load.</li>
+  <li>Explain what independent thread scheduling changed and which idiom it broke.</li>
+  <li>Say why every intra-warp intrinsic now takes a mask.</li>
+  <li>Write a warp-level sum reduction and say why it beats the shared-memory version.</li>
+  <li>Give the four steps of an efficient block-wide reduction and count its barriers.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The object manager: namespace, directories and security | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The object manager: namespace, directories and security</h1>
+<p class="lead"><a href="win-03-object-manager.html">Chapter 04</a> covered handles from a driver's point of
+view — creating an object, referencing it, closing it. This chapter is the object manager as a general-purpose
+subsystem: the single namespace almost everything in Windows lives in, how <code>\Device</code>,
+<code>\??</code> and <code>C:\</code> all fit together, and why an access check happens at open time rather
+than every time a handle is used afterward.</p>
+
+<h2 id="everything">Almost everything nameable in Windows is an object manager object</h2>
+
+<p>Chapter 04 covered handles from a driver's point of view. This is the same machinery seen whole: one implementation of naming, reference counting and security serving every kind of object in the system.</p>
+
+<pre class="diagram">   Processes, threads, files, events, mutexes, sections
+   (memory-mapped regions), semaphores, ALPC ports,
+   symbolic links, device objects, drivers, even the object
+   TYPES themselves - all are OBJECT MANAGER OBJECTS,
+   created via the same underlying primitives
+   (ObCreateObject) and referenced the same way
+   (ObReferenceObject / ObDereferenceObject).
+
+   This uniformity is deliberate: it means one reference-
+   counting mechanism, one security-checking mechanism, and
+   one naming mechanism serve the ENTIRE kernel, rather than
+   each subsystem inventing its own. A driver author who
+   understands how a MUTEX is referenced and named already
+   understands most of how a FILE or a SECTION works too.</pre>
+
+<h2 id="namespace">One namespace, organised as directories</h2>
+
+<p>Named objects live in a real, browsable hierarchy that has nothing to do with the drive letters you see in Explorer. Learning its shape explains where your device object actually lives and why <code>C:\</code> is not what it appears to be.</p>
+
+<pre class="diagram">   THE ROOT OF EVERYTHING:  \
+
+   \Device                every device object a driver's
+                           AddDevice or IoCreateDevice
+                           created lives here, named or
+                           anonymous
+   \Driver                one entry per loaded driver
+   \GLOBAL??               (often just shown as \??) - DOS
+                           drive letters and many Win32
+                           symbolic device names live here:
+                           \??\C: is a SYMBOLIC LINK, not a
+                           real object, pointing at the
+                           actual device
+   \BaseNamedObjects       where Win32's CreateEvent,
+                           CreateMutex etc. put their named
+                           objects by default
+   \Sessions\0\...         SESSION 0 gets its OWN private
+                           BaseNamedObjects, Windows, and
+                           DosDevices - the mechanism behind
+                           Session 0 isolation (chapter 34)
+   \RPC Control            named pipes and ports RPC uses
+   \Callback               kernel notification callback
+                           objects
+
+   NAVIGATE IT LIVE with WinObj (a Sysinternals tool) or, in
+   WinDbg:
+     kd&gt; !object \Device
+     kd&gt; !object \Driver\mydriver
+
+   This is a REAL, browsable directory hierarchy, exactly
+   the way a filesystem is - the object manager's
+   "directory object" type is a genuine container that
+   other objects are inserted into by name, and it supports
+   the same kind of enumeration a folder does.</pre>
+
+<div class="key">
+<b>Why <code>C:\</code> is a symbolic link, and why that matters</b>
+<p>Win32 code never sees <code>\Device\HarddiskVolume3</code> — it sees <code>C:\Windows\System32</code>. The
+translation happens because <code>\??\C:</code> is a symbolic link object pointing at the real device object,
+and the Win32 subsystem's I/O functions prepend <code>\??\</code> before handing a path to the native API. This
+indirection is precisely what lets <code>subst</code>, drive-letter reassignment, and per-session drive
+mappings (<code>\Sessions\1\DosDevices\C:</code>, giving a Remote Desktop session its own private drive
+letters) work without the underlying device names ever changing. A driver author who creates a symbolic link
+from a friendly name to a raw device object — the standard pattern for exposing a device to user mode — is
+using exactly this same mechanism.</p>
+</div>
+
+<h2 id="objectheader">The object header: what every object carries regardless of type</h2>
+
+<p>Every object, whatever its type, carries the same small header before its body. That header is where naming, security and the two reference counts live — and those two counts are why an object can outlive every handle to it.</p>
+
+<pre class="diagram">   Every object manager object has a small, FIXED header
+   immediately preceding its type-specific body:
+
+   +----------------------------------+
+   | OBJECT_HEADER                    |
+   |   PointerCount   (references via  |
+   |                   a raw pointer,  |
+   |                   e.g. from       |
+   |                   another kernel  |
+   |                   structure)      |
+   |   HandleCount    (references via  |
+   |                   an open handle  |
+   |                   from some       |
+   |                   process)        |
+   |   Type           -&gt; points at the |
+   |                   OBJECT_TYPE     |
+   |                   descriptor for  |
+   |                   this kind of    |
+   |                   object          |
+   |   SecurityDescriptor (below)      |
+   |   NameInfoOffset (if it has a     |
+   |                   name at all -   |
+   |                   many objects,   |
+   |                   like most       |
+   |                   events, do not) |
+   +----------------------------------+
+   | THE OBJECT BODY - EVENT, MUTEX,   |
+   | FILE_OBJECT, DEVICE_OBJECT...     |
+   | (type-specific layout)            |
+   +----------------------------------+
+
+   THE OBJECT IS FREED ONLY WHEN BOTH COUNTS REACH ZERO -
+   which is precisely why a driver must be scrupulous about
+   pairing every ObReferenceObject with an
+   ObDereferenceObject: a leaked reference does not crash
+   anything immediately, it just means the object outlives
+   every handle to it, silently, until the leak eventually
+   exhausts memory or - worse - the object holds a reference
+   to something else that then cannot be cleaned up either.</pre>
+
+<h2 id="security">Access checks happen once, at open time</h2>
+
+<p>Every named, securable object carries a <strong>security descriptor</strong> — an owner, a group, and a
+discretionary access control list (DACL) of access-control entries, each naming a security identifier (SID)
+and the access rights it is allowed or denied. The crucial design decision, and the one that surprises people
+coming from simpler permission models, is <em>when</em> that check happens: the Security Reference Monitor
+evaluates the caller's token against the object's DACL exactly once, at the moment a handle is opened
+(<a href="win-37-security-internals.html">chapter 36</a> covers tokens and DACLs in depth), and the resulting
+handle is stamped with whichever subset of the requested rights was actually granted. Every subsequent
+operation through that handle checks only against the rights already granted to <em>that handle</em> — the
+DACL is never re-consulted for the lifetime of the handle.</p>
+
+<div class="warn">
+<b>The practical consequence: revoking access does not affect open handles</b>
+<p>If you change a file's or a registry key's DACL to remove a user's access, any process that already holds a
+handle opened before the change keeps whatever rights that handle was granted — the change only affects
+<em>future</em> open attempts. This is not a bug; it follows directly from access checks happening at open
+time rather than per-operation, and it is why revoking access to something sensitive in real time generally
+requires also closing or invalidating existing handles, not merely editing the ACL.</p>
+</div>
+
+<h2 id="handletable">The handle table: per-process, and why handle values are not pointers</h2>
+
+<p>A handle is a small integer, not a pointer, and it means something only inside the process that owns it. That single fact explains why handles cannot simply be passed between processes and what has to happen instead.</p>
+
+<pre><code>/* A HANDLE is an opaque, small integer - NOT a pointer,
+   and not directly usable across process boundaries, even
+   though the underlying kernel object might be shared.   */
+
+kd&gt; !handle 0 f fffffa80`03a2b7f0
+Handle table at fffff8a0`... with 340 entries in use
+
+  0004: Object: fffffa80`0439a4a0  GrantedAccess: 001f0001
+        Type: File
+  0008: Object: fffffa80`0439b010  GrantedAccess: 00100020
+        Type: Event
+
+/* EACH PROCESS HAS ITS OWN HANDLE TABLE - a per-process
+   array (implemented as a small trie for scalability at
+   large handle counts) mapping small integers to pointers
+   at OBJECT HEADERS. Handle value 0x4 in process A and
+   handle value 0x4 in process B are almost certainly
+   pointing at completely different objects.
+
+   THIS IS WHY YOU CANNOT PASS A RAW HANDLE VALUE TO
+   ANOTHER PROCESS AND HAVE IT MEAN ANYTHING - the value is
+   an index into THIS process's table. DuplicateHandle
+   exists specifically to solve this: it inserts a new
+   entry into the TARGET process's table pointing at the
+   SAME underlying object, and hands back the (necessarily
+   different) handle value that entry got in that table.
+
+   The GrantedAccess field is exactly the "rights checked
+   once, stamped on the handle" value described above - it
+   never changes for the life of this handle, regardless of
+   what happens to the object's ACL afterward.            */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Changed a DACL, but the process still has access</td><td>Access checks happen at open time — the
+existing handle keeps its previously granted rights</td></tr>
+<tr><td>A handle value from another process means nothing</td><td>Handle tables are per-process; use
+<code>DuplicateHandle</code> to share the underlying object</td></tr>
+<tr><td>An object never gets freed despite closing every handle</td><td>A leaked reference held via a raw
+pointer (<code>PointerCount</code> never reaches zero)</td></tr>
+<tr><td><code>C:\</code> path resolves differently in a Remote Desktop session</td><td>Per-session
+<code>\Sessions\N\DosDevices</code> symbolic links</td></tr>
+<tr><td>Two named objects with the same name in different sessions do not collide</td><td>Session 0 isolation
+gives each session its own <code>\BaseNamedObjects</code></td></tr>
+<tr><td><code>!object</code> shows a handle count but the object still cannot be found by name</td><td>The
+object is unnamed — most events and mutexes are, by default</td></tr>
+<tr><td>A named mutex silently already exists with different security</td><td>Two components created the same
+name in different namespaces (global versus session-local)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why almost everything nameable in Windows shares one object manager implementation.</li>
+  <li>Describe the object namespace directory structure and where Win32 named objects live by default.</li>
+  <li>Explain why <code>C:\</code> is a symbolic link and what problem that indirection solves.</li>
+  <li>Name the two reference counts in an object header and what each tracks.</li>
+  <li>Explain when an access check happens and why editing a DACL does not affect open handles.</li>
+  <li>Explain why a handle value cannot be passed directly to another process, and what
+  <code>DuplicateHandle</code> does instead.</li>
+  <li>Explain how Session 0 isolation uses the object namespace to keep sessions from colliding.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

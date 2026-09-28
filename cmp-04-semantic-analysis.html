@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Abstract syntax trees and semantic analysis | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Abstract syntax trees and semantic analysis</h1>
+<p class="lead">The parse tree says what the program <em>looks like</em>. Semantic analysis works out what
+it <em>means</em>: which declaration each name refers to, what type every expression has, and whether the
+program is legal at all.</p>
+
+<h2 id="ast">Parse tree versus AST</h2>
+
+<pre class="diagram">   SOURCE:  1 + 2 * 3
+
+   PARSE TREE (concrete syntax) - every grammar rule appears:
+
+              expr
+             /  |  \
+          expr  +  term
+           |      /  |  \
+         term  term  *  factor
+           |     |        |
+        factor factor  NUMBER(3)
+           |     |
+      NUMBER(1) NUMBER(2)
+
+   AST (abstract syntax) - only what MEANS something:
+
+              (+)
+             /   \
+            1    (*)
+                /   \
+               2     3
+
+  THE AST DROPS: intermediate non-terminals, parentheses
+  (their effect is now the tree shape), semicolons, and
+  most punctuation.
+
+  IT KEEPS: the operations, the operands, and - crucially -
+  the SOURCE LOCATIONS, so later phases can still produce
+  diagnostics that point at real code.
+
+  EVERY PHASE AFTER PARSING works on the AST, and each one
+  ANNOTATES it: semantic analysis adds types and symbol
+  links, later passes add constant values and flags.</pre>
+
+<pre><code>/* A representative AST node: */
+
+typedef enum {
+        NODE_INT_LITERAL, NODE_IDENT, NODE_BINARY,
+        NODE_UNARY, NODE_CALL, NODE_MEMBER, NODE_CAST,
+        NODE_IF, NODE_WHILE, NODE_RETURN, NODE_BLOCK,
+        NODE_VAR_DECL, NODE_FUNC_DECL,
+} NodeKind;
+
+typedef struct Node {
+        NodeKind    kind;
+        SourceRange range;      /* for diagnostics */
+        Type       *type;       /* filled in by semantic
+                                   analysis - NULL until then */
+
+        union {
+                struct { long value; } int_lit;
+                struct { Symbol *sym; } ident;   /* &lt;- resolved
+                                                    by name
+                                                    lookup    */
+                struct { TokenKind op;
+                         struct Node *lhs, *rhs; } binary;
+                struct { struct Node *fn;
+                         struct Node **args;
+                         int nargs; } call;
+                struct { struct Node *cond, *then_br,
+                                     *else_br; } if_stmt;
+                ...
+        };
+} Node;
+
+/* THE TWO FIELDS THAT MATTER MOST are `type` and, for
+   identifiers, `sym`. Before semantic analysis both are
+   empty; afterwards, every expression has a type and every
+   name points at its declaration. That is what "semantic
+   analysis" produces.                                      */</code></pre>
+
+<h2 id="symbols">Symbol tables and scope</h2>
+
+<pre><code>/* NAME RESOLUTION: given an identifier, find its
+   declaration.                                             */
+
+typedef struct Scope {
+        struct Scope *parent;
+        HashMap      *symbols;     /* name -&gt; Symbol* */
+} Scope;
+
+static Symbol *lookup(Scope *s, const char *name)
+{
+        for (; s != NULL; s = s-&gt;parent) {
+                Symbol *sym = map_get(s-&gt;symbols, name);
+                if (sym)
+                        return sym;       /* INNERMOST wins */
+        }
+        return NULL;      /* undeclared */
+}
+
+/* THE SCOPE CHAIN gives shadowing for free: an inner
+   declaration hides an outer one, because lookup stops at the
+   first match.                                             */
+
+        int x = 1;              /* file scope */
+        void f(void) {
+                int x = 2;      /* shadows it */
+                {
+                        int x = 3;   /* shadows again */
+                        printf("%d", x);   /* 3 */
+                }
+                printf("%d", x);           /* 2 */
+        }
+
+/* WHICH IS WHY -Wshadow IS WORTH ENABLING: shadowing is legal
+   and occasionally intended, and far more often a bug where
+   someone redeclared a variable they meant to assign.     */
+
+/* C's SCOPE KINDS:
+     file scope        outside any function
+     block scope       inside { }
+     function scope    LABELS ONLY - a goto label is visible
+                       throughout its function regardless of
+                       nesting
+     function prototype scope   parameter names in a
+                       declaration, which is why they can be
+                       omitted
+
+/* AND C's FOUR NAMESPACES - genuinely separate, so this is
+   all legal and refers to four different things: */
+        struct foo { int foo; };
+        typedef struct foo foo;
+        foo foo;
+        goto foo;
+        foo: ;
+/*   1. ordinary identifiers: variables, functions, typedefs,
+        enum constants
+     2. TAGS: struct, union, enum names - which is why you
+        write `struct foo` rather than `foo` without a typedef
+     3. MEMBERS: one namespace per struct or union
+     4. LABELS                                              */</code></pre>
+
+<h2 id="types">Type checking</h2>
+
+<pre><code>/* Every expression gets a type, computed bottom-up. */
+
+static Type *check_binary(Node *n, Scope *scope)
+{
+        Type *lt = check_expr(n-&gt;binary.lhs, scope);
+        Type *rt = check_expr(n-&gt;binary.rhs, scope);
+
+        switch (n-&gt;binary.op) {
+        case TOK_PLUS:
+                /* POINTER ARITHMETIC is a special case: */
+                if (is_pointer(lt) &amp;&amp; is_integer(rt))
+                        return lt;
+                if (is_integer(lt) &amp;&amp; is_pointer(rt))
+                        return rt;
+                if (is_arithmetic(lt) &amp;&amp; is_arithmetic(rt))
+                        return usual_arithmetic_conversions(lt, rt);
+                error(n, "invalid operands to binary +");
+                return type_error;
+
+        case TOK_MINUS:
+                if (is_pointer(lt) &amp;&amp; is_pointer(rt)) {
+                        if (!compatible(pointee(lt), pointee(rt)))
+                                error(n, "incompatible pointers");
+                        return type_ptrdiff_t;   /* NOT a
+                                                    pointer! */
+                }
+                ...
+
+        case TOK_EQEQ: case TOK_LT:
+                ...
+                return type_int;      /* comparisons yield int
+                                         in C, bool in C++    */
+        }
+}
+
+/* THE USUAL ARITHMETIC CONVERSIONS - the rules that decide
+   what `int + unsigned` means (C track chapter 02): */
+
+   1. if either is long double, convert both to long double
+   2. else if either is double, ...
+   3. else if either is float, ...
+   4. else INTEGER PROMOTIONS on both (anything narrower than
+      int becomes int)
+   5. if both are now the same type, done
+   6. if both signed or both unsigned: the lower rank
+      converts to the higher
+   7. if the UNSIGNED type has rank &gt;= the signed type:
+      the signed converts to UNSIGNED       &lt;-- the trap
+   8. if the signed type can represent every value of the
+      unsigned type: unsigned converts to signed
+   9. otherwise both convert to the unsigned version of the
+      signed type
+
+/* RULE 7 IS THE BUG SOURCE: */
+        int i = -1;
+        unsigned u = 1;
+        if (i &lt; u)              /* i converts to UNSIGNED */
+                puts("less");   /* NOT PRINTED: -1 becomes
+                                   4294967295             */
+
+/* THE COMPILER IS FOLLOWING THE STANDARD EXACTLY. -Wextra
+   warns (-Wsign-compare). Enable it.                     */</code></pre>
+
+<div class="key">
+<b>Implicit conversions are where C bugs live</b>
+<p>The conversion rules are consistent, documented, and almost nobody has them memorised. The practical
+defence is not memorisation: it is <code>-Wconversion -Wsign-compare -Wsign-conversion</code>, plus the
+habit of using explicitly sized types (<code>uint32_t</code>, not <code>unsigned</code>) so the rank
+question is at least visible in the source.</p>
+</div>
+
+<h2 id="lvalues">Lvalues and value categories</h2>
+
+<pre><code>/* An LVALUE designates an object - something with an address
+   you could take. An RVALUE is a value.                    */
+
+        int x, a[10], *p;
+
+        x           lvalue
+        x + 1       rvalue
+        a           lvalue (of array type - but it DECAYS to
+                    a pointer rvalue in most contexts)
+        a[0]        lvalue
+        *p          lvalue
+        &amp;x          rvalue (a pointer VALUE)
+        f()         rvalue in C; may be an lvalue in C++ if it
+                    returns a reference
+        (x = 5)     rvalue in C - which is why `(x = 5) = 6`
+                    is illegal
+
+/* WHERE IT MATTERS - the compiler must check: */
+        x = 5;          /* left side must be a MODIFIABLE
+                           lvalue                            */
+        5 = x;          /* error: not an lvalue */
+        &amp;5;             /* error: cannot take the address */
+        const int c = 1;
+        c = 2;          /* error: not MODIFIABLE */
+        x++;            /* needs a modifiable lvalue */
+
+/* "MODIFIABLE LVALUE" excludes: arrays, const-qualified
+   objects, incomplete types, and structs containing a const
+   member.
+
+/* AND THE ARRAY DECAY RULE, which surprises everyone once: */
+        void f(int a[10]) { sizeof(a); }
+/* `a` here is a POINTER - the [10] is ignored. sizeof(a) is
+   8, not 40. Array parameters do not exist in C; they are
+   silently rewritten to pointers.                        */
+
+/* C++ REFINES this into five value categories - lvalue,
+   xvalue, prvalue, glvalue, rvalue - to support move
+   semantics (C++ track chapter 05). The C model is the
+   simple ancestor.                                        */</code></pre>
+
+<h2 id="checks">What semantic analysis checks</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Check</th><th>Example error</th></tr></thead>
+<tbody>
+<tr><td>Name is declared</td><td>"undeclared identifier 'foo'"</td></tr>
+<tr><td>No duplicate declaration in a scope</td><td>"redefinition of 'x'"</td></tr>
+<tr><td>Types are compatible</td><td>"incompatible pointer types"</td></tr>
+<tr><td>Assignment target is a modifiable lvalue</td><td>"lvalue required as left operand"</td></tr>
+<tr><td>Function call arity and argument types</td><td>"too few arguments to function"</td></tr>
+<tr><td>Return type matches</td><td>"returning 'int *' from a function returning 'int'"</td></tr>
+<tr><td>Struct member exists</td><td>"no member named 'x' in 'struct foo'"</td></tr>
+<tr><td>Type is complete where required</td><td>"invalid use of incomplete type"</td></tr>
+<tr><td>Constant expressions really are constant</td><td>"variably modified type at file scope"</td></tr>
+<tr><td>Case labels are unique and constant</td><td>"duplicate case value"</td></tr>
+<tr><td><code>break</code>/<code>continue</code> are in a loop</td><td>"break statement not within loop or switch"</td></tr>
+<tr><td>Qualifiers are respected</td><td>"assignment discards 'const' qualifier"</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="flow">Flow-sensitive analysis</h2>
+
+<pre><code>/* Some checks need to know the ORDER of execution, not just
+   the tree shape. These are done on a control flow graph.  */
+
+/* --- Uninitialised use --- */
+        int x;
+        if (cond)
+                x = 1;
+        printf("%d", x);        /* MAY be uninitialised */
+
+/* gcc -Wmaybe-uninitialized. It is a MAY analysis, so it has
+   false positives and false negatives - the exact question is
+   undecidable. That is why the warning is separate from
+   -Wuninitialized (which fires only when it is certain).  */
+
+/* --- Missing return --- */
+        int f(int x) {
+                if (x &gt; 0)
+                        return 1;
+                /* falls off the end -&gt; UNDEFINED BEHAVIOUR if
+                   the value is used                        */
+        }
+/* -Wreturn-type. In C++ this is worse than in C: the
+   optimiser may assume the path is unreachable and delete
+   the branch that reaches it (chapter 15).              */
+
+/* --- Unreachable code --- */
+        return 1;
+        printf("never");        /* -Wunreachable-code */
+
+/* --- Fallthrough in a switch --- */
+        switch (x) {
+        case 1:
+                do_a();
+                /* fallthrough - intentional? */
+        case 2:
+                do_b();
+                break;
+        }
+/* -Wimplicit-fallthrough. Silence it deliberately: */
+        __attribute__((fallthrough));
+        /* or, C23: */
+        [[fallthrough]];
+
+/* --- Definite assignment, in other languages --- */
+/* Java and C# REQUIRE definite assignment and reject the
+   program otherwise. Rust goes further with ownership and
+   borrow checking (Rust track chapter 04). C only warns,
+   which is a language design choice with real consequences
+   for how many bugs reach production.                    */</code></pre>
+
+<h2 id="see">Looking at the AST</h2>
+
+<pre><code># Clang prints a genuinely readable AST:
+    clang -Xclang -ast-dump -fsyntax-only test.c
+
+    TranslationUnitDecl
+    `-FunctionDecl 0x... &lt;test.c:1:1, line:4:1&gt; f 'int (int)'
+      |-ParmVarDecl 0x... x 'int'
+      `-CompoundStmt
+        `-ReturnStmt
+          `-BinaryOperator 'int' '+'
+            |-ImplicitCastExpr 'int' &lt;LValueToRValue&gt;
+            | `-DeclRefExpr 'int' lvalue ParmVar 0x... 'x'
+            `-IntegerLiteral 'int' 1
+
+# READ THE ANNOTATIONS - they are the output of semantic
+# analysis:
+#   'int (int)'          the function's computed type
+#   ImplicitCastExpr     a conversion the compiler INSERTED
+#   &lt;LValueToRValue&gt;     the specific conversion kind
+#   lvalue               the value category
+#   DeclRefExpr ... 0x...  the resolved declaration - the
+#                          address links back to the ParmVarDecl
+
+# THE IMPLICIT CASTS ARE THE INTERESTING PART. Every
+# conversion C performs silently appears here as a node. If
+# you have ever wondered where an unexpected promotion came
+# from, this dump answers it exactly.
+
+    clang -Xclang -ast-dump=json -fsyntax-only test.c
+    ; machine-readable, for tooling
+
+    gcc -fdump-tree-original-raw test.c
+    ; GCC's equivalent, considerably less readable
+
+# AND FOR C++, where the answer is much less obvious:
+    clang++ -Xclang -ast-dump -fsyntax-only test.cpp
+    ; shows which overload was selected, which template was
+    ; instantiated, and every implicit conversion - the three
+    ; things hardest to determine by reading.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>"undeclared identifier"</td><td>Missing include, typo, or a scope you did not expect</td></tr>
+<tr><td>Comparison behaves backwards</td><td>Signed/unsigned conversion — enable <code>-Wsign-compare</code></td></tr>
+<tr><td><code>sizeof</code> on a parameter is 8</td><td>Array decay — array parameters are pointers</td></tr>
+<tr><td>"lvalue required"</td><td>Assigning to something with no address</td></tr>
+<tr><td>"incompatible pointer types"</td><td>A real type error — never silence it with a cast without understanding it</td></tr>
+<tr><td>Value changes unexpectedly in arithmetic</td><td>Integer promotion or the usual arithmetic conversions</td></tr>
+<tr><td>Wrong variable modified</td><td>Shadowing — <code>-Wshadow</code></td></tr>
+<tr><td>Works, but a warning about maybe-uninitialised</td><td>Possibly a false positive; possibly a real path you have not considered</td></tr>
+<tr><td>Missing return causes odd behaviour at <code>-O2</code></td><td>UB — the optimiser assumed the path was unreachable</td></tr>
+<tr><td>Cannot tell which overload was chosen (C++)</td><td>Dump the AST</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Draw the parse tree and the AST for one expression, and say what was dropped.</li>
+  <li>Explain how a scope chain gives shadowing, and why <code>-Wshadow</code> is worth enabling.</li>
+  <li>Name C's four namespaces and give an example using all of them.</li>
+  <li>State the usual arithmetic conversions and demonstrate the signed/unsigned trap.</li>
+  <li>Classify six expressions as lvalues or rvalues.</li>
+  <li>Explain array decay and its effect on <code>sizeof</code>.</li>
+  <li>List ten checks semantic analysis performs.</li>
+  <li>Explain why uninitialised-use analysis has false positives.</li>
+  <li>Dump a Clang AST and identify every implicit conversion in it.</li>
+  <li>Explain what the resolved <code>DeclRefExpr</code> address tells you.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

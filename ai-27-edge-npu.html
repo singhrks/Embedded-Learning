@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running models on embedded hardware | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Running models on embedded hardware</h1>
+<p class="lead">The chapter this whole track was heading toward. Everything above, constrained by 256 KB
+of SRAM, a battery, no operating system, and a part that has to cost three dollars.</p>
+
+<h2 id="tiers">Know which tier you are in</h2>
+
+<p>"Running a model on the edge" covers hardware spanning six orders of magnitude of capability, and almost every practical question has a different answer in each tier. Placing yourself first saves a lot of wasted effort.</p>
+
+<pre class="diagram">   "EDGE AI" SPANS FOUR ORDERS OF MAGNITUDE. The right
+   answer depends entirely on which tier you are in, and
+   conflating them is the most common mistake.
+
+   TIER 1 - MCU CLASS      Cortex-M0/M4/M33, RISC-V
+     RAM      16 KB - 1 MB
+     flash    64 KB - 2 MB
+     clock    16-400 MHz, often no FPU
+     power    mW, battery for months or years
+     RUNS     keyword spotting, anomaly detection,
+              gesture recognition, simple vision
+     MODELS   1 KB - 500 KB, int8, often QAT
+     STACK    TFLite Micro, CMSIS-NN, microTVM,
+              ExecuTorch, or hand-written C
+
+   TIER 2 - MCU + NPU      Cortex-M55 + Ethos-U55/U85,
+                           ESP32-S3, nRF54, Kendryte
+     +        1-512 GOPS of int8 accelerator
+     RUNS     real-time vision at low frame rates, speech
+     MODELS   up to a few MB
+     STACK    Vela compiler (Ethos), vendor toolchains
+
+   TIER 3 - APPLICATION PROCESSOR CLASS
+                           i.MX8, Jetson Orin Nano, RK3588,
+                           Raspberry Pi 5, phones
+     RAM      1-32 GB, running Linux or Android
+     NPU      1-100 TOPS
+     RUNS     full vision pipelines, speech, AND SMALL
+              LANGUAGE MODELS (1-8B, quantised)
+     STACK    ONNX Runtime, TensorRT, OpenVINO, llama.cpp,
+              NPU vendor SDKs
+
+   TIER 4 - EDGE SERVER    a GPU in a cabinet
+     Essentially datacentre inference with a latency and
+     privacy requirement. Chapter 25 applies unchanged.
+
+   THE QUESTION THAT DECIDES EVERYTHING:
+
+     DOES THE MODEL'S WORKING SET FIT IN THE MEMORY YOU
+     HAVE?
+
+   Not the parameter count - THE WORKING SET: weights plus
+   the largest activation buffer plus the framework's
+   arena. On an MCU this is the binding constraint, before
+   accuracy, before speed, before anything.</pre>
+
+<h2 id="budget">The memory budget</h2>
+
+<p>On embedded hardware memory is the binding constraint far more often than compute, and the arithmetic that decides whether a model fits is worth doing before anything else.</p>
+
+<pre><code>/* --- WHAT MUST FIT --- */
+
+    FLASH (persistent)
+      model weights (int8: 1 byte per parameter)
+      the inference runtime      20-100 KB
+      your application
+
+    RAM (working)
+      the TENSOR ARENA: the largest set of activation
+        buffers live at once
+      framework state
+      your application's stack and heap
+
+/* THE ARENA IS THE ONE PEOPLE GET WRONG. It is NOT the sum
+   of all activations - a good runtime reuses buffers, so it
+   is the peak of a liveness analysis, exactly like register
+   allocation in a compiler (see the compilers track).
+
+    For a small CNN it is typically driven by ONE layer -
+    usually an early one, where the spatial dimensions are
+    still large:
+
+      a 96x96x3 input with 16 channels after the first conv
+        = 96*96*16 = 147 KB in int8
+      ALREADY TOO BIG for many parts, before any further
+      layers.
+
+    THE FIXES: a smaller input resolution, striding early,
+    and depthwise separable convolutions.
+
+/* --- A WORKED EXAMPLE: KEYWORD SPOTTING --- */
+    Target: Cortex-M4, 256 KB flash, 64 KB RAM.
+
+      input        49 x 10 MFCC features from 1 second of
+                   audio
+      model        DS-CNN, 4 depthwise separable blocks
+      parameters   ~24k -> 24 KB in int8
+      arena        ~21 KB
+      runtime      ~45 KB flash (TFLM + CMSIS-NN)
+      inference    ~10 ms at 80 MHz
+      accuracy     ~95% on 12 keywords
+      energy       runs continuously on a coin cell for
+                   months with duty cycling
+
+    THAT FITS COMFORTABLY, and it is a real, shipping class
+    of product.
+
+/* --- AND THE ONE THAT DOES NOT --- */
+    A 1B-parameter language model at int4 = 500 MB.
+    NOT ON AN MCU. NOT WITH ANY AMOUNT OF CLEVERNESS.
+    That is Tier 3, and being clear about it early saves
+    months.
+
+/* --- THE ARITHMETIC TO DO FIRST, BEFORE ANY WORK --- */
+    weights_bytes  = params * bytes_per_param
+    arena_bytes    = peak concurrent activations
+    flash_needed   = weights + runtime + application
+    ram_needed     = arena + stack + heap
+
+    inference_time ~= MACs / (MACs_per_cycle * clock_hz)
+      Cortex-M4 with CMSIS-NN: ~1-2 int8 MACs/cycle
+      Cortex-M55 + Ethos-U55:  hundreds to thousands
+      -> a 5 MMAC model on an M4 at 80 MHz is ~60 ms;
+         on an M55+U55 it is under a millisecond.
+
+    energy_per_inference = time * average_current * voltage
+      AND FOR A BATTERY DEVICE, COMPUTE THIS EARLY. It
+      frequently rules out an architecture that would
+      otherwise fit.                                      */</code></pre>
+
+<h2 id="stack">The stacks</h2>
+
+<p>The deployment stacks differ more than their marketing suggests, particularly in what happens when an operator is unsupported — which is the case you will actually hit.</p>
+
+<pre><code>/* --- TFLITE MICRO: the MCU standard --- */
+    No dynamic allocation, no OS, no file system. You supply
+    a static arena and it plans everything inside it.
+
+    #include "tensorflow/lite/micro/micro_interpreter.h"
+
+    // the model as a C array, in flash
+    extern const unsigned char g_model[];
+
+    constexpr int kArenaSize = 32 * 1024;
+    alignas(16) static uint8_t tensor_arena[kArenaSize];
+
+    void setup() {
+        const tflite::Model* model =
+            tflite::GetModel(g_model);
+
+        // ONLY the operators you actually use - each one
+        // linked in costs flash
+        static tflite::MicroMutableOpResolver&lt;6&gt; resolver;
+        resolver.AddConv2D();
+        resolver.AddDepthwiseConv2D();
+        resolver.AddFullyConnected();
+        resolver.AddSoftmax();
+        resolver.AddReshape();
+        resolver.AddMaxPool2D();
+
+        static tflite::MicroInterpreter interpreter(
+            model, resolver, tensor_arena, kArenaSize);
+        interpreter.AllocateTensors();
+        // ^ FAILS HERE if the arena is too small, and the
+        //   error tells you the required size. Start large,
+        //   then shrink to fit.
+    }
+
+    void loop(void) {
+        TfLiteTensor* in = interpreter.input(0);
+        // QUANTISE YOUR INPUT WITH THE MODEL'S OWN
+        // PARAMETERS - not with values you guessed
+        for (int i = 0; i &lt; n; i++)
+            in-&gt;data.int8[i] =
+                (int8_t)(raw[i] / in-&gt;params.scale
+                         + in-&gt;params.zero_point);
+
+        if (interpreter.Invoke() != kTfLiteOk) return;
+
+        TfLiteTensor* out = interpreter.output(0);
+        float score = (out-&gt;data.int8[0]
+                       - out-&gt;params.zero_point)
+                      * out-&gt;params.scale;
+    }
+
+/* --- CMSIS-NN --- */
+    ARM's hand-optimised kernels for Cortex-M. 4-5x faster
+    than reference C, using SIMD (SMLAD), DSP instructions
+    and Helium (MVE) on M55.
+    TFLM uses it automatically when built for Cortex-M -
+    verify it actually is, because the reference kernels are
+    the silent fallback and the difference is enormous.
+
+/* --- ETHOS-U AND THE VELA COMPILER --- */
+    vela model_int8.tflite --accelerator-config ethos-u55-128
+
+    Vela AHEAD-OF-TIME compiles the graph into NPU command
+    streams. Operators the NPU cannot handle FALL BACK TO THE
+    CPU, and every fallback costs a round trip through
+    memory.
+
+    READ VELA'S REPORT. It tells you exactly which
+    operations ran where. A model that is 90% NPU-resident
+    is fast; one that ping-pongs is often SLOWER than pure
+    CPU. CHECKING THIS IS THE SINGLE HIGHEST-VALUE
+    OPTIMISATION STEP on an NPU target.
+
+/* --- THE OTHERS --- */
+    ExecuTorch   PyTorch's edge runtime. Growing quickly.
+    microTVM     compile-based, aggressive
+                 auto-scheduling
+    ONNX Runtime Tier 3, with vendor execution providers
+    llama.cpp    Tier 3 language models. GGUF, extremely
+                 portable, runs on a Raspberry Pi
+    OpenVINO     Intel-based edge
+    TensorRT     NVIDIA Jetson
+    Vendor SDKs  Qualcomm QNN, Rockchip RKNN, Hailo,
+                 Ambarella - usually the fastest path on
+                 their own silicon, and the least
+                 portable                                */</code></pre>
+
+<div class="key">
+<b>Design for the target from the start</b>
+<p>Do not train a model and then ask whether it fits. Pick the hardware, compute the budget, choose an
+architecture that fits with margin, and quantise <em>during</em> training if you are anywhere near the
+limit. Retrofitting a model into a device that cannot hold it is the most common and most expensive
+failure in embedded machine learning — and the second most common is discovering at integration time that
+the preprocessing, not the model, is what does not fit.</p>
+</div>
+
+<h2 id="arch">Architectures that fit</h2>
+
+<p>Some architectures survive the trip to constrained hardware far better than others, and the reasons are mostly about memory access patterns rather than parameter counts.</p>
+
+<pre><code>/* --- DEPTHWISE SEPARABLE CONVOLUTION --- */
+    Split a standard convolution into two cheaper steps:
+      DEPTHWISE   one k x k filter PER INPUT CHANNEL
+      POINTWISE   a 1x1 convolution mixing channels
+
+    COST:  standard   k*k * C_in * C_out
+           separable  k*k * C_in  +  C_in * C_out
+
+    For k=3, C_in=C_out=64:  36,864 -> 4,672. 8x FEWER.
+
+    THIS IS THE SINGLE MOST IMPORTANT ARCHITECTURAL IDEA IN
+    EMBEDDED VISION, and it underlies MobileNet,
+    EfficientNet-Lite and essentially every model that runs
+    on a microcontroller.
+
+/* --- THE MODEL FAMILIES WORTH KNOWING --- */
+    VISION       MobileNetV2/V3, EfficientNet-Lite,
+                 MCUNet, NanoDet, YOLO-Nano
+    AUDIO        DS-CNN, TC-ResNet for keyword spotting
+    TIME SERIES  small 1-D CNNs, or a GRU (chapter 18) -
+                 constant memory, which for a continuous
+                 stream is decisive
+    ANOMALY      an autoencoder: reconstruct the input and
+                 threshold the error. NO LABELS NEEDED,
+                 which matters because you usually have no
+                 examples of the fault you are looking for.
+    LANGUAGE     Tier 3 only. Qwen 0.5B, Gemma 3 270M/1B,
+                 Llama 3.2 1B, SmolLM, Phi - all at int4
+
+/* --- THE TECHNIQUES, IN THE ORDER TO APPLY THEM --- */
+  1. REDUCE THE INPUT. 96x96 instead of 224x224 is 5.4x less
+     work AND a much smaller arena. Usually the biggest
+     single win, and usually the first thing to try.
+  2. QUANTISE to int8, with QAT if accuracy matters
+     (chapter 26).
+  3. USE A MOBILE-CLASS ARCHITECTURE rather than shrinking
+     a large one.
+  4. PRUNE STRUCTURALLY - whole channels (chapter 26).
+  5. DISTIL from a larger model.
+  6. NEURAL ARCHITECTURE SEARCH under explicit hardware
+     constraints, if the volume justifies it (MCUNet does
+     exactly this).
+
+/* --- AND THE ONE PEOPLE FORGET: PREPROCESSING --- */
+    An MFCC pipeline needs an FFT, mel filterbanks and a
+    DCT. Image preprocessing needs resize, colour conversion
+    and normalisation.
+
+    THIS CAN COST MORE THAN THE MODEL, and it needs its own
+    buffers in the same RAM. Budget it explicitly. CMSIS-DSP
+    provides fixed-point FFT and filter functions; use them
+    rather than pulling in a float pipeline.               */</code></pre>
+
+<h2 id="ship">Getting it into a product</h2>
+
+<p>Getting a model working on a development board and getting it into a product are different problems, and the second one is mostly about the things that are not the model.</p>
+
+<pre><code>/* --- THE WORKFLOW --- */
+    1. define the task, the METRIC, and the acceptable
+       error rate (chapter 12)
+    2. COLLECT DATA ON THE TARGET HARDWARE, with the
+       production sensor. Data from a different microphone,
+       a different lens, or a development board with a
+       different ground plane WILL NOT TRANSFER.
+    3. train on a workstation, in PyTorch or TensorFlow
+    4. quantise, ideally with QAT
+    5. convert and compile for the target
+    6. VALIDATE ON DEVICE - accuracy AND latency AND
+       memory AND power
+    7. integrate, with a fallback path
+    8. monitor in the field
+
+/* --- STEP 6 IS WHERE PROJECTS FAIL --- */
+    Accuracy measured on a workstation with float inputs is
+    NOT the accuracy you will get. The differences:
+      · int8 quantisation error
+      · a different preprocessing implementation - a
+        fixed-point FFT is not bit-identical to numpy's
+      · real sensor noise, DC offset, gain drift, and
+        temperature effects
+      · timing jitter and dropped samples
+
+    ALWAYS MEASURE END-TO-END ON THE ACTUAL DEVICE, from
+    sensor to decision. A test harness that replays recorded
+    raw sensor data through the real firmware path is worth
+    building early.
+
+/* --- THE ENGINEERING CONCERNS --- */
+
+    DETERMINISM       fixed-size arena, no dynamic
+                      allocation, bounded worst-case
+                      inference time. If the model runs in
+                      a control loop, its WCET is a
+                      real-time constraint like any other
+                      (see the OS track).
+    POWER             duty cycle. A cheap always-on
+                      detector (an analogue threshold, or a
+                      tiny first-stage model) that WAKES the
+                      real model is the standard cascade,
+                      and it is often a 100x energy saving.
+    UPDATES           the model is data. Ship it as a
+                      SIGNED, VERSIONED blob through your
+                      normal firmware update path - and
+                      verify the signature before loading
+                      it, exactly as for firmware
+                      (the cryptography track). A model file
+                      loaded without verification is
+                      arbitrary code's worth of influence
+                      over your device's behaviour.
+    SAFETY            never let a model make an unbounded
+                      safety-critical decision alone. Bound
+                      its authority, add a deterministic
+                      supervisor, and define the behaviour
+                      when it is uncertain.
+    OBSERVABILITY     log inputs that produce low-confidence
+                      or unusual outputs, if you can do so
+                      privately. Field data is how the next
+                      version gets better - and drift
+                      (chapter 12) is invisible without it.
+    PRIVACY           and the strongest argument for on-
+                      device inference: THE DATA NEVER
+                      LEAVES. For audio, video and health
+                      sensing that is not a nice-to-have,
+                      it is often the whole reason the
+                      product is viable.                  */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>AllocateTensors</code> fails</td><td>Arena too small — the error reports the size needed</td></tr>
+<tr><td>Model fits in flash but crashes at runtime</td><td>Arena plus stack exceeds RAM</td></tr>
+<tr><td>Inference 5× slower than expected</td><td>Reference kernels instead of CMSIS-NN</td></tr>
+<tr><td>NPU target slower than CPU</td><td>Operator fallbacks ping-ponging — read the Vela report</td></tr>
+<tr><td>Accuracy far below the workstation figure</td><td>Preprocessing mismatch, or PTQ where QAT was needed</td></tr>
+<tr><td>Works on the dev board, fails in the product</td><td>Different sensor — collect data on the target hardware</td></tr>
+<tr><td>Battery life far below the estimate</td><td>No duty cycling — always-on inference</td></tr>
+<tr><td>Occasional missed deadline in a control loop</td><td>Unbounded inference time — measure WCET</td></tr>
+<tr><td>Preprocessing does not fit</td><td>FFT buffers not budgeted alongside the arena</td></tr>
+<tr><td>Field accuracy degrades over months</td><td>Distribution drift with no monitoring</td></tr>
+<tr><td>Someone loaded a modified model file</td><td>Model blob not signature-verified</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Describe the four edge tiers and what each can realistically run.</li>
+  <li>Explain what a tensor arena is and why it is not the sum of activations.</li>
+  <li>Compute the memory budget for a keyword-spotting model on a 64 KB part.</li>
+  <li>Estimate inference time from MAC count and MACs per cycle.</li>
+  <li>Write the TFLite Micro setup, including why the op resolver is explicit.</li>
+  <li>Explain how to quantise an input using the model's own scale and zero point.</li>
+  <li>Say what Vela does and why operator fallbacks matter so much.</li>
+  <li>Derive the cost saving of depthwise separable convolution.</li>
+  <li>List the six size-reduction techniques in the order to apply them.</li>
+  <li>Explain why preprocessing must be budgeted explicitly.</li>
+  <li>Give five reasons on-device accuracy differs from workstation accuracy.</li>
+  <li>Name six engineering concerns for shipping a model, including update signing.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

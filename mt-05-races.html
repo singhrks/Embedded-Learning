@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Race conditions and data races | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Race conditions and data races</h1>
+<p class="lead">Two different bugs share one word. A <em>data race</em> is undefined behaviour and a tool can
+find it. A <em>race condition</em> is a logic error that no tool can find, because the code is doing exactly
+what you wrote. Telling them apart tells you which of the two entirely different fixes you need.</p>
+
+<h2 id="two">The two bugs</h2>
+
+<p>Start with the smallest possible example. Two threads incrementing one counter is enough to lose updates, and seeing precisely where the interleaving goes wrong is what makes every mechanism later in the track obviously necessary.</p>
+
+<pre class="diagram">   DATA RACE - a language-level violation
+
+     two threads access the same memory location
+     at least one writes
+     they are not ordered by any synchronisation
+
+     -> UNDEFINED BEHAVIOUR in C, C++ and Rust-with-unsafe.
+        Not "you get one value or the other". The compiler
+        was allowed to assume this never happens, so it may
+        have optimised on that assumption.
+
+     FOUND BY: ThreadSanitizer, Helgrind, the Go race
+               detector, Rust's type system at compile time.
+     FIXED BY: a lock, an atomic, or not sharing.
+
+
+   RACE CONDITION - a logic error about ordering
+
+     the program's correctness depends on which of several
+     legal orderings actually happens.
+
+     -> WELL-DEFINED BEHAVIOUR. Every individual operation is
+        properly synchronised. The SEQUENCE is wrong.
+
+     FOUND BY: thinking, review, stress tests, and production.
+     FIXED BY: making the composite operation atomic, or
+               removing the assumption about order.
+
+
+   EVERY DATA RACE IS A RACE CONDITION.
+   NOT EVERY RACE CONDITION IS A DATA RACE.
+
+   And the second kind is the one that survives to production,
+   precisely because your tools said the code was clean.</pre>
+
+<pre><code>/* A DATA RACE. TSan finds this in seconds. */
+
+int counter;                            /* plain int          */
+
+void *worker(void *_) {
+        for (int i = 0; i &lt; 100000; i++)
+                counter++;              /* unsynchronised RMW  */
+        return NULL;
+}
+/* Fix: make it atomic, or hold a lock. */
+
+
+/* A RACE CONDITION with NO data race. TSan says nothing. */
+
+std::mutex m;
+std::map&lt;std::string, int&gt; cache;
+
+int get_or_create(const std::string &amp;k)
+{
+        {   std::lock_guard&lt;std::mutex&gt; g(m);
+            auto it = cache.find(k);
+            if (it != cache.end())
+                    return it-&gt;second;      /* properly locked  */
+        }                                   /* LOCK RELEASED    */
+
+        int v = expensive_compute(k);       /* slow, unlocked   */
+
+        {   std::lock_guard&lt;std::mutex&gt; g(m);
+            cache[k] = v;                   /* properly locked  */
+            return v;
+        }
+}
+
+/* Every access to `cache` is under the mutex. No data race.
+   But two threads calling get_or_create("x") simultaneously
+   both miss, both compute, and both insert. If
+   expensive_compute has a side effect - allocating an id,
+   opening a connection, charging a card - you have just done
+   it twice.
+
+   THE BUG IS THE GAP between the two locked regions. */</code></pre>
+
+<div class="key">
+<b>The test: could an adversary schedule this?</b>
+<p>Imagine an adversary who chooses when every thread is preempted, at instruction granularity, with full
+knowledge of your code. Would the program still be correct? Not "is it likely" — the window in the example
+above is milliseconds wide, and under load it is hit constantly. Any reasoning of the form "the chance of that
+is tiny" is a bug you have decided not to fix.</p>
+</div>
+
+<h2 id="taxonomy">The shapes races take</h2>
+
+<p>"Race condition" covers several distinct failure shapes with different causes and different fixes. Naming them separately is what turns an unreproducible bug into a specific thing to look for.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Shape</th><th>Example</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><strong>Check-then-act</strong></td><td><code>if (!exists(f)) create(f);</code></td><td>One atomic
+operation: <code>O_CREAT|O_EXCL</code>, <code>try_emplace</code>, compare-and-swap</td></tr>
+<tr><td><strong>Read-modify-write</strong></td><td><code>x = x + 1</code></td><td>An atomic RMW, or a
+lock</td></tr>
+<tr><td><strong>Lost update</strong></td><td>Two threads read a record, both edit, both save</td><td>Optimistic
+concurrency: a version number checked on write</td></tr>
+<tr><td><strong>Time-of-check to time-of-use</strong></td><td><code>access()</code> then
+<code>open()</code></td><td>Never re-resolve; use the handle you already checked. A security bug, not just a
+correctness one</td></tr>
+<tr><td><strong>Publication race</strong></td><td>Set a pointer, then initialise the object</td><td>Initialise
+fully, then publish with a release store (<a href="mt-12-memory-ordering.html">chapter 12</a>)</td></tr>
+<tr><td><strong>Iterator invalidation</strong></td><td>One thread iterates while another
+inserts</td><td>Hold the lock for the whole iteration, or copy, or use a concurrent container</td></tr>
+<tr><td><strong>Lifetime race</strong></td><td>Thread B uses an object thread A is destroying</td><td>Shared
+ownership (<code>shared_ptr</code>, refcount) or a join before teardown</td></tr>
+<tr><td><strong>Lazy init</strong></td><td>Double-checked locking, written by hand</td><td><code>std::call_once</code>,
+a function-local <code>static</code>, or an acquire/release pair done properly</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="dclp">Double-checked locking, the canonical wrong answer</h2>
+
+<p>Double-checked locking is the most famous broken optimisation in concurrent programming — it looks obviously correct, was widely published, and is wrong for reasons that only became expressible once languages gained memory models.</p>
+
+<pre><code>/* THE BROKEN VERSION. Published in books for a decade. */
+
+Singleton *instance;                     /* plain pointer      */
+std::mutex m;
+
+Singleton *get(void)
+{
+        if (!instance) {                 /* 1. unsynchronised
+                                               read            */
+                std::lock_guard&lt;std::mutex&gt; g(m);
+                if (!instance)
+                        instance = new Singleton();   /* 2. */
+        }
+        return instance;
+}
+
+/* TWO independent defects:
+
+   (a) Line 1 reads `instance` with no synchronisation while
+       line 2 writes it. That is a DATA RACE: undefined
+       behaviour, full stop.
+
+   (b) Even if the read were somehow fine, `new Singleton()`
+       is three steps:
+              allocate
+              construct
+              assign to instance
+       and nothing forces that order. A compiler or CPU may
+       publish the pointer BEFORE the constructor has run.
+       Another thread sees non-null, returns it, and uses a
+       half-built object.
+
+   Defect (b) is why this is famous: the code looks right, the
+   bug is invisible in the source, and it appears only on
+   weakly-ordered hardware like ARM - so it ships from an x86
+   developer's laptop and fails on the phone.               */
+
+
+/* CORRECT, and simplest: */
+Singleton &amp;get(void)
+{
+        static Singleton instance;   /* C++11 guarantees this
+                                        is thread-safe and
+                                        initialised exactly
+                                        once                  */
+        return instance;
+}
+
+/* CORRECT, when you need the pointer form: */
+std::atomic&lt;Singleton *&gt; instance{nullptr};
+std::mutex m;
+
+Singleton *get(void)
+{
+        Singleton *p = instance.load(std::memory_order_acquire);
+        if (!p) {
+                std::lock_guard&lt;std::mutex&gt; g(m);
+                p = instance.load(std::memory_order_relaxed);
+                if (!p) {
+                        p = new Singleton();
+                        /* release: everything the constructor
+                           wrote is visible to any thread that
+                           acquires this pointer.             */
+                        instance.store(p, std::memory_order_release);
+                }
+        }
+        return p;
+}</code></pre>
+
+<h2 id="find">Finding them on purpose</h2>
+
+<p>Races rarely reproduce on demand, so finding them by testing is unreliable. These tools find them by checking the rules on every access rather than waiting for the unlucky interleaving to occur.</p>
+
+<pre><code># ThreadSanitizer - finds DATA races, not race conditions.
+# Roughly 5-15x slower, 5-10x more memory. Worth every cycle.
+$ gcc -fsanitize=thread -g -O1 app.c -o app
+$ ./app
+WARNING: ThreadSanitizer: data race (pid=4211)
+  Write of size 4 at 0x5586f4a0 by thread T2:
+    #0 worker app.c:12
+  Previous read of size 4 at 0x5586f4a0 by thread T1:
+    #0 worker app.c:12
+  Location is global 'counter' of size 4
+
+# It only reports races it OBSERVES. Code paths not executed
+# are not checked, so run it against your real workload.
+
+$ valgrind --tool=helgrind ./app       # slower, no rebuild
+$ go test -race ./...                  # built in
+$ cargo +nightly build -Z sanitizer=thread
+
+# For RACE CONDITIONS, no tool. What actually works:
+#   * run with more threads than cores, so preemption is
+#     constant rather than rare
+#   * inject delays at suspicious points and see what breaks
+#   * stress in a loop for hours; log the interleaving
+#   * model-check the protocol (TLA+, Spin) if it is critical
+
+# Widening the window deliberately - the cheapest technique
+# in this whole chapter:
+        auto it = cache.find(k);
+        if (it != cache.end()) return it-&gt;second;
++       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int v = expensive_compute(k);
+# If the bug is a gap between two locked regions, a sleep in
+# the gap turns "once a week" into "every single time".</code></pre>
+
+<div class="warn">
+<b>A clean TSan run is not a clean program</b>
+<p>ThreadSanitizer proves the absence of data races <em>on the paths it executed</em>. It says nothing about
+race conditions, nothing about paths you did not run, and nothing about ordering bugs across processes or
+against hardware. Treat it as a lint that catches an important, mechanical class of bug — not as a
+proof.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>A counter is slightly low under load</td><td>Non-atomic read-modify-write; increments
+lost</td></tr>
+<tr><td>A cached value is computed twice</td><td>Check-then-act with an unlocked gap</td></tr>
+<tr><td>A user is charged twice</td><td>The same gap, with a side effect in it</td></tr>
+<tr><td>Crash using a freshly published object</td><td>Publication race — the pointer was visible before the
+constructor finished</td></tr>
+<tr><td>Fails on ARM, never on x86</td><td>Weaker memory ordering exposes a publication or reordering
+bug</td></tr>
+<tr><td>Fails only with optimisation on</td><td>The compiler exploited the undefined behaviour a data race
+permitted</td></tr>
+<tr><td>Iterator crash in a container that is "locked"</td><td>The lock was released between obtaining the
+iterator and using it</td></tr>
+<tr><td>Use-after-free during shutdown</td><td>Lifetime race — no join before teardown</td></tr>
+<tr><td>A file is created twice, or a symlink attack succeeds</td><td>TOCTOU between check and use</td></tr>
+<tr><td>TSan is clean and the bug persists</td><td>It is a race condition, not a data race — different bug,
+different fix</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Define a data race and a race condition precisely, and say which tools find which.</li>
+  <li>Explain why a data race is undefined behaviour rather than "you get one of two values".</li>
+  <li>Write a race condition that contains no data race.</li>
+  <li>State the adversarial-scheduler test and apply it to a piece of your own code.</li>
+  <li>Name six shapes races take and give the fix for each.</li>
+  <li>Give both defects in hand-written double-checked locking.</li>
+  <li>Explain why the double-checked locking bug ships from x86 and fails on ARM.</li>
+  <li>Write the two correct forms of lazy initialisation in C++.</li>
+  <li>Explain what a clean ThreadSanitizer run does and does not prove.</li>
+  <li>Describe the delay-injection technique and why it is so effective on gap bugs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

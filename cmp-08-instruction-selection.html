@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instruction selection and scheduling | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Instruction selection and scheduling</h1>
+<p class="lead">The back end's first two jobs: choosing which machine instructions implement the IR, and
+deciding what order to issue them in so the pipeline stays busy. This is where target knowledge finally
+enters the compiler.</p>
+
+<h2 id="selection">Instruction selection</h2>
+
+<pre class="diagram">The IR says WHAT to compute. Instruction selection decides
+WHICH instructions do it - and there are usually several
+answers.
+
+   IR:      %1 = mul i32 %a, 4
+            %2 = add i32 %b, %1
+
+   CANDIDATES on AArch64:
+
+     (a)  lsl  w1, w0, #2          ; a * 4
+          add  w2, w3, w1
+          -&gt; 2 instructions
+
+     (b)  add  w2, w3, w0, lsl #2  ; ONE instruction:
+          -&gt; the shifted-register addressing form
+
+   ARM's instruction set has many such fused forms, so
+   selection matters more than on a simpler ISA:
+
+     add  x0, x1, x2, lsl #3       shifted operand
+     madd w0, w1, w2, w3           multiply-add
+     msub w0, w1, w2, w3           multiply-subtract
+     ubfx w0, w1, #4, #8           bitfield extract
+     bfi  w0, w1, #4, #8           bitfield insert
+     csel w0, w1, w2, eq           conditional select
+     csinc, csneg, csinv           select-and-modify
+     ldp/stp  x0, x1, [x2]         load/store PAIR
+     ldr  w0, [x1, w2, sxtw #2]    scaled, sign-extended
+                                   index
+
+   RECOGNISING THESE IS THE JOB. A pattern-matching selector
+   covers the IR graph with the cheapest set of patterns that
+   tile it.</pre>
+
+<h2 id="tiling">Tree tiling</h2>
+
+<pre><code>/* The classic formulation: the IR is a tree (or DAG); each
+   instruction is a PATTERN with a COST; find the cheapest
+   cover.                                                   */
+
+   IR TREE for  a[i] = b + 1 :
+
+              store
+             /     \
+          add       add
+         /   \     /   \
+       a    shl   b     1
+           /   \
+          i     2
+
+   PATTERNS available:
+      "add reg, reg"                    cost 1
+      "add reg, reg, lsl #n"            cost 1   &lt;- covers 3
+                                                    nodes
+      "str reg, [reg, reg, lsl #n]"     cost 1   &lt;- covers 5
+                                                    nodes!
+      "lsl reg, reg, #n"                cost 1
+
+   THE GREEDY COVER using the third pattern:
+      add  w1, w2, #1              ; b + 1
+      str  w1, [x0, x3, lsl #2]    ; a[i] = ...
+   TWO instructions for eight IR nodes.
+
+/* THE ALGORITHMS:
+     · maximal munch - greedily take the largest matching
+       pattern at each node. Simple, near-optimal in practice.
+     · dynamic programming (BURG, iburg) - provably optimal
+       tiling for a tree, in linear time
+     · DAG-based selection (LLVM's SelectionDAG) - handles
+       shared subexpressions
+     · GlobalISel (LLVM's newer path) - works on the whole
+       function, better for cross-block patterns and faster
+       to compile
+
+/* IN LLVM you write patterns in TableGen: */
+   def : Pat&lt;(add GPR32:$a, (shl GPR32:$b, imm:$c)),
+             (ADDWrs GPR32:$a, GPR32:$b, imm:$c)&gt;;
+/* and the build generates the matcher. AArch64's target
+   description is roughly 40,000 lines of this - which is a
+   measure of how much of a compiler is target knowledge. */</code></pre>
+
+<h2 id="peephole">Peephole optimisation</h2>
+
+<pre><code>/* After selection, a sliding window over the instruction
+   stream replaces short sequences with better ones.       */
+
+        mov  w0, w0                     -&gt;  (delete)
+        add  w0, w0, #0                 -&gt;  (delete)
+
+        str  w0, [x1]                   -&gt;  str w0, [x1]
+        ldr  w0, [x1]                        (the load is
+                                              redundant)
+
+        mov  w1, #0                     -&gt;  str wzr, [x0]
+        str  w1, [x0]                        (use the zero
+                                              register)
+
+        cmp  w0, #0                     -&gt;  cbz w0, .L1
+        b.eq .L1                             (compare-and-
+                                              branch)
+
+        sub  w0, w0, #1                 -&gt;  subs w0, w0, #1
+        cmp  w0, #0                          b.ne .L1
+        b.ne .L1                             (subs sets the
+                                              flags)
+
+        ldr  w0, [x1]                   -&gt;  ldp w0, w1, [x1]
+        ldr  w1, [x1, #4]                    (paired load)
+
+/* ARM-SPECIFIC ONES worth recognising in output:
+     wzr / xzr        the ZERO REGISTER - reading gives 0,
+                      writing discards. `mov w0, wzr` is how
+                      you zero a register, and `str wzr, [x0]`
+                      stores zero with no register needed.
+     cbz / cbnz       compare-with-zero and branch, one
+                      instruction
+     tbz / tbnz       test a single BIT and branch
+     ldp / stp        load/store pair - half the instructions
+                      for prologues and epilogues
+     ret              a specialised `br x30`                */
+
+/* THE PEEPHOLE PASS IS WHY hand-optimised assembly rarely
+   beats the compiler on straight-line code: every one of
+   these substitutions is applied automatically and
+   exhaustively.                                            */</code></pre>
+
+<h2 id="scheduling">Instruction scheduling</h2>
+
+<pre class="diagram">The processor is pipelined (CA chapter 11). An instruction
+that needs a result not yet available STALLS.
+
+   POORLY SCHEDULED:
+      ldr  w0, [x1]        ; 4-cycle load latency
+      add  w0, w0, #1      ; STALLS 3 cycles waiting for w0
+      ldr  w2, [x3]
+      add  w2, w2, #1      ; STALLS again
+      -&gt; ~14 cycles
+
+   SCHEDULED:
+      ldr  w0, [x1]
+      ldr  w2, [x3]        ; issue the second load while the
+                           ; first is in flight
+      add  w0, w0, #1      ; by now w0 is ready
+      add  w2, w2, #1
+      -&gt; ~8 cycles
+
+  SAME INSTRUCTIONS, same result, fewer stalls.
+
+  THE SCHEDULER NEEDS A MACHINE MODEL:
+     each instruction's LATENCY (when its result is ready)
+     each instruction's THROUGHPUT (how often it can issue)
+     which FUNCTIONAL UNITS it uses, and how many there are
+     the issue WIDTH
+     forwarding paths
+
+  LLVM's is in the target's TableGen; you can see it:
+     llvm-mca -mcpu=cortex-a72 input.s
+  which prints a cycle-by-cycle simulation, the bottleneck
+  resource, and the achieved IPC. It is the best tool for
+  "why is this loop slower than I expect".</pre>
+
+<pre><code>/* LIST SCHEDULING, the standard algorithm:
+
+   1. build a DEPENDENCE DAG for the basic block
+        true dependence   (read-after-write) - real
+        anti-dependence   (write-after-read) - removable by
+                          renaming
+        output dependence (write-after-write) - ditto
+        memory dependences, where aliasing is unclear
+
+   2. compute each node's PRIORITY - usually the critical
+      path length to the end of the block
+
+   3. repeatedly: from the instructions whose operands are
+      ready, issue the highest priority one
+
+   THE TENSION WITH REGISTER ALLOCATION (chapter 09):
+   spreading instructions apart to hide latency INCREASES the
+   number of simultaneously live values, which increases
+   register pressure, which may cause spills that cost more
+   than the stalls saved. Compilers schedule before and after
+   allocation for this reason, and the pre-allocation
+   scheduler is deliberately register-pressure-aware.     */
+
+/* WHY IT MATTERS LESS THAN IT USED TO:
+   an out-of-order core (CA chapter 12) reorders instructions
+   itself, within its window. So scheduling matters most on:
+     · in-order cores - Cortex-A53, A55, most microcontrollers
+     · very long dependence chains that exceed the window
+     · code where the compiler can see further ahead than the
+       hardware can
+
+   ON A CORTEX-A53 (in-order) good scheduling can be worth
+   20-30%. On a Cortex-X (aggressively out-of-order) it is
+   often under 5%. -mtune= tells the compiler which model to
+   use, and it is worth setting correctly even when -march
+   must stay generic.                                     */</code></pre>
+
+<div class="key">
+<b><code>-march</code> versus <code>-mtune</code></b>
+<p><code>-march</code> says which instructions may be <em>emitted</em> — get it wrong and you get an illegal
+instruction on older hardware. <code>-mtune</code> says which core to <em>optimise for</em> — scheduling,
+inlining thresholds, alignment. Tuning for the wrong core costs performance; targeting the wrong
+architecture costs correctness. For a product shipping on one SoC, set both: <code>-mcpu=cortex-a53</code>
+sets them together.</p>
+</div>
+
+<h2 id="software">Software pipelining</h2>
+
+<pre><code>/* Overlap iterations, so the loop body issues work from
+   several iterations at once and no stage waits.          */
+
+   NAIVE:  for each i:  load a[i] ; compute ; store b[i]
+
+           |load|      |          |
+           |    |compute|         |
+           |    |      |store|    |
+                             |load|      |
+   -&gt; the load latency is exposed every iteration.
+
+   PIPELINED:
+           |load i+2 | compute i+1 | store i |
+           |load i+3 | compute i+2 | store i+1|
+   -&gt; each iteration issues a load for a FUTURE element, a
+      compute for the previous one, and a store for the one
+      before that. The pipeline is always full.
+
+   REQUIRES a PROLOGUE to fill the pipeline and an EPILOGUE to
+   drain it, which is why software-pipelined loops look
+   complicated in the assembly.
+
+/* GCC: -fmodulo-sched, and it is not on by default at -O2
+   because it increases register pressure and code size.
+   LLVM does it for some targets via the MachinePipeliner.
+
+/* YOU CAN DO IT BY HAND, and on an in-order DSP-like core it
+   is sometimes worth it: */
+        t = a[0];
+        for (i = 0; i &lt; n - 1; i++) {
+                u = a[i + 1];           /* load for NEXT */
+                b[i] = f(t);            /* compute for THIS */
+                t = u;
+        }
+        b[n-1] = f(t);
+/* But measure first. On an out-of-order core the hardware
+   already does this.                                     */</code></pre>
+
+<h2 id="reading">Reading the output</h2>
+
+<pre><code>; int dot(const int *a, const int *b, int n)
+; aarch64 -O2 -mcpu=cortex-a53
+
+dot:
+        cmp     w2, #0
+        b.le    .Lzero
+        mov     x3, #0                  ; i
+        mov     w4, #0                  ; sum
+.Lloop:
+        ldr     w5, [x0, x3, lsl #2]    ; a[i] - SCALED INDEX
+        ldr     w6, [x1, x3, lsl #2]    ; b[i]
+        add     x3, x3, #1              ; i++  - issued while
+                                        ; the loads are in
+                                        ; flight
+        cmp     x3, x2, sxtw
+        madd    w4, w5, w6, w4          ; sum += a[i]*b[i]
+                                        ; ONE instruction
+        b.lt    .Lloop
+        mov     w0, w4
+        ret
+.Lzero:
+        mov     w0, #0
+        ret
+
+/* WHAT TO NOTICE:
+
+   `[x0, x3, lsl #2]`   the index scaling is FREE, folded
+                        into the addressing mode. No separate
+                        multiply or shift.
+   `madd`               multiply-accumulate in one
+                        instruction - selection recognised the
+                        pattern.
+   `add x3, x3, #1` placed BETWEEN the loads and their use -
+                        the scheduler hiding load latency.
+   `sxtw`               sign-extend w2 to 64 bits, folded into
+                        the compare.
+   `cmp` then `b.lt`    the flags are set once and used once.
+
+   FIVE INSTRUCTIONS in the loop body for a load, a load, a
+   multiply, an add, an index update and a branch. That is
+   what good selection plus scheduling looks like, and it is
+   why hand-writing this in assembly is unlikely to help. */
+
+# --- ANALYSE IT ---
+    llvm-mca -mcpu=cortex-a53 -timeline dot.s
+    ; cycle-by-cycle, with the bottleneck identified
+
+    perf stat -e cycles,instructions,stalled-cycles-frontend ./prog
+    perf annotate                 ; per-instruction cost</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Illegal instruction on target</td><td><code>-march</code> allowed something the CPU lacks</td></tr>
+<tr><td>Slower than expected on an in-order core</td><td>Wrong <code>-mtune</code>; the schedule targets a different pipeline</td></tr>
+<tr><td>Many separate shifts and adds for an index</td><td>The addressing mode was not matched — often an unusual element size</td></tr>
+<tr><td>Multiply and add not fused</td><td>Rounding rules for FP, or the intermediate value is used elsewhere</td></tr>
+<tr><td>Long stalls on loads</td><td>Dependence chain the scheduler could not break — or a real cache miss</td></tr>
+<tr><td>Loop faster with manual reordering</td><td>Register pressure prevented the scheduler from doing it</td></tr>
+<tr><td>Assembly full of prologue/epilogue code</td><td>Software pipelining or vectorisation — normal</td></tr>
+<tr><td>Hand-written assembly no faster</td><td>Peephole plus selection already found those patterns</td></tr>
+<tr><td>IPC far below the issue width</td><td>Run <code>llvm-mca</code> — it names the bottleneck resource</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain instruction selection and give three ARM fused forms it must recognise.</li>
+  <li>Tile a small IR tree and count the instructions saved.</li>
+  <li>Name four peephole substitutions and the ARM features they exploit.</li>
+  <li>Explain what the zero register buys.</li>
+  <li>Explain why scheduling matters and what a machine model must contain.</li>
+  <li>Describe list scheduling and its tension with register allocation.</li>
+  <li>Say when scheduling matters most and least, and why.</li>
+  <li>Distinguish <code>-march</code> from <code>-mtune</code> and the failure each wrong choice
+  causes.</li>
+  <li>Explain software pipelining and why it needs a prologue and epilogue.</li>
+  <li>Read a compiled loop and identify selection and scheduling decisions in it.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

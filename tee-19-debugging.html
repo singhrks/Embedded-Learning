@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debugging OP-TEE and trusted applications | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Debugging OP-TEE and trusted applications</h1>
+<p class="lead">Debugging the secure world is harder than debugging Linux and easier than debugging
+firmware, and the tools are unfamiliar rather than absent. This chapter is the toolkit, ordered by how often
+you will need each thing, starting with the one that answers most questions.</p>
+
+<h2 id="panic">Reading a panic</h2>
+
+<p>When a trusted application fails, the output is terse by design — the secure world deliberately reveals little. Extracting a usable diagnosis from what it does print is the skill this chapter builds.</p>
+
+<pre><code># A TA panic looks like this on the SECURE console. It is
+# dense and it contains everything you need.
+
+E/TC:0 0 tee_ta_verify_param:...  invalid memory access
+E/TC:0 0 Status of TA 7f2e9c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b
+E/TC:0 0  arch: aarch64  load address: 0x40016000
+E/LD:  arch: aarch64
+E/LD:  region  0: va 0x40016000 pa 0x0e56d000 size 0x002000 flags r-x
+E/LD:  region  1: va 0x40018000 pa 0x0e56f000 size 0x001000 flags rw-
+E/LD:  region  2: va 0x40019000 pa 0x0e570000 size 0x008000 flags rw- (stack)
+E/TC:0 0 Core data-abort at address 0x0 (translation fault)
+E/TC:0 0  esr 0x92000006  ttbr0 0x...  cidr 0x0
+E/TC:0 0  cpu #0          cpsr 0x60000100
+E/TC:0 0  x0 0000000000000000 x1 0000000040018210
+E/TC:0 0  x2 0000000000000020 x3 0000000000000000
+...
+E/TC:0 0  elr 0x40016a3c
+E/TC:0 0 Call stack:
+E/TC:0 0  0x40016a3c
+E/TC:0 0  0x40016b10
+E/TC:0 0  0x400171d4
+
+# THE PROCEDURE:
+#
+# 1. Note the LOAD ADDRESS: 0x40016000
+# 2. Subtract it from each call-stack address:
+#      0x40016a3c - 0x40016000 = 0xa3c
+#      0x40016b10 - 0x40016000 = 0xb10
+#      0x400171d4 - 0x40016000 = 0x11d4
+# 3. Look those offsets up in the TA's ELF:
+
+$ aarch64-linux-gnu-addr2line -f -p -e ta/my_ta.elf 0xa3c 0xb10 0x11d4
+do_sign at /work/my_project/ta/my_ta.c:142
+handle_command at /work/my_project/ta/my_ta.c:201
+TA_InvokeCommandEntryPoint at /work/my_project/ta/my_ta.c:230
+
+# 4. Decode the ESR: 0x92000006
+#      EC = 0x24  data abort from a lower EL
+#      DFSC = 0x06  translation fault, level 2
+#      WnR = 1     it was a WRITE
+#    So: a write to an unmapped address - and FAR says 0x0.
+#    A NULL pointer write at my_ta.c:142.
+
+# OP-TEE ships a script that does steps 1-3 for you:
+$ optee_os/scripts/symbolize.py -d ta/ -d optee_os/out/.../core/ \
+    &lt; secure-console.log
+# Pipe the whole console through it and every address becomes
+# a file and line. Set this up once and never do the
+# arithmetic again.</code></pre>
+
+<div class="key">
+<b>Build for symbolisation before you need it</b>
+<p>Two flags make panics readable: <code>CFG_UNWIND=y</code> for the call stack, and
+<code>CFG_CORE_ASLR=n</code> plus <code>CFG_TA_ASLR=n</code> so addresses are stable between runs. Keep the
+unstripped <code>.elf</code> next to every <code>.ta</code> you ship to a test device — without it, a panic
+log is a list of numbers.</p>
+</div>
+
+<h2 id="trace">Logging</h2>
+
+<p>Tracing from inside the secure world is possible and has to route out through the normal world, with both practical limits and a security consideration about what you print.</p>
+
+<pre><code># Levels, set at build time:
+$ make CFG_TEE_CORE_LOG_LEVEL=3 CFG_TEE_TA_LOG_LEVEL=4
+#   0 none  1 error  2 info  3 debug  4 flow
+
+# In a TA:
+    EMSG("failed: 0x%08x", res);    /* always              */
+    IMSG("state now %u", n);        /* level 2             */
+    DMSG("entering with %p", p);    /* level 3             */
+    FMSG("tick");                   /* level 4             */
+    DHEXDUMP(buf, len);             /* a hex dump          */
+
+# Output carries the function and line automatically:
+E/TA: do_sign:142 failed: 0xffff0006
+
+# In the CORE, the same macros plus:
+    MSG_RAW(...)      no prefix
+    EMSG_RAW(...)
+    panic("message"); /* takes the whole TEE down          */
+
+# Per-TA level, without rebuilding everything - set it in the
+# TA's own Makefile:
+    CFG_TEE_TA_LOG_LEVEL ?= 4
+
+# Level 4 on the core is extremely verbose and genuinely
+# useful when you are lost:
+F/TC:0 0 thread_alloc_and_run:...  thread 0
+F/TC:0 0 tee_ta_open_session:...   uuid 7f2e9c1a-...
+F/TC:0 0 ldelf_load_ta:...
+F/TC:0 0 tee_ta_invoke_command:... cmd 0
+# You can see exactly how far a call got before it failed.</code></pre>
+
+<h2 id="gdb">GDB on the secure world</h2>
+
+<p>A source-level debugger can be attached to the secure world under emulation, which is by far the most productive way to develop trusted applications.</p>
+
+<pre><code># QEMU's stub debugs every exception level (QEMU chapter 11).
+# The secure world is not special.
+
+$ cd ~/optee/build
+$ make run-only GDBSERVER=y
+# or add -s -S to the QEMU command line yourself
+
+$ aarch64-linux-gnu-gdb
+(gdb) target remote :1234
+
+# Load symbols for every image, at its link address:
+(gdb) add-symbol-file ~/optee/optee_os/out/arm-plat-vexpress/core/tee.elf \
+        0x0e100000
+(gdb) add-symbol-file ~/optee/trusted-firmware-a/build/qemu/release/bl31/bl31.elf
+(gdb) add-symbol-file ~/optee/linux/vmlinux
+
+# Break inside OP-TEE:
+(gdb) break tee_ta_open_session
+(gdb) break tee_entry_std
+(gdb) break panic
+(gdb) continue
+
+# Which world are we in?
+(gdb) monitor info registers | grep -E 'PSTATE|SCR'
+# PSTATE ... EL1h  with SCR_EL3.NS == 0  ->  secure world
+
+# A TA is loaded at a runtime address, so its symbols must be
+# added AFTER it loads:
+(gdb) break tee_ta_invoke_command
+(gdb) continue
+(gdb) p ctx-&gt;ts_ctx           # find the load address
+(gdb) add-symbol-file ta/my_ta.elf 0x40016000
+(gdb) break do_sign
+
+# OP-TEE ships GDB helpers:
+(gdb) source ~/optee/optee_os/scripts/gdb/optee.py
+(gdb) optee_ta_list
+(gdb) optee_mem_map
+(gdb) optee_threads
+
+# On real hardware you need a JTAG probe that can see the
+# secure world - and many cannot, or are disabled by fuses in
+# production. That asymmetry is why so much OP-TEE development
+# happens on QEMU.</code></pre>
+
+<h2 id="ftrace">Function tracing inside a TA</h2>
+
+<p>The OS can report where time was spent inside a call, which is how you find out whether a slow operation is the crypto, the storage or the world switches.</p>
+
+<pre><code># OP-TEE can instrument a TA's every function entry and exit,
+# and dump the trace through tee-supplicant.
+
+$ make CFG_TA_GPROF_SUPPORT=y CFG_FTRACE_SUPPORT=y \
+       CFG_SYSCALL_FTRACE=y
+
+# Build the TA with instrumentation:
+#   in ta/Makefile:
+    CFG_FTRACE_SUPPORT=y
+#   or per-file:
+    cflags-my_ta.c-y += -pg
+
+$ tee-supplicant -d
+# Run the client, then:
+$ ls /tmp/ftrace-*.out
+$ optee_os/scripts/ftrace_format.py /tmp/ftrace-7f2e9c1a-....out
+
+  0.000 us | TA_InvokeCommandEntryPoint() {
+  1.200 us |   do_sign() {
+  0.400 us |     load_key() {
+ 12.100 us |       TEE_OpenPersistentObject();
+              }   /* load_key: 13.900 us */
+ 45.300 us |     TEE_AsymmetricSignDigest();
+              }   /* do_sign: 60.100 us */
+              } /* TA_InvokeCommandEntryPoint: 61.500 us */
+
+# This answers "where is the time going" definitively, and the
+# answer is usually "the one call that does an RPC". Above,
+# TEE_OpenPersistentObject costs 12 us of a 61 us call -
+# cache it in the session context and the call halves.
+
+# gprof-style profiling, for the same question aggregated:
+$ make CFG_TA_GPROF_SUPPORT=y
+$ ls /tmp/gmon-*.out
+$ aarch64-linux-gnu-gprof ta/my_ta.elf /tmp/gmon-....out</code></pre>
+
+<h2 id="sanitizers">Sanitizers</h2>
+
+<p>The same instrumentation that finds memory errors in ordinary C is available here, and it matters more than usual because the code runs with high privilege.</p>
+
+<pre><code># OP-TEE can build itself and TAs with ASan and UBSan. On
+# QEMU, where you have memory to spare, leave them on during
+# development.
+
+$ make CFG_CORE_SANITIZE_UNDEFINED=y \
+       CFG_CORE_SANITIZE_KADDRESS=y \
+       CFG_TA_SANITIZE_UNDEFINED=y
+
+# A UBSan hit on the secure console:
+E/TC:0 0 Undefined behavior at my_ta.c:88
+E/TC:0 0   left shift of 1 by 31 places cannot be represented
+           in type 'int'
+
+# An ASan hit:
+E/TC:0 0 KASAN: heap-buffer-overflow at 0x40018210
+E/TC:0 0   write of size 4 at offset 68 of a 64-byte region
+
+# These find, before shipping, exactly the class of bug that a
+# security researcher would find after. The cost is memory and
+# speed, both of which you have in development and neither of
+# which matters in a test.
+
+# Also worth running, and cheap:
+$ xtest                       # the full GP conformance suite
+$ xtest -t regression
+$ xtest --stats               # memory high-water marks (ch. 13)
+$ xtest -t benchmark</code></pre>
+
+<h2 id="procedure">A procedure for "it does not work"</h2>
+
+<p>A method rather than a tool list: the order of questions that isolates a problem to a layer before you start reading code.</p>
+
+<pre class="diagram">   Work down. Each step is cheap and eliminates a layer.
+
+   1. Is there output on the SECURE console at all?
+        no  -> the second serial port is not set up (ch. 4).
+               Fix that before anything else.
+
+   2. What is the CLIENT's result and ORIGIN? (chapter 8)
+        origin 1 (API)   -> your client's arguments
+        origin 2 (COMMS) -> transport: /dev/tee0, the driver
+        origin 3 (TEE)   -> OP-TEE core rejected it. The
+                            secure console says why.
+        origin 4 (TA)    -> your TA returned this deliberately
+
+   3. 0xFFFF0008 ITEM_NOT_FOUND?
+        -> the .ta is not in /lib/optee_armtz, or the filename
+           does not match the UUID, or tee-supplicant is not
+           running.
+
+   4. 0xFFFF000F SECURITY?
+        -> signed with the wrong key (chapter 14).
+
+   5. 0xFFFF3024 TARGET_DEAD?
+        -> the TA panicked. Symbolize the log. Go to the top
+           of this chapter.
+
+   6. 0xFFFF0006 BAD_PARAMETERS with origin 4?
+        -> your paramTypes check is failing. Print what you
+           got and what you expected:
+             EMSG("ptypes 0x%08x expected 0x%08x", ptypes, exp);
+           This one line resolves it in seconds and it is
+           worth leaving in permanently.
+
+   7. It hangs?
+        -> thread exhaustion or a supplicant deadlock (ch. 9).
+           cat /proc/&lt;client&gt;/stack and
+           cat /proc/&lt;tee-supplicant&gt;/stack
+
+   8. It works, then stops after a while?
+        -> a leak. xtest --stats, and check handle cleanup on
+           every error path (chapter 12).
+
+   9. Still lost?
+        -> CFG_TEE_CORE_LOG_LEVEL=4 and read the flow trace.
+           It shows exactly how far the call got.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Panic log is just hex addresses</td><td>No <code>.elf</code> kept, or ASLR on. Rebuild with
+<code>CFG_TA_ASLR=n</code> and keep the ELF</td></tr>
+<tr><td>Call stack is empty</td><td><code>CFG_UNWIND=n</code></td></tr>
+<tr><td><code>addr2line</code> gives nonsense</td><td>Forgot to subtract the load address, or used the
+<code>.ta</code> instead of the <code>.elf</code></td></tr>
+<tr><td>No output from <code>DMSG</code></td><td><code>CFG_TEE_TA_LOG_LEVEL</code> below 3</td></tr>
+<tr><td>GDB breakpoint in a TA never hits</td><td>Symbols added before the TA was loaded, or at the wrong
+address</td></tr>
+<tr><td>ftrace produces nothing</td><td><code>tee-supplicant</code> not running, or the TA not built with
+<code>-pg</code></td></tr>
+<tr><td>Sanitizer build runs out of memory</td><td>ASan needs shadow memory; raise
+<code>TA_DATA_SIZE</code> and <code>TZDRAM_SIZE</code></td></tr>
+<tr><td>Cannot attach a debugger on real hardware</td><td>Secure debug disabled by fuses. Expected in
+production</td></tr>
+<tr><td>Bug disappears with logging enabled</td><td>A race — logging changed the timing. Look for shared state
+under <code>MULTI_SESSION</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Given a panic log, recover the source file and line for every frame.</li>
+  <li>Decode an ESR from a TA panic into fault type and direction.</li>
+  <li>Name the two build flags that make panics readable.</li>
+  <li>Give the four trace macros and the level each requires.</li>
+  <li>Attach GDB to the secure world and break inside OP-TEE.</li>
+  <li>Explain how to get symbols for a TA that is loaded at runtime.</li>
+  <li>Use ftrace to find where a TA invocation spends its time.</li>
+  <li>Name the sanitizer build flags and what each catches.</li>
+  <li>Walk the nine-step procedure and say what each step eliminates.</li>
+  <li>Explain why the return origin is the second thing to check, after the secure console.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

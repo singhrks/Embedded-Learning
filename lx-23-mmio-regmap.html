@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MMIO access and regmap | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>MMIO access and regmap</h1>
+<p class="lead">Touching hardware registers correctly: the accessor functions, the ordering guarantees they
+carry, why a plain pointer dereference is wrong, and the framework that removes most of the boilerplate
+along with a class of bugs.</p>
+
+<h2 id="accessors">The accessors</h2>
+
+<p>Talking to hardware means reading and writing registers that are mapped into memory but are not memory. You cannot use a normal pointer dereference for this — the compiler and CPU would be free to cache, reorder, merge or eliminate the access entirely, all of which are wrong.</p>
+
+<pre><code>#include &lt;linux/io.h&gt;
+
+        u8  readb(const volatile void __iomem *addr);
+        u16 readw(...);         /* 16-bit */
+        u32 readl(...);         /* 32-bit - the common one */
+        u64 readq(...);         /* 64-bit */
+
+        void writeb(u8  value, volatile void __iomem *addr);
+        void writew(u16 value, ...);
+        void writel(u32 value, ...);
+        void writeq(u64 value, ...);
+
+/* NOTE THE ARGUMENT ORDER: writel(VALUE, ADDRESS). It is the
+   opposite of what most people expect and of memcpy. Getting
+   it backwards compiles fine and writes an address into a
+   register.                                                 */
+
+/* WHAT readl/writel GUARANTEE:
+     · exactly one access of exactly that width. The compiler
+       cannot split, merge, reorder, or elide it.
+     · ordering with respect to OTHER readl/writel calls -
+       they carry the barriers needed so accesses reach the
+       device in program order.
+     · correct byte order: they assume LITTLE-ENDIAN device
+       registers and convert if the CPU is big-endian.
+
+/* WHY A PLAIN DEREFERENCE IS WRONG: */
+        val = *(volatile u32 *)base;      /* NO */
+   volatile stops the compiler reordering, but does NOTHING
+   about the CPU's memory ordering, nothing about access
+   width (the compiler may use a different instruction), and
+   nothing about endianness. On arm64 it often appears to
+   work, which is what makes it dangerous - it fails on
+   another core, another compiler, or under load.
+
+/* THE RELAXED VARIANTS - no ordering barriers: */
+        readl_relaxed(), writel_relaxed()
+
+   Faster, because they omit the barrier. Use them ONLY when
+   you know ordering does not matter - typically a burst of
+   writes to a FIFO where only the last one must be ordered:
+
+        for (i = 0; i &lt; n; i++)
+                writel_relaxed(data[i], base + FIFO);
+        writel(GO, base + CTRL);    /* ordered: this one
+                                       carries the barrier   */
+
+   THE RULE: use readl/writel by default. Reach for _relaxed
+   only in a measured hot path, and then make sure the last
+   access in the sequence is ordered.                       */</code></pre>
+
+<h2 id="barriers">Ordering, DMA and the barriers that matter</h2>
+
+<p>Even with the correct accessors, the order in which your writes reach the device is not automatically the order you wrote them — and when DMA is involved, a buffer you filled may not be visible to the device when you tell it to start. This section is the small set of rules that prevents both.</p>
+
+<pre class="diagram">Three different ordering questions, three different tools:
+
+  1. CPU-to-DEVICE ordering
+        Does the device see my writes in the order I made
+        them?
+     -&gt; readl()/writel() handle this. Device memory
+        (nGnRE, ARM ch. 11) is not reordered by the CPU,
+        and the accessors add the compiler barriers.
+
+  2. MEMORY-to-DEVICE ordering
+        I filled a DMA buffer in RAM, then wrote the "GO"
+        register. Will the device see the DATA before it
+        acts on GO?
+     -&gt; NOT AUTOMATIC. Normal memory writes and Device
+        writes are ordered differently. You need:
+
+           fill_dma_buffer(buf);
+           dma_wmb();                /* buffer visible to
+                                        the device FIRST   */
+           writel(GO, base + CTRL);
+
+        And on the receive side:
+
+           if (readl(base + STATUS) & DONE) {
+                   dma_rmb();        /* do not read the
+                                        buffer before the
+                                        status read        */
+                   consume(buf);
+           }
+
+  3. CPU-to-CPU ordering
+        -&gt; smp_wmb(), smp_rmb(), smp_mb() (chapter 14).
+        NEVER substitute these for the DMA ones: smp_* compile
+        to nothing on a uniprocessor kernel, and a DMA engine
+        is a second agent regardless of CPU count.
+
+  THE MISTAKE that costs the most time: using smp_wmb() where
+  dma_wmb() is needed. It works on your 4-core test board and
+  silently corrupts on a single-core variant, or under a
+  different compiler.</pre>
+
+<h2 id="poll">Waiting for hardware</h2>
+
+<p>Hardware takes time. A driver constantly needs to wait for a status bit to change, and there is a right way to do it that handles the timeout, avoids burning the CPU, and works in both sleeping and atomic contexts.</p>
+
+<pre><code>#include &lt;linux/iopoll.h&gt;
+
+/* NEVER an unbounded spin: */
+        while (readl(base + STATUS) &amp; BUSY)     /* NO */
+                ;
+/* If the device wedges - and it will - this hangs a CPU
+   forever with no diagnostic.                             */
+
+/* SLEEPING VERSION - process context: */
+        u32 val;
+        int ret;
+
+        ret = readl_poll_timeout(base + REG_STATUS,  /* addr   */
+                                 val,                /* var    */
+                                 !(val &amp; BUSY),      /* cond   */
+                                 10,          /* poll every 10us*/
+                                 1000);       /* give up at 1ms */
+        if (ret)
+                return dev_err_probe(dev, ret, "timed out\n");
+
+/* ATOMIC VERSION - interrupt context, holding a spinlock: */
+        ret = readl_poll_timeout_atomic(base + REG_STATUS, val,
+                                        !(val &amp; BUSY), 1, 100);
+
+/* PICKING THE NUMBERS:
+     sleep_us   how long between polls. Too small and you burn
+                CPU; too large and you add latency. Roughly
+                one tenth of the expected completion time.
+     timeout_us the datasheet's worst case, times a safety
+                factor of two or three. NEVER "a number that
+                works on my board".
+
+   AND ALWAYS handle the timeout. A driver that logs
+   "timed out" and returns an error is debuggable; one that
+   ignores it produces corrupt data with no clue why.       */</code></pre>
+
+<h2 id="regmap">regmap: the framework</h2>
+
+<p>Writing register accessors by hand is repetitive and easy to get subtly wrong, especially for read-modify-write and for devices behind a slow bus. regmap does it once, correctly, for every bus — and gives you caching, locking and a debug interface for free.</p>
+
+<pre><code>/* regmap abstracts "a set of registers" over MMIO, I2C, SPI or
+   anything else, and adds caching, locking and debugfs for
+   free. Use it unless you have a reason not to.            */
+
+#include &lt;linux/regmap.h&gt;
+
+static const struct regmap_config mydev_regmap_config = {
+        .reg_bits      = 32,       /* register address width */
+        .val_bits      = 32,       /* register value width   */
+        .reg_stride    = 4,        /* registers are 4 apart  */
+        .max_register  = 0xff,
+
+        .cache_type    = REGCACHE_MAPLE,   /* or RBTREE, FLAT,
+                                              or NONE         */
+        .volatile_reg  = mydev_volatile_reg,
+        .writeable_reg = mydev_writeable_reg,
+        .readable_reg  = mydev_readable_reg,
+        .precious_reg  = mydev_precious_reg,
+};
+
+/* WHICH REGISTERS ARE WHICH - this is the important part: */
+
+static bool mydev_volatile_reg(struct device *dev, unsigned int reg)
+{
+        /* VOLATILE = the hardware can change it by itself.
+           Never cache these; always read the hardware.     */
+        switch (reg) {
+        case MYDEV_REG_STATUS:
+        case MYDEV_REG_FIFO_DATA:
+        case MYDEV_REG_IRQ_STATUS:
+                return true;
+        default:
+                return false;
+        }
+}
+
+static bool mydev_precious_reg(struct device *dev, unsigned int reg)
+{
+        /* PRECIOUS = reading it has a SIDE EFFECT, such as
+           clearing the bits or popping a FIFO. regmap must
+           never read these speculatively - not for a cache
+           fill, not for the debugfs dump.                  */
+        return reg == MYDEV_REG_IRQ_STATUS ||
+               reg == MYDEV_REG_FIFO_DATA;
+}
+
+/* in probe: */
+        d-&gt;regmap = devm_regmap_init_mmio(dev, d-&gt;base,
+                                          &amp;mydev_regmap_config);
+        if (IS_ERR(d-&gt;regmap))
+                return PTR_ERR(d-&gt;regmap);
+
+/* USING IT: */
+        unsigned int val;
+
+        ret = regmap_read(d-&gt;regmap, MYDEV_REG_STATUS, &amp;val);
+        ret = regmap_write(d-&gt;regmap, MYDEV_REG_CTRL, 0x1);
+
+        /* read-modify-write, ATOMICALLY with respect to other
+           regmap users - this is the big win over hand-rolled
+           MMIO, where the RMW race is easy to write        */
+        ret = regmap_update_bits(d-&gt;regmap, MYDEV_REG_CTRL,
+                                 MYDEV_CTRL_ENABLE,   /* mask */
+                                 MYDEV_CTRL_ENABLE);  /* val  */
+
+        /* bulk, for FIFOs and contiguous blocks */
+        ret = regmap_bulk_read(d-&gt;regmap, MYDEV_REG_DATA,
+                               buf, count);
+
+        /* poll, the regmap equivalent of readl_poll_timeout */
+        ret = regmap_read_poll_timeout(d-&gt;regmap,
+                                       MYDEV_REG_STATUS, val,
+                                       !(val &amp; BUSY), 10, 1000);
+
+        /* fields, when you work with one bitfield repeatedly */
+        static const struct reg_field gain_field =
+                REG_FIELD(MYDEV_REG_CTRL, 4, 7);
+        d-&gt;gain_rf = devm_regmap_field_alloc(dev, d-&gt;regmap,
+                                             gain_field);
+        regmap_field_write(d-&gt;gain_rf, 3);   /* shifts and
+                                                masks for you */</code></pre>
+
+<div class="key">
+<b>What regmap buys you</b>
+<ul>
+<li><strong>Atomic read-modify-write</strong> — the single most common MMIO race, eliminated.</li>
+<li><strong>Locking</strong> against concurrent access, without you writing it.</li>
+<li><strong>A register cache</strong>, so a chatty I2C or SPI device is not re-read constantly, and so
+suspend/resume can restore state with <code>regcache_sync()</code>.</li>
+<li><strong>Bus independence</strong> — the same driver logic over MMIO, I2C and SPI variants of one chip.</li>
+<li><strong>A free debugfs register dump</strong> at <code>/sys/kernel/debug/regmap/&lt;dev&gt;/registers</code>.</li>
+<li><strong>Endianness and width handling</strong> declared once instead of at every call site.</li>
+</ul>
+</div>
+
+<h2 id="cache">Cached registers and suspend</h2>
+
+<p>If a device is powered off to save energy, its registers lose their contents, and every setting written since boot has to be restored on resume. regmap can track this for you, which turns a long and error-prone restore function into a configuration option.</p>
+
+<pre><code>/* The cache is what makes regmap worth using on a slow bus,
+   and it is also what makes resume simple.                 */
+
+static int mydev_suspend(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+
+        /* stop touching the hardware, and remember everything
+           by marking the cache dirty                       */
+        regcache_cache_only(d-&gt;regmap, true);
+        regcache_mark_dirty(d-&gt;regmap);
+
+        clk_disable_unprepare(d-&gt;clk);
+        return 0;
+}
+
+static int mydev_resume(struct device *dev)
+{
+        struct mydev *d = dev_get_drvdata(dev);
+        int ret;
+
+        ret = clk_prepare_enable(d-&gt;clk);
+        if (ret)
+                return ret;
+
+        regcache_cache_only(d-&gt;regmap, false);
+
+        /* write every cached value back to hardware that just
+           came up from reset - the whole register state,
+           restored in one call                             */
+        ret = regcache_sync(d-&gt;regmap);
+        if (ret)
+                dev_err(dev, "cache sync failed: %d\n", ret);
+
+        return ret;
+}
+
+/* Without regmap you would write, and maintain, a shadow copy
+   of every register plus a restore function - and get it
+   subtly wrong when someone adds a register.
+
+/* THE CACHE TYPES:
+     REGCACHE_NONE    no caching. Correct for MMIO where reads
+                      are cheap and you want the truth.
+     REGCACHE_FLAT    an array. Fast, uses max_register words
+                      of memory. Good for small maps.
+     REGCACHE_MAPLE   the modern sparse cache. Good default.
+     REGCACHE_RBTREE  the older sparse cache.
+
+   For a plain MMIO device, NONE is often right - the cache
+   exists to avoid slow bus traffic, and MMIO is not slow.
+   But even with NONE you keep the locking, the atomic RMW and
+   the debugfs dump.                                        */</code></pre>
+
+<h2 id="patterns">Register definition style</h2>
+
+<p>How you define register addresses and bitfields is not merely cosmetic; a consistent scheme makes the difference between a driver that can be checked against a datasheet in minutes and one where every constant has to be hunted down.</p>
+
+<pre><code>/* Define registers and their fields together, with the bit
+   positions expressed structurally rather than as magic
+   numbers.                                                 */
+
+#include &lt;linux/bitfield.h&gt;
+#include &lt;linux/bits.h&gt;
+
+#define MYDEV_REG_CTRL          0x04
+#define  MYDEV_CTRL_ENABLE      BIT(0)
+#define  MYDEV_CTRL_RESET       BIT(1)
+#define  MYDEV_CTRL_MODE        GENMASK(5, 4)   /* bits 5:4 */
+#define  MYDEV_CTRL_GAIN        GENMASK(11, 8)  /* bits 11:8 */
+
+/* FIELD_PREP shifts a value INTO position;
+   FIELD_GET extracts one OUT. Both check at compile time
+   that the value fits the mask.                            */
+
+        u32 ctrl = MYDEV_CTRL_ENABLE
+                 | FIELD_PREP(MYDEV_CTRL_MODE, MODE_BURST)
+                 | FIELD_PREP(MYDEV_CTRL_GAIN, 7);
+        writel(ctrl, base + MYDEV_REG_CTRL);
+
+        u32 gain = FIELD_GET(MYDEV_CTRL_GAIN,
+                             readl(base + MYDEV_REG_CTRL));
+
+/* versus the hand-rolled version, which has two bugs waiting
+   to happen (a wrong shift, and an unmasked value that
+   overflows into the neighbouring field):                  */
+        ctrl = 1 | (MODE_BURST &lt;&lt; 4) | (7 &lt;&lt; 8);   /* avoid */
+
+/* A NAMING CONVENTION that pays for itself:
+     MYDEV_REG_xxx     a register offset
+     MYDEV_xxx_yyy     a field within register xxx
+   and indent the field defines under their register, as
+   above, so the structure is visible at a glance.         */</code></pre>
+
+<h2 id="debug">Debugging register access</h2>
+
+<p>When a device does not respond, the first question is whether your writes are reaching it at all. There are several ways to see the actual traffic, and using one of them is invariably faster than reasoning about what the code should be doing.</p>
+
+<pre><code># regmap's free debugfs interface:
+    ls /sys/kernel/debug/regmap/1c000000.my-device/
+      access  name  range  registers  rbtree
+    cat /sys/kernel/debug/regmap/*/registers
+      00: 4d594445
+      04: 00000701
+      08: 00000000
+
+# From userspace, without any driver support:
+    devmem 0x1c000004                 # read
+    devmem 0x1c000004 32 0x1          # write
+    busybox devmem 0x1c000004
+
+# Trace every regmap access - extremely useful:
+    echo 1 > /sys/kernel/tracing/events/regmap/enable
+    cat /sys/kernel/tracing/trace_pipe
+      regmap_reg_write: 1c000000.my-device reg=4 val=1
+      regmap_reg_read:  1c000000.my-device reg=8 val=0
+
+# This is the regmap feature that most often justifies using
+# it: a complete, timestamped log of every register access,
+# with no code changes. Reproducing a bug once with this
+# enabled usually shows you the wrong write immediately.</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Register writes have no effect</td><td>Arguments reversed — <code>writel(value, addr)</code></td></tr>
+<tr><td>Reads return 0 or 0xFFFFFFFF</td><td>Clock off, in reset, wrong address, or access denied (<a href="sec-20-xpu-debug.html">isolation ch. 20</a>)</td></tr>
+<tr><td>Works on one compiler, breaks on another</td><td>Direct dereference instead of <code>readl</code>/<code>writel</code></td></tr>
+<tr><td>DMA reads stale data</td><td>Missing <code>dma_wmb()</code> before the doorbell write</td></tr>
+<tr><td>Corruption on a single-core build only</td><td><code>smp_wmb()</code> used where <code>dma_wmb()</code> was needed</td></tr>
+<tr><td>CPU hangs waiting for the device</td><td>Unbounded polling loop — use <code>readl_poll_timeout</code></td></tr>
+<tr><td>Two threads clobber a shared register</td><td>Non-atomic read-modify-write — use <code>regmap_update_bits</code></td></tr>
+<tr><td>A FIFO empties by itself</td><td>Regmap read it speculatively — mark it <code>precious</code></td></tr>
+<tr><td>Status register never changes</td><td>Cached — mark it <code>volatile</code></td></tr>
+<tr><td>Device is misconfigured after resume</td><td>No <code>regcache_sync()</code>, or the cache was not marked dirty</td></tr>
+<tr><td>A field write corrupts the neighbouring field</td><td>Hand-rolled shift without masking — use <code>FIELD_PREP</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write the accessors with the correct argument order and say what they guarantee.</li>
+  <li>Explain why <code>volatile</code> plus a cast is not equivalent.</li>
+  <li>Say when <code>_relaxed</code> is appropriate and what must still be ordered.</li>
+  <li>Distinguish the three ordering questions and pick the right barrier for each.</li>
+  <li>Explain why <code>smp_wmb()</code> is wrong for DMA ordering.</li>
+  <li>Replace a spin loop with <code>readl_poll_timeout</code> and justify the timings.</li>
+  <li>Write a <code>regmap_config</code> with correct volatile and precious predicates.</li>
+  <li>Explain what <code>precious</code> prevents and give an example register.</li>
+  <li>Use the register cache to implement suspend and resume.</li>
+  <li>Define a register with <code>BIT</code>/<code>GENMASK</code> and use
+  <code>FIELD_PREP</code>/<code>FIELD_GET</code>.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

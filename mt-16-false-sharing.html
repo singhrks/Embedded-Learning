@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache effects: false sharing and contention | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Cache effects: false sharing and contention</h1>
+<p class="lead">The most common reason parallel code is slower than serial code has nothing to do with locks
+or algorithms. It is that two cores are fighting over one 64-byte line of memory that they do not even
+logically share — and nothing in the source code shows it.</p>
+
+<h2 id="coherence">Why a cache line is the unit of everything</h2>
+
+<p>Before false sharing makes sense, the mechanism underneath it: caches on different cores are kept consistent automatically, and that consistency has a cost paid per cache line rather than per variable.</p>
+
+<pre class="diagram">   Coherence protocols operate on CACHE LINES, not variables.
+   A line is 64 bytes on x86 and most ARM (128 on Apple
+   Silicon's performance cores, which catches people out).
+
+   MESI, simplified. Each line, in each core's cache, is in
+   one of four states:
+
+     M odified   I have it, it is dirty, nobody else has it
+     E xclusive  I have it, it is clean, nobody else has it
+     S hared     several caches have it, all clean
+     I nvalid    I do not have it
+
+   THE RULE THAT COSTS YOU:
+     to WRITE a line, a core must own it EXCLUSIVELY.
+     So every write must INVALIDATE every other copy.
+
+   TWO CORES READING the same line:
+     both in S. No traffic at all after the first fetch.
+     Reads scale perfectly.
+
+   TWO CORES WRITING the same line, alternately:
+     core 1 writes -> must invalidate core 2's copy
+     core 2 writes -> must invalidate core 1's copy
+     ... the line PING-PONGS between them.
+
+     Each transfer costs 50-200 cycles on the same die, and
+     far more across sockets. Do it in a tight loop and the
+     two cores together are slower than one core alone.</pre>
+
+<h2 id="false">False sharing</h2>
+
+<p>Here is the consequence that surprises people: two threads touching two entirely separate variables can contend, because those variables happen to share one cache line. Nothing in the source hints at it.</p>
+
+<pre><code>/* TRUE sharing: two threads use the same variable. The cost
+   is inherent - you asked for it.
+
+   FALSE sharing: two threads use DIFFERENT variables that
+   happen to sit in the same cache line. The cost is pure
+   accident, and pure waste.                                */
+
+struct counters {
+        long a;          /* thread 0 increments this  */
+        long b;          /* thread 1 increments this  */
+};                       /* 16 bytes: ONE cache line  */
+
+/* Threads 0 and 1 touch nothing in common. Logically there is
+   no sharing at all. But every increment of `a` invalidates
+   the line holding `b`, so thread 1 must re-fetch it - and
+   vice versa, millions of times per second.
+
+   Measured effect: commonly 5-20x slower than the same code
+   with the fields separated. On a 2-socket machine, worse. */
+
+/* THE FIX: pad to a cache line. */
+
+#define CACHELINE 64
+
+struct counters {
+        alignas(CACHELINE) long a;
+        alignas(CACHELINE) long b;
+};                       /* 128 bytes, two lines, zero
+                            interference                       */
+
+/* C++17 gives you the portable constants: */
+#include &lt;new&gt;
+struct counters {
+        alignas(std::hardware_destructive_interference_size) long a;
+        alignas(std::hardware_destructive_interference_size) long b;
+};
+/* hardware_destructive_interference_size  = keep apart
+   hardware_constructive_interference_size = keep together   */
+
+/* Linux kernel: */
+        struct foo {
+                int a;
+                ____cacheline_aligned int b;
+        };
+/* Or the whole-struct form, for per-CPU data:              */
+        DEFINE_PER_CPU_ALIGNED(struct stats, my_stats);</code></pre>
+
+<div class="key">
+<b>The diagnostic question</b>
+<p>"Do two threads write to memory within 64 bytes of each other?" If yes, and it is in a hot loop, that is
+almost certainly your problem. Note it is <em>within 64 bytes</em>, not <em>the same variable</em> — adjacent
+array elements, adjacent struct members, and two objects from the same allocation batch all qualify.</p>
+</div>
+
+<h2 id="where">Where it hides</h2>
+
+<p>False sharing arises from a small number of recognisable layouts. Knowing them means you can spot the risk while writing the structure rather than discovering it in a profile months later.</p>
+
+<pre><code>/* 1. AN ARRAY INDEXED BY THREAD ID - the classic. */
+long results[NUM_THREADS];            /* 8 threads = 64 bytes
+                                         = ONE line. Every
+                                         thread fights every
+                                         other thread.        */
+/* FIX: */
+struct padded { alignas(64) long v; };
+struct padded results[NUM_THREADS];
+
+/* 2. A LOCK NEXT TO THE DATA IT PROTECTS. */
+struct node {
+        pthread_mutex_t lock;
+        int             data;         /* same line as the lock */
+};
+/* Waiters spinning on the lock word invalidate the line, so
+   the HOLDER - who is trying to work on `data` - keeps losing
+   its cache line to the very threads waiting for it. Separate
+   them, or accept it for cold locks.                        */
+
+/* 3. HEAD AND TAIL OF A QUEUE. Producer writes tail, consumer
+      writes head. Adjacent -> every push fights every pop.
+      This is why the SPSC queue in chapter 13 has
+      alignas(64) on both.                                    */
+
+/* 4. REFERENCE COUNTS INSIDE SHARED OBJECTS. Many readers
+      touching an object they only READ still write its
+      refcount, so a "read-only" workload writes constantly.
+      This is a large part of why shared_ptr copies are
+      expensive, and why RCU (chapter 10) is worth the
+      complexity for read-mostly data.                        */
+
+/* 5. FALSE SHARING YOU INHERITED. Two unrelated globals the
+      linker placed adjacently. Two objects malloc returned
+      from the same 64-byte chunk. A vector&lt;bool&gt; where
+      "different" elements are bits of one byte.              */
+
+/* 6. std::atomic MEMBERS IN A STRUCT. Atomics make the
+      invalidation explicit and frequent - false sharing
+      between two atomics is the worst case of all.           */</code></pre>
+
+<h2 id="measure">Measuring it</h2>
+
+<p>False sharing is invisible in code and unmistakable in hardware counters. These are the events that identify it, and they distinguish it from ordinary contention on the same variable.</p>
+
+<pre><code># The definitive counter on x86: HITM - a cache hit in a
+# MODIFIED line in ANOTHER core's cache. That is the ping-pong.
+
+$ perf c2c record ./app
+$ perf c2c report --stdio
+# Shared Data Cache Line Table
+#  Total  Tot  ----- LLC Load Hitm -----
+#  Rmt  Lcl   Hitm    Total  Lcl  Rmt   Data address
+#  ...  ...   82.4%    1621  1338  283   0x55d4a2f01840
+#
+#   ----- Offset ---  Code address   Symbol
+#         0x0            worker+0x24  results[tid]++
+#         0x8            worker+0x24  results[tid]++
+#
+# TWO DIFFERENT OFFSETS in ONE line, both hot, both written.
+# That is false sharing, named and located.
+
+# Cheaper first check:
+$ perf stat -e cache-misses,cache-references,\
+LLC-load-misses,LLC-store-misses ./app
+
+# On ARM, the equivalent counters vary by implementation:
+$ perf list | grep -i 'snoop\|coheren'
+
+# THE ZERO-TOOL TEST, and it is a good one:
+#   pad the suspect structure to 64 bytes and re-run.
+#   If it gets dramatically faster, you found it.
+#   If nothing changes, it was not false sharing - stop
+#   guessing and go back to the profiler.</code></pre>
+
+<h2 id="layout">Designing for it</h2>
+
+<p>The fix is always the same in principle — get the contended fields into different cache lines — and there are several ways to express it with different costs in memory and portability.</p>
+
+<pre><code>/* THE GENERAL PRINCIPLE: separate by WRITER, not by meaning. */
+
+/* BAD: grouped by what the fields mean. */
+struct connection {
+        int             fd;              /* read by all       */
+        atomic_long     bytes_in;        /* written by reader */
+        atomic_long     bytes_out;       /* written by writer */
+        atomic_int      refs;            /* written by all    */
+        struct sockaddr peer;            /* read by all       */
+};
+
+/* GOOD: grouped by who writes them. */
+struct connection {
+        /* immutable after construction - shared freely, and
+           never invalidated. Put it first and it stays hot. */
+        int             fd;
+        struct sockaddr peer;
+
+        alignas(64) atomic_long bytes_in;    /* reader thread */
+        alignas(64) atomic_long bytes_out;   /* writer thread */
+        alignas(64) atomic_int  refs;        /* everyone      */
+};
+
+/* AND THE BETTER ANSWER: do not share the counters at all. */
+
+struct stats { alignas(64) long n, bytes; };
+struct stats per_thread[NUM_THREADS];
+
+void record(int tid, long b) {           /* no atomics, no
+        per_thread[tid].n++;                contention, plain
+        per_thread[tid].bytes += b;         increments        */
+}
+
+long total_n(void) {                     /* pay once, when you
+        long t = 0;                         actually need it   */
+        for (int i = 0; i &lt; NUM_THREADS; i++)
+                t += per_thread[i].n;
+        return t;
+}
+/* Sharding beats optimising the shared case. A per-thread
+   counter with a periodic merge is faster than the cleverest
+   atomic, because it generates no coherence traffic at all. */</code></pre>
+
+<div class="warn">
+<b>Do not pad everything</b>
+<p>Padding costs memory and cache capacity. A struct padded from 24 to 128 bytes means five times fewer fit
+in L2, and a traversal that was cache-friendly becomes cache-hostile. Pad only fields that are
+<em>written by different threads in a hot loop</em>. Everything else benefits from being packed —
+<code>hardware_constructive_interference_size</code> exists to say "keep these together" for exactly that
+reason.</p>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Parallel version slower than serial, no locks involved</td><td>False sharing</td></tr>
+<tr><td>Scaling is negative past 2–4 threads</td><td>A line ping-ponging between more and more
+cores</td></tr>
+<tr><td>Adding a field to a struct halved throughput</td><td>It pushed two hot fields into one line, or
+shifted alignment</td></tr>
+<tr><td>Performance changes with unrelated code edits</td><td>The linker moved two globals into the same
+line</td></tr>
+<tr><td>Much worse on a 2-socket machine</td><td>Cross-socket coherence traffic is far more
+expensive</td></tr>
+<tr><td>Worse on Apple Silicon than expected</td><td>128-byte lines; 64-byte padding is not enough</td></tr>
+<tr><td>Atomic counter is the hottest line in <code>perf c2c</code></td><td>True sharing — shard it
+instead</td></tr>
+<tr><td>A "read-only" workload generates write traffic</td><td>Reference counts, or a shared iterator</td></tr>
+<tr><td>Padding made it slower</td><td>You padded a cold structure and destroyed its cache
+density</td></tr>
+<tr><td>Lock holder is starved by its own waiters</td><td>Lock word in the same line as the protected
+data</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why writing requires exclusive ownership of a line, and what that costs.</li>
+  <li>Distinguish true from false sharing with an example of each.</li>
+  <li>Explain why <code>long results[8]</code> indexed by thread id is a performance disaster.</li>
+  <li>Name six places false sharing hides.</li>
+  <li>Give the two C++17 interference-size constants and say what each is for.</li>
+  <li>Describe what <code>perf c2c</code> shows and what "two offsets in one line" means.</li>
+  <li>Give the zero-tool test for false sharing and how to interpret both outcomes.</li>
+  <li>Restructure a struct to group by writer rather than by meaning.</li>
+  <li>Explain why sharding beats optimising the shared counter.</li>
+  <li>Say when padding is wrong, and what it costs.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMMU: faults and debugging | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>SMMU: faults and debugging</h1>
+<p class="lead">SMMU faults are asynchronous, reported through a queue rather than as an exception, and easy
+to misread. This chapter is the practical one: decode an event record, work out which of six things went
+wrong, and fix it.</p>
+
+<h2 id="reporting">How a fault is reported</h2>
+
+<p>When the SMMU blocks a transaction it records what happened in an event queue rather than raising an immediate exception on some processor. Knowing where that record lands is the first step of every SMMU investigation.</p>
+
+<pre class="diagram">Unlike a CPU fault, which is a synchronous exception with ESR
+and FAR (ARM chapter 29), an SMMU fault is:
+
+   1. detected while translating a DEVICE transaction
+   2. written as a 32-byte EVENT RECORD into the event queue
+   3. signalled by an interrupt (or MSI)
+   4. read and logged by software, LATER
+
+  So the fault is decoupled from anything the CPU was doing.
+  There is no register to read at the moment it happens — the
+  event record IS the evidence.
+
+  The transaction itself is either TERMINATED (an abort returned
+  to the device) or STALLED, depending on STE.S1STALLD and
+  whether the device supports stalling.
+
+  CONSEQUENCE: a device that faults typically reports a bus
+  error, a timeout, or simply produces wrong data — and the
+  SMMU's event record in dmesg is the only thing that says why.</pre>
+
+<h2 id="record">Reading an event record</h2>
+
+<p>An event record names the device, the address, the access type and the reason. Reading one field by field turns "DMA is not working" into a specific statement about which check failed.</p>
+
+<pre><code>arm-smmu-v3 2b400000.iommu: event 0x10 received:
+arm-smmu-v3 2b400000.iommu: 0x0000004200000010
+arm-smmu-v3 2b400000.iommu: 0x0000000000000000
+arm-smmu-v3 2b400000.iommu: 0x00000000fffff000
+arm-smmu-v3 2b400000.iommu: 0x0000000000000000
+
+/* Four 64-bit words. The layout, generally: */
+
+   word 0  [7:0]    event type
+           [63:32]  StreamID
+   word 1  [31:0]   SubstreamID (if SSV set)
+           [32]     SSV — SubstreamID valid
+           [33]     PnU — privileged or unprivileged
+           [34]     InD — instruction or data
+           [35]     RnW — read or write
+           [36]     S2  — the fault was at stage 2
+           [37]     Class
+   word 2  [63:12]  the faulting INPUT ADDRESS (IOVA or IPA)
+   word 3           the faulting IPA, for stage-2 faults
+
+/* Decoding the example above:
+      type      = 0x10  = C_BAD_STREAMID
+      StreamID  = 0x42
+      address   = 0xfffff000
+
+   Meaning: a device emitting StreamID 0x42 issued a transaction,
+   and there is no valid Stream Table Entry for 0x42.
+
+   The address is almost irrelevant here — the problem is the
+   StreamID, not what it tried to touch.                    */</code></pre>
+
+<h2 id="types">The event types</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Code</th><th>Name</th><th>Means</th><th>Check</th></tr></thead>
+<tbody>
+<tr><td><code>0x01</code></td><td><code>F_UUT</code></td><td>Unsupported upstream transaction</td><td>The device is issuing something the SMMU cannot handle — an unsupported size or attribute</td></tr>
+<tr><td><code>0x02</code></td><td><code>C_BAD_STREAMID</code></td><td><strong>No valid STE for this StreamID</strong></td><td><strong>Device tree / IORT StreamID mismatch.</strong> The most common failure.</td></tr>
+<tr><td><code>0x04</code></td><td><code>F_STE_FETCH</code></td><td>Could not read the STE</td><td>Stream table address wrong, or the memory is unreachable by the SMMU</td></tr>
+<tr><td><code>0x05</code></td><td><code>C_BAD_STE</code></td><td>The STE is malformed</td><td>Driver bug, reserved bits set, or mismatched memory attributes</td></tr>
+<tr><td><code>0x06</code></td><td><code>F_BAD_ATS_TREQ</code></td><td>ATS request from a stream where ATS is not enabled</td><td><code>STE.EATS</code></td></tr>
+<tr><td><code>0x08</code></td><td><code>F_STREAM_DISABLED</code></td><td>The stream is configured to abort</td><td>Deliberate — an unconfigured device, or <code>disable_bypass</code></td></tr>
+<tr><td><code>0x0A</code></td><td><code>C_BAD_SUBSTREAMID</code></td><td>SubstreamID out of range for this STE</td><td><code>STE.S1CDMax</code></td></tr>
+<tr><td><code>0x0B</code></td><td><code>F_CD_FETCH</code></td><td>Could not read the CD</td><td><code>S1ContextPtr</code>, or CD table memory</td></tr>
+<tr><td><code>0x0C</code></td><td><code>C_BAD_CD</code></td><td>The CD is malformed</td><td>TCR-equivalent fields, alignment</td></tr>
+<tr><td><code>0x0D</code></td><td><code>F_WALK_EABT</code></td><td>External abort during a table walk</td><td>The page tables themselves are in unreadable or denied memory</td></tr>
+<tr><td><code>0x10</code></td><td><code>F_TRANSLATION</code></td><td><strong>The address is not mapped</strong></td><td><strong>Wrong address programmed into the device, or the mapping was torn down early</strong></td></tr>
+<tr><td><code>0x11</code></td><td><code>F_ADDR_SIZE</code></td><td>Address exceeds the configured output size</td><td><code>dma_set_mask()</code> versus the SMMU's OAS</td></tr>
+<tr><td><code>0x12</code></td><td><code>F_ACCESS</code></td><td>Access flag not set</td><td>The <code>AF</code> bit in the descriptor</td></tr>
+<tr><td><code>0x13</code></td><td><code>F_PERMISSION</code></td><td><strong>Mapped, but the wrong permission</strong></td><td><strong>DMA direction mismatch</strong> — mapped <code>TO_DEVICE</code> and the device is writing</td></tr>
+<tr><td><code>0x20</code></td><td><code>F_TLB_CONFLICT</code></td><td>Overlapping TLB entries</td><td>Break-before-make violation</td></tr>
+<tr><td><code>0x21</code></td><td><code>F_CFG_CONFLICT</code></td><td>Conflicting cached configuration</td><td>An STE or CD changed without invalidation</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The three-way split</b>
+<p>Group the event types by what they tell you:</p>
+<ul>
+<li><strong>Configuration faults</strong> (<code>C_BAD_*</code>, <code>F_*_FETCH</code>) — the SMMU could not
+find or parse its own tables. A software or integration bug; the device did nothing wrong.</li>
+<li><strong>Translation faults</strong> (<code>F_TRANSLATION</code>, <code>F_ACCESS</code>,
+<code>F_PERMISSION</code>) — the tables were fine; the address or the access type was wrong. Almost always a
+driver bug.</li>
+<li><strong>Stream faults</strong> (<code>C_BAD_STREAMID</code>, <code>F_STREAM_DISABLED</code>) — identity.
+Device tree, IORT, or an unconfigured device.</li>
+</ul>
+</div>
+
+<h2 id="triage">Triage</h2>
+
+<p>SMMU faults come from a small number of causes, and the record usually distinguishes them directly. This is the order to check them in, cheapest question first.</p>
+
+<pre class="diagram">   Device does not work, or corrupts memory
+        |
+        v
+   Is a fault reported AT ALL?
+      NO  -> the SMMU may be in BYPASS. Check:
+               dmesg | grep 'Default domain type'
+               cat /proc/cmdline  (iommu.passthrough?)
+             A device that "works" with no SMMU configured is a
+             SECURITY BUG, not a success.
+      YES |
+          v
+   What is the EVENT TYPE?
+      |
+      +-- C_BAD_STREAMID -----> the StreamID in the record is
+      |                         what the HARDWARE emits. Compare
+      |                         with the device tree. Fix the DT.
+      |
+      +-- C_BAD_STE / C_BAD_CD -> driver or integration bug.
+      |                         Check memory attributes for the
+      |                         table memory (chapter 04).
+      |
+      +-- F_TRANSLATION ------> the address is not mapped. Look
+      |                         at the ADDRESS in word 2:
+      |                           looks physical  -> driver passed
+      |                                              phys instead of
+      |                                              dma_addr_t
+      |                           looks like a VA -> driver passed a
+      |                                              kernel virtual
+      |                                              address
+      |                           a valid IOVA    -> unmapped too
+      |                                              early, or DMA
+      |                                              outlived the
+      |                                              mapping
+      |
+      +-- F_PERMISSION ------> mapped, wrong direction. Check the
+      |                        DMA_TO_DEVICE / DMA_FROM_DEVICE
+      |                        argument.
+      |
+      +-- F_ADDR_SIZE -------> dma_set_mask() claims more bits
+      |                        than the SMMU's output supports.
+      |
+      +-- F_WALK_EABT -------> the page tables are in memory the
+                               SMMU cannot read. Check the table
+                               allocation and any firewall
+                               (chapters 17-20).</pre>
+
+<h2 id="addresses">Reading the faulting address</h2>
+
+<p>With two stages of translation and several address spaces in play, the single hardest question during a fault is which kind of address you are looking at. Getting that wrong sends investigations in the wrong direction entirely.</p>
+
+<pre><code>/* The address in word 2 is the single most informative field
+   after the event type. Learn to recognise the shapes:    */
+
+   0x0000_0000_8xxx_xxxx    looks like a PHYSICAL address on a
+                            typical SoC (DRAM at 0x80000000)
+                            -> the driver passed phys_to_dma
+                               incorrectly, or used virt_to_phys
+
+   0xffff_8xxx_xxxx_xxxx    a KERNEL VIRTUAL address
+                            -> the driver passed a kmalloc pointer
+                               straight to the device
+
+   0x0000_0000_0000_0000    NULL
+                            -> uninitialised descriptor, or a
+                               failed allocation not checked
+
+   0x0000_00ff_xxxx_xxxx    a plausible IOVA in the allocated
+                            range
+                            -> the mapping existed and was torn
+                               down. Look for: dma_unmap before
+                               the device finished, remove()
+                               without quiescing the device, or
+                               a driver freeing a buffer early.
+
+   0x0000_0000_08xx_xxxx    the ITS doorbell region
+                            -> an MSI write that was not mapped
+                               (chapter 03)
+
+/* Cross-check against what was actually mapped: */
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe | grep -i map
+#   map: IOVA=0x00000000ff000000 paddr=0x0000000082340000 size=4096</code></pre>
+
+<h2 id="bisect">The bisection that works</h2>
+
+<div class="tip">
+<b>One experiment halves the search space</b>
+<p>Boot once with <code>iommu.passthrough=1</code>.</p>
+<ul>
+<li><strong>The problem disappears</strong> &rarr; it is a mapping or StreamID issue. The device programming
+is fine; the SMMU configuration is not.</li>
+<li><strong>The problem persists</strong> &rarr; the bug is in how the device is programmed. The SMMU was just
+the messenger reporting it.</li>
+</ul>
+<p>Never ship with passthrough enabled — but during bring-up this single reboot saves hours of speculation.</p>
+</div>
+
+<pre><code># the sequence that resolves most SMMU bring-up problems
+
+# 1. is the SMMU even active?
+dmesg | grep -iE 'smmu|iommu'
+#   arm-smmu-v3 ...: ias 48-bit, oas 48-bit (features 0x...)
+#   iommu: Default domain type: Translated     <- good
+#   iommu: Default domain type: Passthrough    <- NOT translated
+
+# 2. is this device behind it?
+ls -l /sys/bus/platform/devices/2c000000.dma/iommu_group
+cat /sys/kernel/iommu_groups/*/devices/*
+
+# 3. trigger a transfer and read the fault
+dmesg -w &amp; ./trigger_dma
+
+# 4. compare the StreamID in the record with the device tree
+hexdump -C /proc/device-tree/soc/dma@2c000000/iommus
+
+# 5. watch the mappings being created
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# 6. bisect with passthrough
+# add iommu.passthrough=1 to the command line, reboot, retest</code></pre>
+
+<h2 id="driverbugs">The driver bugs behind most faults</h2>
+
+<p>Most SMMU faults are not attacks or hardware problems — they are ordinary driver mistakes that were previously invisible because nothing was checking. The SMMU simply made them fatal and visible.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bug</th><th>Event</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Passed a kernel virtual address to the device</td><td><code>F_TRANSLATION</code>, VA-shaped address</td><td>Use the <code>dma_addr_t</code> from <code>dma_map_*</code></td></tr>
+<tr><td>Passed a physical address</td><td><code>F_TRANSLATION</code>, PA-shaped address</td><td>Same</td></tr>
+<tr><td>Unmapped while the transfer was in flight</td><td><code>F_TRANSLATION</code>, valid IOVA</td><td>Wait for completion before unmapping</td></tr>
+<tr><td>Did not quiesce the device in <code>remove()</code></td><td><code>F_TRANSLATION</code> after unbind</td><td>Stop the hardware <em>first</em> (<a href="os-16-io-subsystem.html">OS 16</a>)</td></tr>
+<tr><td>Wrong DMA direction</td><td><code>F_PERMISSION</code></td><td>Match <code>DMA_TO_DEVICE</code>/<code>FROM_DEVICE</code> to reality</td></tr>
+<tr><td>DMA to a stack buffer</td><td>Varies</td><td>Never — the stack is not DMA-able</td></tr>
+<tr><td>DMA to <code>vmalloc</code> memory</td><td><code>F_TRANSLATION</code></td><td>Not physically contiguous; use <code>kmalloc</code> or scatter-gather</td></tr>
+<tr><td><code>dma_set_mask</code> too optimistic</td><td><code>F_ADDR_SIZE</code></td><td>Match the device's real addressing capability</td></tr>
+<tr><td>Ignored <code>dma_mapping_error()</code></td><td>Varies</td><td>Always check</td></tr>
+<tr><td>Descriptor ring not <code>dma_alloc_coherent</code></td><td>Varies</td><td>Rings must be coherent (<a href="sec-07-dma-api.html">ch. 07</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="stall">Stall mode and hangs</h2>
+
+<p>A faulting transaction can be aborted or held pending while software decides what to do. The second option enables demand paging for devices and requires the device itself to tolerate the wait.</p>
+
+<pre><code>/* If STE.S1STALLD = 0 and the device supports stalling, a
+   faulting transaction is HELD rather than terminated. The
+   device's pipeline stops until software responds.
+
+   Consequences:
+     · the device appears HUNG rather than reporting an error
+     · a storm of stalled transactions can exhaust the device's
+       internal queues and deadlock it
+     · software MUST respond with CMD_RESUME, or the device
+       never recovers
+
+   Which is why Linux sets S1STALLD = 1 (terminate) unless PRI
+   is in use — an unhandled stall is worse than a clean abort. */
+
+/* If a device hangs with no fault reported at all, check: */
+        dmesg | grep -i 'stall\|resume'
+        cat /sys/kernel/debug/tracing/events/iommu/dev_fault/enable
+
+/* And check the GLOBAL ERROR register — a malformed command or
+   a queue overflow is reported there, not in the event queue: */
+        SMMU_GERROR vs SMMU_GERRORN
+//   arm-smmu-v3: GERROR MSI write aborted
+//   arm-smmu-v3: CMD_SYNC timeout at 0x...
+//   arm-smmu-v3: unexpected global error reported</code></pre>
+
+<h2 id="hypervisor">Faults under virtualisation</h2>
+
+<p>Under virtualisation a fault may belong to the guest, to the host, or to the boundary between them — and routing it to the right one is part of what the hypervisor must configure.</p>
+
+<pre><code>/* With stage 2 in use, a fault may be at either stage — word 1
+   bit 36 (S2) says which, and word 3 holds the IPA.        */
+
+   S2 = 0   a stage-1 fault. The guest's own IOMMU tables are
+            wrong, or the guest programmed the device with a bad
+            IOVA. The guest's problem.
+
+   S2 = 1   a stage-2 fault. The hypervisor has not mapped that
+            IPA for the device. The HOST's problem — usually
+            memory the guest owns but the host has not pinned
+            and mapped for DMA.
+
+/* A very common case: a guest passed a device a buffer in memory
+   the hypervisor had not mapped into the device's stage-2
+   tables. VFIO pins and maps all guest memory for exactly this
+   reason, which is why passthrough VMs cannot use ballooning
+   or overcommit without extra machinery.                   */
+
+# on the host
+dmesg | grep -A4 'event.*received'
+cat /sys/kernel/debug/tracing/events/iommu/enable</code></pre>
+
+<h2 id="tools">The full toolkit</h2>
+
+<p>Everything above is inspectable from a running kernel, which means most SMMU problems can be diagnosed without a debugger or a logic analyser.</p>
+
+<pre><code># fault records
+dmesg -w | grep -i smmu
+
+# mappings, live
+echo 1 &gt; /sys/kernel/debug/tracing/events/iommu/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# per-event tracepoints
+ls /sys/kernel/debug/tracing/events/iommu/
+#   add_device_to_group  attach_device_to_domain  map  unmap
+#   io_page_fault  dev_fault  dev_page_response
+
+# groups, domains and reserved regions
+ls -l /sys/kernel/iommu_groups/*/devices/
+cat /sys/kernel/iommu_groups/*/type
+cat /sys/kernel/iommu_groups/*/reserved_regions
+
+# SMMU performance counters, where present
+perf list | grep -i smmu
+perf stat -e arm_smmu_v3_pmcg_*/transaction/ -a sleep 5
+
+# from a JTAG debugger: read SMMU_STRTAB_BASE, index by the
+# StreamID from the fault record, and dump the STE. If it is
+# zero or invalid, the configuration never reached the hardware.
+
+# bpftrace on the fault path
+sudo bpftrace -e 'tracepoint:iommu:io_page_fault {
+        printf("%s dev=%s addr=%llx\n", comm, str(args->device),
+               args->iova); }'</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td><code>C_BAD_STREAMID</code> on every transfer</td><td>Device tree or IORT StreamID does not match the hardware</td></tr>
+<tr><td><code>F_TRANSLATION</code> with a physical-looking address</td><td>Driver passed a physical address instead of <code>dma_addr_t</code></td></tr>
+<tr><td><code>F_TRANSLATION</code> with a valid IOVA</td><td>Unmapped while DMA was in flight, or on remove without quiescing</td></tr>
+<tr><td><code>F_PERMISSION</code></td><td>DMA direction mismatch</td></tr>
+<tr><td><code>F_ADDR_SIZE</code></td><td><code>dma_set_mask</code> exceeds the SMMU's output address size</td></tr>
+<tr><td><code>F_WALK_EABT</code></td><td>Page tables in memory the SMMU cannot read — check firewalls</td></tr>
+<tr><td>Device hangs with no fault logged</td><td>Stall mode with no responder; check <code>GERROR</code> too</td></tr>
+<tr><td>No faults and no isolation</td><td>Bypass or passthrough enabled</td></tr>
+<tr><td>DMA works, interrupts never arrive</td><td>The MSI doorbell is not mapped for that device</td></tr>
+<tr><td>Faults only under a hypervisor</td><td>Stage-2 mapping missing — check the S2 bit in the record</td></tr>
+<tr><td>Faults appear after enabling <code>strict=0</code></td><td>Deferred invalidation window; a freed page was still reachable</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why an SMMU fault is reported differently from a CPU fault.</li>
+  <li>Decode the four words of an event record.</li>
+  <li>Give the three-way grouping of event types and what each group implicates.</li>
+  <li>Given <code>F_TRANSLATION</code>, name four address shapes and what each indicates.</li>
+  <li>Describe the passthrough bisection and what each outcome tells you.</li>
+  <li>List five driver bugs that produce SMMU faults, with the event each gives.</li>
+  <li>Explain stall mode and why Linux usually disables it.</li>
+  <li>Say how to tell a stage-1 fault from a stage-2 fault, and whose problem each is.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

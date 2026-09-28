@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory management for drivers | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Memory management for drivers</h1>
+<p class="lead">Two pools, one crucial distinction, and a tagging scheme that turns "the system is leaking
+memory" from a week of guesswork into a single command. Plus the lookaside lists that make per-request
+allocation cheap.</p>
+
+<h2 id="pools">Paged and non-paged pool</h2>
+
+<p>Windows gives you two kinds of kernel memory, and choosing between them is not a performance decision — it is a correctness one. Paged memory can be written out to disk and read back on demand, which is fine at low IRQL and an instant bugcheck at high IRQL.</p>
+
+<pre class="diagram">   NON-PAGED POOL
+      · always resident in physical memory
+      · usable at ANY IRQL
+      · a finite, system-wide resource
+      · REQUIRED for anything touched at DISPATCH_LEVEL or
+        above: DPC data, ISR data, spinlock-protected state,
+        DMA buffers, anything in a completion path
+
+   PAGED POOL
+      · may be written to the page file
+      · usable ONLY at IRQL &lt;= APC_LEVEL
+      · much larger
+      · use for: configuration, per-open state touched only
+        at PASSIVE_LEVEL, large infrequently-used buffers
+
+  THE RULE, and it is chapter 03 restated:
+     if the memory can be touched at DISPATCH_LEVEL or above,
+     it MUST be non-paged. No exceptions.
+
+  THE FAILURE if you get it wrong: bugcheck 0xA,
+  IRQL_NOT_LESS_OR_EQUAL - and it is LATENT, because the page
+  is usually resident. It fires weeks later, under memory
+  pressure, on a customer machine.
+
+  WHEN IN DOUBT, USE NON-PAGED. Then measure. A driver holding
+  a few hundred kilobytes of unnecessary non-paged pool is a
+  minor inefficiency; a driver bugchecking under load is a
+  recall.
+
+  COMPARE LINUX: kmalloc is always resident, vmalloc is too -
+  Linux does not page kernel memory at all. So this whole
+  distinction has no Linux counterpart, and it is the thing
+  Linux developers most often get wrong on their first Windows
+  driver.</pre>
+
+<h2 id="alloc">Allocating</h2>
+
+<p>Allocation is one call, and every parameter of it matters: the pool type decides where the memory may be touched, and the tag is what makes a leak attributable to your driver months later.</p>
+
+<pre><code>#include &lt;ntddk.h&gt;
+
+/* THE MODERN API - use this. ExAllocatePoolWithTag is
+   deprecated and ExAllocatePool is long gone.             */
+
+        PVOID p = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                  size,
+                                  'DYMx');   /* the TAG */
+        if (p == NULL)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        /* ExAllocatePool2 ZEROES the memory by default -
+           unlike the old ExAllocatePoolWithTag, which did
+           not. That change closed a large class of
+           information-disclosure bugs.                    */
+
+        ExFreePoolWithTag(p, 'DYMx');   /* tag must MATCH */
+
+/* THE FLAGS: */
+        POOL_FLAG_NON_PAGED          resident, any IRQL
+        POOL_FLAG_PAGED              pageable, PASSIVE only
+        POOL_FLAG_NON_PAGED_EXECUTE  rarely justified
+        POOL_FLAG_UNINITIALIZED      skip the zeroing, if you
+                                     will fill it all anyway
+        POOL_FLAG_CACHE_ALIGNED      start on a cache line
+        POOL_FLAG_RAISE_ON_FAILURE   raise an exception rather
+                                     than returning NULL
+
+/* THE TAG is four characters, written REVERSED because it is
+   stored little-endian and displayed as a string: */
+        'DYMx'   displays as  "xMYD"
+        ' yMD'   displays as  "DMy "
+
+   /* So pick it so the DISPLAY is readable: */
+        #define MY_POOL_TAG  'DYMx'    /* shows as xMYD */
+
+/* USE A DISTINCT TAG PER ALLOCATION SITE, or at least per
+   purpose. This is the single most valuable habit in this
+   chapter - see "finding leaks" below.                   */
+
+/* CONTIGUOUS PHYSICAL MEMORY, for DMA (chapter 19): */
+        PHYSICAL_ADDRESS low = {0}, high, boundary = {0};
+        high.QuadPart = 0xFFFFFFFF;      /* 32-bit device */
+
+        p = MmAllocateContiguousMemorySpecifyCacheNode(
+                size, low, high, boundary, MmCached,
+                MM_ANY_NODE_OK);
+        ...
+        MmFreeContiguousMemory(p);
+
+/* But prefer WDF's DMA common buffers (chapter 19), which do
+   the mapping as well as the allocation.                  */</code></pre>
+
+<div class="key">
+<b>Always check the return</b>
+<p><code>ExAllocatePool2</code> returns NULL on failure and does not raise. An unchecked allocation is a
+NULL dereference at whatever IRQL you happen to be at, which is bugcheck 0xA with a confusing address near
+zero. Every allocation, every time — Driver Verifier's low-resource simulation exists specifically to find
+the ones you missed (<a href="win-21-verifier.html">chapter 22</a>).</p>
+</div>
+
+<h2 id="lookaside">Lookaside lists</h2>
+
+<p>If your driver allocates and frees many objects of one size — one per request, say — a general-purpose allocator is more machinery than the job needs. A lookaside list keeps a small cache of ready-made blocks, and the system tunes its depth for you.</p>
+
+<pre><code>/* For many same-sized objects - one per request, one per
+   packet. The Windows equivalent of a Linux slab cache
+   (Linux ch. 06).                                          */
+
+        LOOKASIDE_LIST_EX Lookaside;
+
+        status = ExInitializeLookasideListEx(
+                        &amp;ctx-&gt;Lookaside,
+                        NULL,          /* custom allocate  */
+                        NULL,          /* custom free      */
+                        NonPagedPoolNx,
+                        0,             /* flags            */
+                        sizeof(MY_REQUEST),
+                        MY_POOL_TAG,
+                        0);            /* depth: 0 = auto  */
+        if (!NT_SUCCESS(status))
+                return status;
+
+        PMY_REQUEST req = ExAllocateFromLookasideListEx(
+                                &amp;ctx-&gt;Lookaside);
+        if (req == NULL)
+                return STATUS_INSUFFICIENT_RESOURCES;
+        ...
+        ExFreeToLookasideListEx(&amp;ctx-&gt;Lookaside, req);
+
+        ExDeleteLookasideListEx(&amp;ctx-&gt;Lookaside);   /* unload */
+
+/* WHY: the list keeps a small per-CPU cache of freed objects,
+   so the common case is a pop off a list rather than a pool
+   allocation with its locking. The system TUNES THE DEPTH
+   automatically based on your hit rate.
+
+   USE ONE when you allocate the same size repeatedly in a hot
+   path. Do not bother for a handful of allocations at
+   startup.
+
+   NOTE NonPagedPoolNx - the NX (no-execute) variant. Plain
+   NonPagedPool is executable and deprecated for that reason;
+   always use the Nx form.                                  */</code></pre>
+
+<h2 id="leaks">Finding pool leaks</h2>
+
+<p>A leaked allocation in the kernel is never reclaimed; it is gone until the machine reboots. The good news is that Windows tracks pool usage by tag, so a leak in your driver is directly visible and directly attributable — provided you tagged your allocations.</p>
+
+<pre><code># THIS IS WHY YOU TAG EVERY ALLOCATION.
+
+# --- On the live machine ---
+    poolmon.exe                    # from the WDK
+    # sort by bytes with 'b', by allocation count with 'a'
+    # Watch YOUR tag over time. A tag whose "Diff" column
+    # climbs and never falls is your leak, named precisely.
+
+     Tag  Type     Allocs      Frees      Diff   Bytes
+     xMYD Nonp     104321     100002      4319   1105664  &lt;--
+     xMYB Nonp        512        512         0         0
+
+# --- Enable pool tagging if it is off ---
+    gflags /r +ptg
+    # (on by default on checked builds and modern Windows)
+
+# --- In WinDbg ---
+    !poolused 2                    # sorted by non-paged usage
+    !poolused /t 10 2              # top 10
+    !poolfind xMYD                 # every allocation with
+                                   # this tag
+    !pool ffff8a0c12345678         # what is this address?
+      Pool page ffff8a0c12345678 region is Nonpaged pool
+       ffff8a0c12345670 size:   40 previous size:    0
+                                   (Allocated) xMYD
+
+# --- Track allocation STACKS, not just counts ---
+    gflags /i mydriver.sys +ust    # user stack trace
+    # or Driver Verifier's pool tracking (chapter 22), then:
+    !verifier 3 mydriver.sys
+    # shows the stack for every outstanding allocation
+
+# THE WORKFLOW for "the system is running out of non-paged
+# pool":
+#   1. poolmon, sort by Diff, find the tag
+#   2. the tag names the driver and the allocation site
+#   3. verifier pool tracking gives you the stack
+#   4. fix the missing free
+# Steps 1 and 2 take about thirty seconds IF the tags are
+# distinct. With every allocation using the same tag, or the
+# default, you learn only "some driver is leaking".</code></pre>
+
+<h2 id="corruption">Pool corruption</h2>
+
+<p>Writing past the end of an allocation does not crash where the mistake is. It quietly damages whatever came next and the machine dies later, somewhere unrelated. These are the tools that move the crash back to the guilty line.</p>
+
+<pre><code>/* Writing past the end of an allocation corrupts the pool
+   header of the NEXT block. The crash happens later, in an
+   unrelated allocation, in someone else's driver.         */
+
+/* BUGCHECKS THAT MEAN POOL CORRUPTION:
+     0xC2  BAD_POOL_CALLER
+             parameter 1 says what:
+               0x07  freeing already-freed memory
+               0x0D  freeing with the wrong tag
+               0x99  freeing an invalid address
+     0x19  BAD_POOL_HEADER
+     0x1A  MEMORY_MANAGEMENT
+     0xCD  DRIVER_PAGE_FAULT_BEYOND_END_OF_ALLOCATION
+     0xC1  SPECIAL_POOL_DETECTED_MEMORY_CORRUPTION
+
+/* SPECIAL POOL is the tool. It puts each allocation on its
+   own page, with a GUARD PAGE immediately after (or before),
+   so an overrun faults AT THE MOMENT IT HAPPENS rather than
+   corrupting a neighbour.                                  */
+
+        verifier /flags 0x1 /driver mydriver.sys
+        # or, targeted at one tag, without full verifier:
+        gflags /r +spp
+        # then set the tag in
+        # HKLM\SYSTEM\CCS\Control\Session Manager\Memory
+        # Management\PoolTag
+
+/* Special pool is the Windows equivalent of KASAN
+   (Linux ch. 34): it converts a delayed, misattributed crash
+   into an immediate, correctly-attributed one. Enable it
+   whenever you are chasing corruption, and keep it on during
+   development.
+
+   COST: each allocation consumes a full page, so the system
+   uses far more memory and runs slower. Target it at your
+   driver, not the whole system.                           */</code></pre>
+
+<h2 id="user">Touching user memory safely</h2>
+
+<p>A pointer that arrived from user mode is not a pointer you can dereference. The address may be invalid, may become invalid while you are using it, and may have been chosen deliberately to make you overwrite kernel memory. There is a correct ritual for handling it.</p>
+
+<pre><code>/* A user-mode address is only valid:
+     · in the context of THAT process
+     · at IRQL &lt;= APC_LEVEL (it can page-fault)
+     · until the user changes it, which they can do at any
+       moment from another thread                          */
+
+/* THE MANDATORY PATTERN when you handle a raw user pointer -
+   METHOD_NEITHER, or a pointer embedded in a buffer
+   (chapter 08):                                            */
+
+        __try {
+                if (Irp-&gt;RequestorMode != KernelMode) {
+                        ProbeForRead(userBuffer, length,
+                                     __alignof(ULONG));
+                        /* or ProbeForWrite for output */
+                }
+
+                /* COPY IT IN. Do not validate in place - the
+                   user can change it between your check and
+                   your use, from another thread. Same TOCTOU
+                   argument as isolation chapter 09.       */
+                RtlCopyMemory(localCopy, userBuffer, length);
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return GetExceptionCode();
+        }
+
+        /* now validate localCopy, and use ONLY localCopy */
+
+/* WHAT ProbeForRead/Write CHECK:
+     · the range lies entirely in user address space
+     · the alignment is correct
+     · nothing about whether it is mapped - a fault can still
+       occur, which is why the __try is also required
+
+/* THE THREE MISTAKES:
+     1. no __try. A bad pointer becomes a bugcheck instead of
+        an error return.
+     2. probing but then using the ORIGINAL pointer. The probe
+        proved nothing about what is there a microsecond
+        later.
+     3. probing at DISPATCH_LEVEL. Illegal - user memory is
+        pageable.
+
+/* THE GOOD NEWS: with METHOD_BUFFERED or METHOD_*_DIRECT
+   (chapter 08), the I/O manager does all of this for you, and
+   you never see a user pointer. That is why METHOD_NEITHER is
+   discouraged.                                             */</code></pre>
+
+<h2 id="mdl">A first look at MDLs</h2>
+
+<p>The alternative to copying a user buffer is to describe the physical pages behind it and lock them in place, which is what a Memory Descriptor List does. This is a first look; the next chapter covers them properly.</p>
+
+<pre><code>/* A Memory Descriptor List describes a buffer's PHYSICAL
+   pages. Covered fully in chapter 09; here is why it exists.
+
+   The problem: a user buffer is virtual, in one process's
+   address space, and possibly paged out. A DMA engine needs
+   physical addresses, and a DPC needs an address valid in any
+   context. An MDL solves both: */
+
+        PMDL mdl = IoAllocateMdl(buffer, length, FALSE, FALSE,
+                                 NULL);
+        if (!mdl)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+        __try {
+                MmProbeAndLockPages(mdl, UserMode,
+                                    IoWriteAccess);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                IoFreeMdl(mdl);
+                return GetExceptionCode();
+        }
+
+        /* now: the pages are LOCKED IN MEMORY and cannot be
+           paged out or freed. Get a kernel address valid in
+           any context: */
+        PVOID kva = MmGetSystemAddressForMdlSafe(mdl,
+                        NormalPagePriority | MdlMappingNoExecute);
+        if (!kva) {
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+                return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        ... use kva at any IRQL, in any process context ...
+
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+
+/* USE MmGetSystemAddressForMdlSafe, NEVER the older
+   MmGetSystemAddressForMdl - the latter raises a bugcheck on
+   failure instead of returning NULL, which turns a resource
+   shortage into a crash.                                   */</code></pre>
+
+<h2 id="quotas">Pool limits and quotas</h2>
+
+<p>Pool is a finite, system-wide resource shared by every driver on the machine. Knowing where the ceilings are — and that your allocations can be charged against the requesting process — matters as soon as your driver handles more than a trickle of requests.</p>
+
+<pre><code>/* Non-paged pool is finite and shared. A driver that
+   allocates without bound in response to user requests is a
+   denial-of-service vector - any user can exhaust system
+   memory.                                                   */
+
+/* CHARGE IT TO THE CALLER'S PROCESS, so their quota limits
+   them rather than the system: */
+        p = ExAllocatePool2(POOL_FLAG_NON_PAGED |
+                            POOL_FLAG_USE_QUOTA, size, TAG);
+
+/* OR, better, BOUND IT YOURSELF: */
+        if (requestedSize &gt; MY_MAX_BUFFER)
+                return STATUS_INVALID_PARAMETER;
+        if (ctx-&gt;OutstandingRequests &gt;= MY_MAX_REQUESTS)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+/* SEE THE LIMITS: */
+        WinDbg:  !vm
+                 Non-paged pool usage / maximum
+        Perfmon: Memory \ Pool Nonpaged Bytes
+        Task Manager -&gt; Performance -&gt; Memory -&gt;
+                        Non-paged pool
+
+/* THE DESIGN RULE, and it is the same as the Linux one
+   (ch. 07): preallocate what you need at start time, bound
+   what you allocate per request, and never let an untrusted
+   caller decide how much kernel memory to consume.        */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Bugcheck 0xA under memory pressure only</td><td>Paged pool touched at DISPATCH_LEVEL — latent until the page is evicted</td></tr>
+<tr><td>Bugcheck 0xC2, parameter 1 = 0x07</td><td>Double free</td></tr>
+<tr><td>Bugcheck 0xC2, parameter 1 = 0x0D</td><td>Freed with the wrong tag</td></tr>
+<tr><td>Bugcheck 0x19 or 0xCD</td><td>Pool overrun — enable special pool</td></tr>
+<tr><td>Crash in an unrelated driver</td><td>You corrupted the pool; special pool will attribute it correctly</td></tr>
+<tr><td>Non-paged pool climbs forever</td><td>Leak — <code>poolmon</code>, sort by Diff, read the tag</td></tr>
+<tr><td>Leak found but the site is unknown</td><td>Same tag used everywhere — use distinct tags</td></tr>
+<tr><td>Bugcheck at an address near zero</td><td>Unchecked allocation return</td></tr>
+<tr><td>Bugcheck touching a user pointer</td><td>No <code>__try</code>, or probed at the wrong IRQL</td></tr>
+<tr><td>User changes data after your validation</td><td>Validated in place instead of copying in</td></tr>
+<tr><td>A user program exhausts system memory</td><td>Unbounded allocation driven by request parameters</td></tr>
+<tr><td>Crash when <code>MmGetSystemAddressForMdl</code> fails</td><td>Use the <code>Safe</code> variant</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State the rule for choosing paged versus non-paged pool, and why the wrong choice is latent.</li>
+  <li>Explain why this distinction has no Linux equivalent.</li>
+  <li>Allocate and free with <code>ExAllocatePool2</code>, and explain the tag byte order.</li>
+  <li>Explain why distinct tags per site are worth the effort.</li>
+  <li>Use a lookaside list and say when it is justified.</li>
+  <li>Find a leak with <code>poolmon</code> and <code>!poolused</code>.</li>
+  <li>Explain what special pool does and what it corresponds to on Linux.</li>
+  <li>Write the full safe pattern for touching a user pointer, and name the three mistakes.</li>
+  <li>Explain what an MDL gives you and why the <code>Safe</code> variant matters.</li>
+  <li>Explain why unbounded allocation from a request is a security bug.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

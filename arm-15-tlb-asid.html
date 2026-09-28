@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TLBs, ASIDs and invalidation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>TLBs, ASIDs and invalidation</h1>
+<p class="lead">The TLB is a cache with no coherence protocol. Hardware will never notice that you changed a
+page table, and the invalidation sequence you must write yourself is exact, order-sensitive, and the source of
+some of the most confusing bugs in system software.</p>
+
+<h2 id="why">Why the TLB exists</h2>
+
+<p>A page walk is several memory accesses, and doing one on every instruction fetch and data access would be ruinous. The TLB caches the results, which means translation is almost free — until something invalidates it.</p>
+
+<pre class="diagram">A four-level walk is up to FOUR memory accesses per translation.
+Every load and store needs one. Without caching, memory access
+would be five times slower.
+
+   L1 TLB      32-128 entries, fully associative, ~1 cycle
+               usually SPLIT: separate iTLB and dTLB
+   L2 TLB      1024-2048 entries, set-associative, ~10 cycles
+               unified, shared between instruction and data
+   miss        → hardware table walker → up to 4 memory accesses,
+                 each of which may itself hit or miss in the caches
+
+   WALK CACHES are a third structure worth knowing: they cache
+   INTERMEDIATE table descriptors (L0/L1/L2), so a miss on a
+   nearby address only needs the final level. This is why
+   sequential access has far cheaper TLB misses than random.
+
+TLB REACH = entries × page size
+     1024 × 4 KB  =    4 MB     ← easily exceeded
+     1024 × 2 MB  =    2 GB     ← why huge pages help so much
+
+A TLB miss on a large random working set can cost more than the
+cache miss that follows it.</pre>
+
+<h2 id="tagging">What tags an entry</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Tag</th><th>Distinguishes</th><th>Set by</th></tr></thead>
+<tbody>
+<tr><td>VA</td><td>Which address</td><td>The access</td></tr>
+<tr><td><strong>ASID</strong></td><td>Which address space (process)</td><td><code>TTBR0_EL1[63:48]</code></td></tr>
+<tr><td><strong>VMID</strong></td><td>Which virtual machine</td><td><code>VTTBR_EL2[63:48]</code></td></tr>
+<tr><td>Exception level / regime</td><td>EL0&amp;1 vs EL2 vs EL3</td><td>The current EL</td></tr>
+<tr><td>Security state</td><td>Secure vs Non-secure</td><td><code>SCR_EL3.NS</code></td></tr>
+<tr><td><code>nG</code></td><td>Whether the ASID applies at all</td><td>The descriptor (<a href="arm-14-descriptors.html">ch. 14</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>Why ASIDs matter so much</b>
+<p>Without them, every context switch would have to flush the entire TLB, and the incoming process would take
+hundreds of misses warming it back up. With them, entries from many processes coexist and a switch is a single
+<code>TTBR0</code> write.</p>
+<p>Kernel mappings are marked <strong>Global</strong> (<code>nG=0</code>) so they match under any ASID — which
+is why a system call disturbs the TLB not at all.</p>
+</div>
+
+<pre><code>/* ASID width is 8 or 16 bits — query it, do not assume: */
+        ID_AA64MMFR0_EL1.ASIDBits    /* 0 = 8 bits, 2 = 16 bits */
+        TCR_EL1.AS                    /* select 8 or 16 bit ASID */
+
+/* A context switch: */
+        ttbr0 = next_mm-&gt;pgd_pa | ((uint64_t)next_mm-&gt;asid &lt;&lt; 48);
+        asm volatile("msr ttbr0_el1, %0" :: "r"(ttbr0));
+        asm volatile("isb");
+/* That is the whole switch. No flush.                        */
+
+/* ASID EXHAUSTION: with 16 bits there are 65536; with 8 bits only
+   256. When they run out, Linux bumps a GENERATION counter and
+   flushes everything, then reassigns. On a system with very many
+   short-lived processes this shows up as a periodic latency
+   blip — rare, but real, and worth recognising.             */</code></pre>
+
+<h2 id="no-coherence">The TLB has no coherence protocol</h2>
+
+<div class="danger">
+<b>The rule</b>
+<p>Caches are kept coherent by hardware (<a href="ca-15-coherence.html">CA ch. 15</a>). <strong>TLBs are
+not.</strong> If you modify a translation table entry, every TLB in the system may continue using the old
+translation indefinitely. Nothing will tell you.</p>
+<p>Worse, on a multi-core system you must invalidate on <em>every</em> core that might hold the entry — which
+is what the Inner Shareable variants of <code>TLBI</code> do, broadcasting the invalidation across the
+coherency domain.</p>
+</div>
+
+<h2 id="tlbi">The TLBI instruction</h2>
+
+<p>Changing a page table does not change the TLB, so software must say what is now stale. The instruction for that has many variants, and choosing a broader one than necessary is a real performance cost.</p>
+
+<pre class="diagram">   TLBI &lt;type&gt;&lt;level&gt;&lt;scope&gt;{, Xt}
+
+   TYPE — what to match
+     ALL      everything in this regime
+     VMALL    all entries for the current VMID (a whole VM)
+     ASID     all entries matching the ASID in Xt
+     VA       one VA, matching the ASID in Xt
+     VAA      one VA, ALL ASIDs ("VA, All ASID")
+     IPAS2    one IPA at stage 2
+     RVA      a RANGE of VAs (ARMv8.4+)
+
+   LEVEL — which regime
+     E1       EL1&0 regime
+     E2       EL2 regime
+     E3       EL3 regime
+     E1OS     ...outer shareable
+
+   SCOPE
+     (none)   this PE only
+     IS       Inner Shareable — BROADCAST to all cores in the
+              inner domain. This is what SMP needs.
+     OS       Outer Shareable — wider still
+
+   Examples:
+     tlbi vae1is, x0      one VA, EL1&0, current ASID, broadcast
+     tlbi vaae1is, x0     one VA, ALL ASIDs, broadcast
+     tlbi aside1is, x0    all entries for one ASID, broadcast
+     tlbi vmalle1is       everything in EL1&0, broadcast
+     tlbi alle1           everything, this core only
+     tlbi vmalls12e1is    both stages, whole VM, broadcast</pre>
+
+<pre><code>/* The Xt operand for VA-based operations is NOT a plain address.
+   It packs the ASID and the VA, shifted:                     */
+
+        Xt[63:48] = ASID
+        Xt[43:0]  = VA[55:12]        /* the page number */
+
+/* So: */
+        addr = (va &gt;&gt; 12) | ((uint64_t)asid &lt;&lt; 48);
+        asm volatile("tlbi vae1is, %0" :: "r"(addr));
+
+/* Passing a raw byte address is a common error. It invalidates
+   the wrong entry, silently, and the stale translation stays.  */</code></pre>
+
+<h2 id="sequence">The invalidation sequence</h2>
+
+<div class="danger">
+<b>Write &rarr; DSB &rarr; TLBI &rarr; DSB &rarr; ISB</b>
+<p>Every part is load-bearing. Omit any one and you get a bug that appears on one core, under load, or only
+after an unrelated change.</p>
+</div>
+
+<pre><code>        /* 1. update the descriptor */
+        *pte = new_value;
+
+        /* 2. DSB ISHST — ensure the WRITE is visible to the table
+              walkers of every core BEFORE we invalidate. Without
+              this, a core could refill its TLB from the OLD value
+              after our TLBI but before our store lands.       */
+        dsb     ishst
+
+        /* 3. TLBI — invalidate, broadcast to the inner domain */
+        tlbi    vae1is, x0
+
+        /* 4. DSB ISH — wait for the invalidation to COMPLETE on
+              every core. TLBI is issued asynchronously; without
+              this, another core may still be using the old entry
+              when we proceed.                                 */
+        dsb     ish
+
+        /* 5. ISB — flush THIS core's pipeline, so no instruction
+              already in flight uses a stale translation.       */
+        isb</code></pre>
+
+<pre><code>/* Linux wraps this. Reading the wrappers is instructive: */
+
+flush_tlb_all()                  /* everything, everywhere      */
+flush_tlb_mm(mm)                 /* one address space (by ASID) */
+flush_tlb_range(vma, start, end) /* a range                     */
+flush_tlb_page(vma, addr)        /* one page                    */
+flush_tlb_kernel_range(s, e)     /* kernel mappings             */
+
+/* And there is a threshold: below ~32 pages Linux issues
+   individual TLBI VA operations; above it, one TLBI ASID, because
+   many individual broadcasts cost more than one bulk flush.
+   ARMv8.4's TLBI RVA (range) instructions remove that trade-off
+   where available.                                            */</code></pre>
+
+<h2 id="shootdown">TLB shootdown</h2>
+
+<p>On a multiprocessor system, invalidating your own TLB is not enough — other cores may hold the same stale entry. How that is coordinated is one of the genuinely tricky parts of a kernel's memory management.</p>
+
+<pre class="diagram">Invalidating on OTHER cores is the expensive part.
+
+  ARM: TLBI ...IS BROADCASTS in hardware. The instruction issues,
+       the interconnect distributes it, and DSB waits for
+       completion. No interrupts, no software involvement.
+
+  x86: NO broadcast instruction. The OS must send an
+       inter-processor INTERRUPT to every core that might hold the
+       entry, and wait for each to acknowledge. Far more expensive.
+
+  This is a genuine architectural advantage for ARM, and it is why
+  munmap-heavy and page-migration-heavy workloads scale better
+  there.
+
+  But it is not free. On a large system, a broadcast TLBI must
+  reach every core in the domain, and the DSB blocks until it has.
+  Workloads that constantly change mappings (JITs, garbage
+  collectors, heavy mmap/munmap) can spend measurable time here.
+
+  Mitigations:
+    · batch invalidations (Linux's mmu_gather does this: it
+      collects the pages freed during an unmap and issues ONE
+      flush at the end)
+    · use TLBI ASID rather than many TLBI VA
+    · TLBI RVA range operations (ARMv8.4)
+    · avoid unnecessary permission changes on hot mappings</pre>
+
+<h2 id="when">When invalidation is required</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Change</th><th>Invalidation needed?</th></tr></thead>
+<tbody>
+<tr><td>Making an invalid entry valid</td><td><strong>No</strong> — nothing could have cached a negative result… <em>but see below</em></td></tr>
+<tr><td>Making a valid entry invalid</td><td><strong>Yes</strong></td></tr>
+<tr><td>Changing the output address</td><td><strong>Yes</strong>, with break-before-make</td></tr>
+<tr><td>Changing memory attributes</td><td><strong>Yes</strong>, with break-before-make</td></tr>
+<tr><td>Making permissions <em>more</em> restrictive</td><td><strong>Yes</strong></td></tr>
+<tr><td>Making permissions <em>less</em> restrictive</td><td>Not architecturally required — the fault handler will re-walk. Linux does it anyway on some paths.</td></tr>
+<tr><td>Setting AF or the dirty bit</td><td>No</td></tr>
+<tr><td>Splitting a block into pages</td><td><strong>Yes</strong>, with break-before-make</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The "no invalidation needed" case has an exception</b>
+<p>Making an invalid entry valid appears safe — how could a TLB cache "not present"? But some implementations
+<em>do</em> cache negative entries, and more importantly, the walk caches may hold intermediate table
+descriptors. If you allocate a new L3 table and link it in, a core with a cached L2 entry pointing at the
+<em>old</em> (invalid) state may not see it. Linux issues an invalidation on these paths for exactly this
+reason. When in doubt, invalidate — it is cheap relative to a stale-translation bug.</p>
+</div>
+
+<h2 id="bbm">Break-before-make, restated</h2>
+
+<p>Changing a live mapping in place can leave the TLB holding two conflicting entries, with architecturally unpredictable results. The safe sequence is fixed, and skipping a step produces faults that are almost impossible to reproduce.</p>
+
+<pre><code>/* Changing a LIVE mapping's address, size or attributes in place
+   permits the TLB to hold BOTH translations simultaneously.
+   The architecture calls the result UNPREDICTABLE, and real
+   hardware may raise a TLB conflict abort or use either
+   translation non-deterministically.                         */
+
+        /* BREAK */
+        *pte = 0;
+        dsb     ishst
+        tlbi    vaae1is, x_addr
+        dsb     ish
+        isb
+
+        /* MAKE */
+        *pte = new_descriptor;
+        dsb     ishst
+        isb
+
+/* This is why splitting a 2 MB block into 4 KB pages — which
+   Linux does when a partial mprotect() hits a THP — is not a
+   simple table edit. It must break the block, invalidate, build
+   the L3 table, and only then install the new L2 pointer.   */</code></pre>
+
+<h2 id="stage2">Stage-2 and VMID</h2>
+
+<p>Under virtualisation there are two levels of translation to keep coherent, and entries are tagged by virtual machine as well as by address space.</p>
+
+<pre><code>/* A guest's TLB entries are tagged with the VMID from
+   VTTBR_EL2[63:48], so several VMs coexist in the TLB just as
+   several processes do.                                       */
+
+/* Invalidating guest translations from EL2: */
+        tlbi    vmalle1is        /* all stage-1 entries, current VMID */
+        tlbi    vmalls12e1is     /* both stages, current VMID         */
+        tlbi    ipas2e1is, x0    /* one IPA at stage 2                */
+
+/* Note the ordering rule when changing a stage-2 mapping: you
+   must invalidate stage 2 BEFORE stage 1, because a stage-1
+   entry may have been formed using the old stage-2 translation:
+
+        tlbi    ipas2e1is, x_ipa
+        dsb     ish
+        tlbi    vmalle1is
+        dsb     ish
+        isb
+
+   Getting this backwards leaves combined TLB entries built from
+   a mixture of old and new — a hypervisor bug class that is
+   very hard to reproduce.                                    */</code></pre>
+
+<h2 id="measuring">Measuring TLB behaviour</h2>
+
+<p>TLB pressure is invisible in source code and very visible in performance counters. These are the events worth watching when a workload is slower than its cache behaviour alone would explain.</p>
+
+<pre><code># is the TLB the bottleneck?
+perf stat -e dTLB-load-misses,iTLB-load-misses,\
+dtlb_walk,itlb_walk,l1d_tlb_refill,l2d_tlb_refill ./prog
+
+#   dtlb_walk counts actual PAGE WALKS — the expensive event.
+#   A high ratio of walks to loads means poor TLB reach.
+
+# does the working set fit?
+#   time a pointer chase over increasing sizes; the step changes
+#   land at the L1 TLB reach, the L2 TLB reach, and the cache
+#   capacities.
+
+# try huge pages and measure the difference
+echo always &gt; /sys/kernel/mm/transparent_hugepage/enabled
+perf stat -e dtlb_walk ./prog        # before and after
+
+# per-process THP usage
+grep -E 'AnonHugePages|ShmemPmdMapped' /proc/PID/smaps_rollup
+
+# TLB shootdown cost, system-wide
+perf stat -e tlb:tlb_flush -a sleep 10
+cat /proc/interrupts | grep -i tlb    # x86 only; ARM broadcasts</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Page table change has no effect</td><td>Missing <code>TLBI</code> entirely</td></tr>
+<tr><td>Works on one core, fails on another</td><td>Used a non-broadcast <code>TLBI</code> instead of the <code>IS</code> variant</td></tr>
+<tr><td>Works, then fails intermittently under load</td><td>Missing <code>DSB</code> before or after the <code>TLBI</code></td></tr>
+<tr><td>Change visible to other cores but not this one</td><td>Missing final <code>ISB</code></td></tr>
+<tr><td>TLB conflict abort</td><td>Break-before-make violation</td></tr>
+<tr><td>Invalidation appears to target the wrong page</td><td>Passed a byte address instead of <code>(va &gt;&gt; 12) | asid&lt;&lt;48</code></td></tr>
+<tr><td>One process sees another's memory</td><td>Mapping marked Global instead of non-Global</td></tr>
+<tr><td>Periodic latency blip with many processes</td><td>ASID rollover forcing a full flush</td></tr>
+<tr><td>Huge pages give a large speedup</td><td>TLB reach was the bottleneck</td></tr>
+<tr><td>Guest memory corruption after a hypervisor remap</td><td>Stage-2 invalidated after stage 1 instead of before</td></tr>
+<tr><td>munmap-heavy workload scales badly</td><td>Shootdown cost; batch with <code>mmu_gather</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what a TLB caches and why walk caches exist as a separate structure.</li>
+  <li>Name the five things that tag a TLB entry.</li>
+  <li>Explain why ASIDs exist and what Global mappings buy.</li>
+  <li>State the full invalidation sequence and justify each of the five steps.</li>
+  <li>Explain the format of the <code>TLBI</code> address operand.</li>
+  <li>Explain what <code>IS</code> does and why ARM's approach beats x86's.</li>
+  <li>Say when break-before-make is required and what happens without it.</li>
+  <li>Give the correct ordering for invalidating stage 2 and stage 1, and why.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

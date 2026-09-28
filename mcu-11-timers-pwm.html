@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timers, PWM, input capture and SysTick | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Timers, PWM, input capture and SysTick</h1>
+<p class="lead">A timer is a counter with comparators attached, and almost every real-time behaviour you will
+ever build is one of four configurations of that idea. Once you see the shape, every vendor's 60-page timer
+chapter becomes navigable.</p>
+
+<h2 id="core">One counter, four uses</h2>
+
+<pre class="diagram">   THE CORE: a counter clocked by (timer clock / PSC+1),
+   counting up to ARR, then wrapping and raising an update
+   event.
+
+   CNT
+    ^
+ARR |    /|    /|    /|
+    |   / |   / |   / |
+CCR |--/--|--/--|--/--|---  compare value
+    | /   | /   | /   |
+   0+-----+-----+-----+--&gt; time
+         UEV   UEV   UEV    update event (interrupt/DMA)
+
+   FOUR USES OF THE SAME HARDWARE:
+
+   1. PERIODIC INTERRUPT   ignore CCR, act on the update
+                           event. Your system tick.
+
+   2. PWM OUTPUT           the output pin is high while
+                           CNT &lt; CCR, low after. Duty
+                           cycle = CCR/ARR. Set and forget:
+                           no CPU involvement at all.
+
+   3. INPUT CAPTURE        an edge on a pin COPIES CNT into
+                           CCR and raises an interrupt. You
+                           read a timestamp, not a value -
+                           this is how you measure a pulse
+                           without polling.
+
+   4. OUTPUT COMPARE       toggle/set/clear a pin the instant
+                           CNT reaches CCR, in hardware, with
+                           zero jitter from interrupt latency.
+
+   Configurations 2, 3 and 4 involve NO CPU once started.
+   That is the entire point: the timer does the timing, and
+   the CPU is free or asleep.</pre>
+
+<h2 id="arithmetic">The arithmetic, done once</h2>
+
+<pre><code>/* f_event = f_timer / ((PSC + 1) * (ARR + 1))
+
+   Both registers hold "value minus one" because a counter
+   from 0 to N inclusive has N+1 states. Forgetting the -1
+   gives an error of one part in ARR - invisible at
+   ARR=65535, badly wrong at ARR=1.                          */
+
+/* GOAL: a 1 kHz update event from a 84 MHz timer clock.
+   (Remember the APB doubling rule from chapter 09: PCLK1 is
+   42 MHz, so TIM2's clock is 84 MHz.)
+
+   84e6 / 1000 = 84000 counts needed.
+   84000 &gt; 65535, so it will not fit in ARR alone.
+
+   PSC = 83  -&gt; timer counts at 84e6/84 = 1 MHz
+   ARR = 999 -&gt; update every 1000 counts = 1 kHz          */
+
+RCC-&gt;APB1ENR |= RCC_APB1ENR_TIM2EN;
+(void) RCC-&gt;APB1ENR;
+
+TIM2-&gt;PSC = 83;
+TIM2-&gt;ARR = 999;
+
+/* PSC is BUFFERED: writes take effect at the next update
+   event, not immediately. To apply it now, force an update: */
+TIM2-&gt;EGR = TIM_EGR_UG;
+/* ...which also sets the update interrupt flag, so clear it
+   before enabling the interrupt or you take one spurious
+   interrupt the instant you enable it.                      */
+TIM2-&gt;SR = ~TIM_SR_UIF;
+
+TIM2-&gt;DIER |= TIM_DIER_UIE;
+NVIC_EnableIRQ(TIM2_IRQn);
+TIM2-&gt;CR1 |= TIM_CR1_CEN;
+
+void TIM2_IRQHandler(void)
+{
+    TIM2-&gt;SR = ~TIM_SR_UIF;    /* clear FIRST (chapter 07)  */
+    tick_count++;
+}
+
+/* Choosing PSC vs ARR when several combinations work:
+   prefer the LARGEST ARR. Resolution is 1/ARR, so
+   PSC=83, ARR=999 gives 0.1% duty steps for PWM, while
+   PSC=8399, ARR=9 gives 10% steps. Same frequency, wildly
+   different usefulness.                                     */
+</code></pre>
+
+<h2 id="pwm">PWM, and why it needs no CPU</h2>
+
+<pre><code>/* PWM on TIM3 channel 1 -> PA6, 20 kHz, for a motor or LED. */
+
+TIM3-&gt;PSC = 0;                    /* full 84 MHz            */
+TIM3-&gt;ARR = 4199;                 /* 84e6/4200 = 20 kHz     */
+
+/* Mode 110 = PWM mode 1: active while CNT &lt; CCR.
+   OCxPE = preload enable: writes to CCR take effect at the
+   next update, so a duty change never produces a runt
+   pulse mid-cycle. Always enable it for PWM.               */
+TIM3-&gt;CCMR1 |= (6u &lt;&lt; 4) | TIM_CCMR1_OC1PE;
+TIM3-&gt;CCER  |= TIM_CCER_CC1E;     /* enable the output      */
+TIM3-&gt;CR1   |= TIM_CR1_ARPE;      /* preload ARR too        */
+TIM3-&gt;EGR    = TIM_EGR_UG;
+TIM3-&gt;CR1   |= TIM_CR1_CEN;
+
+/* Duty cycle is now ONE STORE, any time, from anywhere: */
+TIM3-&gt;CCR1 = 2100;                /* 50%                    */
+
+/* No interrupt, no ISR, no jitter. The pin toggles at
+   exactly the right instant because a comparator does it.
+
+   ADVANCED TIMERS (TIM1, TIM8) add what motor control
+   needs and general timers lack:
+
+     - COMPLEMENTARY outputs (CH1 and CH1N) for a half
+       bridge, with hardware DEAD TIME between them so the
+       high and low transistors are never on together. That
+       dead time is what stops a shoot-through that destroys
+       the bridge - it must be hardware, because a software
+       delay can be preempted.
+
+     - BREAK INPUT: a fault pin that forces all outputs to a
+       safe state in hardware, within nanoseconds, with no
+       CPU involvement. This is a safety mechanism; software
+       cannot react fast enough to save a motor.
+
+     - REPETITION COUNTER: update event every N cycles
+       rather than every cycle.                             */
+TIM1-&gt;BDTR = (72u &lt;&lt; 0)           /* dead time             */
+           | TIM_BDTR_BKE         /* break enabled         */
+           | TIM_BDTR_MOE;        /* master output enable  */
+</code></pre>
+
+<div class="key">
+<b>The general principle: push timing into hardware</b>
+<p>Any time you find yourself writing "wait, then toggle a pin", ask whether a timer channel can do it. Software
+timing is subject to interrupt latency, cache effects and scheduler jitter; a comparator is subject to none of
+them. The difference between a competent embedded design and an amateur one is very often just how much of the
+timing was handed to peripherals — and it is also what lets the CPU sleep, which
+<a href="mcu-13-low-power.html">chapter 13</a> depends on entirely.</p>
+</div>
+
+<h2 id="capture">Input capture: measuring without polling</h2>
+
+<pre><code>/* Measure the period and duty of an incoming signal in
+   hardware. PWM INPUT MODE uses two channels on one pin.  */
+
+/* CH1 captures rising edges -> period
+   CH2 captures falling edges -> high time                 */
+TIM4-&gt;CCMR1 = (1u &lt;&lt; 0)      /* CC1S: IC1 mapped to TI1    */
+            | (2u &lt;&lt; 8);     /* CC2S: IC2 mapped to TI1    */
+TIM4-&gt;CCER  = TIM_CCER_CC1E              /* CH1 rising     */
+            | TIM_CCER_CC2E | TIM_CCER_CC2P;  /* CH2 falling */
+TIM4-&gt;SMCR  = (5u &lt;&lt; 4)      /* TS: trigger = TI1FP1       */
+            | (4u &lt;&lt; 0);     /* SMS: reset mode            */
+TIM4-&gt;CR1  |= TIM_CR1_CEN;
+
+/* Now, with no CPU involvement at all:
+     CCR1 = period in timer ticks
+     CCR2 = high time in timer ticks
+     duty = CCR2 / CCR1
+
+   Reset mode means each rising edge zeroes the counter, so
+   CCR1 is a period rather than a running timestamp. This is
+   how you read an RC receiver, a tachometer, an ultrasonic
+   rangefinder's echo pulse, or any sensor with a
+   pulse-width output - accurately, while the CPU sleeps.
+
+   THE OVERFLOW PROBLEM: if the signal stops, CNT wraps and
+   CCR1 holds a stale value that looks plausible. Always
+   enable the update interrupt as a timeout and treat "no
+   capture since last update" as signal lost. Reading a
+   dead sensor as a valid measurement is worse than reading
+   an error.                                                */
+</code></pre>
+
+<h2 id="systick">SysTick, and why an RTOS wants it</h2>
+
+<pre><code>/* SysTick is architectural (chapter 02): same registers on
+   every Cortex-M, at 0xE000E010. A 24-bit down-counter.
+   It exists so an RTOS port is portable across vendors.   */
+
+SysTick-&gt;LOAD = (SystemCoreClock / 1000u) - 1u;  /* 1 ms   */
+SysTick-&gt;VAL  = 0;
+SysTick-&gt;CTRL = SysTick_CTRL_CLKSOURCE_Msk   /* core clock */
+              | SysTick_CTRL_TICKINT_Msk
+              | SysTick_CTRL_ENABLE_Msk;
+
+volatile uint32_t g_ms;
+void SysTick_Handler(void) { g_ms++; }   /* flag auto-clears */
+
+/* 24 bits: at 168 MHz the maximum period is
+   16777216/168e6 = 99.8 ms. It cannot be your only
+   long-duration timer.
+
+   THE OVERFLOW BUG, and the fix:                          */
+
+/* WRONG - breaks when g_ms wraps at 49.7 days */
+if (g_ms &gt; deadline) { ... }
+
+/* RIGHT - unsigned subtraction wraps correctly */
+if ((int32_t)(g_ms - deadline) &gt;= 0) { ... }
+
+/* The second form works across the wrap because the
+   subtraction is done modulo 2^32 and then interpreted as
+   signed. It is correct for any interval under ~24 days.
+   Every timekeeping bug of the "device fails after seven
+   weeks of uptime" kind is the first form.                */
+
+/* Reading g_ms outside the ISR needs care on a 32-bit
+   counter it is a single aligned access, so it is atomic on
+   Cortex-M. A 64-bit counter is NOT - it needs a critical
+   section or a seqlock, or you will read a torn value once
+   every few billion reads, which is once a week in a busy
+   system.                                                  */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Period is exactly half or double</td><td>APB timer-clock doubling rule (chapter 09)</td></tr>
+<tr><td>Frequency off by one part in ARR</td><td>Forgot that PSC and ARR hold value minus one</td></tr>
+<tr><td>Prescaler change has no effect</td><td>PSC is buffered — force an update with
+<code>EGR.UG</code></td></tr>
+<tr><td>One spurious interrupt right after enabling</td><td><code>EGR.UG</code> set the update flag; clear it
+before enabling the interrupt</td></tr>
+<tr><td>PWM duty steps are very coarse</td><td>ARR too small — trade prescaler for counter range</td></tr>
+<tr><td>Glitch or runt pulse when changing duty</td><td>CCR preload (<code>OCxPE</code>) not enabled</td></tr>
+<tr><td>PWM configured but the pin stays low</td><td>On an advanced timer, <code>BDTR.MOE</code> not
+set</td></tr>
+<tr><td>Motor bridge destroys itself</td><td>No hardware dead time between complementary outputs</td></tr>
+<tr><td>Dead sensor reads as a valid measurement</td><td>Stale capture register; no update-event
+timeout</td></tr>
+<tr><td>Device misbehaves after 49.7 days</td><td>Tick comparison with <code>&gt;</code> instead of wrap-safe
+subtraction</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give the formula relating timer clock, PSC, ARR and event frequency.</li>
+  <li>Explain why both PSC and ARR are stored as value minus one.</li>
+  <li>Choose PSC and ARR for 1 kHz from an 84 MHz timer clock, and justify the split.</li>
+  <li>Explain why <code>EGR.UG</code> is needed and the side effect it has.</li>
+  <li>Explain what CCR preload prevents.</li>
+  <li>Name the three features advanced timers add and what each is for.</li>
+  <li>Explain why hardware dead time cannot be replaced by a software delay.</li>
+  <li>Describe PWM input mode and what CCR1 and CCR2 hold.</li>
+  <li>Explain the stale-capture failure and how to detect signal loss.</li>
+  <li>Write a wrap-safe deadline comparison and explain why it works.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

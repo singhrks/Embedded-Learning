@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unsafe Rust and the unsafe boundary | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Unsafe Rust and the unsafe boundary</h1>
+<p class="lead">Hardware access requires operations the compiler cannot verify. <code>unsafe</code> is where
+you take responsibility for them — and the discipline that makes Rust worthwhile is confining it behind safe
+abstractions rather than spreading it through the codebase.</p>
+
+<h2 id="what">What unsafe actually permits</h2>
+
+<p><code>unsafe</code> is routinely misunderstood as switching the safety off. It permits exactly five additional operations, and knowing the list precisely is what makes the keyword usable rather than frightening.</p>
+
+<pre class="diagram">   `unsafe` enables exactly FIVE things:
+
+     1. dereference a RAW POINTER (*const T, *mut T)
+     2. call an `unsafe fn` (including every extern "C"
+        function)
+     3. access or modify a `static mut`
+     4. implement an `unsafe trait` (Send, Sync, and your own)
+     5. access a union field
+
+   IT DOES NOT:
+     · turn off the borrow checker
+     · turn off lifetimes
+     · turn off type checking
+     · make anything faster
+     · permit undefined behaviour
+
+   THAT LAST POINT IS THE ONE PEOPLE GET WRONG. `unsafe` does
+   not grant permission to break the rules; it moves
+   RESPONSIBILITY FOR UPHOLDING THEM from the compiler to you.
+   Breaking them inside `unsafe` is still undefined behaviour,
+   with all the consequences from compilers chapter 15 - and
+   worse, because the rest of the program was optimised on
+   the assumption that you did not.
+
+   THE PROPERTIES YOU MUST UPHOLD:
+     · no dangling or misaligned pointer dereferences
+     · no aliasing violations: never two &amp;mut, never &amp;mut
+       alongside &amp;
+     · no data races
+     · every value must be VALID for its type - no bool that
+       is 2, no char that is not a scalar value, no
+       uninitialised reads
+     · no breaking of any safe abstraction's invariants</pre>
+
+<h2 id="pointers">Raw pointers</h2>
+
+<p>Raw pointers are what C pointers are, with no guarantees attached. The rules for using them correctly are stricter than C's, and violating them is undefined behaviour rather than a portability question.</p>
+
+<pre><code>    let x = 42;
+    let p: *const i32 = &amp;x;
+    let mut y = 42;
+    let q: *mut i32 = &amp;mut y;
+
+    // creating them is SAFE; dereferencing is not
+    unsafe { println!("{}", *p); }
+    unsafe { *q = 43; }
+
+/* RAW POINTERS, unlike references:
+     · may be null
+     · may dangle
+     · have no lifetime
+     · may alias freely
+     · are not automatically dereferenced
+
+/* THE OPERATIONS worth knowing: */
+    core::ptr::null::&lt;u8&gt;()
+    core::ptr::null_mut::&lt;u8&gt;()
+    p.is_null()
+    p.offset(3)                 // in ELEMENTS, and it is UB
+                                // to go out of bounds
+    p.add(3)  p.sub(3)
+    p.wrapping_add(3)           // no UB, but the result may
+                                // not be dereferenceable
+
+    unsafe { core::ptr::read(p) }
+    unsafe { core::ptr::write(q, 5) }
+    unsafe { core::ptr::read_volatile(p) }      // for MMIO
+    unsafe { core::ptr::write_volatile(q, 5) }
+    unsafe { core::ptr::copy(src, dst, n) }     // memmove
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) }
+                                                // memcpy
+    unsafe { core::ptr::swap(a, b) }
+
+/* ALIGNMENT MATTERS AND IS CHECKED IN DEBUG BUILDS: */
+    let buf: [u8; 8] = [0; 8];
+    let p = buf.as_ptr() as *const u32;
+    unsafe { *p }               // UB if buf is not 4-aligned
+    // correct:
+    unsafe { p.read_unaligned() }
+    // or, better, no unsafe at all:
+    u32::from_le_bytes(buf[0..4].try_into().unwrap())
+
+/* AND `addr_of!` FOR UNALIGNED OR PACKED FIELDS - creating
+   a reference to a misaligned field is UB even without
+   dereferencing it: */
+    use core::ptr::addr_of;
+    let p = unsafe { addr_of!((*packed_ptr).field) };
+    let v = unsafe { p.read_unaligned() };</code></pre>
+
+<h2 id="boundary">The unsafe boundary</h2>
+
+<p>This is the most important idea in the chapter: unsafe code is not spread through a program, it is contained behind a safe interface that cannot be misused. Getting the boundary right is the whole discipline.</p>
+
+<pre class="diagram">   THE CENTRAL DISCIPLINE:
+
+     unsafe code should be SMALL, LOCAL, and WRAPPED IN A SAFE
+     API whose invariants you can state and check.
+
+   The goal is not to eliminate unsafe - hardware access
+   requires it. The goal is that the REST of the program
+   never needs it, so that a memory-safety bug can only be in
+   the few hundred lines you audited.
+
+   BAD:                          GOOD:
+   ┌────────────────────┐        ┌────────────────────┐
+   │ unsafe everywhere  │        │   safe application │
+   │ every driver, every│        ├────────────────────┤
+   │ access, no         │        │   safe driver API  │
+   │ invariants written │        ├────────────────────┤
+   │ down               │        │ unsafe: 20 lines,  │
+   │                    │        │ documented, tested │
+   └────────────────────┘        └────────────────────┘
+
+   THE TEST: can you state, in one sentence, what the caller
+   must guarantee? If yes, that sentence is the safety
+   comment, and the wrapper can be safe. If no, the
+   abstraction is wrong.</pre>
+
+<pre><code>/* --- A SAFE MMIO WRAPPER, the canonical example --- */
+
+pub struct Uart {
+    base: *mut u32,
+}
+
+// SAFETY: the caller of `new` guarantees exclusive access to
+// this peripheral, so sending it between contexts is sound.
+unsafe impl Send for Uart {}
+
+impl Uart {
+    /// # Safety
+    /// `base` must be the address of a UART peripheral of
+    /// this type, correctly clocked, and no other Uart must
+    /// exist for the same address.
+    pub const unsafe fn new(base: usize) -> Self {
+        Uart { base: base as *mut u32 }
+    }
+
+    // SAFE from here on - the constructor took the promise
+    pub fn write_byte(&amp;mut self, b: u8) {
+        while self.flags() &amp; FR_TXFF != 0 {}
+        // SAFETY: base is valid by the constructor's
+        // contract; DR is within the peripheral's register
+        // block
+        unsafe { self.base.add(REG_DR)
+                          .write_volatile(b as u32) };
+    }
+
+    fn flags(&amp;self) -> u32 {
+        // SAFETY: as above
+        unsafe { self.base.add(REG_FR).read_volatile() }
+    }
+}
+
+/* TWO UNSAFE BLOCKS, each one line, each with a SAFETY
+   comment. Everything above is safe, and a user of this
+   driver writes no unsafe at all.
+
+/* THE CONVENTIONS the ecosystem follows, and clippy enforces:
+     · `# Safety` doc section on every `unsafe fn`, stating
+       what the CALLER must guarantee
+     · `// SAFETY:` comment on every `unsafe` BLOCK, stating
+       why the requirements hold HERE
+     · #![deny(unsafe_op_in_unsafe_fn)] - so an unsafe fn
+       still needs explicit blocks inside, rather than being
+       unsafe throughout
+     · #![warn(clippy::undocumented_unsafe_blocks)]        */</code></pre>
+
+<div class="key">
+<b>The two comment kinds, and why both</b>
+<p><code># Safety</code> on a function is a <em>precondition</em>: what the caller must ensure.
+<code>// SAFETY:</code> on a block is a <em>proof</em>: why the preconditions are met at this site. A
+codebase with both can be audited by reading only the unsafe blocks and checking each proof — which is
+exactly the property that makes the guarantee worth anything.</p>
+</div>
+
+<h2 id="mmio">Hardware access patterns</h2>
+
+<p>Memory-mapped I/O is the reason most embedded Rust contains any unsafe at all, and there is a standard way to do it that confines the unsafe to a few lines.</p>
+
+<pre><code>/* --- 1. VOLATILE, always, for MMIO --- */
+    unsafe { ptr.write_volatile(v) }
+    unsafe { ptr.read_volatile() }
+/* A plain `*p = v` may be elided, reordered or merged - the
+   same rule as C's volatile (C++ chapter 02). Rust has no
+   `volatile` type qualifier; it has volatile OPERATIONS,
+   which is the more honest design.
+
+/* --- 2. USE A PAC, and write no unsafe at all --- */
+    let p = pac::Peripherals::take().unwrap();
+    p.gpioa.moder.modify(|_, w| w.moder5().output());
+    p.gpioa.odr.write(|w| w.odr5().set_bit());
+/* The svd2rust-generated PAC (chapter 20) contains the
+   unsafe; you get a typed, field-named, safe API. This is
+   what "confine unsafe to a small audited layer" looks like
+   when the layer is generated from the vendor's own SVD
+   file.
+
+/* --- 3. A CRITICAL SECTION for shared state --- */
+    critical_section::with(|cs| {
+        SHARED.borrow(cs).borrow_mut().update();
+    });
+/* The `cs` token proves interrupts are disabled
+   (chapter 10). No unsafe needed at the use site.
+
+/* --- 4. A STATIC BUFFER without `static mut` --- */
+    use static_cell::StaticCell;
+    static BUF: StaticCell&lt;[u8; 1024]&gt; = StaticCell::new();
+    let buf: &amp;'static mut [u8; 1024] = BUF.init([0; 1024]);
+/* Safe, panics on double init, no heap.
+
+/* --- 5. TRANSMUTE: almost always the wrong answer --- */
+    let f: f32 = unsafe { core::mem::transmute(bits) };  // no
+    let f = f32::from_bits(bits);                        // yes
+    let bytes = unsafe { core::mem::transmute::&lt;u32,
+                                    [u8;4]&gt;(x) };        // no
+    let bytes = x.to_le_bytes();                         // yes
+    let s = unsafe { core::str::from_utf8_unchecked(b) }; // no
+    let s = core::str::from_utf8(b)?;                    // yes
+/* transmute is the most dangerous function in Rust: it
+   reinterprets bits with NO checking of size, validity or
+   alignment. There is nearly always a safe alternative, and
+   where there is not, `bytemuck` or `zerocopy` provide
+   audited, trait-gated versions.
+
+/* --- 6. slice::from_raw_parts, for a DMA buffer --- */
+    // SAFETY: the DMA engine has finished (we checked the
+    // completion flag), `ptr` points to `len` initialised
+    // bytes within BUFFER, and no other reference to that
+    // region exists.
+    let data = unsafe {
+        core::slice::from_raw_parts(ptr, len)
+    };
+/* One of the legitimate uses. Note the safety comment covers
+   validity, initialisation, length AND aliasing - all four
+   are required.                                          */</code></pre>
+
+<h2 id="unions">Unions and uninitialised memory</h2>
+
+<p>Two features that exist mainly for FFI and for performance-critical code, and that carry sharper edges than anything else in the chapter.</p>
+
+<pre><code>/* --- UNIONS, for FFI compatibility --- */
+    #[repr(C)]
+    union Register {
+        word: u32,
+        bytes: [u8; 4],
+    }
+    let r = Register { word: 0x1234_5678 };
+    let b = unsafe { r.bytes };         // reading ANY field
+                                        // is unsafe
+/* Prefer an enum (chapter 05) unless you are matching a C
+   layout. For bit reinterpretation, to_le_bytes is safe and
+   clearer.
+
+/* --- MaybeUninit, for genuinely uninitialised memory --- */
+    use core::mem::MaybeUninit;
+
+    let mut buf: [MaybeUninit&lt;u8&gt;; 1024] =
+        unsafe { MaybeUninit::uninit().assume_init() };
+        // ^ sound ONLY because MaybeUninit&lt;u8&gt; has no
+        //   validity requirement
+
+    let n = read_into(&amp;mut buf);
+
+    // SAFETY: read_into initialised the first `n` elements
+    let data = unsafe {
+        core::slice::from_raw_parts(buf.as_ptr() as *const u8,
+                                    n)
+    };
+
+/* NEVER `mem::uninitialized()` - it is deprecated and always
+   UB for types with validity requirements. And note that
+   reading uninitialised memory is UB even for u8: the value
+   is "poison" (compilers chapter 15), not a random number.
+
+/* THE SAFE ALTERNATIVE, and usually the right one: */
+    let mut buf = [0u8; 1024];          // zeroing 1 KB costs
+                                        // ~100 cycles
+/* Measure before deciding the initialisation is too
+   expensive. It usually is not.                          */</code></pre>
+
+<h2 id="verify">Verifying unsafe code</h2>
+
+<p>Unsafe code cannot be checked by the compiler, which makes the tooling that <em>can</em> check it disproportionately valuable. These are the tools and what each one actually catches.</p>
+
+<pre><code># --- MIRI: an interpreter that detects UB ---
+    rustup +nightly component add miri
+    cargo +nightly miri test
+
+# It catches:
+#   out-of-bounds accesses
+#   use-after-free
+#   invalid values (a bool that is 2)
+#   misaligned accesses
+#   ALIASING VIOLATIONS, under Stacked Borrows / Tree Borrows
+#   data races
+#   uninitialised reads
+#   memory leaks
+#
+# MIRI IS THE MOST IMPORTANT TOOL IN THIS CHAPTER. It finds
+# aliasing bugs that no amount of testing would, because the
+# consequence of an aliasing violation is a wrong
+# optimisation, not a crash.
+#
+# LIMITATION: it cannot run code that touches real hardware or
+# calls into C. So structure the unsafe helpers so they can be
+# tested against a mock on the host - the same argument as
+# chapter 11's testing strategy.
+
+# --- THE SANITIZERS ---
+    RUSTFLAGS="-Zsanitizer=address" cargo +nightly test
+    RUSTFLAGS="-Zsanitizer=thread"  cargo +nightly test
+
+# --- CLIPPY LINTS worth denying ---
+    #![deny(unsafe_op_in_unsafe_fn)]
+    #![warn(clippy::undocumented_unsafe_blocks)]
+    #![warn(clippy::multiple_unsafe_ops_per_block)]
+    #![warn(clippy::missing_safety_doc)]
+    #![warn(clippy::ptr_as_ptr, clippy::cast_ptr_alignment)]
+
+# --- AND THE STRUCTURAL CHECK ---
+    cargo geiger                # counts unsafe per dependency
+    grep -rn 'unsafe' src/ | wc -l
+# Track that number. In a well-structured embedded crate it
+# should be in the tens and concentrated in a few files, not
+# spread across every driver.</code></pre>
+
+<h2 id="review">A review checklist</h2>
+
+<p>Unsafe code gets no help from the compiler, so the review has to supply what the compiler would. Working
+through a fixed list is what turns "this looks fine" into an actual check.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Check</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Is there a <code># Safety</code> section on every <code>unsafe fn</code>?</td><td>The caller cannot uphold an unstated contract</td></tr>
+<tr><td>Is there a <code>// SAFETY:</code> on every block?</td><td>It is the proof that makes the audit possible</td></tr>
+<tr><td>Is the block as small as it can be?</td><td>Large blocks hide the operation that matters</td></tr>
+<tr><td>Is every pointer non-null, aligned and in-bounds?</td><td>All three are separate UB conditions</td></tr>
+<tr><td>Could two <code>&amp;mut</code> to the same data exist?</td><td>The commonest and most damaging violation</td></tr>
+<tr><td>Is the memory initialised before being read?</td><td>Uninitialised reads are UB even for <code>u8</code></td></tr>
+<tr><td>Are all values valid for their type?</td><td>A <code>bool</code> that is 2 is UB immediately</td></tr>
+<tr><td>Does an interrupt or another core race here?</td><td>Data races are UB regardless of the outcome</td></tr>
+<tr><td>Is <code>write_volatile</code> used for MMIO?</td><td>A plain write may be elided or reordered</td></tr>
+<tr><td>Is there a safe alternative?</td><td>Usually yes — <code>from_bits</code>, <code>to_le_bytes</code>, a PAC</td></tr>
+<tr><td>Does Miri pass?</td><td>It finds what testing cannot</td></tr>
+<tr><td>Is the safe wrapper's invariant actually upheld?</td><td>A safe API over unsound unsafe is worse than no wrapper</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>"this operation is unsafe"</td><td>Wrap it in a block — and write the SAFETY comment</td></tr>
+<tr><td>Works in debug, wrong in release</td><td>Aliasing violation the optimiser exploited — run Miri</td></tr>
+<tr><td>Miri: "attempting a read access ... tag does not exist"</td><td>A pointer derived from a reference that has since been invalidated</td></tr>
+<tr><td>Miri: "constructing invalid value"</td><td>A value outside its type's valid range</td></tr>
+<tr><td>Misaligned access fault on ARM</td><td>Cast a <code>u8</code> pointer to a wider type — use <code>read_unaligned</code></td></tr>
+<tr><td>Register write has no effect</td><td>Not <code>volatile</code> — the compiler removed it</td></tr>
+<tr><td>Corruption only with interrupts enabled</td><td>Missing critical section or atomic</td></tr>
+<tr><td>Undefined behaviour after <code>transmute</code></td><td>Sizes, validity or alignment mismatched — use a safe conversion</td></tr>
+<tr><td>Safe API turns out to be unsound</td><td>The invariant was not actually enforced — the worst failure mode</td></tr>
+<tr><td><code>unsafe</code> appearing throughout the codebase</td><td>The abstraction boundary is missing</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the five things <code>unsafe</code> permits, and four it does not.</li>
+  <li>List the properties you must uphold inside an unsafe block.</li>
+  <li>Explain the unsafe boundary and the one-sentence test for a correct wrapper.</li>
+  <li>Write a safe MMIO wrapper with correct <code># Safety</code> and <code>// SAFETY:</code>
+  comments.</li>
+  <li>Explain why volatile operations rather than a volatile type.</li>
+  <li>Give safe alternatives to <code>transmute</code> for four common cases.</li>
+  <li>Explain <code>MaybeUninit</code> and why reading uninitialised memory is UB.</li>
+  <li>Run Miri and say what it catches that testing cannot.</li>
+  <li>Enable the four lints that enforce unsafe discipline.</li>
+  <li>Work the twelve-point review checklist on a real unsafe block.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

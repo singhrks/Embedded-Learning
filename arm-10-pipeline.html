@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How an instruction executes | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>How an instruction executes</h1>
+<p class="lead"><a href="ca-11-pipelining.html">CA chapter 11</a> covered pipelining in general. This chapter
+follows one AArch64 instruction through a real core, showing where the MMU, the caches and the exception
+machinery each enter the picture — and what can go wrong at each point.</p>
+
+<h2 id="stages">The pipeline, concretely</h2>
+
+<p>A processor does not execute one instruction at a time from start to finish. It has many in flight at once, at different stages, and almost every performance effect in this track comes from something disturbing that flow.</p>
+
+<pre class="diagram">   ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+   │ FETCH  │→│ DECODE │→│ RENAME │→│ ISSUE  │→│EXECUTE │→│ RETIRE │
+   │        │ │        │ │        │ │        │ │ MEMORY │ │        │
+   └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+        ▲          ▲                     ▲          ▲          ▲
+        │          │                     │          │          │
+   branch      fixed 32-bit         scheduler   MMU + caches  in ORDER,
+   predictor   encoding makes       picks ready              architectural
+   + I-TLB     this cheap and       instructions             state updates
+   + I-cache   parallel                                      HERE ONLY
+
+  Depth varies enormously by core:
+     Cortex-A53     8 stages, in-order, 2-wide
+     Cortex-A78    13 stages, out-of-order, 4-wide fetch/6-wide issue
+     Neoverse V2   deeper still, 8-wide
+
+  Same architecture. Same binary. Very different behaviour — the
+  distinction from chapter 01.</pre>
+
+<h2 id="fetch">Fetch: where translation begins</h2>
+
+<p>Before an instruction can be decoded it has to be fetched, and fetching means an address translation and a cache lookup. That is why instruction-side misses and TLB pressure are real performance problems and not just a data-side concern.</p>
+
+<pre><code>/* The PC is a VIRTUAL address. Before any instruction bytes can be
+   read, it must be translated.                                */
+
+   PC → I-TLB lookup
+          hit  → physical address in ~1 cycle
+          miss → hardware page table walk (chapter 13)
+                 walk fails → INSTRUCTION ABORT
+                              ESR.EC = 0x20 (lower EL) or 0x21
+        → L1 instruction cache
+          hit  → up to 4-8 instructions returned
+          miss → L2 → interconnect → DRAM
+
+/* In parallel, the branch predictor is already producing the NEXT
+   fetch address, so the front end never waits for decode to
+   discover that an instruction was a branch (CA chapter 12).  */
+
+/* Three things can go wrong here:
+     · translation fault      → instruction abort
+     · permission fault       → the page is XN (execute-never)
+     · the page is Device     → instruction fetch from Device
+                                memory is UNPREDICTABLE. Never
+                                execute from an MMIO mapping.  */</code></pre>
+
+<h2 id="decode">Decode and rename</h2>
+
+<p>Decoding turns instruction bits into work for the execution units, and on an out-of-order core it also renames registers — which is what allows instructions to execute in a different order without producing wrong answers.</p>
+
+<pre><code>/* Fixed 32-bit encodings mean the decoder can split N instructions
+   simultaneously with no serial dependency — the single biggest
+   front-end advantage of the ISA (chapter 03).               */
+
+/* Two things happen that software cannot see but must understand: */
+
+/* 1. CRACKING — some instructions become several micro-operations */
+        ldp     x0, x1, [x2]        // may become two loads
+        stp     x0, x1, [x2, #16]!  // store + address update
+
+/* 2. REGISTER RENAMING — architectural registers are mapped onto
+      a much larger physical register file.                    */
+
+        add     x0, x1, x2      // x0 → physical reg p37
+        ldr     x0, [x3]        // x0 → physical reg p52  (a NEW one)
+        add     x4, x0, #1      //         reads p52
+
+/* Renaming removes WAR and WAW hazards entirely: the second write
+   to x0 does not have to wait for the first, because they are
+   different physical registers. Only TRUE dependencies (RAW)
+   remain, and those are the ones you can attack in source code
+   with multiple accumulators (CA chapter 19).               */</code></pre>
+
+<h2 id="memory">The memory stage, in detail</h2>
+
+<p>Loads and stores are the most complicated stage, because a load may hit, miss, or need to wait for an earlier store to the same address. This is where most stalls in real code actually originate.</p>
+
+<pre class="diagram">This is where most of the interesting failures live.
+
+   effective address computed (base + offset, or base + index&lt;&lt;s)
+        │
+        ▼
+   ① ALIGNMENT CHECK
+        Device memory: ANY unaligned access faults
+        Normal memory: allowed, unless SCTLR.A is set
+        SP-relative:   SP must be 16-byte aligned if SCTLR.SA
+        │
+        ▼
+   ② TRANSLATION — D-TLB, tagged by ASID
+        miss → hardware table walk, up to 4 memory accesses
+        invalid descriptor → TRANSLATION FAULT
+              ESR.EC = 0x24/0x25, FAR = the address
+        │
+        ▼
+   ③ PERMISSION CHECK
+        AP bits vs current EL and access type
+        PXN/UXN for instruction fetch
+        PAN: may EL1 touch this user page right now? (chapter 05)
+        fail → PERMISSION FAULT
+        │
+        ▼
+   ④ STAGE 2 — only if a hypervisor is active
+        IPA → PA via VTTBR_EL2, second permission check
+        fail → exception to EL2, not EL1 (chapter 16)
+        │
+        ▼
+   ⑤ MEMORY TYPE from MAIR, via the descriptor's AttrIndx
+        Normal cacheable  → probe the cache
+        Device            → bypass the cache, no speculation,
+                            no merging (chapter 11)
+        │
+        ▼
+   ⑥ CACHE — L1 hit? L2? L3? interconnect?
+        │
+        ▼
+   ⑦ INTERCONNECT — AXI/CHI transaction carrying
+        address, master ID, NS bit, cacheability
+        SMMU may translate it (for non-CPU masters)
+        XPU may REFUSE it → external abort, DFSC = 0b010000
+        │
+        ▼
+   ⑧ data returned, or the store retires
+
+Every fault code you will decode in chapter 29 corresponds to a
+specific step in this list.</pre>
+
+<h2 id="ooo">Out-of-order execution and its limits</h2>
+
+<p>Out-of-order execution hides latency by running later instructions while an earlier one waits. It is powerful and finite, and knowing what limits it tells you which stalls the hardware can absorb and which it cannot.</p>
+
+<pre><code>/* Instructions EXECUTE when their operands are ready, in any
+   order. They RETIRE strictly in program order.             */
+
+        ldr     x0, [x1]        // L2 miss: 40 cycles
+        add     x2, x3, x4      // independent — executes NOW
+        add     x5, x6, x7      // independent — executes NOW
+        add     x8, x0, #1      // DEPENDENT on x0 — must wait
+
+/* The reorder buffer holds results until retirement. Two
+   properties follow, and both matter:                      */
+
+/* 1. PRECISE EXCEPTIONS. If the load faults, everything after it
+      is discarded before retiring, so the architectural state
+      looks exactly as if execution stopped at the load. That is
+      what makes demand paging possible: the OS fixes the mapping
+      and the SAME instruction re-executes (OS chapter 12).  */
+
+/* 2. SPECULATIVE state is NOT rolled back. Caches, TLBs and
+      predictor tables were already changed. This is the entire
+      basis of Spectre (CA chapter 12), and the reason ARM added
+      CSDB, SB and SSBS.                                     */
+
+/* What LIMITS the reordering window:
+     · reorder buffer size (~100-500 entries)
+     · load/store queue depth
+     · physical register file size
+     · a full BARRIER, which drains it deliberately (chapter 21) */</code></pre>
+
+<h2 id="hazards">Where stalls come from</h2>
+
+<p>A pipelined core's steady-state throughput of "roughly one instruction per cycle" is a best case, not a
+guarantee, and every row here is a different reason an instruction has to wait rather than issue immediately.
+They fall into two kinds worth telling apart: the first five rows are the pipeline waiting on <em>memory or
+prediction</em> — the data or the next instruction simply is not ready yet — and no amount of code
+restructuring removes the miss, it can only make misses less frequent or hide their latency behind other work.
+The last three rows are different: they are the cost of correctness mechanisms — barriers, atomics — that
+exist to make concurrent code behave predictably, and the fix there is usually to use a weaker, cheaper
+mechanism rather than to eliminate the need for one entirely.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Cause</th><th>Cost</th><th>Source-level fix</th></tr></thead>
+<tbody>
+<tr><td>L1 data miss</td><td>~12 cycles</td><td>Locality, layout (<a href="ca-13-memory-hierarchy.html">CA 13</a>)</td></tr>
+<tr><td>Last-level miss &rarr; DRAM</td><td>~200 cycles</td><td>Blocking, prefetch, smaller working set</td></tr>
+<tr><td>TLB miss &rarr; page walk</td><td>10s–100s of cycles</td><td>Huge pages</td></tr>
+<tr><td>Branch mispredict</td><td>10–20 cycles</td><td>Branchless code, predictable branches</td></tr>
+<tr><td>True dependency chain</td><td>Latency of each link</td><td><strong>Multiple accumulators</strong> (<a href="ca-19-parallelism.html">CA 19</a>)</td></tr>
+<tr><td>Divide</td><td>10–20 cycles, not pipelined</td><td>Avoid, or use reciprocal multiply</td></tr>
+<tr><td>Store-to-load forwarding failure</td><td>10s of cycles</td><td>Avoid overlapping partial stores then wide loads</td></tr>
+<tr><td><code>ISB</code> / <code>DSB</code></td><td>Full drain — expensive</td><td>Use the weakest barrier that suffices</td></tr>
+<tr><td>Exclusive-loop contention</td><td>Unbounded retries</td><td>LSE atomics (<a href="arm-22-atomics.html">ch. 22</a>)</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The dependency chain is the one you control most directly: */
+
+/* 4-cycle FP add latency, serialised — 4 cycles per element */
+for (i = 0; i &lt; n; i++) sum += a[i];
+
+/* four independent chains — the latencies overlap */
+for (i = 0; i &lt; n; i += 4) {
+        s0 += a[i];   s1 += a[i+1];
+        s2 += a[i+2]; s3 += a[i+3];
+}
+sum = (s0 + s1) + (s2 + s3);
+/* Typically ~4x faster with an UNCHANGED instruction count. The
+   compiler will not do this for floats without -ffast-math,
+   because it changes the rounding (CA chapter 03).         */</code></pre>
+
+<h2 id="pmu">Measuring what the pipeline is doing</h2>
+
+<p>All of the above is measurable. The performance monitoring unit counts exactly these events in hardware, which turns a theory about why code is slow into a number.</p>
+
+<pre><code># the top-down view: where are the issue slots going?
+perf stat -e cycles,instructions,stall_frontend,stall_backend ./prog
+
+#   stall_frontend high → INSTRUCTION supply
+#        I-cache misses, branch mispredicts, ITLB misses
+#        fix: code layout, PGO, fewer/predictable branches
+#
+#   stall_backend high  → DATA supply or execution
+#        D-cache misses, dependency chains, divides
+#        fix: data layout, more parallelism, better algorithms
+
+# drill down
+perf stat -e l1d_cache_refill,l2d_cache_refill,ll_cache_miss_rd \
+          -e dtlb_walk,itlb_walk \
+          -e br_mis_pred_retired,br_retired \
+          -e inst_spec,inst_retired ./prog
+
+#   inst_spec vs inst_retired = how much work was SPECULATED and
+#   thrown away. A large gap means heavy mispredict waste.
+
+# which instruction?
+perf record -e l1d_cache_refill ./prog &amp;&amp; perf annotate
+
+# ARM's own tooling gives a full top-down breakdown
+#   topdown-tool (from Arm's telemetry solution)
+#   Arm Streamline, Arm MAP</code></pre>
+
+<div class="tip">
+<b>IPC is the first number to look at</b>
+<p>Instructions per cycle tells you immediately which world you are in. Below ~0.5 on a wide core means you
+are stalled — find out on what. Above ~2 means the core is busy and further gains must come from doing
+<em>less work</em>, i.e. a better algorithm. Between the two, look at the stall counters. This one number
+saves a great deal of misdirected optimisation.</p>
+</div>
+
+<h2 id="exceptions">Where exceptions fit</h2>
+
+<p>An exception has to appear to happen at a precise instruction, even though dozens are in flight. How the pipeline achieves that explains why some faults are recoverable and others are not.</p>
+
+<pre class="diagram">   Any stage can raise an exception:
+
+     FETCH    instruction abort — translation or permission
+     DECODE   undefined instruction; trapped by a higher EL
+     EXECUTE  FP exception, divide-by-zero (where trapped)
+     MEMORY   data abort, alignment fault, external abort
+     any      IRQ/FIQ arriving asynchronously
+     any      SError — an imprecise external abort, often from
+              a write posted long ago
+
+   SYNCHRONOUS exceptions are precise: the instruction is
+   identified exactly, and ELR points at it (or past it, for SVC).
+
+   ASYNCHRONOUS ones are taken between instructions, at a point
+   the hardware chooses.
+
+   SError is the awkward case: the reported PC has NOTHING to do
+   with the cause, because the failing transaction retired long
+   before the error came back. This is why external aborts from a
+   bus firewall (security chapter 20) are so hard to attribute,
+   and why an ESB (Error Synchronization Barrier) is used to
+   contain them at known points.
+
+   Chapter 28 covers the entry sequence; chapter 29 covers
+   decoding what happened.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>IPC below 0.5 with few cache misses</td><td>Long dependency chains, or frontend-bound</td></tr>
+<tr><td>Loop 4× faster after manual unrolling</td><td>Broke a true dependency chain</td></tr>
+<tr><td>Large gap between <code>inst_spec</code> and <code>inst_retired</code></td><td>Heavy branch misprediction; work thrown away</td></tr>
+<tr><td>Unaligned access faults on one region only</td><td>That region is mapped as Device memory</td></tr>
+<tr><td>Fetching instructions from a peripheral hangs</td><td>Execution from Device memory is unpredictable</td></tr>
+<tr><td>Fault address unrelated to the reported PC</td><td>SError — an imprecise, asynchronous abort</td></tr>
+<tr><td>Code faster on a big core than expected</td><td>Deeper reorder window hides the latency</td></tr>
+<tr><td>Barrier in a hot loop destroys throughput</td><td><code>DSB</code>/<code>ISB</code> drains the pipeline; use a weaker one</td></tr>
+<tr><td>Timing-dependent bug only on out-of-order cores</td><td>Reordering the in-order core happened not to perform</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Name the pipeline stages and say which two involve address translation.</li>
+  <li>Explain what register renaming removes and what it cannot remove.</li>
+  <li>List the eight checks a load passes through in the memory stage.</li>
+  <li>Explain precise exceptions and why demand paging depends on them.</li>
+  <li>Explain why speculative state is not rolled back, and one consequence.</li>
+  <li>Give five sources of pipeline stalls and the source-level fix for each.</li>
+  <li>Say what <code>stall_frontend</code> versus <code>stall_backend</code> tells you to do.</li>
+  <li>Explain why SError is harder to diagnose than a data abort.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

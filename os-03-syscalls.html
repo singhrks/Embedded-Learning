@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The user/kernel boundary and system calls | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>The user/kernel boundary and system calls</h1>
+<p class="lead">The system call is the one door between an application and the kernel. Everything an OS
+offers passes through it, every argument crossing it is hostile until validated, and its cost shapes the
+design of every high-performance I/O interface ever built.</p>
+
+<h2 id="why">Why a special mechanism</h2>
+
+<p>A function call cannot cross the privilege boundary. If user code could simply <code>call</code> a kernel
+address, it could call <em>any</em> kernel address — landing in the middle of a function, skipping permission
+checks, with attacker-chosen register state. Isolation would be decorative.</p>
+
+<div class="key">
+<b>The three requirements</b>
+<ol>
+<li><strong>Privilege escalation</strong> must happen atomically with the control transfer.</li>
+<li><strong>The entry point is chosen by the kernel</strong>, not the caller. User code supplies a
+<em>number</em>, not an address.</li>
+<li><strong>The kernel must be able to return</strong> to exactly where the caller was, at its original
+privilege.</li>
+</ol>
+<p>A synchronous exception provides all three, which is why every architecture implements system calls as a
+deliberate trap.</p>
+</div>
+
+<h2 id="mechanism">The mechanism</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Architecture</th><th>Instruction</th><th>Number in</th><th>Arguments in</th><th>Return in</th></tr></thead>
+<tbody>
+<tr><td>AArch64 (Linux)</td><td><code>svc #0</code></td><td><code>x8</code></td><td><code>x0</code>–<code>x5</code></td><td><code>x0</code></td></tr>
+<tr><td>x86-64 (Linux)</td><td><code>syscall</code></td><td><code>rax</code></td><td><code>rdi rsi rdx r10 r8 r9</code></td><td><code>rax</code></td></tr>
+<tr><td>ARM32 (Linux)</td><td><code>svc #0</code></td><td><code>r7</code></td><td><code>r0</code>–<code>r5</code></td><td><code>r0</code></td></tr>
+<tr><td>RISC-V</td><td><code>ecall</code></td><td><code>a7</code></td><td><code>a0</code>–<code>a5</code></td><td><code>a0</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<b>The syscall ABI is not the C ABI</b>
+<p>Note the differences: on x86-64 the fourth argument is in <code>r10</code>, not <code>rcx</code>, because
+the <code>syscall</code> instruction clobbers <code>rcx</code> with the return address. On AArch64 the
+syscall number sits in <code>x8</code>, outside the normal argument registers. Kernel entry code must know
+both conventions, and this is exactly the mismatch that makes hand-written syscall wrappers error-prone —
+use libc's.</p>
+</div>
+
+<pre><code>/* what write(1, "hi\n", 3) compiles to on AArch64 Linux */
+        mov     x0, #1                  // fd
+        adr     x1, msg                 // buf
+        mov     x2, #3                  // count
+        mov     x8, #64                 // __NR_write
+        svc     #0
+        // x0 now holds the byte count, or a negative errno</code></pre>
+
+<h2 id="flow">The full round trip</h2>
+
+<p>The system call is the only doorway between an application and the kernel. Following one all the way through is the single most useful thing you can do to understand how the two halves connect.</p>
+
+<pre class="diagram">USER (EL0)                          KERNEL (EL1)
+──────────                          ────────────
+ write(fd, buf, n)
+   │ libc marshals arguments into
+   │ the syscall registers
+   ▼
+ svc #0
+   │
+   ├══> HARDWARE, atomically:
+   │      ELR_EL1  ← return address
+   │      SPSR_EL1 ← saved PSTATE
+   │      ESR_EL1  ← exception class 0x15 (SVC)
+   │      PSTATE: EL→1, SP→SP_EL1, D/A/I/F masked
+   │      PC      ← VBAR_EL1 + 0x400
+   │
+   └────────────────────────────►  vector entry stub
+                                     save x0-x30, SP_EL0, ELR, SPSR
+                                     to the kernel stack (pt_regs)
+                                     decode ESR → syscall path
+                                         │
+                                         ▼
+                                   validate x8 &lt; NR_syscalls
+                                   look up sys_call_table[x8]
+                                         │
+                                         ▼
+                                   sys_write(fd, buf, n)
+                                     fdget(fd)        → struct file
+                                     security hooks   (LSM)
+                                     vfs_write()
+                                     f_op->write_iter()
+                                     copy_from_user() ← the ONLY safe
+                                                        way to read buf
+                                         │
+                                         ▼
+                                   return byte count in x0
+                                         │
+                                   ret_to_user:
+                                     pending signals? reschedule?
+                                     restore registers, ELR, SPSR
+                                         │
+   ┌◄════════════════════════════════ eret
+   │
+   ▼
+ libc: x0 negative? set errno, return -1
+   │
+   ▼
+ your code
+
+Every step is in ARM chapters 28 and 30 at the register level. The
+structural point here: the kernel chose the entry point, saved the
+full user context, and validated the number before dispatching.</pre>
+
+<h2 id="validation">Validating what crosses</h2>
+
+<div class="danger">
+<b>Every byte from user space is hostile</b>
+<p>A system call argument is attacker-controlled input arriving at the highest privilege level. The kernel
+must assume the caller is malicious — not merely buggy — because a local user exploiting a validation gap
+gets kernel code execution.</p>
+</div>
+
+<pre><code>/* NEVER dereference a user pointer directly. */
+long sys_example(void __user *ubuf, size_t len)
+{
+        char kbuf[256];
+
+        /* WRONG — the pointer may reference kernel memory, unmapped
+           memory, or memory that another thread unmaps mid-call. */
+        memcpy(kbuf, ubuf, len);
+
+        /* RIGHT */
+        if (len &gt; sizeof kbuf)
+                return -EINVAL;                 /* bound FIRST      */
+        if (copy_from_user(kbuf, ubuf, len))
+                return -EFAULT;                 /* returns bytes NOT copied */
+        ...
+}
+
+/* copy_from_user / copy_to_user do three things you cannot skip:
+     1. check the address really lies in user space
+     2. install an exception fixup, so a fault returns -EFAULT
+        instead of oopsing
+     3. respect PAN/SMAP, the hardware feature that blocks kernel
+        access to user pages outside these helpers          */</code></pre>
+
+<h3>The five validation rules</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Rule</th><th>Failure if ignored</th></tr></thead>
+<tbody>
+<tr><td><strong>Bound every length</strong> before using it</td><td>Kernel buffer overflow</td></tr>
+<tr><td><strong>Copy before validating</strong>, never validate in place</td><td>TOCTOU: another thread changes the value between check and use</td></tr>
+<tr><td><strong>Check every index and enum</strong> against its range</td><td>Out-of-bounds table access</td></tr>
+<tr><td><strong>Zero output structures fully</strong> before filling them</td><td>Padding bytes leak kernel stack contents to userspace</td></tr>
+<tr><td><strong>Reject unknown flags</strong> rather than ignoring them</td><td>Cannot add meanings later without breaking programs</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Rule 2, the TOCTOU trap, written out */
+struct req *r = (struct req __user *)arg;
+
+if (r-&gt;len &gt; MAX) return -EINVAL;      /* read #1 — validate */
+process(r-&gt;buf, r-&gt;len);                /* read #2 — USE      */
+/* Another thread in the same process can change r->len between
+   the two reads. The check applied to a value that no longer
+   exists. This is a real and repeatedly exploited pattern.   */
+
+/* Correct: one copy, then validate the copy */
+struct req k;
+if (copy_from_user(&amp;k, r, sizeof k)) return -EFAULT;
+if (k.len &gt; MAX) return -EINVAL;
+process(k.buf, k.len);
+
+/* Rule 4, the info leak */
+struct info out;
+memset(&amp;out, 0, sizeof out);           /* padding too (C ch. 07) */
+out.a = x; out.b = y;
+if (copy_to_user(u, &amp;out, sizeof out)) return -EFAULT;</code></pre>
+
+<h2 id="abi">The ABI is forever</h2>
+
+<div class="key">
+<b>"We do not break userspace"</b>
+<p>Linus Torvalds' rule, and the reason Linux binaries from 1995 still run. A system call's number, argument
+layout and semantics are permanent once released. You cannot change a struct, repurpose a field, or tighten
+validation in a way that rejects previously-accepted input.</p>
+</div>
+
+<pre><code>/* This is why the syscall table has entries like: */
+open, openat, openat2                  /* three generations */
+stat, stat64, fstatat, statx
+clone, clone3
+epoll_create, epoll_create1
+dup, dup2, dup3
+
+/* Each new one adds a flags argument or a size field, because the
+   old one could not be extended. Designing for extension from the
+   start is the lesson:                                          */
+
+struct my_args {
+        __u32 size;         /* sizeof(struct) — lets the kernel tell
+                               which version the caller compiled against */
+        __u32 flags;        /* reject unknown bits, so new ones are safe */
+        __u64 field_a;
+        __u64 field_b;
+        /* new fields appended here in future versions */
+};
+
+long sys_myop(struct my_args __user *uargs, size_t usize)
+{
+        struct my_args a = {};
+
+        if (usize &gt; PAGE_SIZE) return -E2BIG;
+        /* copy_struct_from_user handles version skew both ways:
+           zero-fills a smaller old struct, and requires that any
+           extra bytes from a newer caller are all zero.        */
+        if (copy_struct_from_user(&amp;a, sizeof a, uargs, usize))
+                return -EFAULT;
+
+        if (a.flags &amp; ~MY_VALID_FLAGS) return -EINVAL;   /* rule 5 */
+        ...
+}</code></pre>
+
+<h2 id="cost">Cost, and the interfaces built to avoid it</h2>
+
+<p>Crossing the boundary is not free, and the cost has risen noticeably since the speculative-execution vulnerabilities forced mitigations into the path. Knowing the figure explains why avoiding the crossing is worth so much.</p>
+
+<pre class="diagram">A minimal syscall costs roughly 50-500 ns:
+
+   trap and privilege change          ~20-50 cycles
+   save and restore user registers    ~30-60 cycles
+   table lookup and dispatch          ~10 cycles
+   pipeline and branch predictor cost variable
+   Spectre/Meltdown mitigations       +100-400 cycles on affected CPUs
+
+That is 100-1000x a function call. For a program doing millions of
+small operations it dominates everything else.
+
+Four families of workaround, all worth recognising:
+
+  BATCH        do more per call
+               writev, readv, sendmmsg, io_submit
+
+  AVOID        remove the kernel from the path entirely
+               mmap (page-fault once, then plain loads/stores)
+               vDSO (see below)
+               DPDK, SPDK — poll the device from user space
+
+  AMORTISE     submit many operations, collect many completions
+               io_uring: shared ring buffers, often ZERO syscalls
+               in steady state
+
+  MOVE IN      run the logic in the kernel instead
+               eBPF: verified user code, executed kernel-side</pre>
+
+<pre><code>/* The vDSO — a small shared object the kernel maps into every
+   process, containing implementations that need no privilege.  */
+clock_gettime(CLOCK_MONOTONIC, &amp;ts);
+/* Reads a kernel-maintained page of timekeeping data plus the
+   hardware counter, in USER MODE. No trap at all. Roughly 25 ns
+   instead of 300 ns.                                           */
+
+cat /proc/self/maps | grep vdso
+LD_SHOW_AUXV=1 /bin/true | grep VDSO</code></pre>
+
+<h2 id="observing">Observing system calls</h2>
+
+<p>Every system call a program makes can be watched, counted and timed. That turns "the program is slow" into a specific claim about which calls it makes and how often.</p>
+
+<pre><code># trace every syscall a process makes
+strace ./program
+strace -c ./program              # summary: counts, time, errors
+strace -f -e trace=openat,read,write ./program
+strace -p 1234                   # attach to a running process
+
+# lower overhead, system-wide
+perf trace ./program
+perf stat -e raw_syscalls:sys_enter ./program
+
+# who is making the most syscalls, system-wide
+sudo bpftrace -e 'tracepoint:raw_syscalls:sys_enter {
+        @[comm, args-&gt;id] = count(); }'
+
+# Windows
+# Process Monitor, or Event Tracing for Windows (ETW)
+
+# the syscall table itself
+ausyscall --dump                       # numbers to names
+cat /usr/include/asm-generic/unistd.h  # canonical numbering</code></pre>
+
+<div class="tip">
+<b><code>strace -c</code> first</b>
+<p>When a program is inexplicably slow, run <code>strace -c</code> before anything else. A count of two
+million <code>read()</code> calls of 1 byte each, or thousands of failed <code>stat()</code> calls probing
+for a file, diagnoses the problem in seconds — and both are extremely common.</p>
+</div>
+
+<h2 id="windows">Windows</h2>
+
+<p>Windows solves the same problem with a different structure, and comparing the two directly shows which parts of the design are essential and which are merely conventional.</p>
+
+<pre class="diagram">Win32 is NOT the syscall layer. There are two hops:
+
+  application
+      │  CreateFile(...)                    documented, stable API
+      ▼
+  kernel32.dll / kernelbase.dll
+      │  NtCreateFile(...)                  Native API
+      ▼
+  ntdll.dll
+      │  mov eax, 0x55        ← syscall NUMBER, and it CHANGES
+      │  syscall                 between Windows versions
+      ▼
+  ═══ kernel ═══
+  KiSystemService → SSDT lookup → NtCreateFile
+
+Consequences:
+  · Windows' stable ABI is Win32, not the syscall interface
+  · calling syscalls directly is unsupported and breaks on update
+    (which is why malware does it, and why EDR products watch for it)
+  · Linux is the opposite: the SYSCALL is stable and libc is a
+    convenience wrapper</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Program is slow with low CPU usage</td><td>Syscall-bound; check <code>strace -c</code></td></tr>
+<tr><td>Reading a file byte-by-byte is 100× slower</td><td>One syscall per byte; buffer it</td></tr>
+<tr><td>Performance dropped after a kernel security update</td><td>Spectre/Meltdown mitigations on syscall entry</td></tr>
+<tr><td>Kernel oops on a bad pointer from userspace</td><td>Direct dereference instead of <code>copy_from_user</code></td></tr>
+<tr><td>Vulnerability from a length passed by the caller</td><td>Length used before being bounded</td></tr>
+<tr><td>Exploit changes a value after validation</td><td>TOCTOU: validated in place instead of after copying</td></tr>
+<tr><td>Kernel stack bytes appear in userspace output</td><td>Struct padding not zeroed</td></tr>
+<tr><td>New kernel flag breaks an old program</td><td>Unknown flags were ignored rather than rejected</td></tr>
+<tr><td>Windows software breaks after an update</td><td>Called syscalls directly instead of via Win32</td></tr>
+<tr><td><code>clock_gettime</code> is unexpectedly cheap</td><td>Served by the vDSO, no trap</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give three reasons a system call cannot be an ordinary function call.</li>
+  <li>Name the AArch64 syscall instruction and which register carries the number.</li>
+  <li>Walk the round trip from <code>svc #0</code> to <code>eret</code>, naming what hardware saves.</li>
+  <li>Give the five rules for validating user input, and the failure each prevents.</li>
+  <li>Explain the TOCTOU pattern and the fix.</li>
+  <li>Explain why <code>openat2</code> exists alongside <code>open</code>.</li>
+  <li>Design an extensible syscall argument struct and say how version skew is handled.</li>
+  <li>Name four techniques for reducing syscall cost, with an example of each.</li>
+  <li>Explain why Windows' stable ABI is Win32 rather than the syscall layer.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

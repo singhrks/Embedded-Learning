@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copying to and from user space | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Copying to and from user space</h1>
+<p class="lead">The kernel/user boundary is the one place where a hostile caller meets privileged code every
+single second. Every pointer that crosses it is an attack, and the rules for handling one are short, strict,
+and universally applicable.</p>
+
+<h2 id="why">Why you cannot just dereference</h2>
+
+<p>A pointer handed to you by a user program looks like an ordinary pointer, and dereferencing it looks like ordinary C. It is neither. That address is meaningful only in the calling process's address space, may point at nothing at all, and may have been chosen deliberately to attack you — which is why the kernel refuses to let you follow it directly.</p>
+
+<pre class="diagram">A user pointer is a number in a DIFFERENT address space, chosen
+by an untrusted program. Dereferencing it directly is wrong for
+four separate reasons:
+
+  1. IT MAY BE INVALID. Unmapped, freed, or never valid. In
+     user space that is a segfault for one process; in the
+     kernel it is an oops, and possibly a panic with a lock
+     still held.
+
+  2. IT MAY POINT AT KERNEL MEMORY. A caller passing
+     0xffff800008000000 to your ioctl is asking your privileged
+     code to read or write kernel memory on their behalf. This
+     is the confused deputy again - the same shape as the TEE
+     problem in isolation chapter 12, at a different boundary.
+
+  3. IT MAY NOT BE RESIDENT. The page may be swapped out or
+     not yet faulted in, so touching it requires SLEEPING to
+     fault it in - illegal in atomic context.
+
+  4. THE MAPPING MAY CHANGE. Another thread in the same process
+     can munmap or remap it while you work. Anything you check
+     and then re-read can differ.
+
+  So arm64 also enforces it in hardware: PAN (Privileged Access
+  Never, ARMv8.1) faults on ANY EL1 access to a user address
+  unless it is explicitly permitted. The accessor functions
+  toggle it; your stray dereference does not.
+
+  Which means the "just dereference it" bug does not silently
+  work on modern hardware - it faults immediately. That is a
+  kindness.</pre>
+
+<h2 id="api">The accessors</h2>
+
+<p>These are the functions that do it safely. Each one arranges for a fault on a bad address to be caught and reported as an error instead of crashing the kernel, which is exactly what a plain dereference cannot do.</p>
+
+<pre><code>#include &lt;linux/uaccess.h&gt;
+
+/* BULK - the workhorses. Return the number of bytes NOT
+   copied. Zero means success.                              */
+
+unsigned long copy_to_user(void __user *to, const void *from,
+                           unsigned long n);
+unsigned long copy_from_user(void *to, const void __user *from,
+                             unsigned long n);
+
+        if (copy_to_user(ubuf, kbuf, len))
+                return -EFAULT;         /* the ONLY idiom */
+
+/* NOT `if (copy_to_user(...) != 0)` and definitely not
+   `if (copy_to_user(...) < 0)` - the return is UNSIGNED, so a
+   `< 0` test is always false and your error handling never
+   runs.                                                    */
+
+/* SCALARS - faster, type-checked: */
+        get_user(x, uptr);              /* one value in  */
+        put_user(x, uptr);              /* one value out */
+        /* these return 0 or -EFAULT, so: */
+        if (get_user(val, (int __user *)arg))
+                return -EFAULT;
+
+/* STRINGS: */
+        strncpy_from_user(dst, src, count);   /* returns the
+                                                 length, or
+                                                 -EFAULT      */
+        strnlen_user(src, max);
+        /* or, better, let the kernel allocate: */
+        char *s = strndup_user(uptr, PATH_MAX);
+        if (IS_ERR(s))
+                return PTR_ERR(s);
+        ...
+        kfree(s);
+
+/* CLEARING: */
+        clear_user(uptr, n);
+
+/* CHECKING WITHOUT COPYING - rarely what you want: */
+        if (!access_ok(uptr, size))
+                return -EFAULT;
+/* access_ok only checks the address RANGE is plausibly user
+   space. It does NOT check the memory is mapped. Between the
+   check and the copy anything can change. The copy functions
+   do this check themselves, so calling access_ok separately is
+   almost always redundant - and relying on it INSTEAD of a
+   real copy is a bug.                                       */</code></pre>
+
+<div class="key">
+<b>The four rules</b>
+<ol>
+<li><strong>Never dereference a <code>__user</code> pointer.</strong> Only the accessors touch it.</li>
+<li><strong>Always check the return.</strong> A partial copy is a failure; return <code>-EFAULT</code>.</li>
+<li><strong>Only in process context.</strong> These functions can sleep — never in an interrupt, a softirq,
+or while holding a spinlock.</li>
+<li><strong>Copy once, then use only the copy.</strong> Re-reading user memory after validating it is the
+TOCTOU bug, and it is exploitable.</li>
+</ol>
+</div>
+
+<h2 id="toctou">The double-fetch bug</h2>
+
+<p>Here is a bug that looks impossible until you see it. If you copy the same value from user space twice — once to validate it, once to use it — another thread in that process can change it in between, so the value you checked is not the value you use.</p>
+
+<pre><code>/* WRONG - reads the same user memory twice: */
+static long my_ioctl(struct file *f, unsigned cmd, unsigned long arg)
+{
+        struct my_req __user *ureq = (void __user *)arg;
+        u32 len;
+
+        if (get_user(len, &amp;ureq-&gt;len))          /* fetch 1 */
+                return -EFAULT;
+        if (len &gt; MAX_LEN)
+                return -EINVAL;                 /* validated */
+
+        buf = kmalloc(len, GFP_KERNEL);
+
+        /* fetch 2 - another thread changed ureq->len in
+           between, and copy_from_user now copies MORE than
+           we allocated                                     */
+        if (copy_from_user(buf, ureq-&gt;data, ureq-&gt;len))
+                return -EFAULT;
+        ...
+}
+
+/* RIGHT - one copy, then work entirely from kernel memory: */
+static long my_ioctl(struct file *f, unsigned cmd, unsigned long arg)
+{
+        struct my_req req;
+        void *buf;
+
+        if (copy_from_user(&amp;req, (void __user *)arg, sizeof(req)))
+                return -EFAULT;         /* ONE fetch */
+
+        if (req.len &gt; MAX_LEN)
+                return -EINVAL;         /* validate the COPY */
+
+        buf = kmalloc(req.len, GFP_KERNEL);
+        if (!buf)
+                return -ENOMEM;
+
+        if (copy_from_user(buf, u64_to_user_ptr(req.data),
+                           req.len)) {  /* req.len is OURS now */
+                kfree(buf);
+                return -EFAULT;
+        }
+        ...
+}
+
+/* This is exactly the "copy in, then validate the copy" rule
+   from the TEE chapters. Same boundary problem, same fix,
+   different privilege levels.                              */</code></pre>
+
+<h2 id="leaks">Leaking kernel memory outward</h2>
+
+<p>Copying in the other direction has its own hazard, and it is quieter: instead of crashing, you silently hand the user memory they should never have seen. Uninitialised structure padding is the usual culprit, and it leaks whatever happened to be on the kernel stack.</p>
+
+<pre><code>/* The other direction is just as dangerous. Copying a struct
+   out copies its PADDING too - and padding contains whatever
+   was previously on the kernel stack.                      */
+
+struct my_info {
+        u8  type;       /* offset 0 */
+                        /* 3 BYTES OF PADDING */
+        u32 value;      /* offset 4 */
+        u16 flags;      /* offset 8 */
+                        /* 6 BYTES OF PADDING */
+        u64 timestamp;  /* offset 16 */
+};                      /* sizeof = 24, 9 bytes uninitialised */
+
+/* WRONG - leaks 9 bytes of stack: */
+        struct my_info info;
+        info.type = 1;
+        info.value = x;
+        info.flags = f;
+        info.timestamp = t;
+        if (copy_to_user(uptr, &amp;info, sizeof(info)))
+                return -EFAULT;
+
+/* RIGHT - zero it first: */
+        struct my_info info = { };        /* zeroes EVERYTHING,
+                                             padding included */
+        /* or: memset(&amp;info, 0, sizeof(info)); */
+
+/* THIS IS A REAL CVE CLASS. Kernel stack contents include
+   return addresses (defeating KASLR), pointers, and fragments
+   of other syscalls' data. Dozens of CVEs, year after year.
+
+   MITIGATIONS to know:
+     · `= { }` or memset on EVERY struct you copy out
+     · design UAPI structs with NO PADDING: order fields
+       largest-first, pad EXPLICITLY with reserved fields, and
+       make the size a multiple of 8
+     · CONFIG_INIT_STACK_ALL_ZERO=y - zero-initialises all
+       stack variables. Cheap on modern compilers. Turn it on.
+     · CONFIG_GCC_PLUGIN_STRUCTLEAK
+
+   And the explicit-padding version of the struct above: */
+
+struct my_info {
+        __u64 timestamp;        /* 8-byte fields first */
+        __u32 value;
+        __u16 flags;
+        __u8  type;
+        __u8  reserved;         /* explicit, and DOCUMENTED as
+                                   must-be-zero so it can be
+                                   used later                */
+};                              /* sizeof = 16, no holes */</code></pre>
+
+<h2 id="compat">32-bit callers on a 64-bit kernel</h2>
+
+<p>A 64-bit kernel must be able to serve 32-bit programs, and the two disagree about how big a pointer is and where structure members sit. Any interface that ignores this works perfectly until someone runs a 32-bit binary against it.</p>
+
+<pre><code>/* An arm64 kernel can run arm32 user space. Their struct
+   layouts differ, so a struct that works natively silently
+   mis-parses from a compat caller.                          */
+
+/* THE PROBLEM: */
+struct bad {
+        int      n;
+        void    *ptr;      /* 4 bytes on arm32, 8 on arm64 */
+        long     val;      /* likewise */
+};      /* different size AND different offsets */
+
+/* THE FIX - use fixed-width types in ALL uapi structs, and
+   __u64 for pointers: */
+struct good {
+        __u64 ptr;         /* always 8 bytes; convert with
+                              u64_to_user_ptr()             */
+        __u64 val;
+        __u32 n;
+        __u32 reserved;
+};      /* identical on 32- and 64-bit */
+
+        void __user *p = u64_to_user_ptr(req.ptr);
+
+/* If you cannot change the layout, provide a compat handler: */
+static const struct file_operations my_fops = {
+        .unlocked_ioctl = my_ioctl,
+        .compat_ioctl   = my_compat_ioctl,   /* or
+                                compat_ptr_ioctl if the only
+                                difference is pointer width */
+};
+
+/* compat_ptr_ioctl is the common case and handles it in one
+   line - use it whenever your structs are already
+   compat-clean.                                            */</code></pre>
+
+<div class="warn">
+<b>Design the UAPI struct as if it were permanent, because it is</b>
+<p>Fixed-width types, explicit reserved fields, no holes, no pointers-as-pointers, a size field or a version
+field. You get one chance: once a userspace program depends on the layout, "we do not break user space"
+means you are keeping it forever. <a href="lx-21-ioctl.html">Chapter 23</a> covers the interface design;
+this is the memory-layout half of the same decision.</p>
+</div>
+
+<h2 id="mmap">Sharing instead of copying</h2>
+
+<p>Sometimes the right answer is not to copy at all. For large or frequently-transferred buffers, mapping the same memory into the process is dramatically cheaper — <a href="lx-47-mmap-and-subsystems.html">chapter 31</a> shows how a driver actually implements it.</p>
+
+<pre><code>/* For large or high-rate data, copying is the bottleneck.
+   mmap() maps the buffer into user space so there is no copy
+   at all.                                                   */
+
+static int my_mmap(struct file *f, struct vm_area_struct *vma)
+{
+        struct my_dev *d = f-&gt;private_data;
+        unsigned long size = vma-&gt;vm_end - vma-&gt;vm_start;
+
+        /* 1. BOUNDS CHECK. The user chose the length. */
+        if (size &gt; d-&gt;buf_size)
+                return -EINVAL;
+        if (vma-&gt;vm_pgoff)              /* no offset support */
+                return -EINVAL;
+
+        /* 2. read-only if they should not write */
+        if (vma-&gt;vm_flags &amp; VM_WRITE)
+                return -EPERM;
+
+        /* 3. map it */
+        return dma_mmap_coherent(d-&gt;dev, vma, d-&gt;cpu_addr,
+                                 d-&gt;dma_addr, size);
+        /* or for ordinary kernel memory:
+             remap_pfn_range(vma, vma->vm_start,
+                             virt_to_phys(d->buf) >> PAGE_SHIFT,
+                             size, vma->vm_page_prot);        */
+}
+
+/* THE TRADE-OFF: no copy, but now user space can change the
+   buffer AT ANY TIME, including while your driver or a DMA
+   engine is reading it. Everything in the shared buffer is
+   untrusted, permanently - the same discipline as TEE shared
+   memory.
+
+   So: use mmap for BULK DATA, and keep CONTROL - indices,
+   lengths, commands - in ioctls where you can copy and
+   validate. That split is what chapter 36's project is
+   built around.                                            */</code></pre>
+
+<h2 id="checklist">The boundary checklist</h2>
+
+<div class="key">
+<b>For every ioctl, read, write and mmap handler</b>
+<ul>
+<li>Every user pointer is marked <code>__user</code>, and <code>sparse</code> is clean.</li>
+<li>Every copy's return value is checked, with <code>-EFAULT</code> on failure.</li>
+<li>Each field is fetched <strong>once</strong>; validation runs against the kernel copy.</li>
+<li>Sizes are validated <em>before</em> allocation, and the arithmetic cannot overflow.</li>
+<li>Structs copied out are zero-initialised.</li>
+<li>The UAPI layout is compat-clean: fixed-width types, no holes, no native pointers.</li>
+<li>Copies happen only in process context, never under a spinlock.</li>
+<li>Permissions are checked — <code>capable()</code>, file mode, or a device-node permission model.</li>
+<li>Error paths free everything they allocated.</li>
+<li>Shared (mmap'd) memory is treated as hostile on every read.</li>
+</ul>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Oops on a user address from kernel code</td><td>Direct dereference of a <code>__user</code> pointer — PAN caught it</td></tr>
+<tr><td>Error handling never triggers</td><td><code>if (copy_to_user(...) &lt; 0)</code> — the return is unsigned</td></tr>
+<tr><td><code>BUG: sleeping function called from invalid context</code> in a copy</td><td>Copying under a spinlock or in an interrupt</td></tr>
+<tr><td>Heap overflow reachable from an ioctl</td><td>Double fetch — the size changed between validation and use</td></tr>
+<tr><td>Userspace sees stale kernel data in unused fields</td><td>Struct padding not zeroed — an information leak</td></tr>
+<tr><td>Works for 64-bit programs, garbage for 32-bit</td><td>Missing <code>compat_ioctl</code>, or native types in the UAPI struct</td></tr>
+<tr><td><code>-EFAULT</code> from a valid-looking pointer</td><td>Address not mapped in that process, or the wrong process's address space</td></tr>
+<tr><td>mmap succeeds, then the kernel crashes</td><td>Size not bounds-checked against the real buffer</td></tr>
+<tr><td>Data corruption only under concurrent access</td><td>Trusting mmap'd memory that userspace is changing</td></tr>
+<tr><td>Sparse warns "incorrect type in argument"</td><td>A <code>__user</code>/kernel pointer mix-up — a real bug, not noise</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Give four reasons a user pointer cannot be dereferenced, and say what PAN does.</li>
+  <li>Write the correct idiom for <code>copy_to_user</code> and explain why <code>&lt; 0</code> is wrong.</li>
+  <li>Explain the double-fetch bug and rewrite a handler to avoid it.</li>
+  <li>Explain how struct padding leaks kernel memory and give three mitigations.</li>
+  <li>Design a UAPI struct that is compat-clean and hole-free.</li>
+  <li>Say when <code>compat_ptr_ioctl</code> is sufficient.</li>
+  <li>Write a bounds-checked <code>mmap</code> handler.</li>
+  <li>Explain why mmap'd memory must be treated as hostile, and how to split control from data.</li>
+  <li>Run the boundary checklist against a driver you have written.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

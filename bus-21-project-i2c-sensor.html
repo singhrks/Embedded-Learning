@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project: an I2C sensor driver, from datasheet to data | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Project: an I2C sensor driver, from datasheet to data</h1>
+<p class="lead">A complete production-quality driver for a real sensor: bus recovery, error counting,
+compensation arithmetic straight from the datasheet, and a state machine that never blocks. This is what the
+whole track has been for.</p>
+
+<h2 id="target">The target</h2>
+
+<pre class="diagram">   SENSOR: Bosch BME280 - temperature, pressure, humidity.
+   Chosen because it is cheap, ubiquitous, well documented,
+   and its compensation arithmetic is genuinely non-trivial
+   in an instructive way.
+
+   ADDRESS: 0x76 or 0x77, selected by the SDO pin.
+   INTERFACE: I2C (or SPI - the register map is identical,
+              which is common and worth noticing).
+
+   WHAT THE DRIVER DOES:
+     - recovers a stuck bus at startup (chapter 07)
+     - probes and verifies the chip ID
+     - reads factory calibration
+     - configures oversampling and filtering
+     - reads all three measurements in ONE burst
+     - applies the datasheet's compensation formulas
+     - counts every error class
+     - never blocks longer than one transaction timeout
+
+   WITHOUT HARDWARE: the compensation arithmetic can be
+   tested on a host with the datasheet's own worked example,
+   which Bosch provides precisely so you can validate an
+   implementation. That test is in the exercises and it is
+   worth doing first - it is the part most likely to be
+   subtly wrong.</pre>
+
+<h2 id="regs">Part 1: the register map</h2>
+
+<pre><code>/* bme280.h - straight from section 5.3 of the datasheet. */
+
+#define BME280_ADDR_LOW    0x76
+#define BME280_ADDR_HIGH   0x77
+#define BME280_CHIP_ID     0x60      /* the value, not a reg */
+
+#define REG_ID             0xD0
+#define REG_RESET          0xE0
+#define REG_CALIB00        0x88      /* 26 bytes            */
+#define REG_CALIB26        0xE1      /* 7 more bytes        */
+#define REG_CTRL_HUM       0xF2
+#define REG_STATUS         0xF3
+#define REG_CTRL_MEAS      0xF4
+#define REG_CONFIG         0xF5
+#define REG_PRESS_MSB      0xF7      /* start of the 8-byte
+                                        burst              */
+
+/* Calibration, as the datasheet names them. Signedness is
+   NOT uniform and getting one wrong gives readings that
+   look plausible and drift with temperature - the worst
+   kind of bug. Copy this table carefully.                 */
+typedef struct {
+    uint16_t T1;  int16_t T2, T3;
+    uint16_t P1;  int16_t P2, P3, P4, P5, P6, P7, P8, P9;
+    uint8_t  H1;  int16_t H2;  uint8_t H3;
+    int16_t  H4, H5;  int8_t H6;
+    int32_t  t_fine;          /* carries temperature into
+                                 the pressure and humidity
+                                 compensation - a shared
+                                 intermediate, and the
+                                 reason temperature must be
+                                 compensated FIRST         */
+} bme280_calib_t;
+
+typedef struct {
+    uint8_t          addr;
+    bme280_calib_t   cal;
+    struct {
+        uint32_t nack, timeout, recover, crc_range, ok;
+    } stats;
+} bme280_t;
+</code></pre>
+
+<h2 id="init">Part 2: probe and initialise</h2>
+
+<pre><code>int bme280_init(bme280_t *d)
+{
+    /* STEP 0: recover the bus BEFORE the first transaction.
+       If the MCU reset mid-read last time, SDA is stuck low
+       and nothing will work (chapter 07). This costs 100 us
+       and eliminates "only works after a power cycle".    */
+    i2c_bus_recover();
+
+    /* STEP 1: find it. Try both addresses rather than
+       assuming - the SDO pin may be strapped either way,
+       and this makes one driver work on two boards.       */
+    for (uint8_t a = BME280_ADDR_LOW; a &lt;= BME280_ADDR_HIGH; a++) {
+        uint8_t id;
+        if (i2c_read_regs(a, REG_ID, &amp;id, 1) == 0 &amp;&amp;
+            id == BME280_CHIP_ID) {
+            d-&gt;addr = a;
+            goto found;
+        }
+    }
+    return -ENODEV;        /* stop here. Nothing above this
+                              layer can work.              */
+found:
+
+    /* STEP 2: soft reset, then WAIT. The datasheet gives
+       2 ms; poll the status register rather than trusting
+       a fixed delay.                                       */
+    i2c_write_reg(d-&gt;addr, REG_RESET, 0xB6);
+    uint32_t deadline = g_ms + 10;
+    do {
+        uint8_t st;
+        if (i2c_read_regs(d-&gt;addr, REG_STATUS, &amp;st, 1) == 0 &amp;&amp;
+            !(st &amp; 0x01)) { break; }          /* not updating */
+        if ((int32_t)(g_ms - deadline) &gt;= 0) { return -ETIMEDOUT; }
+    } while (1);
+
+    /* STEP 3: calibration. Two non-contiguous blocks, and
+       the H4/H5 fields are packed across nibble boundaries -
+       a detail that is easy to get wrong and produces
+       humidity readings that are wildly off.               */
+    uint8_t c1[26], c2[7];
+    if (i2c_read_regs(d-&gt;addr, REG_CALIB00, c1, 26) &lt; 0) { return -EIO; }
+    if (i2c_read_regs(d-&gt;addr, REG_CALIB26, c2,  7) &lt; 0) { return -EIO; }
+
+    d-&gt;cal.T1 = (uint16_t)(c1[0]  | (c1[1]  &lt;&lt; 8));
+    d-&gt;cal.T2 = (int16_t) (c1[2]  | (c1[3]  &lt;&lt; 8));
+    d-&gt;cal.T3 = (int16_t) (c1[4]  | (c1[5]  &lt;&lt; 8));
+    d-&gt;cal.P1 = (uint16_t)(c1[6]  | (c1[7]  &lt;&lt; 8));
+    d-&gt;cal.P2 = (int16_t) (c1[8]  | (c1[9]  &lt;&lt; 8));
+    /* ... P3-P9 likewise ... */
+    d-&gt;cal.H1 = c1[25];
+    d-&gt;cal.H2 = (int16_t)(c2[0] | (c2[1] &lt;&lt; 8));
+    d-&gt;cal.H3 = c2[2];
+    /* THE PACKED PAIR: H4 is 12 bits split 8+4, H5 is 12
+       bits split 4+8, sharing byte c2[4].                  */
+    d-&gt;cal.H4 = (int16_t)((c2[3] &lt;&lt; 4) | (c2[4] &amp; 0x0F));
+    d-&gt;cal.H5 = (int16_t)((c2[5] &lt;&lt; 4) | (c2[4] &gt;&gt; 4));
+    d-&gt;cal.H6 = (int8_t)  c2[6];
+
+    /* STEP 4: configure. CTRL_HUM MUST be written BEFORE
+       CTRL_MEAS - the datasheet says so, and writing them
+       in the other order silently leaves humidity
+       oversampling at its previous value. A footnote that
+       costs an afternoon (chapter 18).                     */
+    i2c_write_reg(d-&gt;addr, REG_CTRL_HUM,  0x01);  /* x1 hum   */
+    i2c_write_reg(d-&gt;addr, REG_CONFIG,    0xA0);  /* 1s, IIR4 */
+    i2c_write_reg(d-&gt;addr, REG_CTRL_MEAS, 0x27);  /* x1,x1,
+                                                     normal   */
+    return 0;
+}
+</code></pre>
+
+<h2 id="read">Part 3: one burst, three measurements</h2>
+
+<pre><code>/* All eight data registers in ONE transaction. This is not
+   an optimisation - it is a CORRECTNESS requirement. The
+   sensor shadows its output registers during a burst, so
+   reading them separately can return values from two
+   different measurements: a temperature from one sample
+   and a pressure from the next.
+
+   The datasheet says so, and it is a general property of
+   sensors with multi-register values. Always read related
+   registers in one burst.                                 */
+
+int bme280_read(bme280_t *d, int32_t *temp_c100,
+                uint32_t *press_pa, uint32_t *hum_1024)
+{
+    uint8_t b[8];
+    int rc = i2c_read_regs(d-&gt;addr, REG_PRESS_MSB, b, 8);
+    if (rc == -ENXIO)     { d-&gt;stats.nack++;    return rc; }
+    if (rc == -ETIMEDOUT) { d-&gt;stats.timeout++;
+                            i2c_bus_recover();
+                            d-&gt;stats.recover++;  return rc; }
+    if (rc &lt; 0)           { return rc; }
+
+    /* 20-bit values, left-aligned in 3 bytes. */
+    int32_t adc_p = (int32_t)(((uint32_t)b[0] &lt;&lt; 12) |
+                              ((uint32_t)b[1] &lt;&lt; 4)  | (b[2] &gt;&gt; 4));
+    int32_t adc_t = (int32_t)(((uint32_t)b[3] &lt;&lt; 12) |
+                              ((uint32_t)b[4] &lt;&lt; 4)  | (b[5] &gt;&gt; 4));
+    int32_t adc_h = (int32_t)(((uint32_t)b[6] &lt;&lt; 8)  |  b[7]);
+
+    /* 0x80000 and 0x8000 are the "measurement skipped"
+       sentinels. Treating them as data gives you a
+       plausible-looking wrong answer.                     */
+    if (adc_t == 0x80000 || adc_p == 0x80000 || adc_h == 0x8000) {
+        d-&gt;stats.crc_range++;
+        return -EAGAIN;
+    }
+
+    *temp_c100 = bme280_compensate_t(&amp;d-&gt;cal, adc_t);  /* FIRST */
+    *press_pa  = bme280_compensate_p(&amp;d-&gt;cal, adc_p);
+    *hum_1024  = bme280_compensate_h(&amp;d-&gt;cal, adc_h);
+
+    /* Range check against the datasheet's specified limits.
+       A sensor that has come loose reads a value that is
+       numerically valid and physically impossible.        */
+    if (*temp_c100 &lt; -4000 || *temp_c100 &gt; 8500) {
+        d-&gt;stats.crc_range++;
+        return -ERANGE;
+    }
+
+    d-&gt;stats.ok++;
+    return 0;
+}
+
+/* INTEGER COMPENSATION, from datasheet section 4.2.3.
+   Fixed-point throughout: no float, so it runs on an M0.  */
+
+int32_t bme280_compensate_t(bme280_calib_t *c, int32_t adc_T)
+{
+    int32_t v1 = ((((adc_T &gt;&gt; 3) - ((int32_t)c-&gt;T1 &lt;&lt; 1))) *
+                  ((int32_t)c-&gt;T2)) &gt;&gt; 11;
+    int32_t v2 = (((((adc_T &gt;&gt; 4) - ((int32_t)c-&gt;T1)) *
+                    ((adc_T &gt;&gt; 4) - ((int32_t)c-&gt;T1))) &gt;&gt; 12) *
+                  ((int32_t)c-&gt;T3)) &gt;&gt; 14;
+    c-&gt;t_fine = v1 + v2;              /* SHARED - see below  */
+    return (c-&gt;t_fine * 5 + 128) &gt;&gt; 8;   /* 0.01 C units    */
+}
+
+uint32_t bme280_compensate_p(bme280_calib_t *c, int32_t adc_P)
+{
+    int64_t v1 = ((int64_t)c-&gt;t_fine) - 128000;   /* t_fine! */
+    int64_t v2 = v1 * v1 * (int64_t)c-&gt;P6;
+    v2 = v2 + ((v1 * (int64_t)c-&gt;P5) &lt;&lt; 17);
+    v2 = v2 + (((int64_t)c-&gt;P4) &lt;&lt; 35);
+    v1 = ((v1 * v1 * (int64_t)c-&gt;P3) &gt;&gt; 8) +
+         ((v1 * (int64_t)c-&gt;P2) &lt;&lt; 12);
+    v1 = (((((int64_t)1) &lt;&lt; 47) + v1)) * ((int64_t)c-&gt;P1) &gt;&gt; 33;
+
+    if (v1 == 0) { return 0; }        /* AVOID DIVIDE BY ZERO -
+                                         the datasheet's own
+                                         guard, and a real
+                                         possibility with
+                                         corrupt calibration */
+
+    int64_t p = 1048576 - adc_P;
+    p = (((p &lt;&lt; 31) - v2) * 3125) / v1;
+    v1 = (((int64_t)c-&gt;P9) * (p &gt;&gt; 13) * (p &gt;&gt; 13)) &gt;&gt; 25;
+    v2 = (((int64_t)c-&gt;P8) * p) &gt;&gt; 19;
+    p = ((p + v1 + v2) &gt;&gt; 8) + (((int64_t)c-&gt;P7) &lt;&lt; 4);
+    return (uint32_t)(p &gt;&gt; 8);        /* Pa                  */
+}
+
+/* NOTE t_fine: temperature compensation computes it, and
+   pressure and humidity both consume it. So temperature
+   MUST be compensated first, every cycle. Call them out of
+   order and pressure is wrong in a way that tracks
+   temperature - which looks like a sensor fault rather
+   than a software one.
+
+   NOTE the 64-bit arithmetic. On a Cortex-M0 without a
+   hardware divider this is genuinely expensive - hundreds
+   of cycles. Bosch also publishes a 32-bit version with
+   slightly reduced accuracy for exactly this reason.      */
+</code></pre>
+
+<h2 id="nonblocking">Part 4: never block</h2>
+
+<pre><code>/* The blocking version above is fine in an RTOS task. In a
+   superloop (mcu chapter 17) it must become a state
+   machine.                                                */
+
+typedef enum { S_IDLE, S_TRIGGER, S_WAIT, S_READ } st_t;
+
+void bme280_step(bme280_t *d)
+{
+    static st_t st = S_IDLE;
+    static uint32_t t0;
+
+    switch (st) {
+    case S_IDLE:
+        if ((int32_t)(g_ms - t0 - 1000) &lt; 0) { break; }
+        st = S_TRIGGER;
+        break;
+
+    case S_TRIGGER:
+        /* forced mode: one measurement, then sleep */
+        i2c_write_reg(d-&gt;addr, REG_CTRL_MEAS, 0x25);
+        t0 = g_ms;
+        st = S_WAIT;
+        break;
+
+    case S_WAIT:
+        /* Max measurement time from datasheet section 9.1,
+           for this oversampling: 9.3 ms. Use the DATASHEET
+           number, not a guess.                            */
+        if ((int32_t)(g_ms - t0 - 10) &gt;= 0) { st = S_READ; }
+        break;
+
+    case S_READ: {
+        int32_t t; uint32_t p, h;
+        if (bme280_read(d, &amp;t, &amp;p, &amp;h) == 0) {
+            publish(t, p, h);
+        }
+        t0 = g_ms;
+        st = S_IDLE;
+        break;
+    }
+    }
+}
+
+/* FORCED MODE rather than normal mode is the right default
+   for a battery device: the sensor measures once and
+   returns to sleep at 0.1 uA, instead of free-running.
+   Combined with the MCU sleeping between measurements
+   (mcu chapter 13), the whole system draws microamps
+   between samples.                                        */
+</code></pre>
+
+<h2 id="exercises">Exercises</h2>
+
+<ul>
+  <li><strong>Validate the compensation on a host first.</strong> Bosch's datasheet gives a worked example with
+  known calibration constants and raw values. Compile the compensation functions for your PC and check them
+  against it before touching hardware — this separates arithmetic bugs from bus bugs completely.</li>
+  <li><strong>Break the bus deliberately.</strong> Reset the MCU mid-read with a debugger. Confirm the bus is
+  stuck, then confirm your recovery frees it.</li>
+  <li><strong>Read the registers separately</strong> instead of in one burst, then heat the sensor while
+  changing pressure, and look for the inconsistent pairs.</li>
+  <li><strong>Capture a transaction</strong> with a logic analyser (chapter 20) and hand-decode the address,
+  register and data against the datasheet.</li>
+  <li><strong>Remove the pull-ups</strong> and observe the edges on a scope; then fit 10 kΩ and try 400 kHz
+  (chapter 07).</li>
+  <li><strong>Port it to SPI.</strong> The register map is identical; only the transport changes. Structure the
+  driver so this is a 30-line change — that separation is the point.</li>
+  <li><strong>Add a second sensor</strong> at the other address and confirm both work on one bus.</li>
+</ul>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Chip ID read fails</td><td>Wrong address, unpowered, or a stuck bus — run recovery first</td></tr>
+<tr><td>Temperature plausible, pressure wildly wrong</td><td>Compensation called out of order;
+<code>t_fine</code> is stale</td></tr>
+<tr><td>Humidity wildly wrong</td><td>H4/H5 nibble packing decoded incorrectly</td></tr>
+<tr><td>Readings drift with temperature in a way the sensor should correct</td><td>A calibration constant's
+signedness is wrong</td></tr>
+<tr><td>Humidity oversampling has no effect</td><td><code>CTRL_HUM</code> written after
+<code>CTRL_MEAS</code></td></tr>
+<tr><td>Occasional mismatched temperature and pressure</td><td>Registers read separately rather than in one
+burst</td></tr>
+<tr><td>Reads 0x80000 sometimes</td><td>Measurement skipped or not ready — treat as a sentinel, not
+data</td></tr>
+<tr><td>Divide-by-zero fault</td><td>Corrupt calibration data; keep the datasheet's guard</td></tr>
+<tr><td>Works after power cycle only</td><td>No bus recovery at startup</td></tr>
+<tr><td>Very slow on a Cortex-M0</td><td>64-bit compensation without a hardware divider — use the 32-bit
+variant</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why bus recovery runs before the first transaction, not after the first failure.</li>
+  <li>Say why the driver probes both possible addresses.</li>
+  <li>Explain why related registers must be read in one burst.</li>
+  <li>Explain what <code>t_fine</code> is and the ordering constraint it imposes.</li>
+  <li>Describe the H4/H5 packing and why it is easy to get wrong.</li>
+  <li>Say why <code>CTRL_HUM</code> must be written before <code>CTRL_MEAS</code>.</li>
+  <li>Explain the role of the 0x80000 sentinel value.</li>
+  <li>Justify keeping the divide-by-zero guard from the datasheet.</li>
+  <li>Explain why forced mode suits a battery device.</li>
+  <li>Say how you would validate the compensation arithmetic without any hardware.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

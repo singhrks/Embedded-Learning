@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtualisation, containers and isolation | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Virtualisation, containers and isolation</h1>
+<p class="lead">Three different answers to "run this workload without letting it interfere with that one" —
+with three very different isolation strengths and costs. This chapter closes the OS track by making the
+trade-off explicit.</p>
+
+<h2 id="spectrum">The isolation spectrum</h2>
+
+<p>"Virtualisation" covers techniques from full machine emulation to little more than a directory change. Placing them on a spectrum of isolation versus overhead is what makes the choice between them rational.</p>
+
+<pre class="diagram">weaker isolation, lower cost ──────────► stronger, higher cost
+
+  process        namespace/       VM              separate
+                 container                        hardware
+  ┌──────┐      ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ MMU  │      │ MMU +    │    │ MMU +    │    │ physical │
+  │ page │      │ kernel   │    │ 2-stage  │    │ air gap  │
+  │tables│      │ namespaces│   │ + EL2    │    │          │
+  └──────┘      └──────────┘    └──────────┘    └──────────┘
+  shared         SHARED          own kernel      own everything
+  kernel         KERNEL          shared hardware
+
+  attack surface: the shared component
+  ~30M lines      ~30M lines      ~50K lines      none
+  (the kernel)    (the kernel)    (hypervisor)
+
+The whole argument between containers and VMs is that middle row:
+a container escape needs one kernel bug; a VM escape needs a
+hypervisor bug, and there is far less hypervisor to get wrong.</pre>
+
+<h2 id="vm">Virtual machines</h2>
+
+<p>A virtual machine gives a guest operating system the illusion of owning hardware. What makes that both possible and efficient is hardware support that traps exactly the operations that would break the illusion.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Type</th><th>Runs on</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td><strong>Type 1</strong> (bare metal)</td><td>Directly on hardware</td><td>Xen, Hyper-V, ESXi, Jailhouse, Hafnium</td></tr>
+<tr><td><strong>Type 2</strong> (hosted)</td><td>On a host OS</td><td>VirtualBox, VMware Workstation, QEMU/TCG</td></tr>
+<tr><td><strong>Hybrid</strong></td><td>A host kernel module <em>becomes</em> the hypervisor</td><td><strong>KVM</strong> — Linux is both host OS and Type 1 hypervisor</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">The three things a hypervisor must virtualise:
+
+  CPU     the guest kernel expects to run privileged instructions.
+          Modern hardware makes this cheap: the guest runs at EL1
+          natively, and only "sensitive" operations TRAP to EL2.
+          (ARM VHE, Intel VT-x, AMD-V)
+
+  MEMORY  the guest believes it owns physical memory. A SECOND
+          translation stage maps guest-physical (IPA) to real
+          physical, owned by the hypervisor and unchangeable by
+          the guest.
+              guest VA ─[stage 1, guest]─► IPA ─[stage 2, HV]─► PA
+          ARM chapter 16 covers the mechanics.
+
+  I/O     the guest programs devices that do not exist.
+          Either emulate them, paravirtualise them, or hand over
+          a real one (below).</pre>
+
+<h3>How a trap works</h3>
+
+<pre><code>/* The guest kernel writes to what it believes is a UART register. */
+
+        writel(1, uart_base + UART_CR);      /* guest, at EL1 */
+
+/* 1. stage-1 translation: guest VA → IPA, using the guest's own
+      page tables. Succeeds — the guest mapped it.
+   2. stage-2 lookup of that IPA in VTTBR_EL2. The hypervisor
+      deliberately left it UNMAPPED.
+   3. stage-2 data abort → taken to EL2, not EL1.
+   4. the hypervisor reads:
+          HPFAR_EL2   the faulting IPA — which device register
+          ESR_EL2.ISS ISV/SAS/SRT/WnR — size, direction, and which
+                      guest register held the value
+   5. it emulates the UART in software and updates its model.
+   6. it advances the guest's ELR_EL2 past the faulting
+      instruction and ERETs.
+
+   The guest never knows. This is exactly how QEMU/KVM presents
+   virtual hardware — and why emulated I/O is slow: every register
+   access is a full world switch.                             */</code></pre>
+
+<h2 id="io">Three ways to give a VM I/O</h2>
+
+<p>Giving a guest access to devices is the hardest part of virtualisation, and there are three approaches with very different performance and isolation characteristics.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Approach</th><th>Mechanism</th><th>Cost</th><th>Guest needs</th></tr></thead>
+<tbody>
+<tr><td><strong>Full emulation</strong></td><td>Trap every register access; emulate a real device (e1000, IDE)</td><td>Very high — a trap per access</td><td>Nothing; stock drivers work</td></tr>
+<tr><td><strong>Paravirtualisation</strong></td><td><code>virtio</code>: a shared-memory ring plus a doorbell</td><td>Low — batched, few exits</td><td>A virtio driver</td></tr>
+<tr><td><strong>Passthrough</strong></td><td>Assign the real device to the guest via the IOMMU</td><td>Near zero</td><td>The real driver; the device is exclusive</td></tr>
+<tr><td><strong>SR-IOV</strong></td><td>The device presents multiple virtual functions, one per guest</td><td>Near zero</td><td>Device support</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="diagram">virtio is the same design as io_uring and every high-performance
+IPC (OS chapter 08):
+
+   guest driver                        host / device backend
+   ┌──────────────┐                   ┌──────────────────┐
+   │ available    │──── shared ───────│  reads requests  │
+   │   ring       │     memory        │                  │
+   │ used ring    │◄──────────────────│  writes results  │
+   └──────┬───────┘                   └────────▲─────────┘
+          │ doorbell: ONE MMIO write            │ interrupt
+          │ per BATCH, not per request          │ (or polling)
+          └─────────────────────────────────────┘
+
+  Bulk data by shared memory; exits only when the peer needs
+  waking. Recognise this shape — it is the answer to nearly every
+  "cross a boundary at high rate" problem in systems design.</pre>
+
+<div class="danger">
+<b>Passthrough requires an IOMMU, without exception</b>
+<p>A device assigned to a guest is programmed by the guest with <em>guest-physical</em> addresses. Without an
+IOMMU translating and constraining its DMA, the device would write those addresses as real physical addresses
+— scribbling over the host or another guest. The IOMMU's stage-2 translation is what makes passthrough safe,
+and it is the single most important reason the SMMU exists. Covered fully in the
+<a href="track.html?t=sec">security track</a>.</p>
+</div>
+
+<h2 id="containers">Containers</h2>
+
+<div class="key">
+<b>A container is not a thing</b>
+<p>There is no container object in the Linux kernel. A "container" is an ordinary process started with a
+particular combination of <strong>namespaces</strong> (what it can see), <strong>cgroups</strong> (what it can
+use) and <strong>capabilities/seccomp/LSM</strong> (what it can do). Docker and Podman are tools that assemble
+that combination; the kernel only sees processes.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Namespace</th><th>Isolates</th></tr></thead>
+<tbody>
+<tr><td><code>mnt</code></td><td>The mount table — its own filesystem view</td></tr>
+<tr><td><code>pid</code></td><td>Process IDs — the container's init is PID 1, and it cannot see host processes</td></tr>
+<tr><td><code>net</code></td><td>Interfaces, routes, firewall rules, ports</td></tr>
+<tr><td><code>uts</code></td><td>Hostname and domain name</td></tr>
+<tr><td><code>ipc</code></td><td>System V IPC and POSIX message queues</td></tr>
+<tr><td><code>user</code></td><td>UID/GID mapping — root inside, unprivileged outside. <strong>The one that makes rootless containers possible.</strong></td></tr>
+<tr><td><code>cgroup</code></td><td>The cgroup hierarchy view</td></tr>
+<tr><td><code>time</code></td><td>Boot and monotonic clock offsets</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code># build one by hand — this IS a container
+sudo unshare --pid --net --mount --uts --ipc --fork --mount-proc \
+     chroot /path/to/rootfs /bin/sh
+
+# inspect any process's namespaces
+ls -l /proc/self/ns/
+readlink /proc/1/ns/net /proc/$$/ns/net    # same link = same namespace
+
+nsenter -t PID -n -m -p /bin/sh            # join an existing one</code></pre>
+
+<pre><code># cgroups v2 — the resource half
+mkdir /sys/fs/cgroup/myapp
+echo $$              &gt; /sys/fs/cgroup/myapp/cgroup.procs
+echo "200000 1000000" &gt; /sys/fs/cgroup/myapp/cpu.max     # 20% of one CPU
+echo 512M            &gt; /sys/fs/cgroup/myapp/memory.max
+echo "259:0 rbps=10485760" &gt; /sys/fs/cgroup/myapp/io.max
+
+cat /sys/fs/cgroup/myapp/memory.current
+cat /sys/fs/cgroup/myapp/memory.events     # oom_kill counter
+cat /sys/fs/cgroup/myapp/cpu.stat          # throttling counters</code></pre>
+
+<div class="warn">
+<b>The container is still using the host kernel</b>
+<p><code>uname -r</code> inside a container reports the <em>host's</em> kernel. Consequences that surprise
+people constantly:</p>
+<ul>
+<li>A kernel exploit escapes the container. This is the entire isolation argument against containers for
+untrusted workloads.</li>
+<li>Kernel modules, <code>sysctl</code> settings and the clock are shared or host-controlled.</li>
+<li><code>/proc/cpuinfo</code> and <code>free</code> show <strong>host</strong> values, not the cgroup limit
+— which is why JVMs and thread pools historically sized themselves for 64 cores inside a 2-core container.
+Modern runtimes read the cgroup files; older code and hand-rolled <code>nproc</code> logic do not.</li>
+</ul>
+</div>
+
+<h2 id="hardening">Narrowing what a container can do</h2>
+
+<p>Isolation is only as good as the boundary, and a hypervisor's attack surface is larger than it first appears. These are the measures that actually reduce it.</p>
+
+<pre><code>/* Namespaces isolate what you SEE. These restrict what you can DO. */
+
+/* 1. Capabilities — split root's power into ~40 pieces */
+capsh --print
+docker run --cap-drop=ALL --cap-add=NET_BIND_SERVICE ...
+/* CAP_SYS_ADMIN is so broad it is effectively root — never grant it */
+
+/* 2. seccomp — filter system calls with a BPF program */
+docker run --security-opt seccomp=profile.json ...
+/* Docker's default profile blocks ~44 syscalls. A tight custom
+   profile is one of the highest-value hardening steps available. */
+
+/* 3. LSM — SELinux or AppArmor mandatory access control */
+
+/* 4. no_new_privs — setuid binaries cannot regain privilege */
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+/* 5. USER NAMESPACES — root in the container maps to an
+      unprivileged host UID. Even a container escape lands as
+      nobody. This is the strongest single control, and what
+      rootless Podman is built on.                            */
+podman run --userns=keep-id ...</code></pre>
+
+<h2 id="middle">The middle ground</h2>
+
+<p>Between full virtual machines and plain processes sit several designs offering most of the isolation for a fraction of the overhead — which is where much of the industry has settled.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Technology</th><th>Idea</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>Kata Containers</strong></td><td>Each container runs in a lightweight VM</td><td>Container UX, VM isolation; ~100 ms extra startup</td></tr>
+<tr><td><strong>Firecracker</strong></td><td>A minimal VMM — ~50 K lines, five emulated devices</td><td>~125 ms boot, ~5 MB overhead. Powers AWS Lambda.</td></tr>
+<tr><td><strong>gVisor</strong></td><td>A user-space kernel intercepting syscalls</td><td>Small kernel attack surface; syscall overhead and imperfect compatibility</td></tr>
+<tr><td><strong>WebAssembly</strong></td><td>A sandboxed bytecode VM with capability-based I/O (WASI)</td><td>Microsecond startup, tiny images; a restricted programming model</td></tr>
+<tr><td><strong>Unikernel</strong></td><td>The application linked with only the OS functions it needs</td><td>Minimal surface, fast boot; hard to debug and operate</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="embedded">Virtualisation in embedded systems</h2>
+
+<p>Virtualisation in embedded systems serves a different purpose from the cloud: not packing many workloads onto one machine, but keeping a safety-critical function isolated from a rich but untrusted one.</p>
+
+<pre class="diagram">Not a cloud technology — increasingly standard in vehicles and
+industrial equipment, for CONSOLIDATION and MIXED CRITICALITY.
+
+   one SoC, previously several ECUs:
+
+   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+   │ Instrument   │ │ Infotainment │ │  Safety      │
+   │ cluster      │ │              │ │  functions   │
+   │ (RTOS, ASIL) │ │ (Android)    │ │ (AUTOSAR)    │
+   └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+   ┌──────▼────────────────▼────────────────▼───────┐
+   │  Type-1 hypervisor  (Jailhouse, Xen, QNX HV,   │
+   │                      Hafnium at S-EL2)          │
+   └────────────────────────┬───────────────────────┘
+                            ▼
+                    one multi-core SoC
+
+  Requirements that differ from cloud virtualisation:
+    · STATIC partitioning — cores, memory and devices assigned at
+      build time, not scheduled dynamically
+    · bounded interference: cache partitioning, memory bandwidth
+      regulation. Logical isolation is not enough when guests
+      share a DRAM controller (OS chapter 19).
+    · certification evidence for the hypervisor itself
+    · fast boot: the instrument cluster must display within ~2 s
+
+  Jailhouse is the clearest example: it does NOT schedule at all.
+  It statically partitions the machine and then gets out of the
+  way, which makes its worst-case behaviour analysable.</pre>
+
+<h2 id="cost">What each approach costs</h2>
+
+<p>Each approach has a measurable overhead, and the figures are frequently assumed rather than checked. These are the actual costs, and which dominates depends on the workload.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Process</th><th>Container</th><th>VM</th><th>Unikernel</th></tr></thead>
+<tbody>
+<tr><td>Startup</td><td>~1 ms</td><td>~50–500 ms</td><td>~1–30 s (Firecracker ~125 ms)</td><td>~10 ms</td></tr>
+<tr><td>Memory overhead</td><td>None</td><td>Negligible</td><td>Guest kernel + VMM, ~100 MB+</td><td>~1–10 MB</td></tr>
+<tr><td>CPU overhead</td><td>None</td><td>Negligible</td><td>2–10%, more with emulated I/O</td><td>Low</td></tr>
+<tr><td>Isolation strength</td><td>MMU only</td><td>Kernel-enforced; shared kernel</td><td><strong>Hardware-enforced</strong></td><td>Hypervisor-enforced</td></tr>
+<tr><td>Different OS?</td><td>No</td><td>No — same kernel</td><td><strong>Yes</strong></td><td>N/A</td></tr>
+<tr><td>Density</td><td>Thousands</td><td>Hundreds</td><td>Tens</td><td>Hundreds</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>App sees 64 CPUs inside a 2-CPU container</td><td><code>/proc/cpuinfo</code> is not namespaced; read the cgroup limits</td></tr>
+<tr><td>Container OOM-killed with free host memory</td><td>The cgroup limit, not machine memory</td></tr>
+<tr><td>Container CPU throttled at low utilisation</td><td><code>cpu.max</code> quota exhausted within the period; check <code>cpu.stat</code></td></tr>
+<tr><td>Emulated network in a VM is very slow</td><td>Full device emulation; switch to virtio</td></tr>
+<tr><td>Passthrough device fails to attach</td><td>No IOMMU enabled, or the device shares an IOMMU group</td></tr>
+<tr><td>Guest crashes only under memory pressure</td><td>Host overcommit and ballooning</td></tr>
+<tr><td><code>uname -r</code> in a container shows the host kernel</td><td>Correct — containers share the kernel</td></tr>
+<tr><td>Container escape via a kernel bug</td><td>The shared-kernel trade-off; use a VM for untrusted code</td></tr>
+<tr><td>RT guest misses deadlines despite dedicated cores</td><td>Shared memory bandwidth or cache; needs partitioning</td></tr>
+<tr><td>Nested virtualisation is very slow</td><td>Each level multiplies trap cost</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Order process, container and VM isolation by strength and name the shared component in each.</li>
+  <li>Name the three things a hypervisor must virtualise and how each is done on ARM.</li>
+  <li>Walk through a trapped MMIO access from guest instruction to <code>ERET</code>.</li>
+  <li>Compare emulation, paravirtualisation and passthrough on cost and guest requirements.</li>
+  <li>Explain why passthrough requires an IOMMU.</li>
+  <li>Explain what a container actually is in kernel terms.</li>
+  <li>Name five namespaces and what each isolates.</li>
+  <li>Give three consequences of containers sharing the host kernel.</li>
+  <li>Say why embedded virtualisation favours static partitioning.</li>
+</ul>
+
+<hr>
+
+<div class="tip">
+<b>Track complete</b>
+<p>That closes the operating systems track: what an OS is, kernel architectures, system calls, processes and
+threads, scheduling and context switching, IPC, synchronisation and deadlock, memory management and paging,
+filesystems and storage, the I/O subsystem, interrupts and time, boot, real-time, and virtualisation.</p>
+<p>Next is <a href="track.html?t=arm">the ARM architecture track</a> — 35 chapters taking the concepts from
+computer architecture and operating systems down to the actual registers, page table descriptors, barriers and
+exception vectors of a real machine.</p>
+</div>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

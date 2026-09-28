@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Designing an ioctl interface | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Designing an ioctl interface</h1>
+<p class="lead">read() and write() move bytes. An ioctl is everything else — configure, query, control — and
+because it becomes part of the user-facing ABI the moment it ships, it deserves more care than any other
+part of a driver.</p>
+
+<h2 id="encoding">Encoding a request number</h2>
+
+<p>An ioctl request is not just a number you pick. It packs together the direction of the transfer, the size of the argument and an identifier for your driver, so that the kernel can catch a program calling the wrong driver's ioctl instead of quietly corrupting memory.</p>
+
+<pre><code>#include &lt;linux/ioctl.h&gt;
+
+/* NEVER a bare integer. The encoding macros pack DIRECTION,
+   SIZE and TYPE into the number, which is what lets the
+   kernel validate calls generically and what lets tools like
+   strace decode them without your driver's headers.        */
+
+#define MYDEV_MAGIC  'k'                /* pick something
+                                           unused - see
+                                           Documentation/
+                                           userspace-api/
+                                           ioctl/ioctl-number.rst */
+
+struct mydev_config {
+        __u32  sample_rate_hz;
+        __u32  channel_mask;
+        __u8   gain;
+        __u8   _pad[3];                 /* EXPLICIT padding -
+                                           see below           */
+};
+
+#define MYDEV_GET_CONFIG   _IOR(MYDEV_MAGIC, 1, struct mydev_config)
+#define MYDEV_SET_CONFIG   _IOW(MYDEV_MAGIC, 2, struct mydev_config)
+#define MYDEV_RESET        _IO (MYDEV_MAGIC, 3)
+#define MYDEV_XFER         _IOWR(MYDEV_MAGIC, 4, struct mydev_xfer)
+
+/* _IO    no data transferred
+   _IOR   kernel -&gt; user  (a "get")
+   _IOW   user -&gt; kernel  (a "set")
+   _IOWR  both
+
+   These are NAMES for humans; nothing enforces that _IOR
+   actually only reads. But get it right anyway - strace and
+   generic ioctl tracers use it to know which direction to
+   dump.                                                     */</code></pre>
+
+<div class="danger">
+<b>The struct is a permanent ABI</b>
+<p>Once a binary in the field calls <code>MYDEV_SET_CONFIG</code> with this struct layout, that layout is
+frozen forever. Pad explicitly — never rely on the compiler's implicit padding, which can differ between
+32-bit and 64-bit builds of the <em>same</em> struct. Use fixed-width types (<code>__u32</code>, not
+<code>int</code> or <code>unsigned long</code>) so the size does not change with the architecture. And leave
+room: reserved fields cost nothing today and save you from ever needing
+<code>MYDEV_SET_CONFIG_V2</code>.</p>
+</div>
+
+<h2 id="handler">The handler</h2>
+
+<p>The handler is a switch statement, and the interesting part is everything around it: validating the command, copying the argument safely, and returning the right error for a request you do not recognise.</p>
+
+<pre><code>static long mydev_ioctl(struct file *file, unsigned int cmd,
+                        unsigned long arg)
+{
+        struct mydev_session *s = file-&gt;private_data;
+        struct mydev *d = s-&gt;dev;
+        void __user *uarg = (void __user *)arg;
+        struct mydev_config cfg;
+        int ret;
+
+        switch (cmd) {
+        case MYDEV_GET_CONFIG:
+                mutex_lock(&amp;d-&gt;lock);
+                cfg = d-&gt;config;
+                mutex_unlock(&amp;d-&gt;lock);
+
+                if (copy_to_user(uarg, &amp;cfg, sizeof(cfg)))
+                        return -EFAULT;
+                return 0;
+
+        case MYDEV_SET_CONFIG:
+                if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                        return -EBADF;    /* a read-only fd may
+                                             not configure it   */
+
+                if (copy_from_user(&amp;cfg, uarg, sizeof(cfg)))
+                        return -EFAULT;
+
+                /* VALIDATE EVERYTHING. This struct came from
+                   userspace and userspace is the attacker.   */
+                if (cfg.sample_rate_hz == 0 ||
+                    cfg.sample_rate_hz &gt; MYDEV_MAX_RATE)
+                        return -EINVAL;
+                if (cfg.channel_mask &amp; ~MYDEV_VALID_CHANNELS)
+                        return -EINVAL;
+                if (cfg.gain &gt; MYDEV_MAX_GAIN)
+                        return -EINVAL;
+
+                mutex_lock(&amp;d-&gt;lock);
+                ret = mydev_apply_config(d, &amp;cfg);
+                if (!ret)
+                        d-&gt;config = cfg;
+                mutex_unlock(&amp;d-&gt;lock);
+                return ret;
+
+        case MYDEV_RESET:
+                if (!(file-&gt;f_mode &amp; FMODE_WRITE))
+                        return -EBADF;
+                return mydev_hw_reset(d);
+
+        default:
+                return -ENOTTY;          /* THE conventional
+                                             "no such ioctl",
+                                             not -EINVAL       */
+        }
+}</code></pre>
+
+<div class="key">
+<b>Five rules, in order of how often they are violated</b>
+<ol>
+<li><strong>Validate every field.</strong> Range, mask, size — the struct crossed a trust boundary.</li>
+<li><strong>Check <code>f_mode</code></strong> for anything that changes state.</li>
+<li><strong>Use <code>copy_to_user</code>/<code>copy_from_user</code>, never a direct dereference</strong> of
+a user pointer (<a href="lx-08-user-copy.html">chapter 09</a>).</li>
+<li><strong>Return <code>-ENOTTY</code> for an unknown command</strong>, so a program can probe for
+support.</li>
+<li><strong>Never trust a size or count field to bound a copy</strong> without an upper limit check first —
+that is a remotely-triggered <code>kmalloc(attacker_controlled)</code>.</li>
+</ol>
+</div>
+
+<h2 id="variable">Variable-length transfers</h2>
+
+<p>Fixed-size structures cover most cases, but sometimes the caller needs to pass an array whose length it chooses. Doing that safely requires care, because the size now comes from user space and is therefore untrusted.</p>
+
+<pre><code>/* A common and commonly wrong pattern: a struct that carries a
+   pointer and a count, for a buffer of user-chosen size.    */
+
+struct mydev_xfer {
+        __u64  buf;              /* NOT a pointer type - see
+                                    below */
+        __u32  len;
+        __u32  flags;
+};
+
+static long mydev_xfer_ioctl(struct mydev *d, unsigned long arg)
+{
+        struct mydev_xfer x;
+        void __user *ubuf;
+        void *kbuf;
+        int ret;
+
+        if (copy_from_user(&amp;x, (void __user *)arg, sizeof(x)))
+                return -EFAULT;
+
+        /* BOUND IT before allocating. Without this, a
+           malicious len of 0xFFFFFFFF either fails an
+           allocation harmlessly, or - on a kernel without
+           kmalloc's internal limits - is a resource
+           exhaustion vector. Always cap explicitly.        */
+        if (x.len == 0 || x.len &gt; MYDEV_MAX_XFER)
+                return -EINVAL;
+
+        kbuf = kmalloc(x.len, GFP_KERNEL);
+        if (!kbuf)
+                return -ENOMEM;
+
+        ubuf = u64_to_user_ptr(x.buf);   /* the CORRECT cast -
+                                            see below          */
+
+        if (x.flags &amp; MYDEV_XFER_WRITE) {
+                if (copy_from_user(kbuf, ubuf, x.len)) {
+                        ret = -EFAULT;
+                        goto out;
+                }
+                ret = mydev_hw_write(d, kbuf, x.len);
+        } else {
+                ret = mydev_hw_read(d, kbuf, x.len);
+                if (!ret &amp;&amp; copy_to_user(ubuf, kbuf, x.len))
+                        ret = -EFAULT;
+        }
+
+out:
+        kfree(kbuf);
+        return ret;
+}
+
+/* WHY __u64 buf, not a pointer field:
+
+   A struct with a real pointer member has a DIFFERENT SIZE
+   and LAYOUT on a 32-bit process running on a 64-bit kernel
+   (compat mode) versus a native 64-bit process. __u64 is the
+   same size everywhere, and u64_to_user_ptr() does the
+   sign-correct, warning-free cast:
+
+        #define u64_to_user_ptr(x) ( \
+                (void __user *)(uintptr_t)(x) )
+
+   This single choice is what saves you from writing a
+   .compat_ioctl handler at all (see below).                */</code></pre>
+
+<h2 id="compat">32-bit compatibility</h2>
+
+<p>If a 32-bit program calls your ioctl on a 64-bit kernel, the structure it passes is laid out differently from the one your driver expects. There is a straightforward way to avoid the problem entirely, and a much less pleasant way to fix it after the fact.</p>
+
+<pre><code>/* If a 32-bit binary can ever run on this kernel - and on
+   arm64 that is common - a struct containing a real pointer
+   or a `long` has a DIFFERENT layout when called from that
+   32-bit process. Without a compat handler, SET_CONFIG from a
+   32-bit program corrupts the kernel's read of the struct.  */
+
+static const struct file_operations mydev_fops = {
+        .unlocked_ioctl = mydev_ioctl,
+        .compat_ioctl   = compat_ptr_ioctl,   /* the escape
+                                                 hatch, below */
+};
+
+/* compat_ptr_ioctl() is a generic helper that works AS LONG
+   AS your structs contain no raw pointers or `long` fields -
+   exactly the discipline the __u64/__u32-only design above
+   already gives you. It converts the compat pointer and calls
+   your normal handler. No second implementation needed.
+
+/* If you cannot avoid a pointer-shaped field (rare, and
+   usually a sign to redesign), you need a REAL compat
+   handler with a parallel struct and explicit translation.
+   Avoid that path; it doubles your maintenance burden and is
+   a frequent source of security bugs in real drivers.       */</code></pre>
+
+<h2 id="alt">Consider not using ioctl at all</h2>
+
+<p>A bespoke ioctl is the most flexible interface available and, for that same reason, usually the wrong
+default: Linux already has a standard, subsystem-backed ABI for most needs a driver author reaches for ioctl
+to solve, and reusing it means generic tools already know how to use your device without reading your header
+file first.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Need</th><th>Better than a custom ioctl</th></tr></thead>
+<tbody>
+<tr><td>A simple scalar setting</td><td>A sysfs attribute (<a href="lx-22-sysfs-debugfs.html">chapter 25</a>) — discoverable, self-documenting, one <code>cat</code>/<code>echo</code></td></tr>
+<tr><td>Streaming samples</td><td><code>read()</code>, or a subsystem with its own buffering (IIO, V4L2)</td></tr>
+<tr><td>Asynchronous events</td><td><code>poll()</code> plus <code>read()</code>, or <code>uevent</code></td></tr>
+<tr><td>A sensor, ADC, DAC</td><td>The IIO subsystem — a whole ABI already exists</td></tr>
+<tr><td>Temperature, voltage, fan</td><td>hwmon</td></tr>
+<tr><td>A structured, extensible protocol</td><td>Netlink — versioned, introspectable, used by real subsystems</td></tr>
+<tr><td>Something genuinely device-specific and complex</td><td>ioctl — the right tool, sometimes</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>An ioctl interface is invisible to generic tools, undiscoverable without your header, and — once shipped —
+permanent. Every one of the alternatives above is inspectable with tools that already exist. Reach for ioctl
+last, after checking whether a subsystem already solves your problem (<a href="lx-17-device-model.html">chapter
+19</a>).</p>
+
+<h2 id="header">Shipping the header</h2>
+
+<p>Your ioctl definitions have to be identical in the kernel and in every program that calls them. The kernel has a specific place for headers that user space is meant to include, and putting them anywhere else guarantees the two copies drift apart.</p>
+
+<pre><code>/* include/uapi/linux/mydev.h - the UAPI header, shared
+   VERBATIM between the kernel and any userspace program.   */
+
+#ifndef _UAPI_LINUX_MYDEV_H
+#define _UAPI_LINUX_MYDEV_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/ioctl.h&gt;
+
+struct mydev_config {
+        __u32 sample_rate_hz;
+        __u32 channel_mask;
+        __u8  gain;
+        __u8  reserved[3];       /* MUST be zeroed by callers;
+                                    reserved for future use   */
+};
+
+#define MYDEV_MAGIC        'k'
+#define MYDEV_GET_CONFIG   _IOR(MYDEV_MAGIC, 1, struct mydev_config)
+#define MYDEV_SET_CONFIG   _IOW(MYDEV_MAGIC, 2, struct mydev_config)
+#define MYDEV_RESET        _IO (MYDEV_MAGIC, 3)
+
+#endif
+
+/* RULES for this file specifically:
+     · __u8/__u16/__u32/__u64 only - never int, long, size_t
+     · no kernel-only types (struct list_head, spinlock_t...)
+     · no #ifdef __KERNEL__ tricks to hide fields - one struct,
+       one meaning, for both sides
+     · never remove or renumber an ioctl or a struct field
+     · a NEW, incompatible need gets a NEW number - never
+       redefine an existing one
+
+   This header is literally installed into
+   /usr/include/linux/mydev.h on end systems and copied into
+   the musl/glibc UAPI headers. Programs compile against it
+   for years after you have forgotten it exists.             */</code></pre>
+
+<h2 id="test">Testing an ioctl</h2>
+
+<p>An ioctl cannot be exercised from the shell the way <code>read</code> and <code>write</code> can, so testing needs a small program. Writing it early is worthwhile — it doubles as the example other people will copy.</p>
+
+<pre><code>#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;linux/mydev.h&gt;
+
+int main(void)
+{
+        int fd = open("/dev/mydev", O_RDWR);
+        struct mydev_config cfg;
+
+        if (ioctl(fd, MYDEV_GET_CONFIG, &amp;cfg) &lt; 0) {
+                perror("GET_CONFIG");
+                return 1;
+        }
+        printf("rate=%u mask=0x%x gain=%u\n",
+               cfg.sample_rate_hz, cfg.channel_mask, cfg.gain);
+
+        cfg.sample_rate_hz = 48000;
+        if (ioctl(fd, MYDEV_SET_CONFIG, &amp;cfg) &lt; 0)
+                perror("SET_CONFIG");        /* expect -EINVAL
+                                                cases to work
+                                                too - test them*/
+
+        close(fd);
+        return 0;
+}</code></pre>
+
+<pre><code># strace decodes the direction/size/type automatically once it
+# has your header or a matching ioctl.rst entry:
+    strace -e ioctl ./mytest
+      ioctl(3, MYDEV_GET_CONFIG or _IOC(_IOC_READ, 0x6b, 1, 8), ...) = 0
+
+# NEGATIVE TESTS - the ones that actually find bugs:
+    · call with a NULL pointer                 -&gt; -EFAULT
+    · call with an unmapped pointer            -&gt; -EFAULT
+    · call an unknown command number           -&gt; -ENOTTY
+    · SET_CONFIG on an O_RDONLY fd              -&gt; -EBADF
+    · out-of-range fields                      -&gt; -EINVAL
+    · a huge `len` in a variable transfer      -&gt; -EINVAL,
+                                                   not a hang
+    · call from a 32-bit binary, if supported  -&gt; matches
+                                                   64-bit result
+
+# Fuzz it - genuinely effective on ioctl handlers:
+    syzkaller, or a simple harness with
+    CONFIG_KCOV + CONFIG_KASAN, feeding random cmd/arg pairs
+    at your fd. This finds the missing validation checks that
+    manual testing never will.                              */</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Works on x86 host, corrupts on the arm64 target</td><td>Implicit struct padding differs — pad explicitly</td></tr>
+<tr><td>Works as a 64-bit binary, garbage from a 32-bit one</td><td>Missing <code>.compat_ioctl</code>, or a pointer/<code>long</code> field in the struct</td></tr>
+<tr><td>Kernel crash from a userspace ioctl call</td><td>Unvalidated length used to size an allocation or copy — a real vulnerability</td></tr>
+<tr><td><code>-EFAULT</code> on every call</td><td>Direct pointer dereference instead of <code>copy_to/from_user</code></td></tr>
+<tr><td>Read-only fd can reconfigure the device</td><td><code>f_mode</code> not checked</td></tr>
+<tr><td>Unknown ioctl returns <code>-EINVAL</code></td><td>Should be <code>-ENOTTY</code> — breaks capability probing</td></tr>
+<tr><td>A future kernel breaks an old binary</td><td>A struct field was reused or renumbered instead of extended</td></tr>
+<tr><td><code>strace</code> shows garbage for the ioctl name</td><td>Number not registered in <code>ioctl-number.rst</code>, or magic collides with another driver</td></tr>
+<tr><td>Huge allocation from a small request</td><td>Length field trusted without an upper bound</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Encode a request number with <code>_IOR</code>/<code>_IOW</code>/<code>_IOWR</code> and explain each
+  field.</li>
+  <li>Explain why the struct is a permanent ABI and what explicit padding buys you.</li>
+  <li>Write an ioctl handler that validates every field of an incoming struct.</li>
+  <li>Explain why an unknown command returns <code>-ENOTTY</code>, not <code>-EINVAL</code>.</li>
+  <li>Design a variable-length transfer struct that needs no <code>.compat_ioctl</code> of its own.</li>
+  <li>Explain why a pointer field breaks 32-bit compatibility and how <code>__u64</code> avoids it.</li>
+  <li>List five subsystems to check before writing a custom ioctl interface.</li>
+  <li>Write a correct UAPI header and state its permanence rules.</li>
+  <li>List six negative tests every ioctl handler should pass.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ethernet, the MAC/PHY boundary and MDIO | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Ethernet, the MAC/PHY boundary and MDIO</h1>
+<p class="lead">Ethernet on a microcontroller is three separate things that must all work: a MAC inside the
+chip, a PHY outside it, and a management bus connecting them. Most bring-up problems are at one of the two
+boundaries, and knowing which one you are looking at is most of the diagnosis.</p>
+
+<h2 id="split">MAC and PHY</h2>
+
+<pre class="diagram">   +-------------------------------------------------+
+   |  MICROCONTROLLER                                |
+   |                                                 |
+   |   TCP/IP stack (lwIP)                           |
+   |        |                                        |
+   |   +----+-----+                                  |
+   |   |   MAC    |  frames, addresses, CRC, DMA     |
+   |   +----+-----+                                  |
+   |        |                                        |
+   +--------|----------------+----------------------+
+            | RMII/MII       | MDIO (2 wires)
+            | (7 or 18 wires)|
+   +--------+----------------+----------------------+
+   |   PHY  (external chip)                         |
+   |   encoding, analog drive, link negotiation     |
+   +--------+---------------------------------------+
+            |
+        [magnetics]      transformer - isolation and
+            |            common-mode rejection
+          RJ45
+
+   THE DIVISION OF LABOUR:
+
+   MAC (in the MCU)     frame assembly, source/destination
+                        addresses, CRC, collision handling,
+                        DMA descriptors
+
+   PHY (external)       4B/5B or similar line coding,
+                        analog line driving, auto-
+                        negotiation of speed and duplex,
+                        link detection
+
+   MDIO/MDC             a tiny two-wire management bus so
+                        the MAC can read and write the PHY's
+                        registers. Essentially I2C's job,
+                        with its own protocol.
+
+   MAGNETICS            galvanic isolation to 1.5 kV, and
+                        common-mode rejection. NOT optional -
+                        omitting them is a real design error
+                        that works on a bench and destroys
+                        ports in the field.</pre>
+
+<h2 id="rmii">MII versus RMII</h2>
+
+<pre class="diagram">   MII    18 wires, 25 MHz clock, 4 bits per direction
+   RMII    7 wires, 50 MHz clock, 2 bits per direction
+   RGMII  12 wires, 125 MHz DDR, for gigabit
+
+   RMII is what you will use on a microcontroller: half the
+   pins for the same 100 Mbit/s.
+
+   RMII SIGNALS:
+     REF_CLK    50 MHz, SHARED by MAC and PHY
+     TXD0, TXD1
+     TX_EN
+     RXD0, RXD1
+     CRS_DV     carrier sense / data valid
+
+   THE REF_CLK IS THE CLASSIC BRING-UP PROBLEM. Both ends
+   must use the SAME 50 MHz clock, and there are two valid
+   topologies:
+
+     A) A 50 MHz oscillator feeds both the PHY and the MCU's
+        REF_CLK input. Simple and robust.
+
+     B) The MCU outputs 50 MHz on its MCO pin to the PHY,
+        derived from its own PLL.
+
+   Topology B requires that the MCU's clock configuration
+   produce EXACTLY 50 MHz, and it must be running before the
+   PHY is released from reset. Getting this wrong gives a
+   PHY that never establishes a link, or a link that comes
+   up and passes no traffic - and neither symptom points at
+   the clock.
+
+   MEASURE REF_CLK WITH A SCOPE during bring-up. It is one
+   probe and it eliminates the most likely cause first.</pre>
+
+<h2 id="mdio">MDIO: reading the PHY</h2>
+
+<pre><code>/* MDIO is a 2-wire bus: MDC (clock, up to 2.5 MHz) and
+   MDIO (bidirectional data). The MAC has a register pair
+   that drives it for you.                                 */
+
+static uint16_t phy_read(uint8_t phy_addr, uint8_t reg)
+{
+    ETH-&gt;MACMIIAR = (phy_addr &lt;&lt; 11) | (reg &lt;&lt; 6)
+                  | ETH_MACMIIAR_CR_Div42 | ETH_MACMIIAR_MB;
+    while (ETH-&gt;MACMIIAR &amp; ETH_MACMIIAR_MB) { }   /* + timeout! */
+    return (uint16_t) ETH-&gt;MACMIIDR;
+}
+
+/* THE STANDARD REGISTERS - IEEE 802.3 defines 0-15
+   identically for every PHY ever made, which means this
+   code works with any of them:                            */
+
+/*  0  BMCR    control: reset, speed, duplex, autoneg
+    1  BMSR    status: LINK UP, autoneg complete
+    2  PHYIDR1 |  OUI and model - identifies the chip
+    3  PHYIDR2 |
+    4  ANAR    what we advertise
+    5  ANLPAR  what the link partner advertises
+   16+ vendor specific - including, annoyingly, the
+       resolved speed and duplex on most PHYs           */
+
+int phy_link_status(uint8_t addr, int *speed, int *full_duplex)
+{
+    /* BMSR bit 2 is LATCHING LOW: it reports "link has been
+       down since the last read". Read it TWICE to get the
+       current state - a genuine and very commonly missed
+       detail.                                             */
+    (void) phy_read(addr, 1);
+    uint16_t bmsr = phy_read(addr, 1);
+
+    if (!(bmsr &amp; (1u &lt;&lt; 2))) { return 0; }        /* down    */
+    if (!(bmsr &amp; (1u &lt;&lt; 5))) { return 0; }        /* autoneg
+                                                    not done */
+
+    /* Resolved speed/duplex is vendor-specific. For the
+       common LAN8742 it is register 31.                    */
+    uint16_t sr = phy_read(addr, 31);
+    *speed       = ((sr &gt;&gt; 2) &amp; 3u) &lt;= 1 ? 10 : 100;
+    *full_duplex = (sr &gt;&gt; 4) &amp; 1u;
+    return 1;
+}
+
+/* FINDING THE PHY ADDRESS: it is set by strapping pins and
+   is usually 0 or 1, but vendors vary. Scan for it - the
+   same approach as an I2C scan (chapter 06):              */
+int phy_scan(void)
+{
+    for (uint8_t a = 0; a &lt; 32; a++) {
+        uint16_t id = phy_read(a, 2);
+        if (id != 0xFFFF &amp;&amp; id != 0x0000) { return a; }
+    }
+    return -1;      /* nothing responded: check MDC, the
+                       PHY's reset pin, and its supply     */
+}
+</code></pre>
+
+<div class="key">
+<b>The bring-up order that isolates faults</b>
+<p>Check them in this sequence and each step rules out a layer: <strong>1.</strong> Is REF_CLK present and
+50 MHz? <strong>2.</strong> Does an MDIO scan find the PHY? <strong>3.</strong> Does the PHY report link up and
+auto-negotiation complete? <strong>4.</strong> Does the MAC receive any frames at all (check the receive
+descriptor count, not the IP stack)? <strong>5.</strong> Does a broadcast ARP appear? Only then look at lwIP.
+Debugging from the TCP layer downward is why Ethernet bring-up has a reputation for taking days.</p>
+</div>
+
+<h2 id="descriptors">Descriptors and buffers</h2>
+
+<pre><code>/* The MAC does not have registers you write frames into.
+   It walks a RING of DESCRIPTORS in memory, each pointing
+   at a buffer - the same pattern as any high-throughput
+   DMA engine (mcu chapter 12).                            */
+
+typedef struct {
+    volatile uint32_t status;      /* OWN bit + flags      */
+    uint32_t          ctrl_len;
+    uint32_t          buf1_addr;
+    uint32_t          next_desc;
+} eth_desc_t;
+
+#define DESC_OWN  (1u &lt;&lt; 31)       /* 1 = DMA owns it      */
+
+/* THE OWNERSHIP BIT IS THE WHOLE PROTOCOL:
+     OWN = 1  the DMA engine may use this descriptor
+     OWN = 0  software owns it
+
+   RX: software clears OWN after processing, handing the
+       buffer back. FORGET THIS AND RECEPTION STOPS after
+       exactly as many frames as you have descriptors -
+       a very recognisable symptom.
+
+   TX: software sets OWN to hand the frame over.          */
+
+static eth_desc_t rx_desc[4] __attribute__((aligned(4)));
+static uint8_t    rx_buf[4][1524] __attribute__((aligned(4)));
+
+void eth_rx_poll(void)
+{
+    eth_desc_t *d = &amp;rx_desc[rx_index];
+    if (d-&gt;status &amp; DESC_OWN) { return; }      /* DMA still
+                                                  owns it   */
+    uint16_t len = (uint16_t)((d-&gt;status &gt;&gt; 16) &amp; 0x3FFF);
+    lwip_input(rx_buf[rx_index], len - 4u);    /* strip CRC  */
+
+    d-&gt;status = DESC_OWN;                      /* GIVE IT BACK */
+    rx_index = (rx_index + 1u) &amp; 3u;
+    ETH-&gt;DMARPDR = 0;                          /* poll demand */
+}
+
+/* MEMORY PLACEMENT MATTERS, exactly as in mcu chapter 12:
+   - descriptors and buffers must be in RAM the Ethernet
+     DMA can reach. On STM32F7/H7 the default SRAM often is
+     NOT reachable - use a specific region and place it in
+     the linker script.
+   - on Cortex-M7, either mark that region non-cacheable in
+     the MPU, or do explicit cache maintenance around every
+     descriptor access. Getting this wrong produces an
+     Ethernet port that works for a few seconds and then
+     stops, which is a memorably frustrating bug.          */
+</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>MDIO scan finds nothing</td><td>No REF_CLK, PHY held in reset, or MDC divider misconfigured</td></tr>
+<tr><td>PHY found but link never comes up</td><td>REF_CLK wrong frequency, magnetics or cable
+fault</td></tr>
+<tr><td>Link up, no frames received</td><td>RMII pin configuration, or descriptors in unreachable
+RAM</td></tr>
+<tr><td>Receives exactly N frames then stops</td><td>OWN bit not returned to the DMA — N is your descriptor
+count</td></tr>
+<tr><td>Works a few seconds then stops, Cortex-M7</td><td>Cache coherency on descriptors — mark the region
+non-cacheable</td></tr>
+<tr><td>Link status flaps in software but not physically</td><td>BMSR link bit is latching low; read it
+twice</td></tr>
+<tr><td>Works at 10 Mbit, fails at 100</td><td>Signal integrity, or a duplex mismatch from failed
+auto-negotiation</td></tr>
+<tr><td>Ports damaged in the field</td><td>Magnetics omitted or wrongly specified</td></tr>
+<tr><td>Occasional CRC errors under load</td><td>REF_CLK jitter, or clock topology B with a marginal
+PLL</td></tr>
+<tr><td>TCP is slow but ping is fine</td><td>Descriptor count too low, or buffers being copied
+unnecessarily</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>State which functions belong to the MAC and which to the PHY.</li>
+  <li>Explain what the magnetics do and why they are not optional.</li>
+  <li>Give the wire count and clock rate for MII and RMII.</li>
+  <li>Describe the two valid REF_CLK topologies and the risk of each.</li>
+  <li>Explain what MDIO is for and which registers are standardised.</li>
+  <li>Explain why the BMSR link bit must be read twice.</li>
+  <li>Describe how to find an unknown PHY address.</li>
+  <li>Explain the descriptor ownership bit and the symptom of not returning it.</li>
+  <li>Say why descriptor placement matters on an STM32H7.</li>
+  <li>Give the five-step bring-up order and what each step rules out.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

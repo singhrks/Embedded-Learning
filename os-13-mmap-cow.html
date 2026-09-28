@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory-mapped files and copy-on-write | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Memory-mapped files and copy-on-write</h1>
+<p class="lead">Two applications of the same trick: make the page tables lie, and let a fault fix things up
+on demand. Together they explain why <code>fork()</code> is cheap, why shared libraries cost one copy of
+memory system-wide, and why <code>mmap</code> is sometimes far faster than <code>read</code> and sometimes
+much slower.</p>
+
+<h2 id="mmap">Mapping a file into memory</h2>
+
+<p>Mapping a file into memory replaces read and write calls with ordinary memory access, and removes a copy in the process. It is the mechanism behind program loading, shared libraries and most high-performance I/O.</p>
+
+<pre><code>int fd = open("data.bin", O_RDONLY);
+struct stat st;
+fstat(fd, &amp;st);
+
+void *p = mmap(NULL,            /* let the kernel choose the address */
+               st.st_size,      /* length                            */
+               PROT_READ,       /* protection                        */
+               MAP_PRIVATE,     /* private (COW) or MAP_SHARED       */
+               fd, 0);          /* file and offset (page-aligned)    */
+close(fd);                      /* the MAPPING keeps the file alive  */
+
+/* the file's bytes are now simply memory */
+uint32_t magic = *(uint32_t *)p;
+for (size_t i = 0; i &lt; st.st_size; i++)
+        checksum += ((uint8_t *)p)[i];
+
+munmap(p, st.st_size);</code></pre>
+
+<pre class="diagram">What actually happened:
+
+  mmap() created a VMA and returned. NO data was read.
+  Every page is marked invalid in the page tables.
+
+  The first access to each page faults:
+     · kernel looks up the VMA → this is file-backed at offset N
+     · finds the page in the PAGE CACHE, or reads it from disk
+     · installs a PTE pointing at that page-cache page
+     · retries the instruction
+
+  Consequences:
+     · the mapping is the SAME physical memory as the page cache,
+       so no copy is made
+     · two processes mapping the same file share those frames
+     · a 100 GB file can be mapped on a machine with 8 GB of RAM
+     · reading sequentially triggers readahead, exactly as read()
+       would</pre>
+
+<h2 id="modes">The four combinations</h2>
+
+<p>A mapping is described by two independent choices, giving four combinations with genuinely different behaviour. Picking the wrong one produces changes that silently go nowhere.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>File-backed</th><th>Anonymous</th></tr></thead>
+<tbody>
+<tr><td><strong>MAP_PRIVATE</strong></td><td>Copy-on-write view of a file. Writes are private and never reach disk. <em>Used for: executables, shared libraries.</em></td><td>Ordinary private memory. <em>Used for: <code>malloc</code> of large blocks, thread stacks.</em></td></tr>
+<tr><td><strong>MAP_SHARED</strong></td><td>Writes go to the file and are visible to every other mapper. <em>Used for: databases, IPC over a file.</em></td><td>Shared memory between related processes. <em>Used for: <code>fork</code>-based IPC (<a href="os-08-ipc.html">ch. 08</a>).</em></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* MAP_PRIVATE on a file is where the two ideas meet: */
+void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+p[0] = 'X';
+/* The page was shared read-only with the page cache. Writing it
+   triggers a COW fault: the kernel allocates a fresh frame, copies
+   the contents, and remaps THIS process's PTE to the copy.
+   The file on disk is untouched. Other mappers see the original. */</code></pre>
+
+<h2 id="cow">Copy-on-write</h2>
+
+<p>Copy-on-write lets two processes share pages until one writes, at which point it gets a private copy. It is what makes process creation fast and shared libraries cheap.</p>
+
+<pre class="diagram">   BEFORE fork()
+   parent PTEs ──────►  [ page A ]  [ page B ]  [ page C ]
+                          rw           rw          rw
+
+   AFTER fork() — no data copied, only page TABLES
+   parent PTEs ──┐
+                 ├────►  [ page A ]  [ page B ]  [ page C ]
+   child  PTEs ──┘         RO,cow      RO,cow     RO,cow
+                           refcount 2  refcount 2 refcount 2
+
+   Both mappings are marked READ-ONLY, with a flag saying "this is
+   COW, not genuinely read-only".
+
+   CHILD WRITES page B
+        │ write to a read-only page → PAGE FAULT
+        ▼
+   kernel: the VMA says writable, and the PTE says COW
+        · allocate a new frame
+        · copy page B into it
+        · point the CHILD's PTE at the copy, mark it rw
+        · decrement the original's refcount to 1
+        · since only the parent now maps it, restore ITS PTE to rw
+        · retry the instruction
+
+   parent PTEs ──────►  [ page A ]  [ page B  ]  [ page C ]
+                          RO,cow       rw          RO,cow
+   child  PTEs ──────►  [ page A ]  [ page B' ]  [ page C ]
+                          RO,cow       rw          RO,cow
+
+  Only the pages actually written are ever duplicated. A process
+  that forks and immediately execs copies almost nothing.</pre>
+
+<h3>Where else COW appears</h3>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Use</th><th>How</th></tr></thead>
+<tbody>
+<tr><td><code>fork()</code></td><td>The canonical case</td></tr>
+<tr><td>Shared libraries</td><td>Text is shared read-only; the data segment is COW, so each process gets private globals from one on-disk copy</td></tr>
+<tr><td>The zero page</td><td>All freshly allocated anonymous pages map one shared zero page read-only until written</td></tr>
+<tr><td>KSM</td><td>Kernel Samepage Merging: identical pages across VMs are merged and made COW</td></tr>
+<tr><td>Filesystem snapshots</td><td>btrfs, ZFS, LVM — the same idea at block granularity</td></tr>
+<tr><td>Container images</td><td>overlayfs: the lower layer is shared, writes go to an upper layer</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+<b>The fork memory-accounting confusion</b>
+<p>After <code>fork()</code>, <code>ps</code> shows both processes with the same RSS — but they share almost
+all of it, so the machine's real usage barely changed. RSS double-counts shared pages. Use <strong>PSS</strong>
+(Proportional Set Size), which divides each shared page's size by the number of sharers:</p>
+<pre><code>grep -H '^Pss:' /proc/*/smaps_rollup | sort -k2 -n -r | head
+smem -k -s pss                    # per-process, sorted by PSS
+/* PSS is the only per-process number that sums to something
+   meaningful across all processes.                          */</code></pre>
+</div>
+
+<h2 id="dirtycow">Why COW is security-sensitive</h2>
+
+<p>A famous vulnerability in exactly this mechanism, worth studying because it shows how a subtle race in something this fundamental becomes a complete privilege escalation.</p>
+
+<pre><code>/* Dirty COW (CVE-2016-5195) — a race between the COW fault handler
+   and madvise(MADV_DONTNEED), exploitable to write to a read-only
+   file mapping, giving local root on essentially every Linux
+   system for nine years.
+
+   The lesson is general: COW is a place where the page tables
+   deliberately disagree with the VMA's stated permissions, and
+   the window between fault and fixup is a race that must be
+   handled with great care. Several later CVEs (Dirty Pipe,
+   CVE-2022-0847) follow the same shape.                      */</code></pre>
+
+<h2 id="vs-read">mmap versus read/write</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th><code>mmap</code></th><th><code>read</code>/<code>write</code></th></tr></thead>
+<tbody>
+<tr><td>Copies</td><td>Zero — you touch page-cache pages directly</td><td>One copy, cache &rarr; your buffer</td></tr>
+<tr><td>Syscalls</td><td>One, then page faults</td><td>One per call</td></tr>
+<tr><td>Random access</td><td><strong>Excellent</strong> — just a pointer</td><td>Needs <code>lseek</code> + <code>read</code> per access</td></tr>
+<tr><td>Sequential streaming</td><td>Often <em>slower</em> — fault per page</td><td><strong>Better</strong> — large reads amortise everything</td></tr>
+<tr><td>Small files</td><td>Setup and teardown dominate</td><td>Better</td></tr>
+<tr><td>Error handling</td><td><code>SIGBUS</code> on I/O error — hard to handle</td><td><code>-EIO</code> return value</td></tr>
+<tr><td>File growth</td><td>Must re-map; risk of <code>SIGBUS</code> past EOF</td><td>Just works</td></tr>
+<tr><td>Memory pressure</td><td>Counts against the process; can be reclaimed under you</td><td>Bounded by your buffer</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="key">
+<b>The honest summary</b>
+<p><code>mmap</code> is a win for <strong>random access to large files</strong> and for <strong>sharing</strong>.
+It is frequently a loss for sequential streaming, because a page fault every 4 KB costs more than one
+<code>read()</code> of 1 MB. Linus Torvalds has made this point repeatedly, and benchmarks bear it out. Use
+<code>mmap</code> when you would otherwise be seeking; use <code>read</code> with a large buffer when you are
+streaming.</p>
+</div>
+
+<pre><code>/* If you do use mmap, tell the kernel your access pattern */
+madvise(p, len, MADV_SEQUENTIAL);   /* aggressive readahead, drop behind */
+madvise(p, len, MADV_RANDOM);       /* disable readahead                 */
+madvise(p, len, MADV_WILLNEED);     /* prefault now                      */
+mmap(..., MAP_POPULATE, ...);       /* prefault the whole mapping        */
+
+/* Handling SIGBUS is genuinely awkward: it fires on a truncated
+   file or an I/O error, from anywhere the mapping is touched. In
+   robust code, either avoid mmap for untrusted files, or install
+   a handler and use siglongjmp — which is its own problem.    */</code></pre>
+
+<h2 id="zerocopy">Zero-copy I/O</h2>
+
+<p>Moving data without copying it is the goal of several distinct mechanisms, each suited to a different shape of problem — and each removing a copy that read and write would have made.</p>
+
+<pre><code>/* The general goal: avoid copying data through user space at all. */
+
+/* sendfile: file → socket, entirely in the kernel */
+sendfile(out_fd, in_fd, &amp;offset, count);
+/* saves two copies and two context switches versus read+write.
+   This is how static web servers serve files.                */
+
+/* splice: move data between fds via a pipe, without copying */
+splice(fd_in, NULL, pipefd[1], NULL, len, SPLICE_F_MOVE);
+splice(pipefd[0], NULL, fd_out, NULL, len, SPLICE_F_MOVE);
+
+/* vmsplice: map user pages into a pipe */
+/* copy_file_range: server-side copy, may be offloaded to the
+   filesystem or even the storage device (reflink on btrfs/XFS) */
+copy_file_range(fd_in, &amp;off_in, fd_out, &amp;off_out, len, 0);
+
+/* io_uring: registered buffers plus fixed files remove even the
+   per-operation syscall (OS chapter 08).                      */</code></pre>
+
+<h2 id="dax">Direct access and persistent memory</h2>
+
+<p>When storage is byte-addressable and nearly as fast as memory, the page cache becomes an unnecessary intermediate copy. Bypassing it entirely is what this mode does.</p>
+
+<pre><code>/* DAX: for byte-addressable persistent memory, the page cache is
+   pointless — map the device's pages directly.                */
+mount -o dax /dev/pmem0 /mnt
+
+/* A store instruction now writes persistent storage. Which raises
+   a genuinely new problem: ordering and durability at CPU cache
+   granularity. You need explicit flushes:                     */
+    dc cvap, x0        /* clean to point of persistence (ARM)   */
+    clwb               /* cache line write back (x86)           */
+    sfence
+/* Getting this wrong gives torn, non-atomic updates that survive
+   a power cut — a corruption class that did not exist before. */</code></pre>
+
+<h2 id="tools">Observing mappings</h2>
+
+<p>Everything about a process's mappings is visible from outside, which turns questions about what is mapped, shared or resident into a single command.</p>
+
+<pre><code>cat /proc/PID/maps               # all VMAs
+cat /proc/PID/smaps              # per-VMA detail:
+#   Rss, Pss, Shared_Clean/Dirty, Private_Clean/Dirty,
+#   Referenced, Anonymous, Swap, THPeligible
+cat /proc/PID/smaps_rollup       # totals — much cheaper to parse
+
+pmap -x PID                      # readable summary
+pmap -XX PID                     # everything
+
+# is this page shared, and with whom?
+sudo ./page-types -p PID         # from linux/tools/vm
+
+# how much of the page cache does a file occupy?
+vmtouch -v /path/to/file
+fincore /path/to/file
+
+# force a file out of the cache, for cold benchmarking
+dd of=/path/to/file oflag=nocache conv=notrunc,fdatasync count=0</code></pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>RSS appears to double after <code>fork</code></td><td>Shared COW pages counted twice; read PSS</td></tr>
+<tr><td><code>mmap</code> slower than <code>read</code> for streaming</td><td>One fault per page versus one large read</td></tr>
+<tr><td><code>SIGBUS</code> touching a mapping</td><td>File truncated under you, or an I/O error</td></tr>
+<tr><td>Writes to a <code>MAP_PRIVATE</code> file mapping vanish</td><td>Correct — private mappings never write back</td></tr>
+<tr><td>Two processes mapping the same file do not see each other's writes</td><td>Used <code>MAP_PRIVATE</code>; need <code>MAP_SHARED</code></td></tr>
+<tr><td>Memory usage grows when reading a large file</td><td>Page cache; reclaimable, not a leak</td></tr>
+<tr><td>First write after <code>fork</code> is slow</td><td>COW fault plus a page copy</td></tr>
+<tr><td>Shared library uses one copy of text, many of data</td><td>Text shared, data segment is COW — as designed</td></tr>
+<tr><td>Data corrupted after power loss on pmem</td><td>Missing cache flush to the point of persistence</td></tr>
+<tr><td>Container image uses less disk than the sum of layers</td><td>overlayfs COW at file granularity</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain what <code>mmap</code> does at call time versus at first touch.</li>
+  <li>Give the four private/shared &times; file/anonymous combinations and a use for each.</li>
+  <li>Walk through a COW fault step by step, including what happens to the last sharer.</li>
+  <li>Explain why RSS is misleading after <code>fork</code> and what to use instead.</li>
+  <li>Name four mechanisms besides <code>fork</code> that use copy-on-write.</li>
+  <li>Say when <code>mmap</code> beats <code>read</code> and when it does not.</li>
+  <li>Explain why <code>SIGBUS</code> makes <code>mmap</code> error handling hard.</li>
+  <li>Name three zero-copy mechanisms and what each avoids copying.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

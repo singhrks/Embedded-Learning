@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PSTATE and the condition flags | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>PSTATE and the condition flags</h1>
+<p class="lead">ARMv7 had one CPSR register holding all processor state. AArch64 broke it into independently
+accessible fields called PSTATE. Understanding those fields — especially the interrupt masks — is what lets
+you read an exception handler, a critical section, or a crash dump.</p>
+
+<h2 id="what">What PSTATE is</h2>
+
+<div class="key">
+<b>Not a register</b>
+<p>PSTATE is an <em>abstraction</em>: a collection of processor state bits, each accessed through its own
+system-register name. There is no instruction that reads all of PSTATE at once during normal execution. It is
+only gathered into a single value when an exception is taken, at which point the hardware writes it into
+<code>SPSR_ELx</code> — and <code>ERET</code> restores it from there.</p>
+</div>
+
+<p>The fields below fall into three groups worth telling apart. <code>NZCV</code> and <code>DAIF</code> are
+the ones you read and write constantly — flags from the last comparison, and the interrupt masks. <code>EL</code>
+and <code>SPSel</code> describe where you currently are and which stack you are using, and you query them
+rather than set them directly. Everything below <code>nRW</code> is a security or debug feature that most code
+never touches explicitly, but that shows up when you are chasing a specific class of bug — PAN when a kernel
+NULL-pointer dereference behaves unexpectedly, BTYPE when a jump is rejected under branch protection, TCO when
+Memory Tagging is involved. Knowing the field exists is often enough; you look up its exact semantics only when
+you need it.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Field</th><th>Meaning</th><th>Accessed via</th></tr></thead>
+<tbody>
+<tr><td><code>N Z C V</code></td><td>Condition flags</td><td><code>NZCV</code></td></tr>
+<tr><td><code>D A I F</code></td><td>Exception masks: Debug, SError, IRQ, FIQ</td><td><code>DAIF</code>, <code>DAIFSet</code>, <code>DAIFClr</code></td></tr>
+<tr><td><code>EL</code></td><td>Current exception level, 0–3</td><td><code>CurrentEL</code></td></tr>
+<tr><td><code>SPSel</code></td><td>Which stack pointer is in use</td><td><code>SPSel</code></td></tr>
+<tr><td><code>nRW</code></td><td>Execution state: AArch64 or AArch32</td><td>Only in SPSR</td></tr>
+<tr><td><code>PAN</code></td><td>Privileged Access Never</td><td><code>PAN</code> (v8.1)</td></tr>
+<tr><td><code>UAO</code></td><td>User Access Override</td><td><code>UAO</code> (v8.2)</td></tr>
+<tr><td><code>SSBS</code></td><td>Speculative Store Bypass Safe</td><td><code>SSBS</code> (v8.5)</td></tr>
+<tr><td><code>BTYPE</code></td><td>Branch Target type, for BTI</td><td>Set by hardware (v8.5)</td></tr>
+<tr><td><code>TCO</code></td><td>Tag Check Override, for MTE</td><td><code>TCO</code> (v8.5)</td></tr>
+<tr><td><code>IL</code>, <code>SS</code></td><td>Illegal execution state, software step</td><td>Debug</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="nzcv">The condition flags</h2>
+
+<p>Four bits summarise the result of the last flag-setting operation, and every conditional branch in the instruction set tests some combination of them. They are also the reason comparison and branch can be separate instructions.</p>
+
+<pre class="diagram">   N  Negative   the result's sign bit was 1
+   Z  Zero       the result was zero
+   C  Carry      unsigned overflow (add) / NO borrow (subtract)
+   V  oVerflow   SIGNED overflow
+
+  Set only by instructions with the S suffix, or by CMP/CMN/TST/TEQ
+  (which are themselves encoded as SUBS/ADDS/ANDS with XZR as the
+  destination — see chapter 03).
+
+  THE POINT of having both C and V: one comparison sets both, so
+  the same CMP serves signed and unsigned tests. The condition code
+  you branch on decides which interpretation applies.</pre>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Code</th><th>Meaning</th><th>Flags</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>EQ</code> / <code>NE</code></td><td>Equal / not equal</td><td>Z=1 / Z=0</td><td>Either signedness</td></tr>
+<tr><td><code>HS</code>(<code>CS</code>) / <code>LO</code>(<code>CC</code>)</td><td>&ge; / &lt;</td><td>C=1 / C=0</td><td><strong>Unsigned</strong></td></tr>
+<tr><td><code>HI</code> / <code>LS</code></td><td>&gt; / &le;</td><td>C=1&amp;Z=0 / C=0|Z=1</td><td><strong>Unsigned</strong></td></tr>
+<tr><td><code>GE</code> / <code>LT</code></td><td>&ge; / &lt;</td><td>N=V / N&ne;V</td><td><strong>Signed</strong></td></tr>
+<tr><td><code>GT</code> / <code>LE</code></td><td>&gt; / &le;</td><td>Z=0&amp;N=V / Z=1|N&ne;V</td><td><strong>Signed</strong></td></tr>
+<tr><td><code>MI</code> / <code>PL</code></td><td>Negative / positive-or-zero</td><td>N=1 / N=0</td><td>Sign test</td></tr>
+<tr><td><code>VS</code> / <code>VC</code></td><td>Overflow set / clear</td><td>V=1 / V=0</td><td>Signed overflow detection</td></tr>
+<tr><td><code>AL</code> / <code>NV</code></td><td>Always / never</td><td>—</td><td>Unconditional</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* Why the signed/unsigned distinction is not academic: */
+
+        mov     w0, #-1              // 0xFFFFFFFF
+        mov     w1, #1
+        cmp     w0, w1
+
+        b.lt    signed_less          // TAKEN:   -1 &lt; 1        ✓
+        b.lo    unsigned_less        // NOT taken: 0xFFFFFFFF &gt; 1 ✓
+
+/* Both are correct — for their respective interpretations. Using
+   the wrong condition is the assembly equivalent of the signed/
+   unsigned comparison bug in C chapter 02, and it is exactly as
+   easy to get wrong.                                         */
+
+/* Detecting signed overflow explicitly: */
+        adds    w0, w1, w2
+        b.vs    overflow_handler     // V set = signed overflow
+/* This is what __builtin_add_overflow compiles to (C ch. 02). */</code></pre>
+
+<pre><code>/* Flags survive across unrelated instructions, because most
+   instructions do NOT set them. That enables useful scheduling: */
+
+        cmp     x0, x1               // compute the condition EARLY
+        ldr     x2, [x3]             // ...do a long-latency load...
+        add     x4, x5, x6           // ...and other work...
+        b.eq    equal                // ...then branch. The load has
+                                     //    had time to complete.
+/* On x86 nearly every instruction clobbers EFLAGS, so this
+   separation is not possible. It is a small but real advantage
+   of the explicit-S design.                                   */</code></pre>
+
+<h2 id="daif">The interrupt masks</h2>
+
+<p>Four more bits decide which kinds of interrupt the processor will currently accept. Masking them is how a critical section becomes uninterruptible — and forgetting to unmask them is how a system silently stops responding.</p>
+
+<pre class="diagram">   D  Debug     mask debug exceptions
+   A  SError    mask System Errors (imprecise external aborts)
+   I  IRQ       mask normal interrupts
+   F  FIQ       mask fast interrupts
+
+   1 = MASKED (disabled).  0 = enabled.
+
+   In DAIF, the bits sit at:   D=9  A=8  I=7  F=6
+
+        msr     daifset, #2      // set I  → DISABLE IRQ
+        msr     daifclr, #2      // clear I → ENABLE IRQ
+        msr     daifset, #3      // set I and F
+        msr     daifset, #0xF    // mask everything
+
+   The immediate is a 4-bit mask over {D,A,I,F} = bits {3,2,1,0}
+   of the immediate. So #2 = 0b0010 = the I bit.</pre>
+
+<pre><code>/* Save-and-restore is the ONLY correct pattern for a critical
+   section. Unconditionally re-enabling is a serious bug.     */
+
+static inline unsigned long irq_save(void)
+{
+        unsigned long flags;
+        asm volatile("mrs %0, daif\n\t"
+                     "msr daifset, #2"
+                     : "=r"(flags) :: "memory");
+        return flags;
+}
+
+static inline void irq_restore(unsigned long flags)
+{
+        asm volatile("msr daif, %0" :: "r"(flags) : "memory");
+}
+
+/* Why unconditional enable is wrong:
+
+        outer_lock();          // disables IRQs
+            inner_lock();      // disables IRQs
+            inner_unlock();    // ENABLES IRQs  ← WRONG
+        ...                    // now running unprotected inside
+                               //    the OUTER critical section
+        outer_unlock();
+
+   With save/restore, the inner unlock restores "already disabled"
+   and nesting works. This is exactly why Linux has
+   spin_lock_irqsave() and not just spin_lock_irq()
+   (OS chapter 09).                                          */</code></pre>
+
+<div class="warn">
+<b>Hardware masks D, A, I and F on every exception entry</b>
+<p>This is not optional and not configurable. The reason is that <code>ELR_ELx</code> and
+<code>SPSR_ELx</code> are single registers, not a stack: a second exception arriving before your handler saved
+them would overwrite the return address, and you could never get back. Your handler saves them to the kernel
+stack first, and only <em>then</em> may unmask to allow nesting. Getting this order wrong destroys the
+interrupted context (<a href="arm-28-exception-entry.html">chapter 28</a>).</p>
+</div>
+
+<h2 id="fiq">IRQ versus FIQ</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>IRQ</th><th>FIQ</th></tr></thead>
+<tbody>
+<tr><td>ARMv7</td><td>Standard interrupt</td><td>"Fast": extra banked registers, last vector entry, higher priority</td></tr>
+<tr><td>AArch64</td><td>Standard interrupt</td><td><strong>No banked registers, no speed advantage</strong> — just a second, separately maskable signal</td></tr>
+<tr><td>Conventional use</td><td>Non-secure world</td><td><strong>Secure world</strong>: Group 0 GIC interrupts</td></tr>
+<tr><td>Routing</td><td><code>SCR_EL3.IRQ</code>, <code>HCR_EL2.IMO</code></td><td><code>SCR_EL3.FIQ</code>, <code>HCR_EL2.FMO</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The practical consequence: on a TrustZone system, a Non-secure OS cannot mask secure interrupts by
+clearing <code>I</code>, because they arrive as FIQ and are configured to be taken to EL3. That separation is
+what lets the secure world preempt the normal world reliably
+(<a href="track.html?t=sec">security track</a>).</p>
+
+<h2 id="pan">PAN, UAO and the kernel/user boundary</h2>
+
+<p>These features exist to stop a specific class of attack: kernel code being tricked into reading or executing user-supplied memory. They work by making such accesses fault by default, which is why kernels must deliberately turn them off to copy user data.</p>
+
+<pre><code>/* PAN (Privileged Access Never, ARMv8.1) — when set, EL1 and EL2
+   accesses to memory marked user-accessible FAULT.
+
+   Why: it turns "kernel accidentally dereferenced a user pointer"
+   from a silent, exploitable bug into an immediate fault. It is
+   the ARM equivalent of x86's SMAP.                          */
+
+        msr     pan, #1              // enable PAN
+
+/* Legitimate access to user memory then requires explicitly
+   lifting it, which is exactly what copy_to_user does:      */
+        msr     pan, #0
+        // ... the actual copy, with an exception fixup installed
+        msr     pan, #1
+
+/* UAO (User Access Override, ARMv8.2) makes the unprivileged
+   load/store instructions (LDTR/STTR) behave as privileged,
+   which lets the kernel use ONE code path for both cases.  */
+
+/* This is why you must never dereference a __user pointer
+   directly (OS chapter 03) — on a PAN-enabled system it does not
+   silently work, it faults.                                */</code></pre>
+
+<h2 id="reading">Reading PSTATE in a crash dump</h2>
+
+<p>PSTATE appears in every crash dump, usually as a single hexadecimal value. Decoding it takes a few seconds and frequently tells you the exception level, the interrupt state and the stack in use — before you read a single line of the trace.</p>
+
+<pre><code>/* A Linux arm64 oops prints the saved PSTATE: */
+
+pstate: 60400009 (nZCv daif +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+        ^^^^^^^^  ^^^^ ^^^^  ^^^^
+        raw value │    │     features
+                  │    └── masks: lowercase = CLEAR (enabled)
+                  │                UPPERCASE = SET (masked)
+                  └─────── flags:  lowercase = clear, upper = set
+
+/* Reading it:
+     nZCv   → N=0, Z=1, C=1, V=0   (the last comparison was equal)
+     daif   → all lowercase = interrupts were ENABLED
+     DAIF   → all uppercase = all masked (typical inside a handler)
+     +PAN   → PAN was active, so this was NOT a user-memory access
+
+   The low bits of the raw value encode the EL and SPSel:
+     0x...09 = 0b1001 → EL2h    0x...05 = 0b0101 → EL1h
+     0x...04 = 0b0100 → EL1t    0x...00 = 0b0000 → EL0t
+
+   So `pstate: ...09` means the fault happened at EL2 using
+   SP_EL2 — which immediately tells you it was hypervisor code,
+   not the guest.                                            */</code></pre>
+
+<pre><code># in gdb
+p/x $cpsr                    # PSTATE, on targets that expose it
+p $pstate
+
+# in Linux, at runtime
+cat /proc/cpuinfo | grep Features       # pan, uao, ssbs, bti...
+
+# check what the kernel enabled
+dmesg | grep -iE 'PAN|SSBS|BTI|MTE'</code></pre>
+
+<h2 id="spsr">SPSR: PSTATE, frozen</h2>
+
+<p>PSTATE has to be preserved across an exception, because the handler will change it. The saved copy is what makes returning to the interrupted code possible, and modifying it deliberately is how a kernel changes what it returns to.</p>
+
+<pre class="diagram">On exception entry the hardware packs PSTATE into SPSR_ELx:
+
+   31 30 29 28        21 20    12 11 10  9  8  7  6  5  4  3   0
+  ┌──┬──┬──┬──┬────────┬──┬─────┬─────┬──┬──┬──┬──┬──┬──┬───────┐
+  │ N│ Z│ C│ V│  ...   │IL│ ... │ ... │ D│ A│ I│ F│ 0│nRW│ M[3:0]│
+  └──┴──┴──┴──┴────────┴──┴─────┴─────┴──┴──┴──┴──┴──┴──┴───────┘
+
+   M[3:0] encodes the EL and stack selection to return to:
+        0b0000  EL0t        0b0100  EL1t        0b1000  EL2t
+                            0b0101  EL1h        0b1001  EL2h
+        0b1100  EL3t        0b1101  EL3h
+
+   ERET restores PSTATE from SPSR_ELx and PC from ELR_ELx, both
+   ATOMICALLY. That atomicity is the whole point: there is no
+   window in which the privilege has changed but the PC has not.
+
+   Firmware uses this to DROP to a lower EL during boot: write the
+   target state into SPSR_EL3, the entry point into ELR_EL3, then
+   ERET (chapter 28).</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Comparison behaves oddly at the sign boundary</td><td>Used a signed condition for unsigned values, or the reverse</td></tr>
+<tr><td>Interrupts stay disabled after a critical section</td><td>Unconditional enable instead of save/restore</td></tr>
+<tr><td>Nested critical sections lose protection</td><td>Same — the inner unlock re-enabled prematurely</td></tr>
+<tr><td>Corrupted return address in a nested exception</td><td>Unmasked interrupts before saving ELR/SPSR</td></tr>
+<tr><td>Kernel faults dereferencing a user pointer</td><td>PAN is doing its job — use <code>copy_from_user</code></td></tr>
+<tr><td>Secure interrupt not maskable by the normal OS</td><td>Delivered as FIQ, routed to EL3 — by design</td></tr>
+<tr><td>Overflow check never fires</td><td>No <code>S</code> suffix, so V was never set</td></tr>
+<tr><td>Crash dump shows <code>pstate: ...09</code></td><td>The fault was at EL2h — hypervisor, not guest</td></tr>
+<tr><td><code>ERET</code> returns to the wrong level</td><td>Wrong <code>M[3:0]</code> encoding in SPSR</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Explain why PSTATE is not a single register and when it becomes one.</li>
+  <li>Give the four condition flags and say why both C and V are needed.</li>
+  <li>Choose the right condition code for a signed and an unsigned "less than".</li>
+  <li>Write a nesting-safe critical section and explain why unconditional enable is wrong.</li>
+  <li>Explain why hardware masks DAIF on exception entry.</li>
+  <li>State how FIQ differs from IRQ on AArch64 and what it is used for.</li>
+  <li>Explain what PAN prevents and how <code>copy_to_user</code> works with it.</li>
+  <li>Decode <code>pstate: 60400009 (nZCv daif +PAN)</code> into plain English.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>

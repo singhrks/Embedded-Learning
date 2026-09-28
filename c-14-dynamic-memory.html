@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dynamic memory and its failure modes | Embedded Learning Hub</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<main class="content">
+
+<h1>Dynamic memory and its failure modes</h1>
+<p class="lead">C gives you four functions and no safety net. Every use-after-free, double free, leak and heap
+overflow in the history of computing came through this interface. This chapter covers using it correctly, the
+ownership discipline that makes it tractable, and why embedded systems often ban it outright.</p>
+
+<h2 id="api">The four functions</h2>
+
+<p>Four functions, each with behaviour worth knowing precisely — including two edge cases that are defined but almost never what the caller intended.</p>
+
+<pre><code>void *malloc(size_t size);              /* uninitialised            */
+void *calloc(size_t n, size_t size);    /* zeroed, checked multiply */
+void *realloc(void *p, size_t size);    /* resize, may move         */
+void  free(void *p);                    /* release; free(NULL) is a no-op */
+
+/* correct malloc usage */
+int *p = malloc(n * sizeof *p);    /* `sizeof *p`, not sizeof(int) —
+                                      stays correct if the type changes */
+if (!p)
+        return -ENOMEM;            /* ALWAYS check                       */
+
+/* Do NOT cast the result in C. The cast is required in C++, is
+   noise in C, and historically hid the missing-prototype bug.    */</code></pre>
+
+<div class="warn">
+<b>The multiplication is the vulnerability</b>
+<pre><code>void *p = malloc(n * sizeof(struct item));
+/* If n is attacker-controlled and large, n * sizeof(...) WRAPS.
+   You allocate 16 bytes, then write n elements into it.
+   This is a textbook heap overflow.                            */
+
+/* calloc checks the multiplication internally — use it: */
+void *p = calloc(n, sizeof(struct item));
+
+/* or check explicitly */
+if (n &gt; SIZE_MAX / sizeof(struct item))
+        return -EOVERFLOW;
+
+/* or use a builtin */
+size_t bytes;
+if (__builtin_mul_overflow(n, sizeof(struct item), &amp;bytes))
+        return -EOVERFLOW;
+
+/* Linux kernel helpers that do this for you: */
+kmalloc_array(n, size, GFP_KERNEL);
+kcalloc(n, size, GFP_KERNEL);
+kmalloc(struct_size(p, items, n), GFP_KERNEL);   /* flexible arrays */</code></pre>
+</div>
+
+<h3>realloc, and the leak everyone writes once</h3>
+
+<pre><code>/* WRONG: if realloc fails it returns NULL and the ORIGINAL block
+   is still allocated — you have just leaked it and lost the data. */
+p = realloc(p, new_size);
+if (!p) return -ENOMEM;      /* the old block is now unreachable */
+
+/* RIGHT: keep the original until you know the new one exists */
+void *tmp = realloc(p, new_size);
+if (!tmp) {
+        free(p);             /* or keep using p — your choice, but
+                                make it deliberately */
+        return -ENOMEM;
+}
+p = tmp;
+
+/* Other realloc facts worth knowing:
+     realloc(NULL, n)  == malloc(n)
+     realloc(p, 0)     is implementation-defined in C17 and
+                       UNDEFINED in C23 — never rely on it as free
+     the block MAY MOVE, so every pointer into it is invalidated  */
+
+/* That last point causes real bugs: */
+int *elem = &amp;vec-&gt;data[3];
+vec_push(vec, x);            /* may realloc */
+*elem = 5;                   /* DANGLING — store an index, not a pointer */</code></pre>
+
+<h2 id="ownership">Ownership: the discipline that makes this work</h2>
+
+<div class="key">
+<b>Every allocation has exactly one owner</b>
+<p>The owner is responsible for freeing it. Ownership may be <em>transferred</em>, but it is never shared
+implicitly. Write down, in the function's documentation or its name, who owns what. C gives you no
+enforcement, so the convention is all you have — which is precisely why it must be explicit.</p>
+</div>
+
+<pre><code>/* Document ownership in the API. These are the three patterns: */
+
+/* 1. Caller owns — the function borrows */
+size_t parse(const char *input, struct result *out);
+/*     ^ const: we only read it        ^ caller-provided storage */
+
+/* 2. Callee allocates, caller owns — transfer OUT */
+struct buffer *buffer_create(size_t n);   /* caller must
+void buffer_destroy(struct buffer *b);       call destroy */
+
+/* 3. Callee takes ownership — transfer IN */
+void queue_push(struct queue *q, char *msg);   /* q now owns msg;
+                                                  caller must not
+                                                  free or reuse it */
+/* Make this obvious in the name if it is not obvious from context: */
+void queue_push_owned(struct queue *q, char *msg);
+
+/* Matching create/destroy pairs, consistently named, are the single
+   most effective convention in C memory management:            */
+foo_create / foo_destroy
+foo_alloc  / foo_free
+foo_new    / foo_delete        /* pick ONE style per project */</code></pre>
+
+<h2 id="patterns">Patterns that reduce the surface</h2>
+
+<p>Most allocation bugs come from unclear ownership rather than from the allocator itself. These patterns make ownership explicit, which is what makes the cleanup obviously correct.</p>
+
+<h3>The goto cleanup ladder</h3>
+
+<pre><code>/* Idiomatic C, and the reason `goto` is not banned in kernel code.
+   Resources are released in exactly reverse order of acquisition. */
+int setup(struct dev *d)
+{
+        int ret;
+
+        d-&gt;buf = malloc(SIZE);
+        if (!d-&gt;buf)
+                return -ENOMEM;
+
+        d-&gt;fd = open_device();
+        if (d-&gt;fd &lt; 0) {
+                ret = d-&gt;fd;
+                goto err_free;
+        }
+
+        ret = start_thread(d);
+        if (ret)
+                goto err_close;
+
+        return 0;
+
+err_close:
+        close(d-&gt;fd);
+err_free:
+        free(d-&gt;buf);
+        d-&gt;buf = NULL;
+        return ret;
+}
+/* Labels named for what they UNDO, not where they are. One exit
+   point per resource. This scales to a dozen resources without
+   nesting.                                                     */</code></pre>
+
+<h3>Scope-based cleanup</h3>
+
+<pre><code>/* GCC/Clang `cleanup` attribute — RAII in C. Adopted by the Linux
+   kernel in 6.5 and spreading through systemd and glib.       */
+static inline void freep(void *p) { free(*(void **)p); }
+#define _cleanup_free_ __attribute__((cleanup(freep)))
+
+int process(void)
+{
+        _cleanup_free_ char *buf = malloc(1024);
+        if (!buf)
+                return -ENOMEM;
+
+        if (early_error)
+                return -EIO;        /* freed automatically */
+
+        return 0;                   /* freed automatically */
+}
+
+/* Linux 6.5+ provides this properly, with type safety: */
+#include &lt;linux/cleanup.h&gt;
+struct foo *f __free(kfree) = kmalloc(sizeof(*f), GFP_KERNEL);
+guard(mutex)(&amp;lock);                /* unlocked on scope exit */</code></pre>
+
+<h3>Arena and pool allocation</h3>
+
+<pre><code>/* When many objects share a lifetime, allocate them from one arena
+   and free the whole arena at once. No per-object bookkeeping, no
+   leaks, and dramatically faster.                              */
+
+struct arena { char *base; size_t size, used; };
+
+void *arena_alloc(struct arena *a, size_t n)
+{
+        n = (n + 15) &amp; ~(size_t)15;             /* align to 16 */
+        if (a-&gt;used + n &gt; a-&gt;size)
+                return NULL;
+        void *p = a-&gt;base + a-&gt;used;
+        a-&gt;used += n;
+        return p;
+}
+void arena_reset(struct arena *a) { a-&gt;used = 0; }   /* frees everything */
+
+/* Ideal for: per-request server allocations, compiler AST nodes,
+   parsing, frame-based game logic. The tradeoff is that you cannot
+   free individual objects — which is exactly what removes the
+   use-after-free class.                                        */
+
+/* A fixed-size POOL is the embedded variant: pre-allocate N objects,
+   hand them out from a free list, never fragment.              */</code></pre>
+
+<h2 id="failures">The failure modes</h2>
+
+<p>Dynamic memory fails in a small number of recognisable ways. Naming them separately is what lets you pick the right tool, because each is found by a different one.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Bug</th><th>What happens</th><th>Detection</th></tr></thead>
+<tbody>
+<tr><td><strong>Leak</strong></td><td>Memory never freed; process grows until OOM</td><td>ASan (<code>LeakSanitizer</code>), Valgrind</td></tr>
+<tr><td><strong>Use after free</strong></td><td>Reads garbage, or writes into a reallocated object</td><td>ASan, Valgrind, KASAN</td></tr>
+<tr><td><strong>Double free</strong></td><td>Corrupts allocator metadata; often exploitable</td><td>ASan, glibc's own checks</td></tr>
+<tr><td><strong>Heap overflow</strong></td><td>Writes past the block into adjacent data or metadata</td><td>ASan, <code>_FORTIFY_SOURCE</code></td></tr>
+<tr><td><strong>Invalid free</strong></td><td>Freeing a stack pointer, an interior pointer, or a non-pointer</td><td>ASan, glibc</td></tr>
+<tr><td><strong>Mismatched allocator</strong></td><td><code>free</code> on <code>new</code>, or <code>kfree</code> on <code>vmalloc</code></td><td>Review; some checkers</td></tr>
+<tr><td><strong>Uninitialised read</strong></td><td><code>malloc</code> memory contains old data</td><td>MSan, Valgrind</td></tr>
+<tr><td><strong>Fragmentation</strong></td><td>Free memory exists but no contiguous block is large enough</td><td>Long-running tests; arena/pool design</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The habits that prevent most of these */
+
+free(p);
+p = NULL;         /* a later use crashes loudly; a second free is a no-op */
+
+/* Free in the same layer that allocated. If a function allocates
+   on some paths and not others, that is a design smell.        */
+
+/* Never free something you did not allocate, and never hand a
+   pointer to a different allocator:                            */
+kfree(vmalloc_ptr);        /* kernel: corrupts the slab allocator */
+
+/* Zero sensitive data before freeing (chapter 06) — and remember
+   plain memset may be optimised away.                          */
+explicit_bzero(key, sizeof key);
+free(key);</code></pre>
+
+<h2 id="tools">Finding them</h2>
+
+<p>Memory errors rarely crash where the mistake is. These tools move the failure to the offending line, and using them from the start costs far less than adopting them after a bug appears.</p>
+
+<pre><code># AddressSanitizer — the default choice. ~2x slower; run everything under it.
+gcc -fsanitize=address -fno-omit-frame-pointer -g prog.c
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 ./prog
+
+# MemorySanitizer — uninitialised reads (Clang only, needs all deps rebuilt)
+clang -fsanitize=memory -fno-omit-frame-pointer -g prog.c
+
+# Valgrind — no rebuild, ~20x slower, finds slightly different things
+valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./prog
+
+# glibc's built-in checks, free at runtime
+MALLOC_CHECK_=3 ./prog
+MALLOC_PERTURB_=165 ./prog      # fill freed memory with a pattern
+
+# static analysis
+gcc -fanalyzer                  # GCC 10+; finds many leaks and UAFs
+clang --analyze
+cppcheck --enable=all
+
+# in the kernel
+CONFIG_KASAN=y  CONFIG_DEBUG_KMEMLEAK=y  CONFIG_DEBUG_OBJECTS=y</code></pre>
+
+<h2 id="embedded">Why embedded systems restrict or ban it</h2>
+
+<p>Many embedded and safety-critical projects forbid dynamic allocation entirely. The reasons are concrete rather than dogmatic, and understanding them explains what such systems do instead.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Problem</th><th>Consequence in an embedded context</th></tr></thead>
+<tbody>
+<tr><td><strong>Fragmentation</strong></td><td>Over weeks of uptime, allocation fails despite free memory. No way to recover without a reboot.</td></tr>
+<tr><td><strong>Non-determinism</strong></td><td><code>malloc</code> has no bounded worst-case time. Unacceptable in a hard real-time path.</td></tr>
+<tr><td><strong>No recovery path</strong></td><td>What does a brake controller <em>do</em> when <code>malloc</code> returns NULL?</td></tr>
+<tr><td><strong>Unbounded footprint</strong></td><td>Static analysis cannot prove the system fits in RAM</td></tr>
+<tr><td><strong>Silent failure</strong></td><td>Heap corruption in a system with no MMU corrupts anything, anywhere</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>/* The standard alternatives, in rough order of preference: */
+
+/* 1. Static allocation — everything sized at build time */
+static struct session sessions[MAX_SESSIONS];
+static uint8_t rx_buffer[MAX_FRAME];
+/* The linker tells you at BUILD TIME whether it fits. */
+
+/* 2. Fixed-size pools */
+static struct msg pool[64];
+static uint64_t pool_used;             /* a bitmap */
+struct msg *msg_alloc(void)
+{
+        int i = __builtin_ffsll(~pool_used) - 1;
+        if (i &lt; 0) return NULL;
+        pool_used |= 1ull &lt;&lt; i;
+        return &amp;pool[i];
+}
+
+/* 3. Allocate only at init, never at runtime — the MISRA and
+      DO-178C compromise. Startup allocation is deterministic
+      because nothing has fragmented yet.                       */
+
+/* MISRA C:2012 Rule 21.3 bans malloc/calloc/realloc/free outright
+   in safety-critical code. AUTOSAR and DO-178C impose similar
+   restrictions.                                                */</code></pre>
+
+<h2 id="allocators">What the allocator is doing</h2>
+
+<p>When the standard allocator is unsuitable, writing a specialised one is often straightforward — and the simplest designs are both faster and easier to reason about than the general-purpose one.</p>
+
+<pre class="diagram">A typical glibc heap block
+
+   +-----------+-----------------------------+---------+
+   |  header   |        your data            | padding |
+   |  size,    |  &lt;- malloc returns THIS     |         |
+   |  flags    |                             |         |
+   +-----------+-----------------------------+---------+
+    8-16 bytes
+
+  · malloc(1) really costs 32 bytes. Many tiny allocations are
+    mostly overhead — a reason to use pools or arenas.
+  · The header sits immediately BEFORE your data, which is why a
+    single-byte underflow corrupts allocator metadata, and why
+    that is so often exploitable.
+  · free() reads that header to learn the size. Passing an
+    interior pointer therefore reads garbage as a size.
+  · Freed blocks go on size-class free lists ("bins"); adjacent
+    free blocks are coalesced. This is where fragmentation lives.
+  · Large requests (&gt;128 KB by default) go straight to mmap and
+    are returned to the OS on free — which is why RSS sometimes
+    drops after free and sometimes does not.
+
+Alternative allocators worth knowing: jemalloc and tcmalloc
+(better multithreaded scaling), mimalloc, and for embedded,
+TLSF (bounded worst-case time) and FreeRTOS heap_4/heap_5.</pre>
+
+<h2 id="fails">How it shows up</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Crash far from the faulty code</td><td>Heap corruption from an earlier overflow</td></tr>
+<tr><td>"free(): invalid pointer"</td><td>Double free, interior pointer, or a stack address</td></tr>
+<tr><td>"malloc(): corrupted top size"</td><td>Heap overflow overwrote allocator metadata</td></tr>
+<tr><td>Process RSS grows without bound</td><td>Leak — or fragmentation preventing return to the OS</td></tr>
+<tr><td>Works with small input, corrupts with large</td><td>Size calculation overflowed</td></tr>
+<tr><td>Data changes after a container append</td><td><code>realloc</code> moved the block; stored pointer dangles</td></tr>
+<tr><td>Leak only on the error path</td><td>Missing cleanup in an early return; use the goto ladder</td></tr>
+<tr><td>Memory lost when an allocation fails</td><td><code>p = realloc(p, n)</code> overwrote the original pointer</td></tr>
+<tr><td>Long-running device eventually fails to allocate</td><td>Fragmentation; switch to pools</td></tr>
+<tr><td>Values differ between debug and release</td><td>Reading uninitialised <code>malloc</code> memory</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">Check yourself</h2>
+<ul class="checklist">
+  <li>Write a correct allocation of <code>n</code> items with the overflow check.</li>
+  <li>Show the <code>realloc</code> leak and the correct form.</li>
+  <li>Name the three ownership patterns and how you would document each in an API.</li>
+  <li>Write a goto cleanup ladder for three resources, in the right order.</li>
+  <li>Explain what the <code>cleanup</code> attribute does and what problem it solves.</li>
+  <li>Explain when an arena allocator is the right choice and what it gives up.</li>
+  <li>Give four reasons embedded systems ban dynamic allocation, and two alternatives.</li>
+  <li>Explain why a one-byte heap underflow is often exploitable.</li>
+</ul>
+
+</main>
+</div>
+<script src="assets/js/site.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>
